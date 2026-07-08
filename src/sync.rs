@@ -67,8 +67,8 @@ pub fn compare_music_dicts<'a>(
     wf_dict
         .iter()
         .filter(|(name, wf_info)| match mode {
-            Mode::Legacy => !sf_dict.contains_key(*name),
-            Mode::Default => {
+            Mode::Compat => !sf_dict.contains_key(*name),
+            Mode::Lossless => {
                 if let Some(sf_info) = sf_dict.get(*name) {
                     if let (Ok(size1), Ok(size2)) =
                         (wf_info.0.parse::<u64>(), sf_info.0.parse::<u64>())
@@ -124,8 +124,8 @@ pub fn sync_music_library(
                 "flac" => {
                     bar.set_message(format!("Processing FLAC: {}", name));
                     match mode {
-                        Mode::Default => copy_file(src_path, dest_folder, name),
-                        Mode::Legacy => convert_flac_to_mp3(src_path, dest_folder, name),
+                        Mode::Lossless => copy_file(src_path, dest_folder, name),
+                        Mode::Compat => convert_flac_to_mp3(src_path, dest_folder, name),
                     }
                 }
                 "ncm" => {
@@ -276,7 +276,7 @@ fn process_ncm_file(
     temp_file.write_all(&final_data)?;
 
     match (mode, file_format.as_str()) {
-        (Mode::Legacy, "flac") => {
+        (Mode::Compat, "flac") => {
             convert_flac_to_mp3(&temp_path, dest_folder, name_stem)?;
             fs::remove_file(&temp_path)?;
         }

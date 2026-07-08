@@ -32,13 +32,20 @@ fn main() -> Result<(), Error> {
         )
     })?;
 
+    let Config {
+        source,
+        destination,
+        mode,
+        lossless_format,
+    } = config;
+
     println!(
-        "Config loaded: Source='{}', Destination='{}', Mode={:?}",
-        config.source, config.destination, config.mode
+        "Config loaded: Source='{}', Destination='{}', Mode={:?}, LosslessFormat={:?}",
+        source, destination, mode, lossless_format
     );
 
-    let wf = &config.source;
-    let sf = &config.destination;
+    let wf = &source;
+    let sf = &destination;
 
     if !Path::new(wf).exists() {
         eprintln!("Source folder does not exist: {}", wf);
@@ -61,11 +68,11 @@ fn main() -> Result<(), Error> {
     let sf_dict = get_music_dict(sf);
     println!("Found {} music files in destination.", sf_dict.len());
 
-    let new_songs = compare_music_dicts(&wf_dict, &sf_dict, &config.mode);
+    let new_songs = compare_music_dicts(&wf_dict, &sf_dict, &mode);
     println!("Found {} new songs to sync.", new_songs.len());
 
     if !new_songs.is_empty() {
-        sync_music_library(&new_songs, sf, &config.mode)?;
+        sync_music_library(&new_songs, sf, &mode)?;
     }
 
     println!("Sync completed successfully.");

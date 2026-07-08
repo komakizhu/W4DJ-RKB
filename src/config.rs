@@ -1,11 +1,18 @@
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
-    #[serde(rename = "default")]
-    Default,
-    #[serde(rename = "legacy")]
-    Legacy,
+    Compat,
+    Lossless,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LosslessFormat {
+    Wav,
+    Flac,
+    Aiff,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13,6 +20,8 @@ pub struct Config {
     pub source: String,
     pub destination: String,
     pub mode: Mode,
+    #[serde(default)]
+    pub lossless_format: Option<LosslessFormat>,
 }
 
 #[derive(clap::Parser)]
@@ -25,4 +34,23 @@ pub struct Config {
 pub struct Cmd {
     #[arg(long, short, default_value = "config.toml")]
     pub config: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, LosslessFormat, Mode};
+
+    #[test]
+    fn parses_mode_and_lossless_output_format() {
+        let toml = r#"
+source = "/music/in"
+destination = "/music/out"
+mode = "compat"
+lossless_format = "flac"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(matches!(config.mode, Mode::Compat));
+        assert!(matches!(config.lossless_format, Some(LosslessFormat::Flac)));
+    }
 }
