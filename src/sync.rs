@@ -1,7 +1,7 @@
 use crate::config::{LosslessFormat, Mode};
 use crate::metadata::{FlacMetadata, Metadata, Mp3Metadata};
+use crate::task::{TaskController, TaskSnapshot};
 use ncmdump::Ncmdump;
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -144,9 +144,38 @@ pub fn sync_music_library_with_policy(
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
-) -> io::Result<()> {
+) -> io::Result<TaskSnapshot> {
+    let task_controller = TaskController::running(new_songs.len());
+    sync_music_library_with_task(new_songs, dest_folder, mode, lossless_format, &task_controller)
+}
+
+pub fn sync_music_library_with_task(
+    new_songs: &HashMap<&String, &(String, String)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    task_controller: &TaskController,
+) -> io::Result<TaskSnapshot> {
+    sync_music_library_with_observer(
+        new_songs,
+        dest_folder,
+        mode,
+        lossless_format,
+        task_controller,
+        |_, _| {},
+    )
+}
+
+pub fn sync_music_library_with_observer(
+    new_songs: &HashMap<&String, &(String, String)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    task_controller: &TaskController,
+    mut after_file: impl FnMut(&str, &TaskController),
+) -> io::Result<TaskSnapshot> {
     if new_songs.is_empty() {
-        return Ok(());
+        return Ok(task_controller.snapshot());
     }
 
     let bar = indicatif::ProgressBar::new(new_songs.len() as u64);
@@ -157,48 +186,71 @@ pub fn sync_music_library_with_policy(
         .unwrap(),
     );
 
-    let results: Vec<io::Result<()>> = new_songs
-        .par_iter()
-        .map(|(&name, info)| {
-            let src_path = Path::new(&info.1);
-            let extension = src_path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+    for (&name, info) in new_songs.iter() {
+        if task_controller.is_cancelled() {
+            bar.abandon_with_message("Sync cancelled.");
+            return Ok(task_controller.snapshot());
+        }
 
-            let task_result = match extension.as_str() {
-                "mp3" => {
-                    bar.set_message(format!("Copying MP3: {}", name));
-                    copy_file(src_path, dest_folder, name)
-                }
-                "flac" => {
-                    bar.set_message(format!("Processing FLAC: {}", name));
-                    match mode {
-                        Mode::Lossless => copy_file(src_path, dest_folder, name),
-                        Mode::Compat => convert_flac_to_mp3(src_path, dest_folder, name),
-                    }
-                }
-                "ncm" => {
-                    bar.set_message(format!("Dumping NCM: {}", name));
-                    process_ncm_file(src_path, dest_folder, name, mode, lossless_format)
-                }
-                _ => unreachable!(
-                    "Invalid file extension '{}' for song '{}'. Filter failed.",
-                    extension, name
-                ),
-            };
-            bar.inc(1);
-            task_result
-        })
-        .collect();
+        if !task_controller.should_start_next_file() {
+            bar.abandon_with_message("Sync paused after current file.");
+            return Ok(task_controller.snapshot());
+        }
 
-    if let Some(err) = results.into_iter().find_map(Result::err) {
-        bar.abandon_with_message(format!("Sync encountered errors. First error: {}", err));
-        Err(err)
-    } else {
-        bar.finish_with_message("Sync processing complete.");
-        Ok(())
+        let task_result = process_music_file(name, info, dest_folder, mode, lossless_format, &bar);
+        if let Err(err) = task_result {
+            bar.abandon_with_message(format!("Sync encountered errors. First error: {}", err));
+            return Err(err);
+        }
+
+        task_controller.complete_current_file();
+        bar.inc(1);
+        after_file(name, task_controller);
+    }
+
+    let snapshot = task_controller.snapshot();
+    bar.finish_with_message(format!(
+        "Sync processing complete. {}/{} files processed.",
+        snapshot.completed, snapshot.total
+    ));
+    Ok(snapshot)
+}
+
+fn process_music_file(
+    name: &str,
+    info: &(String, String),
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    bar: &indicatif::ProgressBar,
+) -> io::Result<()> {
+    let src_path = Path::new(&info.1);
+    let extension = src_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match extension.as_str() {
+        "mp3" => {
+            bar.set_message(format!("Copying MP3: {}", name));
+            copy_file(src_path, dest_folder, name)
+        }
+        "flac" => {
+            bar.set_message(format!("Processing FLAC: {}", name));
+            match mode {
+                Mode::Lossless => copy_file(src_path, dest_folder, name),
+                Mode::Compat => convert_flac_to_mp3(src_path, dest_folder, name),
+            }
+        }
+        "ncm" => {
+            bar.set_message(format!("Dumping NCM: {}", name));
+            process_ncm_file(src_path, dest_folder, name, mode, lossless_format)
+        }
+        _ => unreachable!(
+            "Invalid file extension '{}' for song '{}'. Filter failed.",
+            extension, name
+        ),
     }
 }
 

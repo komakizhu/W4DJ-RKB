@@ -3,6 +3,8 @@
 mod config;
 #[path = "../src/metadata.rs"]
 mod metadata;
+#[path = "../src/task.rs"]
+mod task;
 #[path = "../src/sync.rs"]
 mod sync;
 
