@@ -1,4 +1,5 @@
 mod config;
+pub mod gui;
 mod sync;
 mod metadata;
 pub mod task;
