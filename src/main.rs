@@ -18,6 +18,7 @@ fn main() -> Result<(), Error> {
     }
 
     let cmd = Cmd::parse();
+    let launch_gui = cmd.gui;
     let config_file_path = cmd.config.expect("Clap should provide default value");
 
     let config_content = fs::read_to_string(&config_file_path).map_err(|e| {
@@ -45,6 +46,20 @@ fn main() -> Result<(), Error> {
         "Config loaded: Source='{}', Destination='{}', Mode={:?}, LosslessFormat={:?}",
         source, destination, mode, lossless_format
     );
+
+    if launch_gui {
+        let shell = gui::launch_shell(&Config {
+            source: source.clone(),
+            destination: destination.clone(),
+            mode,
+            lossless_format,
+        });
+        println!(
+            "GUI shell launched: source='{}', destination='{}', mode={:?}",
+            shell.source_directory, shell.destination_directory, shell.mode
+        );
+        return Ok(());
+    }
 
     let wf = &source;
     let sf = &destination;

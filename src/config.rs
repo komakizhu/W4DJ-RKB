@@ -34,6 +34,8 @@ pub struct Config {
 pub struct Cmd {
     #[arg(long, short, default_value = "config.toml")]
     pub config: Option<String>,
+    #[arg(long, default_value_t = false)]
+    pub gui: bool,
 }
 
 #[cfg(test)]
