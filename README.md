@@ -4,11 +4,11 @@ W4DJ 是一个简单的命令行工具，用于同步网易云音乐（Netease C
 
 ## 功能特点
 
-- 🎵 扫描并同步网易云音乐下载的歌曲
-- 🔄 自动识别并转换 NCM 加密格式为 MP3直出或原格式输出
+- 🎵 扫描并同步网易云音乐下载目录
+- 🔄 支持 `compat` 和 `lossless` 两种模式
 - 📁 支持自定义源目录和目标目录
-- ⚡ rayon多线程处理，快速同步大量文件
-- 🚀 rust编写，内存占用极低
+- ⚡ rayon 多线程处理，快速同步大量文件
+- 🚀 Rust 编写，内存占用极低
 ![w4dj](imgs/w4dj.png)
 
 
@@ -55,44 +55,56 @@ Windows端已经拥有捆绑的ffmpeg。
 ## 使用方法
 
 
-### 1. 创建配置文件 `config.toml`：<br>
-Windows路径需要`/`隔开
+### 1. 创建配置文件 `config.toml`
 
-1. 歌曲同步器
+Windows 路径请使用 `/`。
+
+1. 兼容模式
    ```toml
    source = "/path/to/netmusic/songs"       # 网易云音乐下载目录
    destination = "/path/to/music/library"   # 目标音乐库目录
-   mode = "default"                         # 同步模式，default为原格式输出模式
+   mode = "compat"                          # 兼容模式：输出 mp3
    ```
 
-2. 歌曲同步器（MP3）
+2. 无损模式
    ```toml
    source = "/path/to/netmusic/songs"       # 网易云音乐下载目录
    destination = "/path/to/music/library"   # 目标音乐库目录
-   mode = "legacy"                          # 同步模式，legacy仅输出mp3
-   ```
-
-3. 歌曲转换器
-   ```toml
-   source = "/path/to/netmusic/songs"       # 待转换的目录
-   destination = "/path/to/music/library"   # 待输出目录
-   mode = "legacy"                          # legacy仅输出mp3
+   mode = "lossless"                        # 无损模式：输出 wav / flac / aiff
+   lossless_format = "flac"
    ```
 
 
-### 2.运行程序：
+### 2. 运行程序
 
-双击exe。
+双击 exe，或指定配置文件路径：
 
-   或指定配置文件路径：
-   ```bash
-   ./w4dj --config /path/to/your/config.toml
-   ```
+```bash
+./w4dj --config /path/to/your/config.toml
+```
 
-### 3.程序将自动：
+如果要进入 GUI 入口：
+
+```bash
+./w4dj --gui --config /path/to/your/config.toml
+```
+
+### 3. 运行桌面窗口开发版
+
+桌面窗口使用 Tauri + Web UI。首次运行前先安装前端依赖：
+
+```bash
+cd app
+npm install
+npm run build
+cd ..
+cargo build --manifest-path src-tauri/Cargo.toml
+```
+
+### 4.程序将自动：
    - 扫描源目录和目标目录
-   - 识别新增的歌曲
-   - 转换 NCM 格式并复制到目标目录
+   - 识别新增歌曲
+   - 按模式执行转换或复制
    - 显示同步进度和结果
 
 

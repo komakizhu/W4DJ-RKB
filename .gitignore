@@ -1,3 +1,5 @@
 /target
 /app/dist
 /app/node_modules
+/src-tauri/gen
+/src-tauri/target
