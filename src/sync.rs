@@ -1,4 +1,4 @@
-use crate::config::Mode;
+use crate::config::{LosslessFormat, Mode};
 use crate::metadata::{FlacMetadata, Metadata, Mp3Metadata};
 use ncmdump::Ncmdump;
 use rayon::prelude::*;
@@ -9,6 +9,56 @@ use std::io::{self, Error, ErrorKind, Write};
 use std::path::Path;
 use std::process::Command;
 use which;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputPolicy {
+    pub output_extension: &'static str,
+    pub target_profile: TargetProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetProfile {
+    CompatMp3,
+    LosslessWav,
+    LosslessFlac,
+    LosslessAiff,
+}
+
+impl TargetProfile {
+    fn output_extension(self) -> &'static str {
+        match self {
+            TargetProfile::CompatMp3 => "mp3",
+            TargetProfile::LosslessWav => "wav",
+            TargetProfile::LosslessFlac => "flac",
+            TargetProfile::LosslessAiff => "aiff",
+        }
+    }
+}
+
+pub fn resolve_output_policy(
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    _source_extension: &str,
+) -> OutputPolicy {
+    match mode {
+        Mode::Compat => OutputPolicy {
+            output_extension: "mp3",
+            target_profile: TargetProfile::CompatMp3,
+        },
+        Mode::Lossless => {
+            let target_profile = match lossless_format.unwrap_or(LosslessFormat::Flac) {
+                LosslessFormat::Wav => TargetProfile::LosslessWav,
+                LosslessFormat::Flac => TargetProfile::LosslessFlac,
+                LosslessFormat::Aiff => TargetProfile::LosslessAiff,
+            };
+
+            OutputPolicy {
+                output_extension: target_profile.output_extension(),
+                target_profile,
+            }
+        }
+    }
+}
 
 pub fn find_ffmpeg() -> Option<String> {
     if let Ok(exe_dir) = env::current_exe() {
@@ -89,10 +139,11 @@ pub fn compare_music_dicts<'a>(
         .collect()
 }
 
-pub fn sync_music_library(
+pub fn sync_music_library_with_policy(
     new_songs: &HashMap<&String, &(String, String)>,
     dest_folder: &str,
     mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
 ) -> io::Result<()> {
     if new_songs.is_empty() {
         return Ok(());
@@ -130,7 +181,7 @@ pub fn sync_music_library(
                 }
                 "ncm" => {
                     bar.set_message(format!("Dumping NCM: {}", name));
-                    process_ncm_file(src_path, dest_folder, name, mode)
+                    process_ncm_file(src_path, dest_folder, name, mode, lossless_format)
                 }
                 _ => unreachable!(
                     "Invalid file extension '{}' for song '{}'. Filter failed.",
@@ -203,6 +254,7 @@ fn process_ncm_file(
     dest_folder: &str,
     name_stem: &str,
     mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
 ) -> io::Result<()> {
     let file = File::open(src_path)?;
     let mut ncm = Ncmdump::from_reader(file).map_err(|e| {
@@ -238,49 +290,58 @@ fn process_ncm_file(
     } else {
         ncm_metadata.format.to_lowercase()
     };
+    let output_policy = resolve_output_policy(*mode, lossless_format, &file_format);
+
     // 创建目标文件路径
-    let temp_file_name = format!("{}.{}", name_stem, file_format);
+    let temp_file_name = format!("{}.{}", name_stem, output_policy.output_extension);
     let temp_path = Path::new(dest_folder).join(&temp_file_name);
     // 确保目录存在
     if let Some(parent) = temp_path.parent() {
         fs::create_dir_all(parent)?;
     }
     // ===== 关键修改：注入元数据 =====
-    let final_data = match file_format.as_str() {
-        "mp3" => {
-            // 创建MP3元数据注入器
-            Mp3Metadata::new(&ncm_metadata, &image_data, &music_data)
-                .inject_metadata(music_data.clone()) // 注入封面和元数据
+    let final_data = match output_policy.output_extension {
+        "mp3" => match file_format.as_str() {
+            "mp3" => Mp3Metadata::new(&ncm_metadata, &image_data, &music_data)
+                .inject_metadata(music_data.clone())
                 .map_err(|e| {
                     Error::new(
                         ErrorKind::InvalidData,
                         format!("MP3元数据注入失败 {}: {}", name_stem, e),
                     )
-                })?
-        }
-        "flac" => {
-            // 创建FLAC元数据注入器
-            FlacMetadata::new(&ncm_metadata, &image_data, &music_data)
-                .inject_metadata(music_data.clone()) // 注入封面和元数据
+                })?,
+            "flac" => FlacMetadata::new(&ncm_metadata, &image_data, &music_data)
+                .inject_metadata(music_data.clone())
                 .map_err(|e| {
                     Error::new(
                         ErrorKind::InvalidData,
                         format!("FLAC元数据注入失败 {}: {}", name_stem, e),
                     )
-                })?
-        }
-        _ => music_data, // 其他格式保持原始数据
+                })?,
+            _ => music_data,
+        },
+        "flac" => match file_format.as_str() {
+            "flac" => FlacMetadata::new(&ncm_metadata, &image_data, &music_data)
+                .inject_metadata(music_data.clone())
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("FLAC元数据注入失败 {}: {}", name_stem, e),
+                    )
+                })?,
+            _ => music_data,
+        },
+        _ => music_data,
     };
     // 写入处理后的数据（包含封面）
     let mut temp_file = File::create(&temp_path)?;
     temp_file.write_all(&final_data)?;
 
-    match (mode, file_format.as_str()) {
-        (Mode::Compat, "flac") => {
-            convert_flac_to_mp3(&temp_path, dest_folder, name_stem)?;
-            fs::remove_file(&temp_path)?;
-        }
-        _ => {}
+    if matches!(output_policy.target_profile, TargetProfile::CompatMp3)
+        && file_format.as_str() == "flac"
+    {
+        convert_flac_to_mp3(&temp_path, dest_folder, name_stem)?;
+        fs::remove_file(&temp_path)?;
     }
 
     Ok(())

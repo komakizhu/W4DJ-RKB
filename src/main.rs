@@ -2,7 +2,7 @@ mod config;
 mod sync;
 mod metadata;
 use crate::config::{Cmd, Config};
-use crate::sync::{compare_music_dicts, get_music_dict, sync_music_library};
+use crate::sync::{compare_music_dicts, get_music_dict, sync_music_library_with_policy};
 use clap::Parser;
 use std::fs;
 use std::io::{Error, ErrorKind};
@@ -72,7 +72,7 @@ fn main() -> Result<(), Error> {
     println!("Found {} new songs to sync.", new_songs.len());
 
     if !new_songs.is_empty() {
-        sync_music_library(&new_songs, sf, &mode)?;
+        sync_music_library_with_policy(&new_songs, sf, &mode, lossless_format)?;
     }
 
     println!("Sync completed successfully.");
