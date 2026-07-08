@@ -104,6 +104,26 @@ impl DesktopController {
         self.push_log("Pause requested");
     }
 
+    pub fn record_file_started(&mut self, file_name: impl Into<String>) {
+        self.state.current_file = file_name.into();
+        self.push_log(format!("Processing {}", self.state.current_file));
+    }
+
+    pub fn complete_current_file(&mut self) {
+        self.task_controller.complete_current_file();
+        let snapshot = self.task_controller.snapshot();
+        self.state.progress_completed = snapshot.completed;
+
+        if snapshot.completed >= snapshot.total && snapshot.total > 0 {
+            self.state.status = DesktopStatus::Completed;
+            self.push_log("Sync completed");
+        }
+    }
+
+    pub fn pause_after_current_file(&self) -> bool {
+        self.task_controller.pause_after_current_file()
+    }
+
     pub fn push_log(&mut self, line: impl Into<String>) {
         self.state.logs.push(line.into());
     }
