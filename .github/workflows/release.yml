@@ -1,0 +1,53 @@
+name: Release W4DJ
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest'
+            args: '--bundles dmg,app'
+          - platform: 'windows-latest'
+            args: '--bundles nsis,msi'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Frontend Dependencies
+        working-directory: ./app
+        run: npm install
+
+      - name: Build Frontend
+        working-directory: ./app
+        run: npm run build
+
+      - name: Build and Package Tauri App
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'W4DJ ${{ github.ref_name }}'
+          releaseBody: 'Automatic cross-platform release build for W4DJ (macOS DMG & Windows EXE/MSI).'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
