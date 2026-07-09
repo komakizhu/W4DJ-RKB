@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "W4DJ",
+  "productName": "w4dj plus",
   "version": "0.1.0",
   "identifier": "com.slipstream.w4dj",
   "build": {
@@ -13,7 +13,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "W4DJ",
+        "title": "w4dj plus",
         "width": 880,
         "height": 620,
         "minWidth": 760,
