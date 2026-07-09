@@ -92,7 +92,7 @@ export function renderApp(state: AppViewState = defaultState): HTMLElement {
   root.innerHTML = `
     <header class="topbar">
       <div class="brand-block">
-        <p class="eyebrow">W4DJ plus</p>
+        <p class="eyebrow">W4DJ RKB</p>
         <h1>如果我是DJ</h1>
       </div>
     </header>
