@@ -76,6 +76,15 @@ impl TaskController {
         self.with_state(|state| state.cancelled = true);
     }
 
+    pub fn set_total(&self, total: usize) {
+        self.with_state(|state| {
+            state.total = total;
+            if state.completed > total {
+                state.completed = total;
+            }
+        });
+    }
+
     pub fn should_start_next_file(&self) -> bool {
         self.with_state(|state| state.should_start_next_file())
     }

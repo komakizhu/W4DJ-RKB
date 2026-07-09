@@ -7,13 +7,13 @@ fn progress_updates_are_reflected_in_desktop_state() {
     let mut controller = test_controller();
 
     controller.start_sync(3);
-    controller.record_file_started("track.flac");
+    controller.record_file_started("track.wav");
     controller.complete_current_file();
 
     assert!(matches!(controller.state().status, DesktopStatus::Running));
     assert_eq!(controller.state().progress_total, 3);
     assert_eq!(controller.state().progress_completed, 1);
-    assert_eq!(controller.state().current_file, "track.flac");
+    assert_eq!(controller.state().current_file, "track.wav");
 }
 
 #[test]

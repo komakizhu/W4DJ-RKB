@@ -1,0 +1,152 @@
+# Review package: 9114da6..24e774a
+
+## Commits
+24e774a feat: add shared sync config
+
+## Files changed
+ src/config.rs | 38 +++++++++++++++++++++++++++++++++-----
+ src/sync.rs   | 10 +++++-----
+ 2 files changed, 38 insertions(+), 10 deletions(-)
+
+## Diff
+diff --git a/src/config.rs b/src/config.rs
+index 486d7fc..02a5b5a 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -1,28 +1,56 @@
+ use serde::Deserialize;
+ 
+-#[derive(Debug, Deserialize)]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
++#[serde(rename_all = "lowercase")]
+ pub enum Mode {
+-    #[serde(rename = "default")]
+-    Default,
+-    #[serde(rename = "legacy")]
+-    Legacy,
++    Compat,
++    Lossless,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub enum LosslessFormat {
++    Wav,
++    Flac,
++    Aiff,
+ }
+ 
+ #[derive(Debug, Deserialize)]
+ pub struct Config {
+     pub source: String,
+     pub destination: String,
+     pub mode: Mode,
++    #[serde(default)]
++    pub lossless_format: Option<LosslessFormat>,
+ }
+ 
+ #[derive(clap::Parser)]
+ #[command(
+     name = "w4dj",
+     version = "0.1.0",
+     author = "slipstream",
+     about = "网易云音乐曲库同步器"
+ )]
+ pub struct Cmd {
+     #[arg(long, short, default_value = "config.toml")]
+     pub config: Option<String>,
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{Config, LosslessFormat, Mode};
++
++    #[test]
++    fn parses_mode_and_lossless_output_format() {
++        let toml = r#"
++source = "/music/in"
++destination = "/music/out"
++mode = "compat"
++lossless_format = "flac"
++"#;
++
++        let config: Config = toml::from_str(toml).unwrap();
++        assert!(matches!(config.mode, Mode::Compat));
++        assert!(matches!(config.lossless_format, Some(LosslessFormat::Flac)));
++    }
++}
+diff --git a/src/sync.rs b/src/sync.rs
+index a621b69..69dd0cb 100644
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -60,22 +60,22 @@ pub fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
+ }
+ 
+ pub fn compare_music_dicts<'a>(
+     wf_dict: &'a HashMap<String, (String, String)>,
+     sf_dict: &'a HashMap<String, (String, String)>,
+     mode: &Mode,
+ ) -> HashMap<&'a String, &'a (String, String)> {
+     wf_dict
+         .iter()
+         .filter(|(name, wf_info)| match mode {
+-            Mode::Legacy => !sf_dict.contains_key(*name),
+-            Mode::Default => {
++            Mode::Compat => !sf_dict.contains_key(*name),
++            Mode::Lossless => {
+                 if let Some(sf_info) = sf_dict.get(*name) {
+                     if let (Ok(size1), Ok(size2)) =
+                         (wf_info.0.parse::<u64>(), sf_info.0.parse::<u64>())
+                     {
+                         let max_size = size1.max(size2) as f64;
+                         if max_size > 0.0 {
+                             let diff = (size1 as f64 - size2 as f64).abs();
+                             return (diff / max_size) >= 0.05;
+                         }
+                         return size1 != size2;
+@@ -117,22 +117,22 @@ pub fn sync_music_library(
+                 .to_lowercase();
+ 
+             let task_result = match extension.as_str() {
+                 "mp3" => {
+                     bar.set_message(format!("Copying MP3: {}", name));
+                     copy_file(src_path, dest_folder, name)
+                 }
+                 "flac" => {
+                     bar.set_message(format!("Processing FLAC: {}", name));
+                     match mode {
+-                        Mode::Default => copy_file(src_path, dest_folder, name),
+-                        Mode::Legacy => convert_flac_to_mp3(src_path, dest_folder, name),
++                        Mode::Lossless => copy_file(src_path, dest_folder, name),
++                        Mode::Compat => convert_flac_to_mp3(src_path, dest_folder, name),
+                     }
+                 }
+                 "ncm" => {
+                     bar.set_message(format!("Dumping NCM: {}", name));
+                     process_ncm_file(src_path, dest_folder, name, mode)
+                 }
+                 _ => unreachable!(
+                     "Invalid file extension '{}' for song '{}'. Filter failed.",
+                     extension, name
+                 ),
+@@ -269,19 +269,19 @@ fn process_ncm_file(
+                     )
+                 })?
+         }
+         _ => music_data, // 其他格式保持原始数据
+     };
+     // 写入处理后的数据（包含封面）
+     let mut temp_file = File::create(&temp_path)?;
+     temp_file.write_all(&final_data)?;
+ 
+     match (mode, file_format.as_str()) {
+-        (Mode::Legacy, "flac") => {
++        (Mode::Compat, "flac") => {
+             convert_flac_to_mp3(&temp_path, dest_folder, name_stem)?;
+             fs::remove_file(&temp_path)?;
+         }
+         _ => {}
+     }
+ 
+     Ok(())
+ }

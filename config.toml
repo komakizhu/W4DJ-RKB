@@ -1,3 +1,4 @@
-source="/mnt/c/CloudMusic"
-destination="/mnt/c/Users/slipstream/Music"
-mode="default"
+source="/Users/mac/Music/网易云音乐"
+destination="/Users/mac/Downloads"
+mode="compat"
+lossless_format="aiff"

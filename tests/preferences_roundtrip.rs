@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 use w4dj::config::{LosslessFormat, Mode};
-use w4dj::preferences::{load_preferences, save_preferences, AppPreferences};
+use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 
 #[test]
 fn preferences_roundtrip_persists_last_directories() {
@@ -11,7 +11,7 @@ fn preferences_roundtrip_persists_last_directories() {
         source_directory: "/music/in".into(),
         destination_directory: "/music/out".into(),
         mode: Mode::Compat,
-        lossless_format: Some(LosslessFormat::Flac),
+        lossless_format: Some(LosslessFormat::Aiff),
     };
 
     save_preferences(&path, &preferences).unwrap();
@@ -20,7 +20,7 @@ fn preferences_roundtrip_persists_last_directories() {
     assert_eq!(loaded.source_directory, "/music/in");
     assert_eq!(loaded.destination_directory, "/music/out");
     assert!(matches!(loaded.mode, Mode::Compat));
-    assert!(matches!(loaded.lossless_format, Some(LosslessFormat::Flac)));
+    assert!(matches!(loaded.lossless_format, Some(LosslessFormat::Aiff)));
 }
 
 #[test]

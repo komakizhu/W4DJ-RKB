@@ -8,7 +8,7 @@ pub enum GuiView {
     Paused,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct GuiShell {
     pub source_directory: String,
     pub destination_directory: String,
@@ -17,6 +17,7 @@ pub struct GuiShell {
     pub task: TaskSnapshot,
     pub view: GuiView,
     pub log_lines: Vec<String>,
+    task_controller: TaskController,
 }
 
 impl GuiShell {
@@ -29,6 +30,7 @@ impl GuiShell {
             task: task.snapshot(),
             view: GuiView::Ready,
             log_lines: vec![String::from("GUI shell ready")],
+            task_controller: task.clone(),
         }
     }
 
@@ -52,25 +54,40 @@ impl GuiShell {
         self.push_log("Lossless format updated");
     }
 
-    pub fn start(&mut self, task: &TaskController) {
-        self.refresh_task(task);
+    pub fn start(&mut self, total_files: usize) {
+        self.task_controller = TaskController::running(total_files);
+        self.refresh_task();
         self.view = GuiView::Running;
         self.push_log("Sync started");
     }
 
-    pub fn pause(&mut self, task: &TaskController) {
-        task.request_pause();
-        self.refresh_task(task);
+    pub fn pause(&mut self) {
+        self.task_controller.request_pause();
+        self.refresh_task();
         self.view = GuiView::Paused;
         self.push_log("Pause requested");
     }
 
-    pub fn refresh_task(&mut self, task: &TaskController) {
-        self.task = task.snapshot();
+    pub fn refresh_task(&mut self) {
+        self.task = self.task_controller.snapshot();
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
         self.log_lines.push(line.into());
+    }
+
+    pub fn status_summary(&self) -> String {
+        format!(
+            "view={:?}, source='{}', destination='{}', mode={:?}, lossless_format={:?}, completed={}/{}, logs={}",
+            self.view,
+            self.source_directory,
+            self.destination_directory,
+            self.mode,
+            self.lossless_format,
+            self.task.completed,
+            self.task.total,
+            self.log_lines.len()
+        )
     }
 }
 

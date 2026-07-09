@@ -9,9 +9,9 @@ mod sync;
 #[path = "../src/task.rs"]
 mod task;
 
+use config::Mode;
 use std::collections::HashMap;
 use std::fs;
-use config::Mode;
 use task::{TaskController, TaskState};
 
 #[test]
@@ -87,10 +87,7 @@ fn sync_entry_stops_before_next_file_when_pause_requested() {
 
 #[test]
 fn pause_requested_after_current_file_stops_before_next_file() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "w4dj-task-state-{}",
-        std::process::id()
-    ));
+    let temp_dir = std::env::temp_dir().join(format!("w4dj-task-state-{}", std::process::id()));
     let source = temp_dir.join("source");
     let dest = temp_dir.join("dest");
     fs::create_dir_all(&source).unwrap();
@@ -103,7 +100,10 @@ fn pause_requested_after_current_file_stops_before_next_file() {
     let first_name = String::from("first");
     let second_name = String::from("second");
     let first_info = (String::from("5"), first_file.to_string_lossy().into_owned());
-    let second_info = (String::from("6"), second_file.to_string_lossy().into_owned());
+    let second_info = (
+        String::from("6"),
+        second_file.to_string_lossy().into_owned(),
+    );
     let mut owned_files = HashMap::new();
     owned_files.insert(first_name, first_info);
     owned_files.insert(second_name, second_info);

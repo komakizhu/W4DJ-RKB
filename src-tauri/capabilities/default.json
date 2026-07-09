@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default desktop permissions for W4DJ.",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

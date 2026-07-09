@@ -26,27 +26,84 @@ pub(crate) trait Metadata {
     fn inject_metadata(&mut self, data: Vec<u8>) -> Result<Vec<u8>>;
 }
 
+pub(crate) fn build_id3_tag(info: &NcmInfo, image: &[u8]) -> id3::Tag {
+    let artists = info
+        .artist
+        .iter()
+        .map(|item| item.0.to_owned())
+        .collect::<Vec<String>>();
+
+    build_id3_tag_from_parts(&info.name, &info.album, &artists, image)
+}
+
+pub(crate) fn build_id3_tag_from_parts(
+    title: &str,
+    album: &str,
+    artists: &[String],
+    image: &[u8],
+) -> id3::Tag {
+    let mut tag = id3::Tag::new();
+    let artist = artists.join("/");
+
+    tag.set_title(title);
+    tag.set_album(album);
+    tag.set_artist(artist);
+
+    if !image.is_empty() {
+        tag.add_frame(Picture {
+            mime_type: get_image_mime_type(image).to_owned(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: image.to_vec(),
+        });
+    }
+
+    tag
+}
+
+pub(crate) fn build_id3_tag_from_flac(tag: &metaflac::Tag) -> id3::Tag {
+    let comments = tag.vorbis_comments();
+    let title = comments
+        .and_then(|block| block.title())
+        .and_then(|values| values.first())
+        .map(String::as_str)
+        .unwrap_or_default();
+    let album = comments
+        .and_then(|block| block.album())
+        .and_then(|values| values.first())
+        .map(String::as_str)
+        .unwrap_or_default();
+    let artists = comments
+        .and_then(|block| block.artist())
+        .cloned()
+        .unwrap_or_default();
+    let image = tag
+        .pictures()
+        .find(|picture| picture.picture_type == metaflac::block::PictureType::CoverFront)
+        .or_else(|| tag.pictures().next())
+        .map(|picture| picture.data.as_slice())
+        .unwrap_or_default();
+
+    build_id3_tag_from_parts(title, album, &artists, image)
+}
+
 pub(crate) struct Mp3Metadata(id3::Tag);
 
 impl Mp3Metadata {
     pub(crate) fn new(info: &NcmInfo, image: &[u8], data: &[u8]) -> Self {
         let cursor = Cursor::new(data.to_vec());
         let mut tag = id3::Tag::read_from2(cursor).unwrap_or_else(|_| id3::Tag::new());
-        let artist = info
-            .artist
-            .iter()
-            .map(|item| item.0.to_owned())
-            .collect::<Vec<String>>()
-            .join("/");
-        tag.set_title(&info.name);
-        tag.set_album(&info.album);
-        tag.set_artist(artist);
-        if !image.is_empty() {
+        tag.remove_extended_text(Some("163 key(Don't modify)"), None);
+        let base_tag = build_id3_tag(info, image);
+        tag.set_title(base_tag.title().unwrap_or_default());
+        tag.set_album(base_tag.album().unwrap_or_default());
+        tag.set_artist(base_tag.artist().unwrap_or_default());
+        for picture in base_tag.pictures() {
             tag.add_frame(Picture {
-                mime_type: get_image_mime_type(image).to_owned(),
-                picture_type: id3::frame::PictureType::CoverFront,
-                description: "".to_string(),
-                data: image.to_vec(),
+                mime_type: picture.mime_type.clone(),
+                picture_type: picture.picture_type,
+                description: picture.description.clone(),
+                data: picture.data.clone(),
             });
         }
         Self(tag)

@@ -1,6 +1,6 @@
 use crate::config::{LosslessFormat, Mode};
 use crate::preferences::AppPreferences;
-use crate::task::TaskController;
+use crate::task::{TaskController, TaskSnapshot};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +65,13 @@ impl DesktopController {
         }
     }
 
+    pub fn apply_preferences(&mut self, preferences: AppPreferences) {
+        self.state.source_directory = preferences.source_directory;
+        self.state.destination_directory = preferences.destination_directory;
+        self.state.mode = preferences.mode;
+        self.state.lossless_format = preferences.lossless_format;
+    }
+
     pub fn state(&self) -> &DesktopState {
         &self.state
     }
@@ -98,6 +105,20 @@ impl DesktopController {
         self.push_log("Sync started");
     }
 
+    pub fn task_controller(&self) -> TaskController {
+        self.task_controller.clone()
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self.state.status, DesktopStatus::Running)
+    }
+
+    pub fn set_progress_total(&mut self, total_files: usize) {
+        self.task_controller.set_total(total_files);
+        self.state.progress_total = total_files;
+        self.state.progress_completed = 0;
+    }
+
     pub fn pause_sync(&mut self) {
         self.task_controller.request_pause();
         self.state.status = DesktopStatus::Paused;
@@ -118,6 +139,30 @@ impl DesktopController {
             self.state.status = DesktopStatus::Completed;
             self.push_log("Sync completed");
         }
+    }
+
+    pub fn record_file_completed(&mut self, file_name: impl Into<String>, snapshot: TaskSnapshot) {
+        self.state.current_file = file_name.into();
+        self.state.progress_completed = snapshot.completed;
+        self.push_log(format!("Processed {}", self.state.current_file));
+    }
+
+    pub fn finish_sync(&mut self, snapshot: TaskSnapshot) {
+        self.state.progress_total = snapshot.total;
+        self.state.progress_completed = snapshot.completed;
+
+        if snapshot.paused {
+            self.state.status = DesktopStatus::Paused;
+            self.push_log("Sync paused after current file");
+        } else {
+            self.state.status = DesktopStatus::Completed;
+            self.push_log("Sync completed");
+        }
+    }
+
+    pub fn fail_sync(&mut self, message: impl Into<String>) {
+        self.state.status = DesktopStatus::Error;
+        self.push_log(message);
     }
 
     pub fn pause_after_current_file(&self) -> bool {

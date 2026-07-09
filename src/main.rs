@@ -1,7 +1,7 @@
 mod config;
 pub mod gui;
-mod sync;
 mod metadata;
+mod sync;
 pub mod task;
 use crate::config::{Cmd, Config};
 use crate::sync::{compare_music_dicts, get_music_dict, sync_music_library_with_policy};
@@ -9,6 +9,7 @@ use clap::Parser;
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use text_to_ascii_art::to_art;
 
 fn main() -> Result<(), Error> {
@@ -20,6 +21,10 @@ fn main() -> Result<(), Error> {
     let cmd = Cmd::parse();
     let launch_gui = cmd.gui;
     let config_file_path = cmd.config.expect("Clap should provide default value");
+
+    if launch_gui {
+        return launch_desktop_window();
+    }
 
     let config_content = fs::read_to_string(&config_file_path).map_err(|e| {
         Error::new(
@@ -54,10 +59,7 @@ fn main() -> Result<(), Error> {
             mode,
             lossless_format,
         });
-        println!(
-            "GUI shell launched: source='{}', destination='{}', mode={:?}",
-            shell.source_directory, shell.destination_directory, shell.mode
-        );
+        println!("GUI shell launched: {}", shell.status_summary());
         return Ok(());
     }
 
@@ -85,7 +87,7 @@ fn main() -> Result<(), Error> {
     let sf_dict = get_music_dict(sf);
     println!("Found {} music files in destination.", sf_dict.len());
 
-    let new_songs = compare_music_dicts(&wf_dict, &sf_dict, &mode);
+    let new_songs = compare_music_dicts(&wf_dict, &sf_dict, &mode, lossless_format);
     println!("Found {} new songs to sync.", new_songs.len());
 
     if !new_songs.is_empty() {
@@ -97,5 +99,26 @@ fn main() -> Result<(), Error> {
     }
 
     println!("Sync completed successfully.");
+    Ok(())
+}
+
+fn launch_desktop_window() -> Result<(), Error> {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src-tauri")
+        .join("Cargo.toml");
+
+    let _child = Command::new("cargo")
+        .args(["run", "--manifest-path"])
+        .arg(manifest_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!("Failed to launch desktop window: {}", error),
+            )
+        })?;
     Ok(())
 }

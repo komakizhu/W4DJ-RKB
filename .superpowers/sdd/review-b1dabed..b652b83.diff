@@ -1,0 +1,104 @@
+# Review package: b1dabed..b652b83
+
+## Commits
+b652b83 feat: add task state
+
+## Files changed
+ src/main.rs         |  1 +
+ src/task.rs         | 32 ++++++++++++++++++++++++++++++++
+ tests/task_state.rs | 29 +++++++++++++++++++++++++++++
+ 3 files changed, 62 insertions(+)
+
+## Diff
+diff --git a/src/main.rs b/src/main.rs
+index 510e5f8..536ae0a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,13 +1,14 @@
+ mod config;
+ mod sync;
+ mod metadata;
++mod task;
+ use crate::config::{Cmd, Config};
+ use crate::sync::{compare_music_dicts, get_music_dict, sync_music_library_with_policy};
+ use clap::Parser;
+ use std::fs;
+ use std::io::{Error, ErrorKind};
+ use std::path::Path;
+ use text_to_ascii_art::to_art;
+ 
+ fn main() -> Result<(), Error> {
+     match to_art("W4DJ".to_string(), "standard", 0, 2, 0) {
+diff --git a/src/task.rs b/src/task.rs
+new file mode 100644
+index 0000000..e20e1b0
+--- /dev/null
++++ b/src/task.rs
+@@ -0,0 +1,32 @@
++#![allow(dead_code)]
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct TaskState {
++    pub total: usize,
++    pub completed: usize,
++    pub paused: bool,
++}
++
++impl TaskState {
++    pub fn running(total: usize) -> Self {
++        Self {
++            total,
++            completed: 0,
++            paused: false,
++        }
++    }
++
++    pub fn request_pause(&mut self) {
++        self.paused = true;
++    }
++
++    pub fn pause_after_current_file(&self) -> bool {
++        self.paused
++    }
++
++    pub fn complete_current_file(&mut self) {
++        if self.completed < self.total {
++            self.completed += 1;
++        }
++    }
++}
+diff --git a/tests/task_state.rs b/tests/task_state.rs
+new file mode 100644
+index 0000000..78dbda1
+--- /dev/null
++++ b/tests/task_state.rs
+@@ -0,0 +1,29 @@
++#![allow(dead_code)]
++
++#[path = "../src/task.rs"]
++mod task;
++
++use task::TaskState;
++
++#[test]
++fn pause_waits_for_current_file() {
++    let mut task = TaskState::running(3);
++    task.request_pause();
++    assert!(task.pause_after_current_file());
++}
++
++#[test]
++fn running_initializes_progress() {
++    let task = TaskState::running(3);
++    assert_eq!(task.total, 3);
++    assert_eq!(task.completed, 0);
++    assert!(!task.paused);
++}
++
++#[test]
++fn completion_does_not_exceed_total() {
++    let mut task = TaskState::running(1);
++    task.complete_current_file();
++    task.complete_current_file();
++    assert_eq!(task.completed, 1);
++}

@@ -11,7 +11,6 @@ pub enum Mode {
 #[serde(rename_all = "lowercase")]
 pub enum LosslessFormat {
     Wav,
-    Flac,
     Aiff,
 }
 
@@ -48,11 +47,11 @@ mod tests {
 source = "/music/in"
 destination = "/music/out"
 mode = "compat"
-lossless_format = "flac"
+lossless_format = "aiff"
 "#;
 
         let config: Config = toml::from_str(toml).unwrap();
         assert!(matches!(config.mode, Mode::Compat));
-        assert!(matches!(config.lossless_format, Some(LosslessFormat::Flac)));
+        assert!(matches!(config.lossless_format, Some(LosslessFormat::Aiff)));
     }
 }

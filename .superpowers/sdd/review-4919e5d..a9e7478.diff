@@ -1,0 +1,116 @@
+# Review package: 4919e5d..a9e7478
+
+## Commits
+a9e7478 feat: scaffold gui shell
+97f77ac feat: scaffold gui shell
+
+## Files changed
+ src/gui.rs          | 37 +++++++++++++++++++++++++++++++++++++
+ src/lib.rs          |  3 +++
+ src/main.rs         |  1 +
+ tests/gui_launch.rs | 27 +++++++++++++++++++++++++++
+ 4 files changed, 68 insertions(+)
+
+## Diff
+diff --git a/src/gui.rs b/src/gui.rs
+new file mode 100644
+index 0000000..3ec62b1
+--- /dev/null
++++ b/src/gui.rs
+@@ -0,0 +1,37 @@
++use crate::config::{Config, LosslessFormat, Mode};
++use crate::task::{TaskController, TaskSnapshot};
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct GuiShell {
++    pub source_directory: String,
++    pub destination_directory: String,
++    pub mode: Mode,
++    pub lossless_format: Option<LosslessFormat>,
++    pub task: TaskSnapshot,
++    pub log_lines: Vec<String>,
++}
++
++impl GuiShell {
++    pub fn from_config(config: &Config, task: &TaskController) -> Self {
++        Self {
++            source_directory: config.source.clone(),
++            destination_directory: config.destination.clone(),
++            mode: config.mode,
++            lossless_format: config.lossless_format,
++            task: task.snapshot(),
++            log_lines: Vec::new(),
++        }
++    }
++
++    pub fn refresh_task(&mut self, task: &TaskController) {
++        self.task = task.snapshot();
++    }
++
++    pub fn push_log(&mut self, line: impl Into<String>) {
++        self.log_lines.push(line.into());
++    }
++}
++
++pub fn launcher_available() -> bool {
++    true
++}
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..b38413c
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,3 @@
++pub mod config;
++pub mod gui;
++pub mod task;
+diff --git a/src/main.rs b/src/main.rs
+index fd085b1..35bdcfd 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,11 +1,12 @@
+ mod config;
++pub mod gui;
+ mod sync;
+ mod metadata;
+ pub mod task;
+ use crate::config::{Cmd, Config};
+ use crate::sync::{compare_music_dicts, get_music_dict, sync_music_library_with_policy};
+ use clap::Parser;
+ use std::fs;
+ use std::io::{Error, ErrorKind};
+ use std::path::Path;
+ use text_to_ascii_art::to_art;
+diff --git a/tests/gui_launch.rs b/tests/gui_launch.rs
+new file mode 100644
+index 0000000..bac33b4
+--- /dev/null
++++ b/tests/gui_launch.rs
+@@ -0,0 +1,27 @@
++use w4dj::config::{Config, LosslessFormat, Mode};
++use w4dj::gui::{launcher_available, GuiShell};
++use w4dj::task::TaskController;
++
++#[test]
++fn gui_module_exposes_launcher() {
++    assert!(launcher_available());
++}
++
++#[test]
++fn gui_shell_tracks_basic_user_choices() {
++    let config = Config {
++        source: String::from("/music/source"),
++        destination: String::from("/music/destination"),
++        mode: Mode::Lossless,
++        lossless_format: Some(LosslessFormat::Aiff),
++    };
++    let task = TaskController::running(4);
++    let shell = GuiShell::from_config(&config, &task);
++
++    assert_eq!(shell.source_directory, "/music/source");
++    assert_eq!(shell.destination_directory, "/music/destination");
++    assert!(matches!(shell.mode, Mode::Lossless));
++    assert!(matches!(shell.lossless_format, Some(LosslessFormat::Aiff)));
++    assert_eq!(shell.task.total, 4);
++    assert_eq!(shell.task.completed, 0);
++}

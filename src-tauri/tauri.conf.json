@@ -6,10 +6,11 @@
   "build": {
     "beforeDevCommand": "",
     "beforeBuildCommand": "",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://localhost:1423",
     "frontendDist": "../app/dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "W4DJ",
@@ -17,9 +18,11 @@
         "height": 620,
         "minWidth": 760,
         "minHeight": 540,
+        "center": true,
+        "visible": true,
         "resizable": true,
         "fullscreen": false,
-        "transparent": true
+        "transparent": false
       }
     ]
   },

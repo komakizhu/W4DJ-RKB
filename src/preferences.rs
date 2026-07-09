@@ -44,10 +44,7 @@ pub fn load_preferences(path: impl AsRef<Path>) -> io::Result<AppPreferences> {
     }
 }
 
-pub fn save_preferences(
-    path: impl AsRef<Path>,
-    preferences: &AppPreferences,
-) -> io::Result<()> {
+pub fn save_preferences(path: impl AsRef<Path>, preferences: &AppPreferences) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
