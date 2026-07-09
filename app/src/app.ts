@@ -88,15 +88,12 @@ const statusLabels: Record<AppStatus, string> = {
 export function renderApp(state: AppViewState = defaultState): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
+  root.dataset.status = state.status;
   root.innerHTML = `
     <header class="topbar">
       <div class="brand-block">
         <p class="eyebrow">W4DJ plus</p>
         <h1>如果我是DJ</h1>
-      </div>
-      <div class="topbar-meta">
-        ${renderStatusPill(state)}
-        <span class="topbar-progress">${state.progressText}</span>
       </div>
     </header>
 
@@ -212,6 +209,7 @@ export function bindApp(
       state = {
         ...state,
         status: 'error',
+        progressText: 'Error',
         logs: [...state.logs, error instanceof Error ? error.message : String(error)],
       };
       render();

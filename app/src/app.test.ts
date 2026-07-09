@@ -253,6 +253,7 @@ describe('bindApp', () => {
 
     await vi.waitFor(() => {
       expect(root.querySelector('[data-status="error"]')).not.toBeNull();
+      expect(root.textContent).toContain('Error');
       const drawer = root.querySelector('[data-role="log-drawer"]');
       expect(drawer?.textContent).toContain('Sync failed dramatically');
     });
