@@ -1,4 +1,4 @@
-# W4DJ RKB v0.1.0 - 如果我是DJ 🎧
+# W4DJ RKB v1.0.0 - 如果我是DJ 🎧
 
 基于Slipstream-Max-w4dj的首个原生桌面客户端正式版发布！W4DJ 是一款专为 Rekordbox 曲库同步与无损解密打造的桌面视窗工具，原生兼容 MacOs 与 Windows 平台。
 
@@ -16,8 +16,8 @@
 
 ### 💾 安装包下载
 
-- **macOS (Intel/M系列通用)**: 下载下方 `W4DJ_0.1.0_x64.dmg` 双击安装拖拽入文件夹。
-- **Windows (x64)**: 下载下方 `W4DJ_0.1.0_x64-setup.exe` 双击安装。
+- **macOS (Intel/M系列通用)**: 下载下方 `W4DJ RKB_1.0.0_x64.dmg` 双击安装拖拽入文件夹。
+- **Windows (x64)**: 下载下方 `W4DJ RKB_1.0.0_x64-setup.exe` 双击安装。
 
 ### ⚠️ 首次运行说明（系统安全提示解决办法）
 #### 🍏 macOS 提示“已损坏，打不开”解决办法
