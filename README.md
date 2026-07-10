@@ -1,5 +1,7 @@
 # W4DJ RKB v1.0.0 - 如果我是DJ 🎧
 
+**一句话介绍：一键将网易云等流媒体下载的非标音乐，自动解密、重采样并补全封面，转换为 Pioneer DJ 硬件（如 CDJ-2000/RX3）完美兼容的标准无损音频，以便直接拖入 Rekordbox。**
+
 基于 [Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj) 的首个原生桌面客户端正式版。
 
 ![w4dj](imgs/w4dj.png)
