@@ -16,6 +16,8 @@ jobs:
         include:
           - platform: 'macos-latest'
             args: '--bundles dmg,app'
+          - platform: 'macos-15-intel'
+            args: '--bundles dmg,app'
           - platform: 'windows-latest'
             args: '--bundles nsis,msi'
 

@@ -16,6 +16,10 @@ jobs:
             args: --bundles dmg
             artifact_name: W4DJ-RKB-macOS-DMG
             artifact_path: src-tauri/target/release/bundle/dmg/*.dmg
+          - platform: macos-15-intel
+            args: --bundles dmg
+            artifact_name: W4DJ-RKB-macOS-Intel-DMG
+            artifact_path: src-tauri/target/release/bundle/dmg/*.dmg
           - platform: windows-latest
             args: --bundles nsis
             artifact_name: W4DJ-RKB-Windows-EXE
@@ -75,4 +79,3 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_path }}
           if-no-files-found: error
-
