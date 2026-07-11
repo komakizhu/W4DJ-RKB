@@ -1,38 +1,139 @@
 use w4dj::config::Mode;
 use w4dj::desktop::{DesktopController, DesktopState, DesktopStatus};
-use w4dj::preferences::AppPreferences;
+use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
 
 #[test]
 fn progress_updates_are_reflected_in_desktop_state() {
     let mut controller = test_controller();
 
-    controller.start_sync(3);
-    controller.record_file_started("track.wav");
-    controller.complete_current_file();
+    controller.start_sync(0, 3).unwrap();
+    controller.record_file_started(0, "track.wav").unwrap();
+    controller.complete_current_file(0).unwrap();
 
-    assert!(matches!(controller.state().status, DesktopStatus::Running));
-    assert_eq!(controller.state().progress_total, 3);
-    assert_eq!(controller.state().progress_completed, 1);
-    assert_eq!(controller.state().current_file, "track.wav");
+    assert!(matches!(
+        controller.state().slots[0].status,
+        DesktopStatus::Running
+    ));
+    assert_eq!(controller.state().slots[0].progress_total, 3);
+    assert_eq!(controller.state().slots[0].progress_completed, 1);
+    assert_eq!(controller.state().slots[0].current_file, "track.wav");
 }
 
 #[test]
 fn pause_requests_wait_for_current_file() {
     let mut controller = test_controller();
 
-    controller.start_sync(3);
-    controller.pause_sync();
+    controller.start_sync(0, 3).unwrap();
+    controller.pause_sync(0).unwrap();
 
-    assert!(matches!(controller.state().status, DesktopStatus::Paused));
-    assert!(controller.pause_after_current_file());
-    assert_eq!(controller.state().progress_total, 3);
-    assert_eq!(controller.state().progress_completed, 0);
+    assert!(matches!(
+        controller.state().slots[0].status,
+        DesktopStatus::Paused
+    ));
+    assert!(controller.pause_after_current_file(0).unwrap());
+    assert_eq!(controller.state().slots[0].progress_total, 3);
+    assert_eq!(controller.state().slots[0].progress_completed, 0);
+    assert!(!controller.pause_after_current_file(1).unwrap());
+}
+
+#[test]
+fn starting_slot_two_does_not_change_slot_one() {
+    let mut controller = test_controller();
+
+    controller.start_sync(1, 3).unwrap();
+    controller.record_file_started(1, "second.wav").unwrap();
+    controller.complete_current_file(1).unwrap();
+
+    assert!(matches!(
+        controller.state().slots[0].status,
+        DesktopStatus::Idle
+    ));
+    assert_eq!(controller.state().slots[0].progress_completed, 0);
+    assert!(matches!(
+        controller.state().slots[1].status,
+        DesktopStatus::Running
+    ));
+    assert_eq!(controller.state().slots[1].progress_completed, 1);
+    assert_eq!(controller.state().slots[1].current_file, "second.wav");
+}
+
+#[test]
+fn slot_two_blank_destination_falls_back_to_slot_one_destination() {
+    let mut controller = test_controller();
+    controller.select_destination_directory(1, "   ").unwrap();
+
+    assert_eq!(
+        controller.effective_destination(1).unwrap().as_deref(),
+        Some("/music/out-1")
+    );
+    assert_eq!(controller.state().slots[1].destination_directory, "   ");
+}
+
+#[test]
+fn slot_two_uses_its_own_destination_when_configured() {
+    let controller = test_controller();
+
+    assert_eq!(
+        controller.effective_destination(1).unwrap().as_deref(),
+        Some("/music/out-2")
+    );
+}
+
+#[test]
+fn slot_two_fallback_does_not_require_slot_one_source() {
+    let mut controller = test_controller();
+    controller.select_source_directory(0, "").unwrap();
+    controller.select_destination_directory(1, "").unwrap();
+
+    assert_eq!(
+        controller.effective_destination(1).unwrap().as_deref(),
+        Some("/music/out-1")
+    );
+}
+
+#[test]
+fn invalid_slot_indexes_are_rejected() {
+    let mut controller = test_controller();
+
+    assert!(controller.select_source_directory(2, "/invalid").is_err());
+    assert!(controller.start_sync(2, 1).is_err());
+    assert!(controller.effective_destination(2).is_err());
+}
+
+#[test]
+fn global_start_targets_only_configured_idle_slots() {
+    let mut controller = test_controller();
+    controller.select_source_directory(0, "   ").unwrap();
+
+    assert_eq!(controller.startable_slot_indexes(), vec![1]);
+
+    controller.start_sync(1, 0).unwrap();
+    assert!(controller.startable_slot_indexes().is_empty());
+}
+
+#[test]
+fn pausing_all_running_slots_leaves_idle_slots_unchanged() {
+    let mut controller = test_controller();
+    controller.start_sync(0, 3).unwrap();
+
+    controller.pause_all_running().unwrap();
+
+    assert!(matches!(
+        controller.state().slots[0].status,
+        DesktopStatus::Paused
+    ));
+    assert!(matches!(
+        controller.state().slots[1].status,
+        DesktopStatus::Idle
+    ));
 }
 
 fn test_controller() -> DesktopController {
     DesktopController::new(DesktopState::from_preferences(AppPreferences {
-        source_directory: "/music/in".into(),
-        destination_directory: "/music/out".into(),
+        slots: [
+            SyncSlotPreferences::new("/music/in-1", "/music/out-1"),
+            SyncSlotPreferences::new("/music/in-2", "/music/out-2"),
+        ],
         mode: Mode::Compat,
         lossless_format: None,
     }))

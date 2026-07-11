@@ -40,8 +40,14 @@ jobs:
         working-directory: ./app
         run: npm run build
 
-      - name: Create binaries directory
+      - name: Create binaries directory (macOS)
+        if: matrix.platform == 'macos-latest'
         run: mkdir -p src-tauri/binaries
+
+      - name: Create binaries directory (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
 
       - name: Download ffmpeg sidecar (macOS)
         if: matrix.platform == 'macos-latest'

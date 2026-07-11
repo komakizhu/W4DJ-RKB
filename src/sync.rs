@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind, Write};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use which;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputPolicy {
     pub output_extension: &'static str,
@@ -67,20 +67,97 @@ pub fn resolve_output_policy(
 }
 
 pub fn find_ffmpeg() -> Option<String> {
-    if let Ok(exe_dir) = env::current_exe() {
-        if let Some(parent) = exe_dir.parent() {
-            let local_ffmpeg = parent.join("ffmpeg");
-            if local_ffmpeg.exists() {
-                return Some(local_ffmpeg.to_string_lossy().into_owned());
-            }
+    if let Ok(explicit_path) = env::var("W4DJ_FFMPEG_PATH") {
+        let candidate = PathBuf::from(explicit_path);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
         }
+    }
+
+    if let Ok(exe_dir) = env::current_exe()
+        && let Some(found) = find_ffmpeg_next_to_exe(&exe_dir)
+    {
+        return Some(found.to_string_lossy().into_owned());
     }
 
     if let Ok(path) = which::which("ffmpeg") {
         return Some(path.to_string_lossy().into_owned());
     }
 
+    #[cfg(windows)]
+    {
+        if let Ok(path) = which::which("ffmpeg.exe") {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+
     None
+}
+
+fn find_ffmpeg_next_to_exe(exe_path: &Path) -> Option<PathBuf> {
+    let exe_dir = exe_path.parent()?;
+    let search_dirs = [exe_dir.to_path_buf(), exe_dir.join("binaries")];
+
+    for candidate_name in preferred_ffmpeg_candidate_names() {
+        for dir in &search_dirs {
+            let candidate = dir.join(candidate_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for dir in search_dirs {
+        if let Some(found) = find_ffmpeg_sidecar_in_dir(&dir) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn find_ffmpeg_sidecar_in_dir(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy().to_lowercase();
+        if file_name.starts_with("ffmpeg") {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn preferred_ffmpeg_candidate_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        return match std::env::consts::ARCH {
+            "x86_64" => &["ffmpeg-x86_64-pc-windows-msvc.exe", "ffmpeg.exe", "ffmpeg"],
+            "aarch64" => &["ffmpeg-aarch64-pc-windows-msvc.exe", "ffmpeg.exe", "ffmpeg"],
+            _ => &["ffmpeg.exe", "ffmpeg"],
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match std::env::consts::ARCH {
+            "aarch64" => &["ffmpeg-aarch64-apple-darwin", "ffmpeg"],
+            "x86_64" => &["ffmpeg-x86_64-apple-darwin", "ffmpeg"],
+            _ => &["ffmpeg"],
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        &["ffmpeg"]
+    }
 }
 
 pub fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
@@ -95,7 +172,7 @@ pub fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
                     .path()
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .map_or(false, |ext_str| {
+                    .is_some_and(|ext_str| {
                         matches!(ext_str.to_lowercase().as_str(), "mp3" | "flac" | "ncm")
                     })
         })
@@ -159,17 +236,7 @@ pub fn compare_music_dicts<'a>(
             Mode::Compat => {
                 let expected_extension =
                     resolve_output_policy(*mode, lossless_format, "mp3").output_extension;
-                if let Some(existing) = sf_dict.get(*name) {
-                    let existing_extension = Path::new(&existing.1)
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.to_lowercase())
-                        .unwrap_or_default();
-
-                    existing_extension != expected_extension
-                } else {
-                    true
-                }
+                needs_regeneration(sf_dict.get(*name), expected_extension)
             }
             Mode::Lossless => {
                 let source_extension = effective_source_extension(&wf_info.1);
@@ -177,34 +244,28 @@ pub fn compare_music_dicts<'a>(
                     resolve_output_policy(*mode, lossless_format, &source_extension)
                         .output_extension;
 
-                if let Some(sf_info) = sf_dict.get(*name) {
-                    let existing_extension = Path::new(&sf_info.1)
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext.to_lowercase())
-                        .unwrap_or_default();
-
-                    if existing_extension != expected_extension {
-                        return true;
-                    }
-
-                    if let (Ok(size1), Ok(size2)) =
-                        (wf_info.0.parse::<u64>(), sf_info.0.parse::<u64>())
-                    {
-                        let max_size = size1.max(size2) as f64;
-                        if max_size > 0.0 {
-                            let diff = (size1 as f64 - size2 as f64).abs();
-                            return (diff / max_size) >= 0.05;
-                        }
-                        return size1 != size2;
-                    }
-                    true
-                } else {
-                    true
-                }
+                needs_regeneration(sf_dict.get(*name), expected_extension)
             }
         })
         .collect()
+}
+
+fn needs_regeneration(existing: Option<&(String, String)>, expected_extension: &str) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+
+    let existing_extension = Path::new(&existing.1)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase())
+        .unwrap_or_default();
+
+    if existing_extension != expected_extension {
+        return true;
+    }
+
+    existing.0.parse::<u64>().unwrap_or(0) == 0
 }
 
 pub fn sync_music_library_with_policy(
@@ -403,11 +464,12 @@ fn convert_audio_to_target_format(
     let ffmpeg_path = find_ffmpeg().ok_or_else(|| {
         Error::new(
             ErrorKind::NotFound,
-            "FFmpeg not found. Please ensure it is installed and in your PATH.",
+            "FFmpeg not found. Put the sidecar next to the app, in a binaries/ folder, set W4DJ_FFMPEG_PATH, or install FFmpeg in PATH.",
         )
     })?;
 
     let mut command = Command::new(&ffmpeg_path);
+    configure_background_process(&mut command);
     command
         .arg("-y")
         .arg("-i")
@@ -432,14 +494,23 @@ fn convert_audio_to_target_format(
     let status = command.arg(output_path).status()?;
 
     if !status.success() {
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!("FFmpeg conversion failed for {}", name_stem),
-        ));
+        return Err(Error::other(format!(
+            "FFmpeg conversion failed for {}",
+            name_stem
+        )));
     }
 
     Ok(())
 }
+
+#[cfg(target_os = "windows")]
+fn configure_background_process(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn configure_background_process(_command: &mut Command) {}
 
 fn process_ncm_file(
     src_path: &Path,
@@ -664,7 +735,7 @@ fn derive_song_name(path: &Path) -> String {
         _ => None,
     };
 
-    candidate.unwrap_or(fallback_name)
+    candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name))
 }
 
 fn song_name_from_mp3(path: &Path) -> Option<String> {
@@ -693,13 +764,13 @@ fn song_name_from_ncm(path: &Path) -> Option<String> {
         .iter()
         .map(|item| item.0.as_str())
         .collect::<Vec<&str>>()
-        .join(" / ");
+        .join(", ");
     build_song_name(&info.name, &artist)
 }
 
 fn build_song_name(title: &str, artist: &str) -> Option<String> {
-    let title = sanitize_filename_component(title);
-    let artist = sanitize_filename_component(artist);
+    let title = sanitize_filename_component(&normalize_display_text(title));
+    let artist = sanitize_filename_component(&normalize_display_text(artist));
 
     match (title.is_empty(), artist.is_empty()) {
         (true, true) => None,
@@ -707,6 +778,338 @@ fn build_song_name(title: &str, artist: &str) -> Option<String> {
         (true, false) => Some(artist),
         (false, false) => Some(format!("{} - {}", title, artist)),
     }
+}
+
+fn normalize_fallback_song_name(fallback_name: &str) -> String {
+    let display = normalize_display_text(fallback_name);
+
+    if looks_like_soundcloud_text(fallback_name)
+        && let Some((artist, title)) = display.split_once(" - ")
+    {
+        let reordered = build_song_name(title, artist);
+        if let Some(song_name) = reordered {
+            return song_name;
+        }
+    }
+
+    display
+}
+
+fn normalize_display_text(value: &str) -> String {
+    let mut text = value.trim().to_string();
+    if text.is_empty() {
+        return text;
+    }
+
+    let aggressive_soundcloud_cleanup = looks_like_soundcloud_text(&text);
+    text = normalize_unicode_punctuation(&text);
+    text = text.replace('_', " ");
+    text = text.replace('/', ", ");
+    text = strip_promotional_suffixes(&text);
+    if aggressive_soundcloud_cleanup {
+        text = strip_common_trailing_tokens(&text);
+    }
+    text = normalize_collaboration_markers(&text);
+    text = normalize_spacing_around_punctuation(&text);
+
+    text.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn looks_like_soundcloud_text(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    lowered.contains('_')
+        || lowered.contains("free_dl")
+        || lowered.contains("freedl")
+        || lowered.contains("soundcloud")
+        || lowered.contains("unreleased")
+        || lowered.contains("id_id")
+        || lowered.ends_with(" id")
+        || lowered.ends_with(" free")
+        || lowered.ends_with(" dl")
+        || lowered.ends_with(" remix")
+}
+
+fn normalize_unicode_punctuation(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            '，' => ',',
+            '。' => '.',
+            '：' => ':',
+            '；' => ';',
+            '！' => '!',
+            '？' => '?',
+            '（' => '(',
+            '）' => ')',
+            '【' => '[',
+            '】' => ']',
+            '《' => '<',
+            '》' => '>',
+            '“' | '”' => '"',
+            '‘' | '’' => '\'',
+            '／' | '∕' => '/',
+            '—' | '–' | '－' => '-',
+            '·' => '·',
+            other => other,
+        })
+        .collect()
+}
+
+fn strip_promotional_suffixes(value: &str) -> String {
+    let mut text = value.trim().to_string();
+
+    loop {
+        let Some((open, close)) = trailing_bracket_pair(&text) else {
+            break;
+        };
+
+        let Some((start, inner)) = extract_trailing_bracket_content(&text, open, close) else {
+            break;
+        };
+
+        if is_promotional_suffix(inner) {
+            text.truncate(start);
+            text = text
+                .trim_end_matches(&[' ', '-', '_', '|', '~', '/', '·'][..])
+                .to_string();
+            continue;
+        }
+
+        break;
+    }
+
+    text
+}
+
+fn strip_common_trailing_tokens(value: &str) -> String {
+    let mut text = value.trim().to_string();
+
+    loop {
+        let Some(last_token) = text.split_whitespace().last() else {
+            break;
+        };
+
+        let normalized = last_token
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '.' | ','
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '\''
+                        | '"'
+                )
+            })
+            .to_lowercase();
+
+        let is_year = normalized.len() == 4
+            && (normalized.starts_with("19") || normalized.starts_with("20"))
+            && normalized.chars().all(|ch| ch.is_ascii_digit());
+
+        let should_strip = matches!(
+            normalized.as_str(),
+            "id" | "unreleased"
+                | "free"
+                | "dl"
+                | "freedl"
+                | "free_dl"
+                | "soundcloud"
+                | "preview"
+                | "snippet"
+                | "teaser"
+                | "promo"
+                | "promotion"
+                | "official"
+                | "audio"
+                | "video"
+                | "live"
+        ) || is_year;
+
+        if !should_strip {
+            break;
+        }
+
+        let new_len = text
+            .rsplit_once(last_token)
+            .map(|(prefix, _)| prefix.trim_end().len())
+            .unwrap_or(0);
+        text.truncate(new_len);
+        text = text
+            .trim_end_matches(&[' ', '-', '_', '|', '~', '/', '·', '.', ',', ';', ':'][..])
+            .to_string();
+    }
+
+    text
+}
+
+fn trailing_bracket_pair(text: &str) -> Option<(char, char)> {
+    let trimmed = text.trim_end();
+    let close = trimmed.chars().last()?;
+    let open = match close {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        '>' => '<',
+        _ => return None,
+    };
+
+    Some((open, close))
+}
+
+fn extract_trailing_bracket_content(text: &str, open: char, close: char) -> Option<(usize, &str)> {
+    let trimmed = text.trim_end();
+    let close_index = trimmed.char_indices().rev().find(|(_, ch)| *ch == close)?.0;
+    let prefix = &trimmed[..close_index];
+    let open_index = prefix.char_indices().rev().find(|(_, ch)| *ch == open)?.0;
+    let inner = &trimmed[open_index + open.len_utf8()..close_index];
+    Some((open_index, inner.trim()))
+}
+
+fn is_promotional_suffix(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    let compact = lowered.split_whitespace().collect::<String>();
+
+    let keywords = [
+        "officialaudio",
+        "officialvideo",
+        "officialmusicvideo",
+        "musicvideo",
+        "lyricvideo",
+        "lyricsvideo",
+        "lyrics",
+        "lyric",
+        "audio",
+        "video",
+        "visualizer",
+        "visualiser",
+        "mv",
+        "m/v",
+        "performancevideo",
+        "live",
+        "liveaudio",
+        "clean",
+        "explicit",
+        "promo",
+        "promotion",
+        "trailer",
+        "snippet",
+        "teaser",
+        "preview",
+        "remaster",
+        "remastered",
+        "edit",
+        "radioedit",
+        "clubedit",
+        "extendedmix",
+        "instrumental",
+        "karaoke",
+        "specialedition",
+        "singleversion",
+        "soundcloud",
+        "网易云音乐",
+        "网易云",
+        "free_dl",
+        "freedl",
+    ];
+
+    keywords.iter().any(|keyword| compact.contains(keyword))
+}
+
+fn normalize_collaboration_markers(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|token| {
+            let trimmed = token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+            });
+            let lowered = trimmed.to_lowercase();
+
+            match trimmed {
+                "×" => String::from("feat."),
+                _ if matches!(lowered.as_str(), "feat" | "ft" | "featuring" | "with" | "x") => {
+                    String::from("feat.")
+                }
+                _ => token.to_string(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn normalize_spacing_around_punctuation(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut prev_was_space = false;
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        let normalized = match ch {
+            ',' | ':' | ';' | '!' | '?' => ch,
+            '.' => ch,
+            '(' | '[' | '{' => ch,
+            ')' | ']' | '}' => ch,
+            '/' => '/',
+            _ => ch,
+        };
+
+        if normalized.is_whitespace() {
+            if !prev_was_space {
+                output.push(' ');
+                prev_was_space = true;
+            }
+            continue;
+        }
+
+        if matches!(normalized, ',' | ':' | ';' | '!' | '?' | '.') {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            output.push(normalized);
+            if chars.peek().is_some_and(|next| {
+                !next.is_whitespace()
+                    && !matches!(next, ',' | ':' | ';' | '!' | '?' | '.' | ')' | ']' | '}')
+            }) {
+                output.push(' ');
+                prev_was_space = true;
+            } else {
+                prev_was_space = false;
+            }
+            continue;
+        }
+
+        if matches!(normalized, ')' | ']' | '}') {
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            output.push(normalized);
+            prev_was_space = false;
+            continue;
+        }
+
+        if matches!(normalized, '(' | '[' | '{') {
+            if !output.is_empty() && !output.ends_with(' ') {
+                output.push(' ');
+            }
+            output.push(normalized);
+            prev_was_space = false;
+            continue;
+        }
+
+        output.push(normalized);
+        prev_was_space = false;
+    }
+
+    output
 }
 
 fn sanitize_filename_component(value: &str) -> String {
@@ -770,7 +1173,14 @@ fn write_container_tags_from_flac_source(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_song_name, sanitize_filename_component};
+    use super::{
+        build_song_name, compare_music_dicts, derive_song_name, find_ffmpeg_next_to_exe,
+        sanitize_filename_component,
+    };
+    use crate::config::{LosslessFormat, Mode};
+    use std::collections::HashMap;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn sanitizes_invalid_filename_characters() {
@@ -783,5 +1193,159 @@ mod tests {
             build_song_name("paper hearts", "CLV Edit").as_deref(),
             Some("paper hearts - CLV Edit")
         );
+    }
+
+    #[test]
+    fn strips_promotional_parenthetical_suffixes() {
+        assert_eq!(
+            build_song_name("Paper Hearts (Official Video)", "CLV Edit").as_deref(),
+            Some("Paper Hearts - CLV Edit")
+        );
+    }
+
+    #[test]
+    fn normalizes_collaboration_markers_and_spacing() {
+        assert_eq!(
+            build_song_name("Paper Hearts ft. CLV", "A／B").as_deref(),
+            Some("Paper Hearts feat. CLV - A, B")
+        );
+    }
+
+    #[test]
+    fn converts_with_and_unicode_punctuation_to_standard_form() {
+        assert_eq!(
+            build_song_name("Paper Hearts with CLV，Live", "Artist").as_deref(),
+            Some("Paper Hearts feat. CLV, Live - Artist")
+        );
+    }
+
+    #[test]
+    fn normalizes_x_and_times_sign_collaboration_markers() {
+        assert_eq!(
+            build_song_name("Paper Hearts x CLV × Artist", "DJ").as_deref(),
+            Some("Paper Hearts feat. CLV feat. Artist - DJ")
+        );
+    }
+
+    #[test]
+    fn preserves_regular_years_in_non_soundcloud_titles() {
+        assert_eq!(
+            build_song_name("Song 2023", "Artist").as_deref(),
+            Some("Song 2023 - Artist")
+        );
+    }
+
+    #[test]
+    fn normalizes_soundcloud_style_filename_fallbacks() {
+        assert_eq!(
+            derive_song_name(std::path::Path::new(
+                "/tmp/Knock2_ISOxo_Travis_Scott_Yeat_-_Smack_Talk_x_Fein_x_Breathe_Mantra_Edit_FREE_DL.mp3"
+            )),
+            "Smack Talk feat. Fein feat. Breathe Mantra Edit - Knock2 ISOxo Travis Scott Yeat"
+        );
+    }
+
+    #[test]
+    fn strips_soundcloud_trailing_noise_from_filename_fallbacks() {
+        assert_eq!(
+            derive_song_name(std::path::Path::new(
+                "/tmp/Skrillex_ft_ISOxo_Zeina_Logan_olm_-_Take_It_All_Whisper_ID_ID_2023_unreleased.mp3"
+            )),
+            "Take It All Whisper - Skrillex feat. ISOxo Zeina Logan olm"
+        );
+    }
+
+    #[test]
+    fn compare_music_dicts_skips_existing_lossless_output_without_using_source_size() {
+        let mut source = HashMap::new();
+        source.insert(
+            "Song".to_string(),
+            ("100".to_string(), "/music/source/Song.flac".to_string()),
+        );
+
+        let mut destination = HashMap::new();
+        destination.insert(
+            "Song".to_string(),
+            ("4096".to_string(), "/music/dest/Song.wav".to_string()),
+        );
+
+        let diff = compare_music_dicts(
+            &source,
+            &destination,
+            &Mode::Lossless,
+            Some(LosslessFormat::Wav),
+        );
+
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn compare_music_dicts_reprocesses_zero_byte_existing_output() {
+        let mut source = HashMap::new();
+        source.insert(
+            "Song".to_string(),
+            ("100".to_string(), "/music/source/Song.mp3".to_string()),
+        );
+
+        let mut destination = HashMap::new();
+        destination.insert(
+            "Song".to_string(),
+            ("0".to_string(), "/music/dest/Song.mp3".to_string()),
+        );
+
+        let diff = compare_music_dicts(&source, &destination, &Mode::Compat, None);
+
+        assert_eq!(diff.len(), 1);
+    }
+
+    #[test]
+    fn finds_platform_specific_ffmpeg_sidecar_next_to_executable() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj.exe");
+        let sidecar_path = dir.path().join("ffmpeg-x86_64-pc-windows-msvc.exe");
+
+        fs::write(&exe_path, []).unwrap();
+        fs::write(&sidecar_path, []).unwrap();
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+        assert_eq!(found, sidecar_path);
+    }
+
+    #[test]
+    fn finds_ffmpeg_sidecar_inside_binaries_directory() {
+        let dir = tempdir().unwrap();
+        let exe_dir = dir.path();
+        let exe_path = exe_dir.join("w4dj.exe");
+        let binaries_dir = exe_dir.join("binaries");
+        let sidecar_path = binaries_dir.join("ffmpeg-aarch64-apple-darwin");
+
+        fs::create_dir_all(&binaries_dir).unwrap();
+        fs::write(&exe_path, []).unwrap();
+        fs::write(&sidecar_path, []).unwrap();
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+        assert_eq!(found, sidecar_path);
+    }
+
+    #[test]
+    fn prefers_arch_specific_ffmpeg_sidecar_when_multiple_exist() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj.exe");
+        let binaries_dir = dir.path().join("binaries");
+        let preferred_windows = binaries_dir.join("ffmpeg-x86_64-pc-windows-msvc.exe");
+        let preferred_macos = binaries_dir.join("ffmpeg-aarch64-apple-darwin");
+
+        fs::create_dir_all(&binaries_dir).unwrap();
+        fs::write(&exe_path, []).unwrap();
+        fs::write(&preferred_windows, []).unwrap();
+        fs::write(&preferred_macos, []).unwrap();
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(found, preferred_windows);
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(found, preferred_macos);
     }
 }

@@ -55,7 +55,7 @@ fn compare_music_dicts_keeps_mp3_sources_when_destination_matches() {
     let mut sf_dict = HashMap::new();
     sf_dict.insert(
         "Song".to_string(),
-        ("100".to_string(), "/music/dest/Song.mp3".to_string()),
+        ("4096".to_string(), "/music/dest/Song.mp3".to_string()),
     );
 
     let diff = compare_music_dicts(
@@ -65,6 +65,30 @@ fn compare_music_dicts_keeps_mp3_sources_when_destination_matches() {
         Some(LosslessFormat::Aiff),
     );
     assert!(diff.is_empty());
+}
+
+#[test]
+fn compare_music_dicts_rebuilds_zero_byte_destination_files() {
+    let mut wf_dict = HashMap::new();
+    wf_dict.insert(
+        "Song".to_string(),
+        ("100".to_string(), "/music/source/Song.flac".to_string()),
+    );
+
+    let mut sf_dict = HashMap::new();
+    sf_dict.insert(
+        "Song".to_string(),
+        ("0".to_string(), "/music/dest/Song.aiff".to_string()),
+    );
+
+    let diff = compare_music_dicts(
+        &wf_dict,
+        &sf_dict,
+        &Mode::Lossless,
+        Some(LosslessFormat::Aiff),
+    );
+
+    assert_eq!(diff.len(), 1);
 }
 
 #[test]

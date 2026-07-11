@@ -1,11 +1,24 @@
-import { describe, expect, it, vi } from 'vitest';
-import { bindApp, renderApp, type AppServices, type AppViewState, type DesktopState } from './app';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  bindApp,
+  renderApp,
+  type AppServices,
+  type AppSyncSlotViewState,
+  type AppViewState,
+  type DesktopState,
+  type DesktopSyncSlotState,
+  type SyncSlotIndex,
+} from './app';
 
-const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState => ({
+beforeEach(() => {
+  localStorage.clear();
+});
+
+const makeDesktopSlot = (
+  overrides: Partial<DesktopSyncSlotState> = {},
+): DesktopSyncSlotState => ({
   source_directory: '/music/in',
   destination_directory: '/music/out',
-  mode: 'compat',
-  lossless_format: null,
   status: 'idle',
   progress_total: 0,
   progress_completed: 0,
@@ -14,20 +27,68 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   ...overrides,
 });
 
-const makeViewState = (overrides: Partial<AppViewState> = {}): AppViewState => ({
+const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState => ({
+  slots: [
+    makeDesktopSlot({ source_directory: '/music/in-1', destination_directory: '/music/out-1' }),
+    makeDesktopSlot({ source_directory: '/music/in-2', destination_directory: '/music/out-2' }),
+  ],
+  mode: 'compat',
+  lossless_format: null,
+  ...overrides,
+});
+
+const makeDesktopStateWithSlot = (
+  slotIndex: SyncSlotIndex,
+  slotOverrides: Partial<DesktopSyncSlotState>,
+  overrides: Partial<DesktopState> = {},
+): DesktopState => {
+  const state = makeDesktopState(overrides);
+  const slots: [DesktopSyncSlotState, DesktopSyncSlotState] = [
+    { ...state.slots[0] },
+    { ...state.slots[1] },
+  ];
+  slots[slotIndex] = { ...slots[slotIndex], ...slotOverrides };
+  return { ...state, slots };
+};
+
+const makeViewSlot = (overrides: Partial<AppSyncSlotViewState> = {}): AppSyncSlotViewState => ({
   sourceDirectory: '/music/in',
   destinationDirectory: '/music/out',
-  mode: 'compat',
-  losslessFormat: null,
   status: 'idle',
   progressTotal: 0,
   progressCompleted: 0,
-  progressText: 'Ready',
+  progressText: '待命',
   currentFile: '',
   logExpanded: false,
   logs: ['Ready'],
   ...overrides,
 });
+
+const makeViewState = (overrides: Partial<AppViewState> = {}): AppViewState => ({
+  slots: [
+    makeViewSlot({ sourceDirectory: '/music/in-1', destinationDirectory: '/music/out-1' }),
+    makeViewSlot({ sourceDirectory: '/music/in-2', destinationDirectory: '/music/out-2' }),
+  ],
+  mode: 'compat',
+  losslessFormat: null,
+  lang: 'zh',
+  theme: 'light',
+  ...overrides,
+});
+
+const makeViewStateWithSlot = (
+  slotIndex: SyncSlotIndex,
+  slotOverrides: Partial<AppSyncSlotViewState>,
+  overrides: Partial<AppViewState> = {},
+): AppViewState => {
+  const state = makeViewState(overrides);
+  const slots: [AppSyncSlotViewState, AppSyncSlotViewState] = [
+    { ...state.slots[0] },
+    { ...state.slots[1] },
+  ];
+  slots[slotIndex] = { ...slots[slotIndex], ...slotOverrides };
+  return { ...state, slots };
+};
 
 const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => ({
   loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState()),
@@ -36,88 +97,114 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   selectDestinationDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseLosslessFormat: vi.fn().mockResolvedValue(makeDesktopState()),
-  startSync: vi.fn().mockResolvedValue(makeDesktopState({ status: 'running', progress_total: 10 })),
-  pauseSync: vi.fn().mockResolvedValue(makeDesktopState({ status: 'paused' })),
+  startAllSync: vi
+    .fn()
+    .mockResolvedValue(makeDesktopState({
+      slots: [
+        makeDesktopSlot({ status: 'running', progress_total: 10 }),
+        makeDesktopSlot({ status: 'running', progress_total: 8 }),
+      ],
+    })),
+  pauseAllSync: vi.fn().mockResolvedValue(makeDesktopState({
+    slots: [
+      makeDesktopSlot({ status: 'paused' }),
+      makeDesktopSlot({ status: 'paused' }),
+    ],
+  })),
   ...overrides,
 });
 
 describe('renderApp', () => {
-  it('renders standard layout elements and initial state', () => {
+  it('renders two independent sync slots and global controls', () => {
     const root = renderApp(makeViewState());
 
     expect(root.querySelector('h1')?.textContent).toBe('如果我是DJ');
-    expect(root.querySelector('[data-role="source-picker"]')).not.toBeNull();
-    expect(root.querySelector('[data-role="destination-picker"]')).not.toBeNull();
+    expect(root.querySelector('[data-role="workbench-rail"]')).not.toBeNull();
+    expect(root.querySelector('[data-role="workbench-main"]')).not.toBeNull();
+    expect(root.querySelectorAll('[data-role="sync-slot"]')).toHaveLength(2);
+    expect(root.querySelector('[data-role="source-picker"][data-slot="0"]')?.textContent).toContain(
+      '/music/in-1',
+    );
+    expect(
+      root.querySelector('[data-role="destination-picker"][data-slot="1"]')?.textContent,
+    ).toContain('/music/out-2');
     expect(root.querySelector('[data-role="mode-switch"]')).not.toBeNull();
-    expect(root.querySelector('[data-role="status-strip"]')).not.toBeNull();
-    expect(root.querySelector('[data-role="log-drawer"]')).not.toBeNull();
-
-    const primaryBtn = root.querySelector('.primary-action') as HTMLButtonElement;
-    expect(primaryBtn.dataset.action).toBe('start');
-    expect(primaryBtn.textContent).toContain('开始');
-
-    const drawer = root.querySelector('[data-role="log-drawer"]') as HTMLElement;
-    expect(drawer.hidden).toBe(true);
+    expect(root.querySelectorAll('[data-action="start-all"]')).toHaveLength(1);
+    expect(root.querySelectorAll('[data-action="start"]')).toHaveLength(0);
+    expect(root.querySelectorAll('[data-role="log-drawer"][hidden]')).toHaveLength(2);
   });
 
-  it('renders lossless format selector when mode is lossless', () => {
-    const compatRoot = renderApp(makeViewState({ mode: 'compat' }));
-    expect(compatRoot.querySelector('.format-row')).toBeNull();
+  it('renders the selected color theme and a top-right theme toggle', () => {
+    const root = renderApp(makeViewState({ theme: 'dark' }));
 
-    const losslessRoot = renderApp(makeViewState({ mode: 'lossless', losslessFormat: 'wav' }));
-    const formatRow = losslessRoot.querySelector('.format-row');
-    expect(formatRow).not.toBeNull();
-
-    const wavBtn = losslessRoot.querySelector('[data-format="wav"]') as HTMLButtonElement;
-    const aiffBtn = losslessRoot.querySelector('[data-format="aiff"]') as HTMLButtonElement;
-    expect(wavBtn.classList.contains('selected')).toBe(true);
-    expect(aiffBtn.classList.contains('selected')).toBe(false);
+    expect(root.dataset.theme).toBe('dark');
+    expect(root.querySelector('[data-action="toggle-theme"]')).not.toBeNull();
+    expect(root.querySelector('.topbar-actions')?.lastElementChild?.getAttribute('data-action'))
+      .toBe('toggle-lang');
   });
 
-  it('shows running status, pause action, and progress bar', () => {
+  it('renders the global lossless format selector only in lossless mode', () => {
+    expect(renderApp(makeViewState({ mode: 'compat' })).querySelector('.format-row')).toBeNull();
+
+    const root = renderApp(makeViewState({ mode: 'lossless', losslessFormat: 'wav' }));
+    expect(root.querySelector('[data-format="wav"]')?.classList.contains('selected')).toBe(true);
+    expect(root.querySelector('[data-format="aiff"]')?.classList.contains('selected')).toBe(false);
+  });
+
+  it('shows slot two running state without changing slot one', () => {
     const root = renderApp(
-      makeViewState({
+      makeViewStateWithSlot(1, {
         status: 'running',
         progressTotal: 100,
         progressCompleted: 45,
         progressText: '45/100',
-        currentFile: 'track01.mp3',
+        currentFile: 'track02.wav',
       }),
     );
 
-    const primaryBtn = root.querySelector('.primary-action') as HTMLButtonElement;
-    expect(primaryBtn.dataset.action).toBe('pause');
-    expect(primaryBtn.textContent).toContain('暂停');
-
-    const progressFill = root.querySelector('.progress-fill') as HTMLElement;
-    expect(progressFill.style.width).toBe('45%');
-
-    const currentTrack = root.querySelector('.current-track');
-    expect(currentTrack?.textContent).toBe('track01.mp3');
+    const slotOne = root.querySelector('[data-role="sync-slot"][data-slot="0"]') as HTMLElement;
+    const slotTwo = root.querySelector('[data-role="sync-slot"][data-slot="1"]') as HTMLElement;
+    expect(slotOne.dataset.status).toBe('idle');
+    expect(slotTwo.dataset.status).toBe('running');
+    expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
+    expect((slotTwo.querySelector('.progress-fill') as HTMLElement).style.width).toBe('45%');
+    expect(slotTwo.querySelector('.current-track')?.textContent).toBe('track02.wav');
   });
 
-  it('unhides the log drawer when logExpanded is true', () => {
+  it('shows a localized destination fallback hint for slot two', () => {
     const root = renderApp(
-      makeViewState({
-        logExpanded: true,
-        logs: ['Line 1', 'Line 2'],
-      }),
+      makeViewStateWithSlot(1, { destinationDirectory: '' }),
     );
 
-    const drawer = root.querySelector('[data-role="log-drawer"]') as HTMLElement;
+    const hint = root.querySelector('[data-role="fallback-hint"][data-slot="1"]');
+    expect(hint?.textContent).toContain('使用输出目录 1');
+    expect(hint?.textContent).toContain('/music/out-1');
+  });
+
+  it('unhides only the selected slot log drawer', () => {
+    const root = renderApp(
+      makeViewStateWithSlot(1, { logExpanded: true, logs: ['Slot 2 line'] }),
+    );
+
+    expect((root.querySelector('[data-role="log-drawer"][data-slot="0"]') as HTMLElement).hidden)
+      .toBe(true);
+    const drawer = root.querySelector(
+      '[data-role="log-drawer"][data-slot="1"]',
+    ) as HTMLElement;
     expect(drawer.hidden).toBe(false);
-    expect(drawer.textContent).toContain('Line 1');
-    expect(drawer.textContent).toContain('Line 2');
+    expect(drawer.textContent).toContain('Slot 2 line');
   });
 });
 
 describe('bindApp', () => {
-  it('calls loadDesktopState on initialization and renders resolved state', async () => {
+  it('loads and renders both resolved backend slots', async () => {
     const services = makeMockServices({
       loadDesktopState: vi.fn().mockResolvedValue(
         makeDesktopState({
-          source_directory: '/loaded/source',
-          destination_directory: '/loaded/dest',
+          slots: [
+            makeDesktopSlot({ source_directory: '/loaded/source-1' }),
+            makeDesktopSlot({ source_directory: '/loaded/source-2' }),
+          ],
         }),
       ),
     });
@@ -125,137 +212,160 @@ describe('bindApp', () => {
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
-    expect(services.loadDesktopState).toHaveBeenCalled();
-
-    // Wait for async loadDesktopState promise resolution
     await vi.waitFor(() => {
-      expect(root.textContent).toContain('/loaded/source');
-      expect(root.textContent).toContain('/loaded/dest');
+      expect(root.textContent).toContain('/loaded/source-1');
+      expect(root.textContent).toContain('/loaded/source-2');
     });
   });
 
-  it('toggles log drawer visibility when status-toggle button is clicked', async () => {
+  it('toggles only slot two log drawer', async () => {
     const root = document.createElement('div');
-    bindApp(root, makeViewState({ logExpanded: false }), makeMockServices());
+    bindApp(root, makeViewState(), makeMockServices());
+
+    const toggle = root.querySelector(
+      '[data-action="toggle-log"][data-slot="1"]',
+    ) as HTMLButtonElement;
+    toggle.click();
 
     await vi.waitFor(() => {
-      const drawer = root.querySelector('[data-role="log-drawer"]') as HTMLElement;
-      expect(drawer.hidden).toBe(true);
-    });
-
-    const toggleBtn = root.querySelector('[data-action="toggle-log"]') as HTMLButtonElement;
-    toggleBtn.click();
-
-    await vi.waitFor(() => {
-      const drawer = root.querySelector('[data-role="log-drawer"]') as HTMLElement;
-      expect(drawer.hidden).toBe(false);
-    });
-
-    const toggleBtn2 = root.querySelector('[data-action="toggle-log"]') as HTMLButtonElement;
-    toggleBtn2.click();
-
-    await vi.waitFor(() => {
-      const drawer = root.querySelector('[data-role="log-drawer"]') as HTMLElement;
-      expect(drawer.hidden).toBe(true);
+      expect(
+        (root.querySelector('[data-role="log-drawer"][data-slot="0"]') as HTMLElement).hidden,
+      ).toBe(true);
+      expect(
+        (root.querySelector('[data-role="log-drawer"][data-slot="1"]') as HTMLElement).hidden,
+      ).toBe(false);
     });
   });
 
-  it('triggers pickDirectory and selectSourceDirectory on pick-source action', async () => {
+  it('selects slot two source directory with its slot index', async () => {
     const services = makeMockServices({
-      pickDirectory: vi.fn().mockResolvedValue('/new/source/path'),
+      pickDirectory: vi.fn().mockResolvedValue('/new/source-2'),
       selectSourceDirectory: vi.fn().mockResolvedValue(
-        makeDesktopState({ source_directory: '/new/source/path' }),
+        makeDesktopStateWithSlot(1, { source_directory: '/new/source-2' }),
       ),
     });
-
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
-    const pickBtn = root.querySelector('[data-action="pick-source"]') as HTMLButtonElement;
-    pickBtn.click();
+    const button = root.querySelector(
+      '[data-action="pick-source"][data-slot="1"]',
+    ) as HTMLButtonElement;
+    button.click();
 
     await vi.waitFor(() => {
-      expect(services.pickDirectory).toHaveBeenCalledWith('source');
-      expect(services.selectSourceDirectory).toHaveBeenCalledWith('/new/source/path');
-      expect(root.textContent).toContain('/new/source/path');
+      expect(services.pickDirectory).toHaveBeenCalledWith('source', 1);
+      expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '/new/source-2');
+      expect(root.textContent).toContain('/new/source-2');
     });
   });
 
-  it('triggers chooseMode and chooseLosslessFormat when buttons are clicked', async () => {
+  it('updates global mode and lossless format', async () => {
     const services = makeMockServices({
-      chooseMode: vi.fn().mockResolvedValue(
-        makeDesktopState({ mode: 'lossless', lossless_format: 'wav' }),
-      ),
-      chooseLosslessFormat: vi.fn().mockResolvedValue(
-        makeDesktopState({ mode: 'lossless', lossless_format: 'aiff' }),
-      ),
+      chooseMode: vi
+        .fn()
+        .mockResolvedValue(makeDesktopState({ mode: 'lossless', lossless_format: 'wav' })),
+      chooseLosslessFormat: vi
+        .fn()
+        .mockResolvedValue(makeDesktopState({ mode: 'lossless', lossless_format: 'aiff' })),
     });
-
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
-    const losslessModeBtn = root.querySelector('[data-mode="lossless"]') as HTMLButtonElement;
-    losslessModeBtn.click();
+    (root.querySelector('[data-mode="lossless"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('.format-row')).not.toBeNull());
 
+    (root.querySelector('[data-format="aiff"]') as HTMLButtonElement).click();
     await vi.waitFor(() => {
       expect(services.chooseMode).toHaveBeenCalledWith('lossless');
-      expect(root.querySelector('.format-row')).not.toBeNull();
-    });
-
-    const aiffBtn = root.querySelector('[data-format="aiff"]') as HTMLButtonElement;
-    aiffBtn?.click();
-
-    await vi.waitFor(() => {
       expect(services.chooseLosslessFormat).toHaveBeenCalledWith('aiff');
     });
   });
 
-  it('triggers startSync and pauseSync actions', async () => {
+  it('starts and pauses both configured tasks from one global button', async () => {
     const services = makeMockServices({
-      startSync: vi.fn().mockResolvedValue(
-        makeDesktopState({ status: 'running', progress_total: 5 }),
-      ),
-      pauseSync: vi.fn().mockResolvedValue(
-        makeDesktopState({ status: 'paused' }),
-      ),
+      startAllSync: vi
+        .fn()
+        .mockResolvedValue(makeDesktopState({
+          slots: [
+            makeDesktopSlot({ status: 'running', progress_total: 5 }),
+            makeDesktopSlot({ status: 'running', progress_total: 7 }),
+          ],
+        })),
+      pauseAllSync: vi.fn().mockResolvedValue(makeDesktopState({
+        slots: [
+          makeDesktopSlot({ status: 'paused' }),
+          makeDesktopSlot({ status: 'paused' }),
+        ],
+      })),
     });
-
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
-    const startBtn = root.querySelector('[data-action="start"]') as HTMLButtonElement;
-    startBtn.click();
-
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
     await vi.waitFor(() => {
-      expect(services.startSync).toHaveBeenCalled();
-      const pauseBtn = root.querySelector('[data-action="pause"]') as HTMLButtonElement;
-      expect(pauseBtn).not.toBeNull();
+      expect(services.startAllSync).toHaveBeenCalledTimes(1);
+      expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
+      expect(root.querySelectorAll('[data-status="running"][data-role="sync-slot"]')).toHaveLength(2);
     });
 
-    const pauseBtn = root.querySelector('[data-action="pause"]') as HTMLButtonElement;
-    pauseBtn.click();
+    (root.querySelector('[data-action="pause-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.pauseAllSync).toHaveBeenCalledTimes(1));
+  });
+
+  it('toggles and persists the color theme', async () => {
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), makeMockServices());
+
+    (root.querySelector('[data-action="toggle-theme"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(services.pauseSync).toHaveBeenCalled();
+      expect(localStorage.getItem('w4dj_theme')).toBe('dark');
+      expect(root.querySelector('.app-shell')?.getAttribute('data-theme')).toBe('dark');
     });
   });
 
-  it('catches action errors and transitions to error status', async () => {
-    const services = makeMockServices({
-      startSync: vi.fn().mockRejectedValue(new Error('Sync failed dramatically')),
-    });
+  it('toggles the whole interface language and persists it', async () => {
+    const root = document.createElement('div');
+    bindApp(
+      root,
+      makeViewStateWithSlot(1, { destinationDirectory: '' }, { mode: 'lossless' }),
+      makeMockServices(),
+    );
 
+    (root.querySelector('[data-action="toggle-lang"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(localStorage.getItem('w4dj_lang')).toBe('en');
+      expect(root.textContent).toContain('If I Were a DJ');
+      expect(root.textContent).toContain('Use output directory 1');
+      expect(root.querySelector('[data-role="control-panel"]')?.getAttribute('aria-label')).toBe(
+        'Control panel',
+      );
+      expect(root.querySelector('.format-row')?.getAttribute('aria-label')).toBe('Lossless format');
+    });
+  });
+
+  it('reports an action error on only the affected slot', async () => {
+    const services = makeMockServices({
+      startAllSync: vi.fn().mockRejectedValue(new Error('Sync failed dramatically')),
+    });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
-    const startBtn = root.querySelector('[data-action="start"]') as HTMLButtonElement;
-    startBtn.click();
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-status="error"]')).not.toBeNull();
-      expect(root.textContent).toContain('Error');
-      const drawer = root.querySelector('[data-role="log-drawer"]');
-      expect(drawer?.textContent).toContain('Sync failed dramatically');
+      expect(
+        (root.querySelector('[data-role="sync-slot"][data-slot="0"]') as HTMLElement).dataset
+          .status,
+      ).toBe('error');
+      expect(
+        (root.querySelector('[data-role="sync-slot"][data-slot="1"]') as HTMLElement).dataset
+          .status,
+      ).toBe('error');
+      expect(
+        root.querySelector('[data-role="log-drawer"][data-slot="1"]')?.textContent,
+      ).toContain('Sync failed dramatically');
     });
   });
 });

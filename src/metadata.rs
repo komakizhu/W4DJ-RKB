@@ -43,7 +43,7 @@ pub(crate) fn build_id3_tag_from_parts(
     image: &[u8],
 ) -> id3::Tag {
     let mut tag = id3::Tag::new();
-    let artist = artists.join("/");
+    let artist = artists.join(", ");
 
     tag.set_title(title);
     tag.set_album(album);

@@ -1,5 +1,5 @@
 use crate::config::{LosslessFormat, Mode};
-use crate::preferences::AppPreferences;
+use crate::preferences::{AppPreferences, SYNC_SLOT_COUNT, SyncSlotPreferences};
 use crate::task::{TaskController, TaskSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -14,11 +14,9 @@ pub enum DesktopStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DesktopState {
+pub struct SyncSlotState {
     pub source_directory: String,
     pub destination_directory: String,
-    pub mode: Mode,
-    pub lossless_format: Option<LosslessFormat>,
     pub status: DesktopStatus,
     pub progress_total: usize,
     pub progress_completed: usize,
@@ -26,19 +24,24 @@ pub struct DesktopState {
     pub logs: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopState {
+    pub slots: [SyncSlotState; SYNC_SLOT_COUNT],
+    pub mode: Mode,
+    pub lossless_format: Option<LosslessFormat>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DesktopController {
     state: DesktopState,
-    task_controller: TaskController,
+    task_controllers: [TaskController; SYNC_SLOT_COUNT],
 }
 
-impl DesktopState {
-    pub fn from_preferences(preferences: AppPreferences) -> Self {
+impl SyncSlotState {
+    fn from_preferences(preferences: SyncSlotPreferences) -> Self {
         Self {
             source_directory: preferences.source_directory,
             destination_directory: preferences.destination_directory,
-            mode: preferences.mode,
-            lossless_format: preferences.lossless_format,
             status: DesktopStatus::Idle,
             progress_total: 0,
             progress_completed: 0,
@@ -46,11 +49,29 @@ impl DesktopState {
             logs: vec![String::from("Desktop shell ready")],
         }
     }
+}
+
+impl DesktopState {
+    pub fn from_preferences(preferences: AppPreferences) -> Self {
+        let AppPreferences {
+            slots,
+            mode,
+            lossless_format,
+        } = preferences;
+
+        Self {
+            slots: slots.map(SyncSlotState::from_preferences),
+            mode,
+            lossless_format,
+        }
+    }
 
     pub fn preferences(&self) -> AppPreferences {
         AppPreferences {
-            source_directory: self.source_directory.clone(),
-            destination_directory: self.destination_directory.clone(),
+            slots: std::array::from_fn(|index| SyncSlotPreferences {
+                source_directory: self.slots[index].source_directory.clone(),
+                destination_directory: self.slots[index].destination_directory.clone(),
+            }),
             mode: self.mode,
             lossless_format: self.lossless_format,
         }
@@ -61,115 +82,259 @@ impl DesktopController {
     pub fn new(state: DesktopState) -> Self {
         Self {
             state,
-            task_controller: TaskController::running(0),
+            task_controllers: [TaskController::running(0), TaskController::running(0)],
         }
     }
 
     pub fn apply_preferences(&mut self, preferences: AppPreferences) {
-        self.state.source_directory = preferences.source_directory;
-        self.state.destination_directory = preferences.destination_directory;
-        self.state.mode = preferences.mode;
-        self.state.lossless_format = preferences.lossless_format;
+        let AppPreferences {
+            slots,
+            mode,
+            lossless_format,
+        } = preferences;
+
+        for (state_slot, preferences_slot) in self.state.slots.iter_mut().zip(slots) {
+            state_slot.source_directory = preferences_slot.source_directory;
+            state_slot.destination_directory = preferences_slot.destination_directory;
+        }
+        self.state.mode = mode;
+        self.state.lossless_format = lossless_format;
     }
 
     pub fn state(&self) -> &DesktopState {
         &self.state
     }
 
-    pub fn select_source_directory(&mut self, path: impl Into<String>) {
-        self.state.source_directory = path.into();
-        self.push_log("Source directory selected");
+    pub fn select_source_directory(
+        &mut self,
+        slot_index: usize,
+        path: impl Into<String>,
+    ) -> Result<(), String> {
+        let slot = self.slot_mut(slot_index)?;
+        slot.source_directory = path.into();
+        slot.logs.push(String::from("Source directory selected"));
+        Ok(())
     }
 
-    pub fn select_destination_directory(&mut self, path: impl Into<String>) {
-        self.state.destination_directory = path.into();
-        self.push_log("Destination directory selected");
+    pub fn select_destination_directory(
+        &mut self,
+        slot_index: usize,
+        path: impl Into<String>,
+    ) -> Result<(), String> {
+        let slot = self.slot_mut(slot_index)?;
+        slot.destination_directory = path.into();
+        slot.logs
+            .push(String::from("Destination directory selected"));
+        Ok(())
     }
 
     pub fn choose_mode(&mut self, mode: Mode) {
         self.state.mode = mode;
-        self.push_log("Mode updated");
+        self.push_log_to_all("Mode updated");
     }
 
     pub fn choose_lossless_format(&mut self, format: Option<LosslessFormat>) {
         self.state.lossless_format = format;
-        self.push_log("Lossless format updated");
+        self.push_log_to_all("Lossless format updated");
     }
 
-    pub fn start_sync(&mut self, total_files: usize) {
-        self.task_controller = TaskController::running(total_files);
-        self.state.status = DesktopStatus::Running;
-        self.state.progress_total = total_files;
-        self.state.progress_completed = 0;
-        self.state.current_file.clear();
-        self.push_log("Sync started");
+    pub fn start_sync(&mut self, slot_index: usize, total_files: usize) -> Result<(), String> {
+        self.validate_slot_index(slot_index)?;
+        self.task_controllers[slot_index] = TaskController::running(total_files);
+
+        let slot = &mut self.state.slots[slot_index];
+        slot.status = DesktopStatus::Running;
+        slot.progress_total = total_files;
+        slot.progress_completed = 0;
+        slot.current_file.clear();
+        slot.logs.push(String::from("Sync started"));
+        Ok(())
     }
 
-    pub fn task_controller(&self) -> TaskController {
-        self.task_controller.clone()
+    pub fn task_controller(&self, slot_index: usize) -> Result<TaskController, String> {
+        self.validate_slot_index(slot_index)?;
+        Ok(self.task_controllers[slot_index].clone())
     }
 
-    pub fn is_running(&self) -> bool {
-        matches!(self.state.status, DesktopStatus::Running)
+    pub fn is_running(&self, slot_index: usize) -> Result<bool, String> {
+        Ok(matches!(
+            self.slot(slot_index)?.status,
+            DesktopStatus::Running
+        ))
     }
 
-    pub fn set_progress_total(&mut self, total_files: usize) {
-        self.task_controller.set_total(total_files);
-        self.state.progress_total = total_files;
-        self.state.progress_completed = 0;
+    pub fn startable_slot_indexes(&self) -> Vec<usize> {
+        self.state
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot_index, slot)| {
+                (!slot.source_directory.trim().is_empty()
+                    && !matches!(slot.status, DesktopStatus::Running))
+                .then_some(slot_index)
+            })
+            .collect()
     }
 
-    pub fn pause_sync(&mut self) {
-        self.task_controller.request_pause();
-        self.state.status = DesktopStatus::Paused;
-        self.push_log("Pause requested");
+    pub fn set_progress_total(
+        &mut self,
+        slot_index: usize,
+        total_files: usize,
+    ) -> Result<(), String> {
+        let task_controller = self.task_controller(slot_index)?;
+        task_controller.set_total(total_files);
+
+        let slot = self.slot_mut(slot_index)?;
+        slot.progress_total = total_files;
+        slot.progress_completed = 0;
+        Ok(())
     }
 
-    pub fn record_file_started(&mut self, file_name: impl Into<String>) {
-        self.state.current_file = file_name.into();
-        self.push_log(format!("Processing {}", self.state.current_file));
+    pub fn pause_sync(&mut self, slot_index: usize) -> Result<(), String> {
+        let task_controller = self.task_controller(slot_index)?;
+        task_controller.request_pause();
+
+        let slot = self.slot_mut(slot_index)?;
+        slot.status = DesktopStatus::Paused;
+        slot.logs.push(String::from("Pause requested"));
+        Ok(())
     }
 
-    pub fn complete_current_file(&mut self) {
-        self.task_controller.complete_current_file();
-        let snapshot = self.task_controller.snapshot();
-        self.state.progress_completed = snapshot.completed;
+    pub fn pause_all_running(&mut self) -> Result<(), String> {
+        let running_slots: Vec<usize> = self
+            .state
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot_index, slot)| {
+                matches!(slot.status, DesktopStatus::Running).then_some(slot_index)
+            })
+            .collect();
 
-        if snapshot.completed >= snapshot.total && snapshot.total > 0 {
-            self.state.status = DesktopStatus::Completed;
-            self.push_log("Sync completed");
+        for slot_index in running_slots {
+            self.pause_sync(slot_index)?;
         }
+
+        Ok(())
     }
 
-    pub fn record_file_completed(&mut self, file_name: impl Into<String>, snapshot: TaskSnapshot) {
-        self.state.current_file = file_name.into();
-        self.state.progress_completed = snapshot.completed;
-        self.push_log(format!("Processed {}", self.state.current_file));
+    pub fn record_file_started(
+        &mut self,
+        slot_index: usize,
+        file_name: impl Into<String>,
+    ) -> Result<(), String> {
+        let file_name = file_name.into();
+        let slot = self.slot_mut(slot_index)?;
+        slot.current_file = file_name.clone();
+        slot.logs.push(format!("Processing {file_name}"));
+        Ok(())
     }
 
-    pub fn finish_sync(&mut self, snapshot: TaskSnapshot) {
-        self.state.progress_total = snapshot.total;
-        self.state.progress_completed = snapshot.completed;
+    pub fn complete_current_file(&mut self, slot_index: usize) -> Result<(), String> {
+        let task_controller = self.task_controller(slot_index)?;
+        task_controller.complete_current_file();
+        let snapshot = task_controller.snapshot();
+
+        let slot = self.slot_mut(slot_index)?;
+        slot.progress_completed = snapshot.completed;
+        if snapshot.completed >= snapshot.total && snapshot.total > 0 {
+            slot.status = DesktopStatus::Completed;
+            slot.logs.push(String::from("Sync completed"));
+        }
+        Ok(())
+    }
+
+    pub fn record_file_completed(
+        &mut self,
+        slot_index: usize,
+        file_name: impl Into<String>,
+        snapshot: TaskSnapshot,
+    ) -> Result<(), String> {
+        let file_name = file_name.into();
+        let slot = self.slot_mut(slot_index)?;
+        slot.current_file = file_name.clone();
+        slot.progress_completed = snapshot.completed;
+        slot.logs.push(format!("Processed {file_name}"));
+        Ok(())
+    }
+
+    pub fn finish_sync(&mut self, slot_index: usize, snapshot: TaskSnapshot) -> Result<(), String> {
+        let slot = self.slot_mut(slot_index)?;
+        slot.progress_total = snapshot.total;
+        slot.progress_completed = snapshot.completed;
 
         if snapshot.paused {
-            self.state.status = DesktopStatus::Paused;
-            self.push_log("Sync paused after current file");
+            slot.status = DesktopStatus::Paused;
+            slot.logs
+                .push(String::from("Sync paused after current file"));
         } else {
-            self.state.status = DesktopStatus::Completed;
-            self.push_log("Sync completed");
+            slot.status = DesktopStatus::Completed;
+            slot.logs.push(String::from("Sync completed"));
+        }
+        Ok(())
+    }
+
+    pub fn fail_sync(
+        &mut self,
+        slot_index: usize,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        let slot = self.slot_mut(slot_index)?;
+        slot.status = DesktopStatus::Error;
+        slot.logs.push(message.into());
+        Ok(())
+    }
+
+    pub fn pause_after_current_file(&self, slot_index: usize) -> Result<bool, String> {
+        Ok(self.task_controller(slot_index)?.pause_after_current_file())
+    }
+
+    pub fn push_log(&mut self, slot_index: usize, line: impl Into<String>) -> Result<(), String> {
+        self.slot_mut(slot_index)?.logs.push(line.into());
+        Ok(())
+    }
+
+    pub fn effective_destination(&self, slot_index: usize) -> Result<Option<String>, String> {
+        let configured = &self.slot(slot_index)?.destination_directory;
+        if !configured.trim().is_empty() {
+            return Ok(Some(configured.clone()));
+        }
+
+        if slot_index == 1 {
+            let fallback = &self.state.slots[0].destination_directory;
+            if !fallback.trim().is_empty() {
+                return Ok(Some(fallback.clone()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn slot(&self, slot_index: usize) -> Result<&SyncSlotState, String> {
+        self.state
+            .slots
+            .get(slot_index)
+            .ok_or_else(|| invalid_slot_index(slot_index))
+    }
+
+    fn slot_mut(&mut self, slot_index: usize) -> Result<&mut SyncSlotState, String> {
+        self.state
+            .slots
+            .get_mut(slot_index)
+            .ok_or_else(|| invalid_slot_index(slot_index))
+    }
+
+    fn validate_slot_index(&self, slot_index: usize) -> Result<(), String> {
+        self.slot(slot_index).map(|_| ())
+    }
+
+    fn push_log_to_all(&mut self, line: &str) {
+        for slot in &mut self.state.slots {
+            slot.logs.push(line.to_string());
         }
     }
+}
 
-    pub fn fail_sync(&mut self, message: impl Into<String>) {
-        self.state.status = DesktopStatus::Error;
-        self.push_log(message);
-    }
-
-    pub fn pause_after_current_file(&self) -> bool {
-        self.task_controller.pause_after_current_file()
-    }
-
-    pub fn push_log(&mut self, line: impl Into<String>) {
-        self.state.logs.push(line.into());
-    }
+fn invalid_slot_index(slot_index: usize) -> String {
+    format!("Invalid sync slot index: {slot_index}")
 }
