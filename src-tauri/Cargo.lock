@@ -4015,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4034,8 +4034,9 @@ dependencies = [
 
 [[package]]
 name = "w4dj-desktop"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "tauri",
@@ -4043,6 +4044,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "w4dj",
  "window-vibrancy",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

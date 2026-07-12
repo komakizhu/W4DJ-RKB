@@ -12,6 +12,7 @@ mod task;
 use config::Mode;
 use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
 use task::{TaskController, TaskState};
 
 #[test]
@@ -63,7 +64,7 @@ fn snapshot_reports_remaining_work() {
 #[test]
 fn sync_entry_stops_before_next_file_when_pause_requested() {
     let name = String::from("song");
-    let info = (String::from("1"), String::from("/definitely/missing.mp3"));
+    let info = (String::from("1"), PathBuf::from("/definitely/missing.mp3"));
     let mut owned_files = HashMap::new();
     owned_files.insert(name, info);
     let queued_files = owned_files.iter().collect();
@@ -99,11 +100,8 @@ fn pause_requested_after_current_file_stops_before_next_file() {
 
     let first_name = String::from("first");
     let second_name = String::from("second");
-    let first_info = (String::from("5"), first_file.to_string_lossy().into_owned());
-    let second_info = (
-        String::from("6"),
-        second_file.to_string_lossy().into_owned(),
-    );
+    let first_info = (String::from("5"), first_file.clone());
+    let second_info = (String::from("6"), second_file.clone());
     let mut owned_files = HashMap::new();
     owned_files.insert(first_name, first_info);
     owned_files.insert(second_name, second_info);
@@ -116,7 +114,7 @@ fn pause_requested_after_current_file_stops_before_next_file() {
         &Mode::Compat,
         None,
         &task,
-        |_, task| task.request_pause(),
+        |_, task, _| task.request_pause(),
     )
     .unwrap();
 
@@ -131,7 +129,7 @@ fn pause_requested_after_current_file_stops_before_next_file() {
 #[test]
 fn failed_file_does_not_increment_completed_count() {
     let name = String::from("missing");
-    let info = (String::from("1"), String::from("/definitely/missing.mp3"));
+    let info = (String::from("1"), PathBuf::from("/definitely/missing.mp3"));
     let mut owned_files = HashMap::new();
     owned_files.insert(name, info);
     let queued_files = owned_files.iter().collect();
@@ -151,7 +149,7 @@ fn failed_file_does_not_increment_completed_count() {
 
 #[test]
 fn policy_entry_returns_status_snapshot() {
-    let owned_files: HashMap<String, (String, String)> = HashMap::new();
+    let owned_files: HashMap<String, (String, std::path::PathBuf)> = HashMap::new();
     let queued_files = owned_files.iter().collect();
 
     let snapshot = sync::sync_music_library_with_policy(

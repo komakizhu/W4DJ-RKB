@@ -1,110 +1,135 @@
-# W4DJ RKB v1.0.0 - 如果我是DJ 🎧
+# W4DJ RKB
 
-**一句话介绍：一键将网易云等流媒体下载的非标音乐，自动解密、重采样并补全封面，转换为 Pioneer DJ 硬件（如 CDJ-2000/RX3）完美兼容的标准无损音频，以便直接拖入 Rekordbox。**
+如果我是 DJ 🎧
 
-基于 [Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj) 的首个原生桌面客户端正式版。
+![W4DJ RKB 使用界面](imgs/w4dj.png)
 
-![w4dj](imgs/w4dj.png)
+W4DJ RKB 是一款面向 DJ 音乐库的桌面工具，用于整理和转换从网易云音乐、SoundCloud 等来源获得的音频文件，让它们更适合导入 Rekordbox，并在 Pioneer CDJ、XDJ 等设备上播放。
 
----
+## 它解决什么问题？
 
-## 为什么需要这个工具？
+从流媒体平台下载的音乐，常常存在以下问题：
 
-**核心痛点：你从网易云或 SoundCloud 下载的歌，Pioneer 硬件很可能根本读不出来。**
+- 网易云音乐的 `.ncm` 文件无法直接导入 DJ 软件；
+- 采样率过高的音频可能无法被部分 Pioneer 设备识别；
+- 转换后歌曲的标题、艺术家、专辑和封面容易丢失；
+- 手动逐首处理耗时，输出目录也不易维护。
 
-| 问题 | 具体表现 |
-|------|---------|
-| 🔒 网易云 `.ncm` 加密 | 文件被加密锁死，无法直接导入任何 DJ 软件 |
-| ⚠️ 格式、采样率不兼容 | 网易云下载曲目通常为flac，SoundCloud 正版下载经常是 **96000Hz**，Pioneer RX3 / CDJ-2000 等硬件直接**读不出来、卡死或跳过** |
-| ❓ 元数据丢失 | 转换后歌手名变成「未知艺术家」，封面消失，Rekordbox 曲库一片空白（视觉DJ没封面根本记不住歌名的说） |
+W4DJ RKB 可以批量扫描下载目录，按任务同步到输出目录，并在处理过程中尽量保留原始元数据和封面。
 
-**W4DJ RKB 就是为了解决这些问题而生的。** 它把你的音乐统一转换为 **24-bit / 48000Hz**——这是 Pioneer CDJ-2000 / XDJ-RX3 等硬件实测最稳定兼容的规格上限（最早可以支持到CDJ-350 / XDJ-700）。
+## 主要功能
 
----
+### 双任务同步
 
-## 它做什么？
+可以同时配置两个独立任务，每个任务分别设置：
 
-```
-网易云 / SoundCloud 下载目录
-        │
-        ▼
-   ┌─────────────┐
-   │  W4DJ RKB   │  ← 解密 + 降采样至 48kHz + 元数据回写
-   └─────────────┘
-        │
-        ▼
-输出目录（标准格式，直接拖入 Rekordbox）
-```
+- 歌曲下载目录；
+- 输出目录；
+- 任务状态和处理进度。
 
-### 📤 两种输出模式
+如果任务 2 没有单独设置输出目录，会自动使用任务 1 的输出目录。
 
-| 模式 | 输出格式 | 采样率 | 适用场景 |
-|------|---------|--------|---------|
-| **兼容模式** | 320kbps MP3 | 标准 | 所有 DJ 设备通用，文件体积小 |
-| **无损模式** | WAV 或 AIFF | 24-bit / 48000Hz | 追求音质，**确保 RX3 / CDJ-2000 完美兼容** |
+### 两种输出模式
 
-> 💡 **为什么是 48000Hz 而不是更高？**
-> Pioneer 的 CDJ-350、XDJ-700、CDJ-2000 系列以及 XDJ-RX3 的 DAC 解码上限就是 48kHz。高于这个采样率的文件（如 SoundCloud 的 96kHz）会导致硬件无法识别、播放卡顿或直接跳过曲目。48kHz 是兼顾音质与兼容性的最优选择。
-> 
-> ⚠️ **注：** 原文件属于低音质的，本工具并不会进行虚假音质提升。如库中同时混有 128kbps 的 MP3 和无损 FLAC，在选择「无损模式」转换后的结果为：128kbps 依然输出 MP3，而 FLAC 则输出无损 WAV。
+| 模式 | 输出特点 | 适用场景 |
+| --- | --- | --- |
+| 兼容模式 | 最高输出 320kbps MP3 | 文件体积较小，适合通用播放 |
+| 无损模式 | 最高 24-bit / 48kHz，可选 WAV 或 AIFF | 适合 Rekordbox 与 Pioneer DJ 设备 |
 
-### 🏷️ 元数据完整保留
-- 解密时自动提取并回写：**歌手名、歌曲名、专辑封面**
-- 输出文件的 ID3 / FLAC 标签完整，导入 Rekordbox 后不再显示「未知艺术家」
+原文件本身为有损格式时，工具不会虚假提升音质；输出会遵循源文件的实际质量。
 
-### ⚡ 性能
-- Rust 后端 + rayon 多线程并发，数千首歌同步仅需数秒
-- macOS 安装包仅约 24 MB
+### 元数据与封面
 
----
+处理时会尽量保留或恢复：
 
-## 支持的音源平台
+- 歌曲名称；
+- 艺术家和专辑信息；
+- 音频标签；
+- 专辑封面。
 
-| 平台 | 支持情况 | 说明 |
-|------|---------|------|
-| 🎵 网易云音乐 | ✅ 完整支持 | 自动解密 `.ncm` 加密文件 |
-| 🎶 SoundCloud | ✅ 支持 | 重采样 96kHz → 48kHz，解决硬件不兼容问题 |
+### 桌面应用界面
 
----
+- macOS 原生桌面窗口；
+- 中文 / 英文界面切换；
+- 浅色 / 深色模式切换；
+- 可视化任务进度；
+- 支持拖放目录；
+- Rust 后端负责文件处理和同步。
 
-## 安装
+## 基本使用流程
 
-前往 [Releases](https://github.com/komakizhu/w4dj/releases) 页面下载：
+1. 打开 W4DJ RKB。
+2. 为任务 1 和任务 2 选择歌曲下载目录。
+3. 选择输出目录；两个任务可以共用一个目录。
+4. 选择输出模式：兼容模式或无损模式。
+5. 无损模式下选择 WAV 或 AIFF。
+6. 点击“同时开始”。
+7. 将输出目录导入 Rekordbox，或复制到 DJ 设备使用的存储介质。
 
-| 平台 | 文件 |
-|------|------|
-| macOS（Intel / Apple Silicon） | `W4DJ RKB_1.0.0_x64.dmg` |
-| Windows（x64） | `W4DJ RKB_1.0.0_x64-setup.exe` |
+## 支持的平台
 
-### ⚠️ 首次运行安全提示
+| 来源 | 支持情况 | 说明 |
+| --- | --- | --- |
+| 网易云音乐 | ✅ | 支持 `.ncm` 文件解密与转换 |
+| SoundCloud | ✅ | 支持常见音频文件及采样率转换 |
 
-<details>
-<summary>🍏 macOS 提示「已损坏，打不开」</summary>
+## macOS 安装
 
-这是 macOS Gatekeeper 对未签名应用的正常拦截，任选一种方式解锁：
+从 Releases 下载对应架构的安装包：
 
-**方法一（推荐）**：打开 **系统设置 → 隐私与安全性**，找到「已阻止打开 W4DJ RKB」提示，点击 **仍要打开**。
+- Apple Silicon：`W4DJ RKB_1.0.0_aarch64.dmg`
+- Intel：`W4DJ RKB_1.0.0_x64.dmg`
 
-**方法二**：终端运行：
+首次打开时，如果 macOS 提示应用无法验证：
+
+1. 打开“系统设置 → 隐私与安全性”；
+2. 找到被阻止的 W4DJ RKB；
+3. 点击“仍要打开”。
+
+也可以在终端中移除隔离属性：
+
 ```bash
-xattr -cr /Applications/W4DJ\ RKB.app
+xattr -cr "/Applications/W4DJ RKB.app"
 ```
-</details>
 
-<details>
-<summary>🔌 Windows 弹出「已保护你的电脑」</summary>
+## 从源码运行
 
-点击 **更多信息** → **仍要运行** 即可。
-</details>
+项目由 Rust、Tauri 和前端应用组成。需要安装 Rust、Node.js、npm 以及 Tauri 的系统依赖。
 
----
+```bash
+cd W4DJ-RKB/app
+npm install
+npm run build
 
-## 致谢
+cd ../src-tauri
+cargo tauri dev
+```
 
-- [Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj) — 原始命令行同步引擎
-- [anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump) — NCM 解密算法
-- [iqiziqi/ncmdump.rs](https://github.com/iqiziqi/ncmdump.rs) — Rust 版 NCM 解密库
+构建 macOS 安装包：
+
+```bash
+cd W4DJ-RKB/src-tauri
+cargo tauri build
+```
+
+## 项目结构
+
+```text
+W4DJ-RKB/
+├── app/              # 前端界面
+├── src/              # 音频同步与转换逻辑
+├── src-tauri/        # Tauri 桌面应用
+├── tests/             # Rust 测试
+├── config.toml       # 命令行配置
+└── imgs/              # 项目图片资源
+```
 
 ## 免责声明
 
-本工具仅用于个人学习和技术研究目的。请确保您遵守相关法律法规，仅同步您拥有合法使用权的音乐文件。
+本项目仅用于个人学习、研究和合法拥有的音频文件处理。请确认你拥有相关音乐文件的合法使用权，并遵守所在地的法律法规以及相关平台的服务条款。
+
+## 致谢
+
+- [Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj) —— 原始同步引擎
+- [anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump) —— NCM 解密实现
+- [iqiziqi/ncmdump.rs](https://github.com/iqiziqi/ncmdump.rs) —— Rust NCM 解密库

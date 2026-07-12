@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -69,7 +71,7 @@ pub fn resolve_output_policy(
 pub fn find_ffmpeg() -> Option<String> {
     if let Ok(explicit_path) = env::var("W4DJ_FFMPEG_PATH") {
         let candidate = PathBuf::from(explicit_path);
-        if candidate.is_file() {
+        if is_usable_ffmpeg_candidate(&candidate) {
             return Some(candidate.to_string_lossy().into_owned());
         }
     }
@@ -101,7 +103,7 @@ fn find_ffmpeg_next_to_exe(exe_path: &Path) -> Option<PathBuf> {
     for candidate_name in preferred_ffmpeg_candidate_names() {
         for dir in &search_dirs {
             let candidate = dir.join(candidate_name);
-            if candidate.is_file() {
+            if is_usable_ffmpeg_candidate(&candidate) {
                 return Some(candidate);
             }
         }
@@ -121,18 +123,51 @@ fn find_ffmpeg_sidecar_in_dir(dir: &Path) -> Option<PathBuf> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        let is_ffmpeg = entry
+            .file_name()
+            .to_string_lossy()
+            .to_lowercase()
+            .starts_with("ffmpeg");
+
+        if !is_ffmpeg {
             continue;
         }
 
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy().to_lowercase();
-        if file_name.starts_with("ffmpeg") {
-            return Some(path);
+        if !is_usable_ffmpeg_candidate(&path) {
+            continue;
         }
+
+        return Some(path);
     }
 
     None
+}
+
+fn is_usable_ffmpeg_candidate(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+
+    if !metadata.is_file() || metadata.len() == 0 {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        true
+    }
 }
 
 fn preferred_ffmpeg_candidate_names() -> &'static [&'static str] {
@@ -160,7 +195,34 @@ fn preferred_ffmpeg_candidate_names() -> &'static [&'static str] {
     }
 }
 
-pub fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
+pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
+    collect_music_dict(folder, &["mp3", "flac", "ncm", "wav", "aiff"])
+}
+
+pub fn get_destination_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
+    collect_music_dict(folder, &["mp3", "wav", "aiff"])
+}
+
+pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return Ok(());
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_temporary_artifact(&path) {
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_music_dict(folder: &str, allowed_extensions: &[&str]) -> HashMap<String, (String, PathBuf)> {
     let mut music_dict = HashMap::new();
 
     for entry in walkdir::WalkDir::new(folder)
@@ -168,16 +230,18 @@ pub fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
         .filter_map(Result::ok)
         .filter(|entry| {
             entry.file_type().is_file()
+                && !is_temporary_artifact(entry.path())
                 && entry
                     .path()
                     .extension()
                     .and_then(|ext| ext.to_str())
                     .is_some_and(|ext_str| {
-                        matches!(ext_str.to_lowercase().as_str(), "mp3" | "flac" | "ncm")
+                        let lower = ext_str.to_lowercase();
+                        allowed_extensions.iter().any(|allowed| *allowed == lower)
                     })
         })
     {
-        let path = entry.path().to_string_lossy().into_owned();
+        let path = entry.path().to_path_buf();
         let song_name = derive_song_name(entry.path());
         let size = entry
             .metadata()
@@ -197,10 +261,16 @@ pub fn get_music_dict(folder: &str) -> HashMap<String, (String, String)> {
     music_dict
 }
 
+fn is_temporary_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".w4dj-"))
+}
+
 fn should_prefer_file(
-    candidate_path: &str,
+    candidate_path: &Path,
     candidate_size: &str,
-    current: &(String, String),
+    current: &(String, PathBuf),
 ) -> bool {
     let candidate_rank = file_rank(candidate_path);
     let current_rank = file_rank(&current.1);
@@ -210,13 +280,14 @@ fn should_prefer_file(
             && candidate_size.parse::<u64>().unwrap_or(0) >= current.0.parse::<u64>().unwrap_or(0))
 }
 
-fn file_rank(path: &str) -> u8 {
-    match Path::new(path)
+fn file_rank(path: &Path) -> u8 {
+    match path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_lowercase())
         .as_deref()
     {
+        Some("wav") | Some("aiff") => 4,
         Some("flac") => 3,
         Some("ncm") => 2,
         Some("mp3") => 1,
@@ -225,18 +296,18 @@ fn file_rank(path: &str) -> u8 {
 }
 
 pub fn compare_music_dicts<'a>(
-    wf_dict: &'a HashMap<String, (String, String)>,
-    sf_dict: &'a HashMap<String, (String, String)>,
+    wf_dict: &'a HashMap<String, (String, PathBuf)>,
+    sf_dict: &'a HashMap<String, (String, PathBuf)>,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
-) -> HashMap<&'a String, &'a (String, String)> {
+) -> HashMap<&'a String, &'a (String, PathBuf)> {
     wf_dict
         .iter()
         .filter(|(name, wf_info)| match mode {
             Mode::Compat => {
                 let expected_extension =
                     resolve_output_policy(*mode, lossless_format, "mp3").output_extension;
-                needs_regeneration(sf_dict.get(*name), expected_extension)
+                needs_regeneration(sf_dict.get(*name), mode, "mp3", expected_extension)
             }
             Mode::Lossless => {
                 let source_extension = effective_source_extension(&wf_info.1);
@@ -244,32 +315,47 @@ pub fn compare_music_dicts<'a>(
                     resolve_output_policy(*mode, lossless_format, &source_extension)
                         .output_extension;
 
-                needs_regeneration(sf_dict.get(*name), expected_extension)
+                needs_regeneration(
+                    sf_dict.get(*name),
+                    mode,
+                    &source_extension,
+                    expected_extension,
+                )
             }
         })
         .collect()
 }
 
-fn needs_regeneration(existing: Option<&(String, String)>, expected_extension: &str) -> bool {
+fn needs_regeneration(
+    existing: Option<&(String, PathBuf)>,
+    mode: &Mode,
+    source_extension: &str,
+    expected_extension: &str,
+) -> bool {
     let Some(existing) = existing else {
         return true;
     };
 
-    let existing_extension = Path::new(&existing.1)
+    if existing.0.parse::<u64>().unwrap_or(0) == 0 {
+        return true;
+    }
+
+    let existing_extension = existing
+        .1
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_lowercase())
         .unwrap_or_default();
 
-    if existing_extension != expected_extension {
-        return true;
+    match mode {
+        Mode::Compat => existing_extension != expected_extension,
+        Mode::Lossless if source_extension == "mp3" => false,
+        Mode::Lossless => existing_extension != expected_extension,
     }
-
-    existing.0.parse::<u64>().unwrap_or(0) == 0
 }
 
 pub fn sync_music_library_with_policy(
-    new_songs: &HashMap<&String, &(String, String)>,
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
@@ -285,7 +371,7 @@ pub fn sync_music_library_with_policy(
 }
 
 pub fn sync_music_library_with_task(
-    new_songs: &HashMap<&String, &(String, String)>,
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
@@ -297,17 +383,17 @@ pub fn sync_music_library_with_task(
         mode,
         lossless_format,
         task_controller,
-        |_, _| {},
+        |_, _, _| {},
     )
 }
 
 pub fn sync_music_library_with_observer(
-    new_songs: &HashMap<&String, &(String, String)>,
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
     task_controller: &TaskController,
-    mut after_file: impl FnMut(&str, &TaskController),
+    mut after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
 ) -> io::Result<TaskSnapshot> {
     if new_songs.is_empty() {
         return Ok(task_controller.snapshot());
@@ -321,7 +407,12 @@ pub fn sync_music_library_with_observer(
         .unwrap(),
     );
 
-    for (&name, info) in new_songs.iter() {
+    let mut queued_files = new_songs.iter().collect::<Vec<_>>();
+    queued_files.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+    let mut skipped_files = 0usize;
+    let mut last_error: Option<io::Error> = None;
+
+    for (&name, info) in queued_files {
         if task_controller.is_cancelled() {
             bar.abandon_with_message("Sync cancelled.");
             return Ok(task_controller.snapshot());
@@ -333,33 +424,56 @@ pub fn sync_music_library_with_observer(
         }
 
         let task_result = process_music_file(name, info, dest_folder, mode, lossless_format, &bar);
-        if let Err(err) = task_result {
-            bar.abandon_with_message(format!("Sync encountered errors. First error: {}", err));
-            return Err(err);
+        match task_result {
+            Ok(()) => {
+                task_controller.complete_current_file();
+                bar.inc(1);
+                after_file(name, task_controller, None);
+            }
+            Err(err) => {
+                let error_message = err.to_string();
+                skipped_files += 1;
+                last_error = Some(io::Error::new(err.kind(), error_message.clone()));
+                bar.inc(1);
+                after_file(name, task_controller, Some(&err));
+                bar.println(format!("Skipped {}: {}", name, error_message));
+            }
         }
-
-        task_controller.complete_current_file();
-        bar.inc(1);
-        after_file(name, task_controller);
     }
 
     let snapshot = task_controller.snapshot();
+    if snapshot.completed == 0 && skipped_files > 0 {
+        bar.abandon_with_message(format!(
+            "Sync failed after skipping {} files.",
+            skipped_files
+        ));
+        return Err(last_error.unwrap_or_else(|| {
+            io::Error::other(format!("Sync failed after skipping {} files.", skipped_files))
+        }));
+    }
+
     bar.finish_with_message(format!(
-        "Sync processing complete. {}/{} files processed.",
-        snapshot.completed, snapshot.total
+        "Sync processing complete. {}/{} files processed, {} skipped.",
+        snapshot.completed, snapshot.total, skipped_files
     ));
     Ok(snapshot)
 }
 
 fn process_music_file(
     name: &str,
-    info: &(String, String),
+    info: &(String, PathBuf),
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
     bar: &indicatif::ProgressBar,
 ) -> io::Result<()> {
-    let src_path = Path::new(&info.1);
+    let src_path = info.1.as_path();
+    if !src_path.exists() {
+        return Err(Error::new(
+            ErrorKind::NotFound,
+            format!("Source file missing: {}", src_path.display()),
+        ));
+    }
     let extension = src_path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -385,6 +499,27 @@ fn process_music_file(
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
                     strip_163_key_from_mp3(&output_path)?;
                 }
+                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+            }
+
+            result
+        }
+        "wav" | "aiff" => {
+            bar.set_message(format!("Processing {}: {}", extension.to_uppercase(), name));
+            let output_policy = resolve_output_policy(*mode, lossless_format, &extension);
+            let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
+            let result = match output_policy.target_profile {
+                TargetProfile::CompatMp3
+                | TargetProfile::LosslessWav
+                | TargetProfile::LosslessAiff => convert_audio_to_target_format(
+                    src_path,
+                    &output_path,
+                    output_policy.target_profile,
+                    name,
+                ),
+            };
+
+            if result.is_ok() {
                 remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
             }
 
@@ -447,7 +582,17 @@ fn copy_file(src_path: &Path, dest_path: &Path) -> io::Result<()> {
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(src_path, dest_path).map(|_| ())
+    fs::copy(src_path, dest_path).map(|_| ()).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "Failed to copy {} to {}: {}",
+                src_path.display(),
+                dest_path.display(),
+                error
+            ),
+        )
+    })
 }
 
 fn convert_flac_to_mp3(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<()> {
@@ -491,13 +636,45 @@ fn convert_audio_to_target_format(
         }
     }
 
-    let status = command.arg(output_path).status()?;
+    let status = command.arg(output_path).status().map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!("Failed to start FFmpeg at {}: {}", ffmpeg_path, error),
+        )
+    })?;
 
     if !status.success() {
         return Err(Error::other(format!(
             "FFmpeg conversion failed for {}",
             name_stem
         )));
+    }
+
+    ensure_generated_output(output_path, name_stem)
+}
+
+fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()> {
+    let metadata = fs::metadata(output_path).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "FFmpeg reported success for {}, but output {} is unavailable: {}",
+                name_stem,
+                output_path.display(),
+                error
+            ),
+        )
+    })?;
+
+    if metadata.len() == 0 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "FFmpeg produced an empty output for {}: {}",
+                name_stem,
+                output_path.display()
+            ),
+        ));
     }
 
     Ok(())
@@ -519,7 +696,12 @@ fn process_ncm_file(
     mode: Mode,
     lossless_format: Option<LosslessFormat>,
 ) -> io::Result<()> {
-    let file = File::open(src_path)?;
+    let file = File::open(src_path).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!("Failed to open source file {}: {}", src_path.display(), error),
+        )
+    })?;
     let mut ncm = Ncmdump::from_reader(file).map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
@@ -590,8 +772,26 @@ fn process_ncm_file(
         _ => music_data,
     };
 
-    let mut temp_file = File::create(&temp_source_path)?;
-    temp_file.write_all(&temp_data)?;
+    let mut temp_file = File::create(&temp_source_path).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "Failed to create temporary file {}: {}",
+                temp_source_path.display(),
+                error
+            ),
+        )
+    })?;
+    temp_file.write_all(&temp_data).map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "Failed to write temporary file {}: {}",
+                temp_source_path.display(),
+                error
+            ),
+        )
+    })?;
 
     match output_policy.target_profile {
         TargetProfile::CompatMp3 => {
@@ -623,7 +823,20 @@ fn process_ncm_file(
         }
     }
 
-    fs::remove_file(&temp_source_path)?;
+    match fs::remove_file(&temp_source_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::new(
+                error.kind(),
+                format!(
+                    "Failed to remove temporary file {}: {}",
+                    temp_source_path.display(),
+                    error
+                ),
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -636,8 +849,8 @@ fn target_output_path(dest_folder: &str, name_stem: &str, output_extension: &str
     ))
 }
 
-fn effective_source_extension(source_path: &str) -> String {
-    let path = Path::new(source_path);
+fn effective_source_extension(source_path: &Path) -> String {
+    let path = source_path;
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -729,7 +942,7 @@ fn derive_song_name(path: &Path) -> String {
         .to_lowercase();
 
     let candidate = match extension.as_str() {
-        "mp3" => song_name_from_mp3(path),
+        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path),
         "flac" => song_name_from_flac(path),
         "ncm" => song_name_from_ncm(path),
         _ => None,
@@ -738,20 +951,20 @@ fn derive_song_name(path: &Path) -> String {
     candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name))
 }
 
-fn song_name_from_mp3(path: &Path) -> Option<String> {
-    let tag = id3::Tag::read_from_path(path).ok()?;
-    build_song_name(
-        tag.title().unwrap_or_default(),
-        tag.artist().unwrap_or_default(),
-    )
-}
-
 fn song_name_from_flac(path: &Path) -> Option<String> {
     let tag = metaflac::Tag::read_from_path(path).ok()?;
     let id3_tag = build_id3_tag_from_flac(&tag);
     build_song_name(
         id3_tag.title().unwrap_or_default(),
         id3_tag.artist().unwrap_or_default(),
+    )
+}
+
+fn song_name_from_audio_tag(path: &Path) -> Option<String> {
+    let tag = id3::Tag::read_from_path(path).ok()?;
+    build_song_name(
+        tag.title().unwrap_or_default(),
+        tag.artist().unwrap_or_default(),
     )
 }
 
@@ -1174,13 +1387,27 @@ fn write_container_tags_from_flac_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_song_name, compare_music_dicts, derive_song_name, find_ffmpeg_next_to_exe,
-        sanitize_filename_component,
+        build_song_name, compare_music_dicts, derive_song_name, ensure_generated_output,
+        find_ffmpeg_next_to_exe, sanitize_filename_component,
     };
     use crate::config::{LosslessFormat, Mode};
     use std::collections::HashMap;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    fn write_executable_file(path: &Path, contents: &[u8]) {
+        fs::write(path, contents).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
 
     #[test]
     fn sanitizes_invalid_filename_characters() {
@@ -1260,13 +1487,13 @@ mod tests {
         let mut source = HashMap::new();
         source.insert(
             "Song".to_string(),
-            ("100".to_string(), "/music/source/Song.flac".to_string()),
+            ("100".to_string(), PathBuf::from("/music/source/Song.flac")),
         );
 
         let mut destination = HashMap::new();
         destination.insert(
             "Song".to_string(),
-            ("4096".to_string(), "/music/dest/Song.wav".to_string()),
+            ("4096".to_string(), PathBuf::from("/music/dest/Song.wav")),
         );
 
         let diff = compare_music_dicts(
@@ -1284,13 +1511,13 @@ mod tests {
         let mut source = HashMap::new();
         source.insert(
             "Song".to_string(),
-            ("100".to_string(), "/music/source/Song.mp3".to_string()),
+            ("100".to_string(), PathBuf::from("/music/source/Song.mp3")),
         );
 
         let mut destination = HashMap::new();
         destination.insert(
             "Song".to_string(),
-            ("0".to_string(), "/music/dest/Song.mp3".to_string()),
+            ("0".to_string(), PathBuf::from("/music/dest/Song.mp3")),
         );
 
         let diff = compare_music_dicts(&source, &destination, &Mode::Compat, None);
@@ -1305,7 +1532,7 @@ mod tests {
         let sidecar_path = dir.path().join("ffmpeg-x86_64-pc-windows-msvc.exe");
 
         fs::write(&exe_path, []).unwrap();
-        fs::write(&sidecar_path, []).unwrap();
+        write_executable_file(&sidecar_path, b"ffmpeg sidecar");
 
         let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
         assert_eq!(found, sidecar_path);
@@ -1321,7 +1548,7 @@ mod tests {
 
         fs::create_dir_all(&binaries_dir).unwrap();
         fs::write(&exe_path, []).unwrap();
-        fs::write(&sidecar_path, []).unwrap();
+        write_executable_file(&sidecar_path, b"ffmpeg sidecar");
 
         let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
         assert_eq!(found, sidecar_path);
@@ -1337,8 +1564,8 @@ mod tests {
 
         fs::create_dir_all(&binaries_dir).unwrap();
         fs::write(&exe_path, []).unwrap();
-        fs::write(&preferred_windows, []).unwrap();
-        fs::write(&preferred_macos, []).unwrap();
+        write_executable_file(&preferred_windows, b"ffmpeg windows sidecar");
+        write_executable_file(&preferred_macos, b"ffmpeg mac sidecar");
 
         let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
 
@@ -1347,5 +1574,43 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         assert_eq!(found, preferred_macos);
+    }
+
+    #[test]
+    fn does_not_treat_desktop_executable_as_ffmpeg_sidecar() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj-desktop");
+
+        write_executable_file(&exe_path, b"desktop executable");
+
+        assert!(find_ffmpeg_next_to_exe(&exe_path).is_none());
+    }
+
+    #[test]
+    fn rejects_successful_conversion_without_an_output_file() {
+        let dir = tempdir().unwrap();
+        let missing_output = dir.path().join("missing.aiff");
+
+        let error = ensure_generated_output(&missing_output, "Missing Song").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("missing.aiff"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn skips_placeholder_ffmpeg_sidecars() {
+        let dir = tempdir().unwrap();
+        let exe_path = dir.path().join("w4dj");
+        let placeholder = dir.path().join("ffmpeg-aarch64-apple-darwin");
+        let fallback = dir.path().join("ffmpeg");
+
+        fs::write(&exe_path, []).unwrap();
+        fs::write(&placeholder, b"local cargo-check placeholder\n").unwrap();
+        write_executable_file(&fallback, b"real ffmpeg binary");
+
+        let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
+
+        assert_eq!(found, fallback);
     }
 }

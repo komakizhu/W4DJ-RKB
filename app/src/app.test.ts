@@ -22,6 +22,8 @@ const makeDesktopSlot = (
   status: 'idle',
   progress_total: 0,
   progress_completed: 0,
+  new_tracks: 0,
+  skipped_tracks: 0,
   current_file: '',
   logs: ['Ready'],
   ...overrides,
@@ -57,6 +59,8 @@ const makeViewSlot = (overrides: Partial<AppSyncSlotViewState> = {}): AppSyncSlo
   status: 'idle',
   progressTotal: 0,
   progressCompleted: 0,
+  newTracks: 0,
+  skippedTracks: 0,
   progressText: '待命',
   currentFile: '',
   logExpanded: false,
@@ -114,6 +118,17 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   ...overrides,
 });
 
+const createDeferred = <T>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return { promise, resolve, reject };
+};
+
 describe('renderApp', () => {
   it('renders two independent sync slots and global controls', () => {
     const root = renderApp(makeViewState());
@@ -132,21 +147,43 @@ describe('renderApp', () => {
     expect(root.querySelectorAll('[data-action="start-all"]')).toHaveLength(1);
     expect(root.querySelectorAll('[data-action="start"]')).toHaveLength(0);
     expect(root.querySelectorAll('[data-role="log-drawer"][hidden]')).toHaveLength(2);
+    expect(root.querySelector('.rail-copy')).toBeNull();
+  });
+
+  it('renders new and skipped track counts in the global status card', () => {
+    const root = renderApp(
+      makeViewState({
+        slots: [
+          makeViewSlot({ newTracks: 3, skippedTracks: 1 }),
+          makeViewSlot({ newTracks: 2, skippedTracks: 4 }),
+        ],
+      }),
+    );
+
+    const status = root.querySelector('.global-status-card') as HTMLElement;
+    expect(status.textContent).toContain('新增歌曲');
+    expect(status.textContent).toContain('5');
+    expect(status.textContent).toContain('跳过歌曲');
+    expect(status.textContent).toContain('5');
   });
 
   it('renders the selected color theme and a top-right theme toggle', () => {
     const root = renderApp(makeViewState({ theme: 'dark' }));
 
     expect(root.dataset.theme).toBe('dark');
+    expect(root.dataset.lightPalette).toBe('c');
     expect(root.querySelector('[data-action="toggle-theme"]')).not.toBeNull();
     expect(root.querySelector('.topbar-actions')?.lastElementChild?.getAttribute('data-action'))
       .toBe('toggle-lang');
   });
 
   it('renders the global lossless format selector only in lossless mode', () => {
-    expect(renderApp(makeViewState({ mode: 'compat' })).querySelector('.format-row')).toBeNull();
+    const compatRoot = renderApp(makeViewState({ mode: 'compat' }));
+    expect(compatRoot.querySelector('.format-row')).toBeNull();
+    expect(compatRoot.querySelector('.format-slot')).not.toBeNull();
 
     const root = renderApp(makeViewState({ mode: 'lossless', losslessFormat: 'wav' }));
+    expect(root.querySelector('.format-slot')).not.toBeNull();
     expect(root.querySelector('[data-format="wav"]')?.classList.contains('selected')).toBe(true);
     expect(root.querySelector('[data-format="aiff"]')?.classList.contains('selected')).toBe(false);
   });
@@ -310,6 +347,35 @@ describe('bindApp', () => {
 
     (root.querySelector('[data-action="pause-all"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(services.pauseAllSync).toHaveBeenCalledTimes(1));
+  });
+
+  it('ignores repeated global start clicks while the first start is pending', async () => {
+    const deferred = createDeferred<DesktopState>();
+    const services = makeMockServices({
+      startAllSync: vi.fn().mockReturnValue(deferred.promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    const pendingButton = root.querySelector('[data-action="start-all"]') as HTMLButtonElement;
+    expect(pendingButton.disabled).toBe(true);
+    pendingButton.click();
+
+    expect(services.startAllSync).toHaveBeenCalledTimes(1);
+
+    deferred.resolve(
+      makeDesktopState({
+        slots: [
+          makeDesktopSlot({ status: 'running', progress_total: 10 }),
+          makeDesktopSlot({ status: 'running', progress_total: 8 }),
+        ],
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
+    });
   });
 
   it('toggles and persists the color theme', async () => {

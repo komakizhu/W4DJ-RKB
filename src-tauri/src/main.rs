@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
+use std::fs::OpenOptions;
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -9,7 +11,10 @@ use tauri::Manager;
 use w4dj::config::{LosslessFormat, Mode};
 use w4dj::desktop::{DesktopController, DesktopState};
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
-use w4dj::sync::{compare_music_dicts, get_music_dict, sync_music_library_with_observer};
+use w4dj::sync::{
+    cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict, get_music_dict,
+    sync_music_library_with_observer,
+};
 
 #[cfg(target_os = "macos")]
 use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState, apply_vibrancy};
@@ -25,6 +30,10 @@ struct DestinationCoordinator {
     locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
+struct InstanceLock {
+    _file: fs::File,
+}
+
 impl DestinationCoordinator {
     fn lock_for(&self, destination: &Path) -> Arc<Mutex<()>> {
         let key = fs::canonicalize(destination).unwrap_or_else(|_| destination.to_path_buf());
@@ -35,6 +44,62 @@ impl DestinationCoordinator {
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
     }
+}
+
+fn acquire_single_instance_lock() -> io::Result<Option<InstanceLock>> {
+    let lock_path = std::env::temp_dir().join("w4dj-rkb.desktop.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::zeroed;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped = unsafe { zeroed::<OVERLAPPED>() };
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+
+        if locked == 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+
+    let _ = writeln!(&file, "{}", std::process::id());
+    Ok(Some(InstanceLock { _file: file }))
 }
 
 #[tauri::command]
@@ -187,6 +252,12 @@ fn pause_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, Str
 }
 
 fn main() {
+    let Some(_instance_lock) = acquire_single_instance_lock()
+        .unwrap_or_else(|error| panic!("failed to acquire single-instance lock: {}", error))
+    else {
+        return;
+    };
+
     let controller = DesktopController::new(DesktopState::from_preferences(AppPreferences::default()));
 
     tauri::Builder::default()
@@ -351,6 +422,15 @@ fn run_sync_task(
         .lock()
         .expect("destination sync lock poisoned");
 
+    if let Err(error) = cleanup_temporary_outputs(&destination) {
+        fail_sync(
+            &controller,
+            slot_index,
+            format!("无法清理临时文件：{}", error),
+        );
+        return;
+    }
+
     {
         let mut controller = controller.lock().expect("desktop lock poisoned");
         if using_fallback {
@@ -365,7 +445,26 @@ fn run_sync_task(
             .push_log(slot_index, format!("Scanning source: {}", source))
             .expect("sync slot index validated before worker start");
     }
-    let source_files = get_music_dict(&source);
+    let mut source_files = get_music_dict(&source);
+    let missing_sources = source_files
+        .iter()
+        .filter(|(_, (_, path))| !path.exists())
+        .map(|(name, (_, path))| (name.clone(), path.display().to_string()))
+        .collect::<Vec<(String, String)>>();
+
+    if !missing_sources.is_empty() {
+        let mut controller = controller.lock().expect("desktop lock poisoned");
+        for (name, path) in &missing_sources {
+            controller
+                .push_log(
+                    slot_index,
+                    format!("Skipping unavailable source before sync: {} ({})", name, path),
+                )
+                .expect("sync slot index validated before worker start");
+        }
+    }
+
+    source_files.retain(|_, (_, path)| path.exists());
 
     {
         let mut controller = controller.lock().expect("desktop lock poisoned");
@@ -376,7 +475,7 @@ fn run_sync_task(
             )
             .expect("sync slot index validated before worker start");
     }
-    let destination_files = get_music_dict(&destination);
+    let destination_files = get_destination_music_dict(&destination);
     let queued_files = compare_music_dicts(&source_files, &destination_files, &mode, lossless_format);
 
     {
@@ -399,21 +498,39 @@ fn run_sync_task(
         }
     }
 
+    let mut skipped_files = 0usize;
     let result = sync_music_library_with_observer(
         &queued_files,
         &destination,
         &mode,
         lossless_format,
         &task_controller,
-        |name, task| {
+        |name, task, error| {
+            if error.is_some() {
+                skipped_files += 1;
+            }
+
             let mut controller = controller.lock().expect("desktop lock poisoned");
             controller
-                .record_file_completed(slot_index, name, task.snapshot())
+                .record_file_result(
+                    slot_index,
+                    name,
+                    task.snapshot(),
+                    error.map(|err| err.to_string()),
+                )
                 .expect("sync slot index validated before worker start");
         },
     );
 
     let mut controller = controller.lock().expect("desktop lock poisoned");
+    if skipped_files > 0 {
+        controller
+            .push_log(
+                slot_index,
+                format!("Skipped {} file(s) during sync", skipped_files),
+            )
+            .expect("sync slot index validated before worker start");
+    }
     match result {
         Ok(snapshot) => controller
             .finish_sync(slot_index, snapshot)

@@ -20,6 +20,8 @@ pub struct SyncSlotState {
     pub status: DesktopStatus,
     pub progress_total: usize,
     pub progress_completed: usize,
+    pub new_tracks: usize,
+    pub skipped_tracks: usize,
     pub current_file: String,
     pub logs: Vec<String>,
 }
@@ -45,6 +47,8 @@ impl SyncSlotState {
             status: DesktopStatus::Idle,
             progress_total: 0,
             progress_completed: 0,
+            new_tracks: 0,
+            skipped_tracks: 0,
             current_file: String::new(),
             logs: vec![String::from("Desktop shell ready")],
         }
@@ -146,6 +150,8 @@ impl DesktopController {
         slot.status = DesktopStatus::Running;
         slot.progress_total = total_files;
         slot.progress_completed = 0;
+        slot.new_tracks = 0;
+        slot.skipped_tracks = 0;
         slot.current_file.clear();
         slot.logs.push(String::from("Sync started"));
         Ok(())
@@ -187,6 +193,8 @@ impl DesktopController {
         let slot = self.slot_mut(slot_index)?;
         slot.progress_total = total_files;
         slot.progress_completed = 0;
+        slot.new_tracks = 0;
+        slot.skipped_tracks = 0;
         Ok(())
     }
 
@@ -254,7 +262,34 @@ impl DesktopController {
         let slot = self.slot_mut(slot_index)?;
         slot.current_file = file_name.clone();
         slot.progress_completed = snapshot.completed;
+        slot.new_tracks += 1;
         slot.logs.push(format!("Processed {file_name}"));
+        Ok(())
+    }
+
+    pub fn record_file_result(
+        &mut self,
+        slot_index: usize,
+        file_name: impl Into<String>,
+        snapshot: TaskSnapshot,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        let file_name = file_name.into();
+        let slot = self.slot_mut(slot_index)?;
+        slot.current_file = file_name.clone();
+        slot.progress_completed = snapshot.completed;
+
+        match error {
+            Some(error) => {
+                slot.skipped_tracks += 1;
+                slot.logs.push(format!("Skipped {file_name}: {error}"));
+            }
+            None => {
+                slot.new_tracks += 1;
+                slot.logs.push(format!("Processed {file_name}"));
+            }
+        }
+
         Ok(())
     }
 
