@@ -401,18 +401,22 @@ h1 {
 
 .app-shell[data-selection-motion="mode"] .mode-row[data-selected-mode="lossless"]::before {
   animation: mode-slide-down 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
 }
 
 .app-shell[data-selection-motion="mode"] .mode-row[data-selected-mode="compat"]::before {
   animation: mode-slide-up 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
 }
 
 .app-shell[data-selection-motion="format"] .format-row[data-selected-format="aiff"]::before {
   animation: format-slide-right 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
 }
 
 .app-shell[data-selection-motion="format"] .format-row[data-selected-format="wav"]::before {
   animation: format-slide-left 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
 }
 
 .app-shell[data-selection-motion="theme"] {

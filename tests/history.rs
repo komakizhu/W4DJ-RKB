@@ -1,8 +1,8 @@
 use tempfile::tempdir;
+use w4dj::config::Mode;
 use w4dj::history::{
     FailedFile, HistoryEntry, HistoryStatus, append_history, format_error_report, load_history,
 };
-use w4dj::config::Mode;
 
 fn test_entry(index: usize) -> HistoryEntry {
     HistoryEntry {

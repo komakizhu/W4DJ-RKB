@@ -102,12 +102,7 @@ pub fn build_sync_preview(
     } else {
         Default::default()
     };
-    let new_songs = compare_music_dicts(
-        &source_files,
-        &destination_files,
-        &mode,
-        lossless_format,
-    );
+    let new_songs = compare_music_dicts(&source_files, &destination_files, &mode, lossless_format);
 
     for (name, (_, path)) in &source_files {
         let source_size = match fs::metadata(path) {
@@ -134,19 +129,15 @@ pub fn build_sync_preview(
         }
 
         let source_extension = effective_source_extension(path);
-        let output_extension = resolve_output_policy(mode, lossless_format, &source_extension)
-            .output_extension;
+        let output_extension =
+            resolve_output_policy(mode, lossless_format, &source_extension).output_extension;
         let estimated_output_bytes = Some(source_size);
         preview.candidates.push(PreviewCandidate {
             name: (*name).clone(),
             source_path: path.display().to_string(),
-            destination_path: target_output_path(
-                destination_directory,
-                name,
-                output_extension,
-            )
-            .display()
-            .to_string(),
+            destination_path: target_output_path(destination_directory, name, output_extension)
+                .display()
+                .to_string(),
             source_size_bytes: source_size,
             estimated_output_bytes,
         });

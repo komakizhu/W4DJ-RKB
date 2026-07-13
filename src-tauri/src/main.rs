@@ -365,19 +365,6 @@ fn start_confirmed_sync(
                 return Err(format!("任务 {} 没有可处理的文件", slot_index + 1));
             }
 
-            controller.start_confirmed_sync(
-                slot_index,
-                slot_preview.preview.candidates.len(),
-            )?;
-            controller.set_preview_summary(
-                slot_index,
-                slot_preview.preview.existing_count,
-                slot_preview.preview.skipped_count,
-                slot_preview.preview.error_count,
-                slot_preview.preview.estimated_output_bytes,
-            )?;
-            controller.push_log(slot_index, "Confirmed preflight; conversion started")?;
-
             jobs.push(ConfirmedSyncJob {
                 batch_id: batch_id.clone(),
                 slot_index,
@@ -389,6 +376,18 @@ fn start_confirmed_sync(
                 preview: slot_preview.preview,
                 retry_of: retry_of.clone().or(slot_preview.retry_of),
             });
+        }
+
+        for job in &jobs {
+            controller.start_confirmed_sync(job.slot_index, job.candidates.len())?;
+            controller.set_preview_summary(
+                job.slot_index,
+                job.preview.existing_count,
+                job.preview.skipped_count,
+                job.preview.error_count,
+                job.preview.estimated_output_bytes,
+            )?;
+            controller.push_log(job.slot_index, "Confirmed preflight; conversion started")?;
         }
     }
 

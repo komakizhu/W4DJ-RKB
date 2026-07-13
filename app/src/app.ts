@@ -656,10 +656,12 @@ export function bindApp(
     }, 750);
   };
 
-  const refreshHistory = async () => {
+  const refreshHistory = async (renderAfter = true) => {
     try {
       history = await services.loadHistory();
-      render();
+      if (renderAfter && selectionMotion === null) {
+        render();
+      }
     } catch (error) {
       console.error('Failed to load conversion history:', error);
     }
@@ -672,7 +674,7 @@ export function bindApp(
     });
     state = nextState;
     render();
-    void refreshHistory();
+    void refreshHistory(false);
     queueRefresh();
   };
 
@@ -705,10 +707,11 @@ export function bindApp(
       return;
     }
     pendingSelection = kind;
-    selectionMotion = kind;
     render();
     try {
-      applyDesktopState(await action());
+      const nextState = await action();
+      selectionMotion = kind;
+      applyDesktopState(nextState);
     } catch (error) {
       reportError(error);
     } finally {
