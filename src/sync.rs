@@ -841,7 +841,7 @@ fn process_ncm_file(
     Ok(())
 }
 
-fn target_output_path(dest_folder: &str, name_stem: &str, output_extension: &str) -> PathBuf {
+pub(crate) fn target_output_path(dest_folder: &str, name_stem: &str, output_extension: &str) -> PathBuf {
     Path::new(dest_folder).join(format!(
         "{}.{}",
         sanitize_filename_component(name_stem),
@@ -849,7 +849,7 @@ fn target_output_path(dest_folder: &str, name_stem: &str, output_extension: &str
     ))
 }
 
-fn effective_source_extension(source_path: &Path) -> String {
+pub(crate) fn effective_source_extension(source_path: &Path) -> String {
     let path = source_path;
     let extension = path
         .extension()
