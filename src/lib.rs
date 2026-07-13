@@ -1,6 +1,7 @@
 pub mod config;
 pub mod desktop;
 pub mod gui;
+pub mod history;
 pub mod metadata;
 pub mod preview;
 pub mod preferences;

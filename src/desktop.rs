@@ -1,4 +1,5 @@
 use crate::config::{LosslessFormat, Mode};
+use crate::history::FailedFile;
 use crate::preferences::{AppPreferences, SYNC_SLOT_COUNT, SyncSlotPreferences};
 use crate::task::{TaskController, TaskSnapshot};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,10 @@ pub struct SyncSlotState {
     pub progress_completed: usize,
     pub new_tracks: usize,
     pub skipped_tracks: usize,
+    pub existing_tracks: usize,
+    pub error_tracks: usize,
+    pub estimated_output_bytes: Option<u64>,
+    pub failed_files: Vec<FailedFile>,
     pub current_file: String,
     pub logs: Vec<String>,
 }
@@ -49,6 +54,10 @@ impl SyncSlotState {
             progress_completed: 0,
             new_tracks: 0,
             skipped_tracks: 0,
+            existing_tracks: 0,
+            error_tracks: 0,
+            estimated_output_bytes: None,
+            failed_files: Vec::new(),
             current_file: String::new(),
             logs: vec![String::from("Desktop shell ready")],
         }
@@ -152,8 +161,36 @@ impl DesktopController {
         slot.progress_completed = 0;
         slot.new_tracks = 0;
         slot.skipped_tracks = 0;
+        slot.existing_tracks = 0;
+        slot.error_tracks = 0;
+        slot.estimated_output_bytes = None;
+        slot.failed_files.clear();
         slot.current_file.clear();
         slot.logs.push(String::from("Sync started"));
+        Ok(())
+    }
+
+    pub fn start_confirmed_sync(
+        &mut self,
+        slot_index: usize,
+        total_files: usize,
+    ) -> Result<(), String> {
+        self.start_sync(slot_index, total_files)
+    }
+
+    pub fn set_preview_summary(
+        &mut self,
+        slot_index: usize,
+        existing_tracks: usize,
+        skipped_tracks: usize,
+        error_tracks: usize,
+        estimated_output_bytes: Option<u64>,
+    ) -> Result<(), String> {
+        let slot = self.slot_mut(slot_index)?;
+        slot.existing_tracks = existing_tracks;
+        slot.skipped_tracks = skipped_tracks;
+        slot.error_tracks = error_tracks;
+        slot.estimated_output_bytes = estimated_output_bytes;
         Ok(())
     }
 
@@ -290,6 +327,24 @@ impl DesktopController {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn record_file_failed(
+        &mut self,
+        slot_index: usize,
+        failed_file: FailedFile,
+        snapshot: TaskSnapshot,
+    ) -> Result<(), String> {
+        let slot = self.slot_mut(slot_index)?;
+        slot.current_file = failed_file.name.clone();
+        slot.progress_completed = snapshot.completed;
+        slot.error_tracks += 1;
+        slot.failed_files.push(failed_file.clone());
+        slot.logs.push(format!(
+            "Failed {}: {}",
+            failed_file.name, failed_file.message
+        ));
         Ok(())
     }
 
