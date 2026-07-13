@@ -357,6 +357,9 @@ impl DesktopController {
             slot.status = DesktopStatus::Paused;
             slot.logs
                 .push(String::from("Sync paused after current file"));
+        } else if !slot.failed_files.is_empty() {
+            slot.status = DesktopStatus::Error;
+            slot.logs.push(String::from("Sync completed with errors"));
         } else {
             slot.status = DesktopStatus::Completed;
             slot.logs.push(String::from("Sync completed"));

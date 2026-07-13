@@ -1,4 +1,5 @@
 use crate::config::{LosslessFormat, Mode};
+use crate::history::HistoryEntry;
 use crate::sync::{
     compare_music_dicts, effective_source_extension, find_ffmpeg, get_destination_music_dict,
     get_music_dict, resolve_output_policy, target_output_path,
@@ -35,6 +36,15 @@ pub struct SyncPreview {
     pub candidates: Vec<PreviewCandidate>,
     pub skipped: Vec<PreviewIssue>,
     pub errors: Vec<PreviewIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlotPreview {
+    pub slot_index: usize,
+    pub mode: Mode,
+    pub lossless_format: Option<LosslessFormat>,
+    pub preview: SyncPreview,
+    pub retry_of: Option<String>,
 }
 
 pub fn build_sync_preview(
@@ -146,11 +156,16 @@ pub fn build_sync_preview(
             .and_then(|total| total.checked_add(source_size));
     }
 
-    if preview
-        .candidates
-        .iter()
-        .any(|candidate| candidate.destination_path.ends_with(".mp3") && find_ffmpeg().is_none())
-    {
+    let requires_ffmpeg = preview.candidates.iter().any(|candidate| {
+        let extension = Path::new(&candidate.source_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        !matches!(mode, Mode::Compat if extension == "mp3")
+            && !matches!(mode, Mode::Lossless if extension == "mp3")
+    });
+    if requires_ffmpeg && find_ffmpeg().is_none() {
         preview.errors.push(PreviewIssue {
             path: destination_directory.to_string(),
             message: "当前转换需要 FFmpeg，但未找到 FFmpeg".to_string(),
@@ -159,4 +174,53 @@ pub fn build_sync_preview(
 
     preview.error_count = preview.errors.len();
     Ok(preview)
+}
+
+pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
+    let mut preview = SyncPreview {
+        source_directory: entry.source_directory.clone(),
+        destination_directory: entry.destination_directory.clone(),
+        new_count: 0,
+        existing_count: 0,
+        skipped_count: 0,
+        error_count: 0,
+        estimated_output_bytes: Some(0),
+        candidates: Vec::new(),
+        skipped: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    for failed_file in &entry.failed_files {
+        let source_path = Path::new(&failed_file.source_path);
+        match fs::metadata(source_path) {
+            Ok(metadata) if metadata.len() > 0 => {
+                let candidate = PreviewCandidate {
+                    name: failed_file.name.clone(),
+                    source_path: failed_file.source_path.clone(),
+                    destination_path: failed_file.destination_path.clone(),
+                    source_size_bytes: metadata.len(),
+                    estimated_output_bytes: Some(metadata.len()),
+                };
+                preview.estimated_output_bytes = preview
+                    .estimated_output_bytes
+                    .and_then(|total| total.checked_add(metadata.len()));
+                preview.candidates.push(candidate);
+                preview.new_count += 1;
+            }
+            Ok(_) => preview.errors.push(PreviewIssue {
+                path: failed_file.source_path.clone(),
+                message: "源文件为空，无法重试".to_string(),
+            }),
+            Err(error) => preview.errors.push(PreviewIssue {
+                path: failed_file.source_path.clone(),
+                message: format!("重试时找不到源文件：{error}"),
+            }),
+        }
+    }
+
+    preview.error_count = preview.errors.len();
+    if preview.candidates.is_empty() && preview.errors.is_empty() {
+        preview.estimated_output_bytes = None;
+    }
+    preview
 }

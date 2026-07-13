@@ -7,10 +7,18 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 use w4dj::config::{LosslessFormat, Mode};
 use w4dj::desktop::{DesktopController, DesktopState};
+use w4dj::history::{
+    FailedFile, HistoryEntry, HistoryStatus, append_history, format_error_report,
+    load_history as load_history_file,
+};
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
+use w4dj::preview::{
+    PreviewCandidate, SlotPreview, SyncPreview, build_retry_preview, build_sync_preview,
+};
 use w4dj::sync::{
     cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict, get_music_dict,
     sync_music_library_with_observer,
@@ -22,7 +30,20 @@ use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState, apply_vibranc
 struct AppState {
     controller: Arc<Mutex<DesktopController>>,
     preferences_path: Arc<Mutex<PathBuf>>,
+    history_path: Arc<Mutex<PathBuf>>,
     destination_coordinator: DestinationCoordinator,
+}
+
+struct ConfirmedSyncJob {
+    batch_id: String,
+    slot_index: usize,
+    source: String,
+    destination: String,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    candidates: Vec<PreviewCandidate>,
+    preview: SyncPreview,
+    retry_of: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -251,6 +272,206 @@ fn pause_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, Str
     Ok(controller.state().clone())
 }
 
+#[tauri::command]
+fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview>, String> {
+    let (slot_indexes, mode, lossless_format, slots) = {
+        let controller = state.controller.lock().expect("desktop lock poisoned");
+        let slot_indexes = controller.startable_slot_indexes();
+        let mode = controller.state().mode;
+        let lossless_format = controller.state().lossless_format;
+        let slots = slot_indexes
+            .iter()
+            .map(|slot_index| {
+                let slot = &controller.state().slots[*slot_index];
+                let destination = controller
+                    .effective_destination(*slot_index)
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                Ok((*slot_index, slot.source_directory.clone(), destination))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        (slot_indexes, mode, lossless_format, slots)
+    };
+
+    if slot_indexes.is_empty() {
+        return Err(String::from("请至少选择一个歌曲下载目录"));
+    }
+
+    slots
+        .into_iter()
+        .map(|(slot_index, source, destination)| {
+            let preview = build_sync_preview(&source, &destination, mode, lossless_format)
+                .map_err(|error| format!("预检失败：{error}"))?;
+            Ok(SlotPreview {
+                slot_index,
+                mode,
+                lossless_format,
+                preview,
+                retry_of: None,
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn start_confirmed_sync(
+    previews: Vec<SlotPreview>,
+    retry_of: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopState, String> {
+    if previews.is_empty() {
+        return Err(String::from("没有可处理的转换任务"));
+    }
+
+    let batch_id = format!("batch-{}", unique_timestamp());
+    let history_path = state
+        .history_path
+        .lock()
+        .expect("history path lock poisoned")
+        .clone();
+    let destination_coordinator = state.destination_coordinator.clone();
+    let mut jobs = Vec::with_capacity(previews.len());
+    let mut seen_slots = Vec::with_capacity(previews.len());
+
+    {
+        let mut controller = state.controller.lock().expect("desktop lock poisoned");
+        let state_mode = controller.state().mode;
+        let state_lossless_format = controller.state().lossless_format;
+
+        for slot_preview in previews {
+            let slot_index = slot_preview.slot_index;
+            if seen_slots.contains(&slot_index) {
+                return Err(format!("重复的同步任务槽位：{slot_index}"));
+            }
+            seen_slots.push(slot_index);
+
+            let slot = controller
+                .state()
+                .slots
+                .get(slot_index)
+                .ok_or_else(|| format!("无效的同步任务槽位：{slot_index}"))?;
+            if matches!(slot.status, w4dj::desktop::DesktopStatus::Running) {
+                return Err(format!("任务 {} 正在运行", slot_index + 1));
+            }
+            if slot_preview.mode != state_mode
+                || slot_preview.lossless_format != state_lossless_format
+                || slot_preview.preview.source_directory != slot.source_directory
+                || slot_preview.preview.destination_directory
+                    != controller.effective_destination(slot_index)?.unwrap_or_default()
+            {
+                return Err(String::from("任务设置在预检后发生变化，请重新扫描"));
+            }
+            if slot_preview.preview.candidates.is_empty() {
+                return Err(format!("任务 {} 没有可处理的文件", slot_index + 1));
+            }
+
+            controller.start_confirmed_sync(
+                slot_index,
+                slot_preview.preview.candidates.len(),
+            )?;
+            controller.set_preview_summary(
+                slot_index,
+                slot_preview.preview.existing_count,
+                slot_preview.preview.skipped_count,
+                slot_preview.preview.error_count,
+                slot_preview.preview.estimated_output_bytes,
+            )?;
+            controller.push_log(slot_index, "Confirmed preflight; conversion started")?;
+
+            jobs.push(ConfirmedSyncJob {
+                batch_id: batch_id.clone(),
+                slot_index,
+                source: slot_preview.preview.source_directory.clone(),
+                destination: slot_preview.preview.destination_directory.clone(),
+                mode: slot_preview.mode,
+                lossless_format: slot_preview.lossless_format,
+                candidates: slot_preview.preview.candidates.clone(),
+                preview: slot_preview.preview,
+                retry_of: retry_of.clone().or(slot_preview.retry_of),
+            });
+        }
+    }
+
+    for job in jobs {
+        let controller = Arc::clone(&state.controller);
+        let destination_coordinator = destination_coordinator.clone();
+        let history_path = history_path.clone();
+        thread::spawn(move || {
+            run_confirmed_sync_task(controller, destination_coordinator, history_path, job)
+        });
+    }
+
+    Ok(state
+        .controller
+        .lock()
+        .expect("desktop lock poisoned")
+        .state()
+        .clone())
+}
+
+#[tauri::command]
+fn load_history(state: tauri::State<'_, AppState>) -> Vec<HistoryEntry> {
+    let history_path = state
+        .history_path
+        .lock()
+        .expect("history path lock poisoned")
+        .clone();
+    load_history_file(history_path).unwrap_or_else(|error| {
+        eprintln!("Failed to load conversion history: {}", error);
+        Vec::new()
+    })
+}
+
+#[tauri::command]
+fn retry_history_failures(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<SlotPreview, String> {
+    let history_path = state
+        .history_path
+        .lock()
+        .expect("history path lock poisoned")
+        .clone();
+    let entry = load_history_file(history_path)
+        .map_err(|error| format!("无法读取转换历史：{error}"))?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| String::from("找不到对应的转换历史"))?;
+
+    let preview = build_retry_preview(&entry);
+    Ok(SlotPreview {
+        slot_index: entry.slot_index,
+        mode: entry.mode,
+        lossless_format: entry.lossless_format,
+        preview,
+        retry_of: Some(entry.id),
+    })
+}
+
+#[tauri::command]
+fn export_history_error_report(
+    id: String,
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err(String::from("请指定错误报告保存位置"));
+    }
+
+    let history_path = state
+        .history_path
+        .lock()
+        .expect("history path lock poisoned")
+        .clone();
+    let entry = load_history_file(history_path)
+        .map_err(|error| format!("无法读取转换历史：{error}"))?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| String::from("找不到对应的转换历史"))?;
+
+    fs::write(path, format_error_report(&entry)).map_err(|error| format!("错误报告保存失败：{error}"))
+}
+
 fn main() {
     let Some(_instance_lock) = acquire_single_instance_lock()
         .unwrap_or_else(|error| panic!("failed to acquire single-instance lock: {}", error))
@@ -264,6 +485,7 @@ fn main() {
         .manage(AppState {
             controller: Arc::new(Mutex::new(controller)),
             preferences_path: Arc::new(Mutex::new(PathBuf::new())),
+            history_path: Arc::new(Mutex::new(PathBuf::new())),
             destination_coordinator: DestinationCoordinator::default(),
         })
         .plugin(tauri_plugin_dialog::init())
@@ -276,7 +498,12 @@ fn main() {
             start_sync,
             pause_sync,
             start_all_sync,
-            pause_all_sync
+            pause_all_sync,
+            preview_all_sync,
+            start_confirmed_sync,
+            load_history,
+            retry_history_failures,
+            export_history_error_report
         ])
         .setup(|app| {
             let preferences_path = app
@@ -284,6 +511,10 @@ fn main() {
                 .app_config_dir()
                 .expect("failed to resolve app config directory")
                 .join("preferences.json");
+            let history_path = preferences_path
+                .parent()
+                .expect("preferences path should have a parent")
+                .join("history.json");
 
             {
                 let state = app.state::<AppState>();
@@ -292,6 +523,15 @@ fn main() {
                     .lock()
                     .expect("preferences path lock poisoned");
                 *path_guard = preferences_path.clone();
+            }
+
+            {
+                let state = app.state::<AppState>();
+                let mut path_guard = state
+                    .history_path
+                    .lock()
+                    .expect("history path lock poisoned");
+                *path_guard = history_path;
             }
 
             {
@@ -360,6 +600,220 @@ fn persist_preferences(state: &tauri::State<'_, AppState>) {
     if let Err(error) = save_preferences(&preferences_path, &preferences) {
         eprintln!("Failed to save preferences: {}", error);
     }
+}
+
+fn run_confirmed_sync_task(
+    controller: Arc<Mutex<DesktopController>>,
+    destination_coordinator: DestinationCoordinator,
+    history_path: PathBuf,
+    job: ConfirmedSyncJob,
+) {
+    let started_at = timestamp_string();
+    let started = Instant::now();
+    let task_controller = {
+        let controller_guard = controller.lock().expect("desktop lock poisoned");
+        controller_guard
+            .task_controller(job.slot_index)
+            .expect("confirmed slot index should be valid")
+    };
+
+    let mut setup_error: Option<String> = None;
+    if job.source.trim().is_empty() {
+        setup_error = Some(String::from("请选择歌曲下载目录"));
+    } else if !Path::new(&job.source).is_dir() {
+        setup_error = Some(format!("歌曲下载目录不存在：{}", job.source));
+    } else if let Err(error) = fs::create_dir_all(&job.destination) {
+        setup_error = Some(format!("无法创建输出目录：{error}"));
+    }
+
+    if setup_error.is_none() {
+        let destination_lock = destination_coordinator.lock_for(Path::new(&job.destination));
+        let _destination_guard = destination_lock
+            .lock()
+            .expect("destination sync lock poisoned");
+
+        if let Err(error) = cleanup_temporary_outputs(&job.destination) {
+            setup_error = Some(format!("无法清理临时文件：{error}"));
+        } else {
+            let mut candidate_lookup = HashMap::new();
+            let mut source_files: HashMap<String, (String, PathBuf)> = HashMap::new();
+
+            for candidate in &job.candidates {
+                candidate_lookup.insert(candidate.name.clone(), candidate.clone());
+                let source_path = PathBuf::from(&candidate.source_path);
+                if source_path.exists() {
+                    source_files.insert(
+                        candidate.name.clone(),
+                        (candidate.source_size_bytes.to_string(), source_path),
+                    );
+                } else {
+                    record_failed_candidate(
+                        &controller,
+                        job.slot_index,
+                        &task_controller,
+                        candidate,
+                        "源文件在开始转换前已不存在",
+                    );
+                }
+            }
+
+            let queued_files = source_files.iter().collect::<HashMap<_, _>>();
+            let sync_result = if queued_files.is_empty() {
+                Ok(task_controller.snapshot())
+            } else {
+                sync_music_library_with_observer(
+                    &queued_files,
+                    &job.destination,
+                    &job.mode,
+                    job.lossless_format,
+                    &task_controller,
+                    |name, task, error| {
+                        if let Some(error) = error {
+                            let candidate = candidate_lookup.get(name);
+                            let failed_file = FailedFile {
+                                name: name.to_string(),
+                                source_path: candidate
+                                    .map(|candidate| candidate.source_path.clone())
+                                    .unwrap_or_default(),
+                                destination_path: candidate
+                                    .map(|candidate| candidate.destination_path.clone())
+                                    .unwrap_or_default(),
+                                message: error.to_string(),
+                            };
+                            let mut controller_guard =
+                                controller.lock().expect("desktop lock poisoned");
+                            controller_guard
+                                .record_file_failed(job.slot_index, failed_file, task.snapshot())
+                                .expect("confirmed slot index should be valid");
+                        } else {
+                            let mut controller_guard =
+                                controller.lock().expect("desktop lock poisoned");
+                            controller_guard
+                                .record_file_result(
+                                    job.slot_index,
+                                    name,
+                                    task.snapshot(),
+                                    None,
+                                )
+                                .expect("confirmed slot index should be valid");
+                        }
+                    },
+                )
+            };
+
+            let mut controller_guard = controller.lock().expect("desktop lock poisoned");
+            match sync_result {
+                Ok(snapshot) => controller_guard
+                    .finish_sync(job.slot_index, snapshot)
+                    .expect("confirmed slot index should be valid"),
+                Err(error) => controller_guard
+                    .fail_sync(job.slot_index, format!("导出失败：{error}"))
+                    .expect("confirmed slot index should be valid"),
+            }
+        }
+    }
+
+    if let Some(error) = setup_error {
+        for candidate in &job.candidates {
+            record_failed_candidate(
+                &controller,
+                job.slot_index,
+                &task_controller,
+                candidate,
+                &error,
+            );
+        }
+        fail_sync(&controller, job.slot_index, error);
+    }
+
+    let finished_at = timestamp_string();
+    let (snapshot, slot) = {
+        let controller_guard = controller.lock().expect("desktop lock poisoned");
+        (
+            task_controller.snapshot(),
+            controller_guard.state().slots[job.slot_index].clone(),
+        )
+    };
+    let failed_files = slot.failed_files;
+    let status = history_status_for(&snapshot, &failed_files);
+    let history_entry = HistoryEntry {
+        id: format!("{}-slot{}", job.batch_id, job.slot_index + 1),
+        batch_id: job.batch_id,
+        slot_index: job.slot_index,
+        started_at,
+        finished_at,
+        duration_seconds: started.elapsed().as_secs(),
+        source_directory: job.source,
+        destination_directory: job.destination,
+        mode: job.mode,
+        lossless_format: job.lossless_format,
+        new_count: job.preview.new_count,
+        existing_count: job.preview.existing_count,
+        skipped_count: job.preview.skipped_count,
+        error_count: job.preview.error_count,
+        completed_count: snapshot.completed,
+        failed_count: failed_files.len(),
+        failed_files,
+        status,
+        retry_of: job.retry_of,
+    };
+
+    if let Err(error) = append_history(history_path, history_entry) {
+        eprintln!("Failed to save conversion history: {}", error);
+    }
+}
+
+fn record_failed_candidate(
+    controller: &Arc<Mutex<DesktopController>>,
+    slot_index: usize,
+    task_controller: &w4dj::task::TaskController,
+    candidate: &PreviewCandidate,
+    message: &str,
+) {
+    let mut controller_guard = controller.lock().expect("desktop lock poisoned");
+    let already_recorded = controller_guard.state().slots[slot_index]
+        .failed_files
+        .iter()
+        .any(|failed_file| failed_file.name == candidate.name);
+    if already_recorded {
+        return;
+    }
+
+    controller_guard
+        .record_file_failed(
+            slot_index,
+            FailedFile {
+                name: candidate.name.clone(),
+                source_path: candidate.source_path.clone(),
+                destination_path: candidate.destination_path.clone(),
+                message: message.to_string(),
+            },
+            task_controller.snapshot(),
+        )
+        .expect("confirmed slot index should be valid");
+}
+
+fn history_status_for(snapshot: &w4dj::task::TaskSnapshot, failed_files: &[FailedFile]) -> HistoryStatus {
+    if snapshot.cancelled {
+        HistoryStatus::Cancelled
+    } else if snapshot.paused || !failed_files.is_empty() && snapshot.completed > 0 {
+        HistoryStatus::Partial
+    } else if !failed_files.is_empty() {
+        HistoryStatus::Error
+    } else {
+        HistoryStatus::Completed
+    }
+}
+
+fn unique_timestamp() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn timestamp_string() -> String {
+    unique_timestamp().to_string()
 }
 
 fn run_sync_task(
@@ -555,6 +1009,9 @@ fn fail_sync(
 #[cfg(test)]
 mod tests {
     use super::DestinationCoordinator;
+    use super::history_status_for;
+    use w4dj::history::{FailedFile, HistoryStatus};
+    use w4dj::task::TaskController;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -568,5 +1025,26 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn history_status_distinguishes_partial_and_failed_runs() {
+        let task = TaskController::running(2);
+        let failed_file = FailedFile {
+            name: "song".into(),
+            source_path: "/in/song.flac".into(),
+            destination_path: "/out/song.mp3".into(),
+            message: "failed".into(),
+        };
+
+        assert_eq!(
+            history_status_for(&task.snapshot(), &[failed_file.clone()]),
+            HistoryStatus::Error
+        );
+        task.complete_current_file();
+        assert_eq!(
+            history_status_for(&task.snapshot(), &[failed_file]),
+            HistoryStatus::Partial
+        );
     }
 }
