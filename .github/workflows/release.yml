@@ -16,10 +16,13 @@ jobs:
         include:
           - platform: 'macos-latest'
             args: '--bundles dmg'
+            asset_name: 'W4DJ-RKB-macOS-Apple-Silicon-v[version][ext]'
           - platform: 'macos-15-intel'
             args: '--bundles dmg'
+            asset_name: 'W4DJ-RKB-macOS-Intel-v[version][ext]'
           - platform: 'windows-latest'
             args: '--bundles nsis'
+            asset_name: 'W4DJ-RKB-Windows-Installer-v[version][setup][ext]'
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -72,7 +75,8 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'W4DJ ${{ github.ref_name }}'
-          releaseBody: 'Automatic cross-platform release build for W4DJ (macOS DMG & Windows EXE/MSI).'
+          releaseBody: 'Download the installer for your computer: Apple Silicon Mac, Intel Mac, or Windows.'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+          releaseAssetNamePattern: ${{ matrix.asset_name }}
