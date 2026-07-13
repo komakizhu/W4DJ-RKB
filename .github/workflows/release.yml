@@ -15,11 +15,11 @@ jobs:
       matrix:
         include:
           - platform: 'macos-latest'
-            args: '--bundles dmg,app'
+            args: '--bundles dmg'
           - platform: 'macos-15-intel'
-            args: '--bundles dmg,app'
+            args: '--bundles dmg'
           - platform: 'windows-latest'
-            args: '--bundles nsis,msi'
+            args: '--bundles nsis'
 
     runs-on: ${{ matrix.platform }}
     steps:
