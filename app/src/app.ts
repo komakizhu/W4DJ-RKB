@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
 
 export type AppMode = 'compat' | 'lossless';
@@ -9,6 +9,7 @@ export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
 type SelectionMotion = 'mode' | 'format' | 'theme' | 'lang' | null;
+type PendingSelection = 'mode' | 'format' | null;
 
 const LIGHT_PALETTE = 'c' as const;
 
@@ -42,6 +43,10 @@ export type DesktopSyncSlotState = {
   progress_completed: number;
   new_tracks: number;
   skipped_tracks: number;
+  existing_tracks: number;
+  error_tracks: number;
+  estimated_output_bytes: number | null;
+  failed_files: AppFailedFile[];
   current_file: string;
   logs: string[];
 };
@@ -50,6 +55,76 @@ export type DesktopState = {
   slots: [DesktopSyncSlotState, DesktopSyncSlotState];
   mode: AppMode;
   lossless_format: AppLosslessFormat | null;
+};
+
+export type AppFailedFile = {
+  name: string;
+  source_path: string;
+  destination_path: string;
+  message: string;
+};
+
+export type AppPreviewCandidate = {
+  name: string;
+  source_path: string;
+  destination_path: string;
+  source_size_bytes: number;
+  estimated_output_bytes: number | null;
+};
+
+export type AppPreviewIssue = {
+  path: string;
+  message: string;
+};
+
+export type AppSyncPreview = {
+  source_directory: string;
+  destination_directory: string;
+  new_count: number;
+  existing_count: number;
+  skipped_count: number;
+  error_count: number;
+  estimated_output_bytes: number | null;
+  candidates: AppPreviewCandidate[];
+  skipped: AppPreviewIssue[];
+  errors: AppPreviewIssue[];
+};
+
+export type AppPreview = {
+  slot_index: SyncSlotIndex;
+  mode: AppMode;
+  lossless_format: AppLosslessFormat | null;
+  preview: AppSyncPreview;
+  retry_of: string | null;
+};
+
+export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
+
+export type AppHistoryEntry = {
+  id: string;
+  batch_id: string;
+  slot_index: number;
+  started_at: string;
+  finished_at: string;
+  duration_seconds: number;
+  source_directory: string;
+  destination_directory: string;
+  mode: AppMode;
+  lossless_format: AppLosslessFormat | null;
+  new_count: number;
+  existing_count: number;
+  skipped_count: number;
+  error_count: number;
+  completed_count: number;
+  failed_count: number;
+  failed_files: AppFailedFile[];
+  status: AppHistoryStatus;
+  retry_of: string | null;
+};
+
+export type AppPreviewModalState = {
+  previews: AppPreview[];
+  retryOf: string | null;
 };
 
 export type AppServices = {
@@ -62,6 +137,11 @@ export type AppServices = {
   selectDestinationDirectory: (slotIndex: SyncSlotIndex, path: string) => Promise<DesktopState>;
   chooseMode: (mode: AppMode) => Promise<DesktopState>;
   chooseLosslessFormat: (format: AppLosslessFormat | null) => Promise<DesktopState>;
+  previewAllSync: () => Promise<AppPreview[]>;
+  startConfirmedSync: (previews: AppPreview[], retryOf?: string | null) => Promise<DesktopState>;
+  loadHistory: () => Promise<AppHistoryEntry[]>;
+  retryHistoryFailures: (id: string) => Promise<AppPreview>;
+  exportHistoryErrorReport: (id: string, path: string) => Promise<void>;
   startAllSync: () => Promise<DesktopState>;
   pauseAllSync: () => Promise<DesktopState>;
 };
@@ -102,6 +182,25 @@ const translations = {
     skippedTracks: '跳过歌曲',
     darkTheme: '切换深色模式',
     lightTheme: '切换浅色模式',
+    previewTitle: '转换前确认',
+    scanning: '正在扫描任务…',
+    newFiles: '新增文件',
+    existingFiles: '已存在',
+    willSkip: '将跳过',
+    errorFiles: '错误文件',
+    estimatedOutput: '预计输出',
+    confirmStart: '确认并开始转换',
+    cancel: '取消',
+    editBeforeStart: '返回修改',
+    noProcessableFiles: '没有可处理的文件',
+    history: '转换历史',
+    noHistory: '还没有转换记录',
+    retryFailures: '重试失败项目',
+    exportReport: '导出错误报告',
+    completedCount: '完成',
+    failedCount: '失败',
+    sourcePath: '源目录',
+    destinationPath: '输出目录',
   },
   en: {
     eyebrow: 'W4DJ RKB',
@@ -138,6 +237,25 @@ const translations = {
     skippedTracks: 'Skipped tracks',
     darkTheme: 'Switch to dark theme',
     lightTheme: 'Switch to light theme',
+    previewTitle: 'Confirm conversion',
+    scanning: 'Scanning tasks…',
+    newFiles: 'New files',
+    existingFiles: 'Already exists',
+    willSkip: 'Will skip',
+    errorFiles: 'Errors',
+    estimatedOutput: 'Estimated output',
+    confirmStart: 'Confirm and convert',
+    cancel: 'Cancel',
+    editBeforeStart: 'Edit settings',
+    noProcessableFiles: 'No files to process',
+    history: 'Conversion history',
+    noHistory: 'No conversion history yet',
+    retryFailures: 'Retry failed files',
+    exportReport: 'Export error report',
+    completedCount: 'Completed',
+    failedCount: 'Failed',
+    sourcePath: 'Source',
+    destinationPath: 'Output',
   },
 } as const;
 
@@ -201,6 +319,13 @@ const defaultServices: AppServices = {
   chooseMode: (mode) => invoke<DesktopState>('choose_mode', { mode }),
   chooseLosslessFormat: (format) =>
     invoke<DesktopState>('choose_lossless_format', { format }),
+  previewAllSync: () => invoke<AppPreview[]>('preview_all_sync'),
+  startConfirmedSync: (previews, retryOf = null) =>
+    invoke<DesktopState>('start_confirmed_sync', { previews, retryOf }),
+  loadHistory: () => invoke<AppHistoryEntry[]>('load_history'),
+  retryHistoryFailures: (id) => invoke<AppPreview>('retry_history_failures', { id }),
+  exportHistoryErrorReport: (id, path) =>
+    invoke<void>('export_history_error_report', { id, path }),
   startAllSync: () => invoke<DesktopState>('start_all_sync'),
   pauseAllSync: () => invoke<DesktopState>('pause_all_sync'),
 };
@@ -209,6 +334,10 @@ export function renderApp(
   state: AppViewState = defaultState,
   pendingAction: 'start-all' | 'pause-all' | null = null,
   selectionMotion: SelectionMotion = null,
+  previewModal: AppPreviewModalState | null = null,
+  history: AppHistoryEntry[] = [],
+  pendingSelection: PendingSelection = null,
+  previewBusy = false,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -248,16 +377,16 @@ export function renderApp(
             <span>${t('mode', state.lang)}</span>
           </div>
           <div class="mode-row" data-role="mode-switch" data-selected-mode="${state.mode}" aria-label="${t('mode', state.lang)}">
-            <button type="button" class="mode-button ${state.mode === 'compat' ? 'selected' : ''}" data-mode="compat">
+            <button type="button" class="mode-button ${state.mode === 'compat' ? 'selected' : ''}" data-mode="compat" ${pendingSelection === 'mode' ? 'disabled' : ''}>
               ${icon('check')}
               ${t('compatMode', state.lang)}
             </button>
-            <button type="button" class="mode-button ${state.mode === 'lossless' ? 'selected' : ''}" data-mode="lossless">
+            <button type="button" class="mode-button ${state.mode === 'lossless' ? 'selected' : ''}" data-mode="lossless" ${pendingSelection === 'mode' ? 'disabled' : ''}>
               ${icon('disc')}
               ${t('losslessMode', state.lang)}
             </button>
           </div>
-          ${renderLosslessFormats(state)}
+          ${renderLosslessFormats(state, pendingSelection)}
           <div class="rail-lower">
             <div class="rail-note">
               <p>${t('compatNote', state.lang)}</p>
@@ -292,6 +421,8 @@ export function renderApp(
         </div>
       </div>
     </section>
+    ${renderHistory(history, state.lang)}
+    ${renderPreviewModal(previewModal, state.lang, previewBusy)}
   `;
 
   state.slots.forEach((slot, slotIndex) => {
@@ -302,6 +433,113 @@ export function renderApp(
   });
 
   return root;
+}
+
+function renderPreviewModal(
+  modal: AppPreviewModalState | null,
+  lang: AppLanguage,
+  busy = false,
+): string {
+  if (!modal) {
+    return '';
+  }
+
+  const processableCount = modal.previews.reduce(
+    (total, item) => total + item.preview.candidates.length,
+    0,
+  );
+  const canConfirm = processableCount > 0;
+  return `
+    <div class="preview-modal" data-role="preview-modal" role="dialog" aria-modal="true" aria-label="${t('previewTitle', lang)}">
+      <div class="preview-dialog">
+        <header class="preview-head">
+          <div>
+            <p class="panel-kicker">W4DJ RKB</p>
+            <h2>${t('previewTitle', lang)}</h2>
+          </div>
+          <span class="preview-batch-label">${modal.retryOf ? t('retryFailures', lang) : t('startAll', lang)}</span>
+        </header>
+        <div class="preview-cards">
+          ${modal.previews.map((item) => renderPreviewCard(item, lang)).join('')}
+        </div>
+        ${canConfirm ? '' : `<p class="preview-empty">${t('noProcessableFiles', lang)}</p>`}
+        <footer class="preview-actions">
+          <button type="button" class="secondary-action" data-action="cancel-preview" ${busy ? 'disabled' : ''}>${t('cancel', lang)}</button>
+          <button type="button" class="secondary-action" data-action="edit-preview" ${busy ? 'disabled' : ''}>${t('editBeforeStart', lang)}</button>
+          <button type="button" class="global-action preview-confirm" data-action="confirm-start" ${canConfirm && !busy ? '' : 'disabled'}>${busy ? t('scanning', lang) : t('confirmStart', lang)}</button>
+        </footer>
+      </div>
+    </div>
+  `;
+}
+
+function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
+  const preview = item.preview;
+  const errors = preview.errors
+    .map((issue) => `<li>${escapeHtml(issue.path)}：${escapeHtml(issue.message)}</li>`)
+    .join('');
+  return `
+    <article class="preview-card" data-role="preview-card" data-slot="${item.slot_index}">
+      <header class="preview-card-head">
+        <div>
+          <p class="panel-kicker">${t('syncSlot', lang)} ${item.slot_index + 1}</p>
+          <h3>${modeLabel(item.mode, lang)}${item.mode === 'lossless' ? ` · ${(item.lossless_format || 'wav').toUpperCase()}` : ''}</h3>
+        </div>
+          <div class="preview-estimate"><span>${t('estimatedOutput', lang)}</span><strong>${formatBytes(preview.estimated_output_bytes, lang)}</strong></div>
+      </header>
+      <dl class="preview-stats">
+        <div><dt>${t('newFiles', lang)}</dt><dd>${preview.new_count}</dd></div>
+        <div><dt>${t('existingFiles', lang)}</dt><dd>${preview.existing_count}</dd></div>
+        <div><dt>${t('willSkip', lang)}</dt><dd>${preview.skipped_count}</dd></div>
+        <div><dt>${t('errorFiles', lang)}</dt><dd class="preview-error-count">${preview.error_count}</dd></div>
+      </dl>
+      <div class="preview-paths">
+        <p><span>${t('sourcePath', lang)}</span>${escapeHtml(preview.source_directory)}</p>
+        <p><span>${t('destinationPath', lang)}</span>${escapeHtml(preview.destination_directory)}</p>
+      </div>
+      ${errors ? `<ul class="preview-errors">${errors}</ul>` : ''}
+    </article>
+  `;
+}
+
+function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage): string {
+  return `
+    <section class="history-panel" data-role="history">
+      <header class="history-head">
+        <div>
+          <p class="panel-kicker">W4DJ RKB</p>
+          <h2>${t('history', lang)}</h2>
+        </div>
+        <span class="history-count">${entries.length}</span>
+      </header>
+      ${entries.length === 0
+        ? `<p class="history-empty">${t('noHistory', lang)}</p>`
+        : `<div class="history-list">${entries.map((entry) => renderHistoryEntry(entry, lang)).join('')}</div>`}
+    </section>
+  `;
+}
+
+function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
+  const failures = entry.failed_files
+    .map((failedFile) => `<li><strong>${escapeHtml(failedFile.name)}</strong>：${escapeHtml(failedFile.message)}</li>`)
+    .join('');
+  return `
+    <article class="history-entry" data-history-id="${escapeHtml(entry.id)}">
+      <header class="history-entry-head">
+        <div>
+          <strong>${escapeHtml(entry.started_at)}</strong>
+          <span class="history-status" data-history-status="${entry.status}">${historyStatusLabel(entry.status, lang)}</span>
+        </div>
+        <span>${entry.completed_count}/${entry.new_count} · ${entry.failed_count} ${t('failedCount', lang)}</span>
+      </header>
+      <p class="history-output">${escapeHtml(entry.destination_directory)}</p>
+      ${failures ? `<details class="history-failures"><summary>${entry.failed_count} ${t('failedCount', lang)}</summary><ul>${failures}</ul></details>` : ''}
+      <footer class="history-entry-actions">
+        ${entry.failed_count > 0 ? `<button type="button" class="secondary-action" data-action="retry-history" data-history-id="${escapeHtml(entry.id)}">${t('retryFailures', lang)}</button>` : ''}
+        ${entry.failed_count > 0 ? `<button type="button" class="secondary-action" data-action="export-history" data-history-id="${escapeHtml(entry.id)}">${t('exportReport', lang)}</button>` : ''}
+      </footer>
+    </article>
+  `;
 }
 
 function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
@@ -377,9 +615,23 @@ export function bindApp(
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingGlobalAction: 'start-all' | 'pause-all' | null = null;
   let selectionMotion: SelectionMotion = null;
+  let pendingSelection: PendingSelection = null;
+  let previewModal: AppPreviewModalState | null = null;
+  let previewBusy = false;
+  let history: AppHistoryEntry[] = [];
 
   const render = () => {
-    root.replaceChildren(renderApp(state, pendingGlobalAction, selectionMotion));
+    root.replaceChildren(
+      renderApp(
+        state,
+        pendingGlobalAction,
+        selectionMotion,
+        previewModal,
+        history,
+        pendingSelection,
+        previewBusy,
+      ),
+    );
   };
 
   const triggerLocalMotion = (motion: SelectionMotion) => {
@@ -404,6 +656,15 @@ export function bindApp(
     }, 750);
   };
 
+  const refreshHistory = async () => {
+    try {
+      history = await services.loadHistory();
+      render();
+    } catch (error) {
+      console.error('Failed to load conversion history:', error);
+    }
+  };
+
   const applyDesktopState = (desktopState: DesktopState) => {
     const nextState = toViewState(desktopState, state.lang, state.theme);
     nextState.slots.forEach((slot, slotIndex) => {
@@ -411,7 +672,120 @@ export function bindApp(
     });
     state = nextState;
     render();
+    void refreshHistory();
     queueRefresh();
+  };
+
+  const reportError = (error: unknown, errorTarget: SyncSlotIndex | 'all' = 'all') => {
+    const message = error instanceof Error ? error.message : String(error);
+    const slots: [AppSyncSlotViewState, AppSyncSlotViewState] = [
+      { ...state.slots[0], logs: [...state.slots[0].logs] },
+      { ...state.slots[1], logs: [...state.slots[1].logs] },
+    ];
+    const affectedSlots: SyncSlotIndex[] = errorTarget === 'all' ? [0, 1] : [errorTarget];
+    affectedSlots.forEach((slotIndex) => {
+      slots[slotIndex] = {
+        ...slots[slotIndex],
+        status: 'error',
+        progressText: t('error', state.lang),
+        logExpanded: true,
+        logs: [...slots[slotIndex].logs, message],
+      };
+    });
+    state = { ...state, slots };
+    render();
+  };
+
+  const runSelectionAction = async (
+    kind: Exclude<PendingSelection, null>,
+    changed: boolean,
+    action: () => Promise<DesktopState>,
+  ) => {
+    if (!changed || pendingSelection !== null) {
+      return;
+    }
+    pendingSelection = kind;
+    selectionMotion = kind;
+    render();
+    try {
+      applyDesktopState(await action());
+    } catch (error) {
+      reportError(error);
+    } finally {
+      pendingSelection = null;
+      render();
+      setTimeout(() => {
+        if (selectionMotion === kind) {
+          selectionMotion = null;
+          render();
+        }
+      }, 520);
+    }
+  };
+
+  const openPreview = async (retryOf: string | null = null, previewPromise?: Promise<AppPreview[]>) => {
+    pendingGlobalAction = 'start-all';
+    previewBusy = true;
+    render();
+    try {
+      const previews = await (previewPromise || services.previewAllSync());
+      previewModal = { previews, retryOf };
+    } catch (error) {
+      reportError(error);
+    } finally {
+      previewBusy = false;
+      pendingGlobalAction = null;
+      render();
+    }
+  };
+
+  const confirmPreview = async () => {
+    if (!previewModal || previewModal.previews.every((item) => item.preview.candidates.length === 0)) {
+      return;
+    }
+    previewBusy = true;
+    pendingGlobalAction = 'start-all';
+    render();
+    try {
+      const nextState = await services.startConfirmedSync(
+        previewModal.previews,
+        previewModal.retryOf,
+      );
+      previewModal = null;
+      applyDesktopState(nextState);
+    } catch (error) {
+      reportError(error);
+    } finally {
+      previewBusy = false;
+      pendingGlobalAction = null;
+      render();
+    }
+  };
+
+  const retryHistory = async (id: string) => {
+    render();
+    try {
+      const preview = await services.retryHistoryFailures(id);
+      previewModal = { previews: [preview], retryOf: id };
+    } catch (error) {
+      reportError(error);
+    } finally {
+      render();
+    }
+  };
+
+  const exportHistory = async (id: string) => {
+    try {
+      const path = await save({
+        defaultPath: 'W4DJ-error-report.txt',
+        title: state.lang === 'zh' ? '保存错误报告' : 'Save error report',
+      });
+      if (typeof path === 'string') {
+        await services.exportHistoryErrorReport(id, path);
+      }
+    } catch (error) {
+      reportError(error);
+    }
   };
 
   const runAction = async (
@@ -437,24 +811,7 @@ export function bindApp(
       if (errorTarget === undefined) {
         return;
       }
-
-      const message = error instanceof Error ? error.message : String(error);
-      const slots: [AppSyncSlotViewState, AppSyncSlotViewState] = [
-        { ...state.slots[0], logs: [...state.slots[0].logs] },
-        { ...state.slots[1], logs: [...state.slots[1].logs] },
-      ];
-      const affectedSlots: SyncSlotIndex[] = errorTarget === 'all' ? [0, 1] : [errorTarget];
-      affectedSlots.forEach((slotIndex) => {
-        slots[slotIndex] = {
-          ...slots[slotIndex],
-          status: 'error',
-          progressText: t('error', state.lang),
-          logExpanded: true,
-          logs: [...slots[slotIndex].logs, message],
-        };
-      });
-      state = { ...state, slots };
-      render();
+      reportError(error, errorTarget);
     } finally {
       if (pendingAction !== null) {
         pendingGlobalAction = null;
@@ -511,6 +868,35 @@ export function bindApp(
       return;
     }
 
+    if (action === 'cancel-preview' || action === 'edit-preview') {
+      if (!previewBusy) {
+        previewModal = null;
+        render();
+      }
+      return;
+    }
+
+    if (action === 'confirm-start') {
+      void confirmPreview();
+      return;
+    }
+
+    if (action === 'retry-history') {
+      const historyId = button.dataset.historyId;
+      if (historyId) {
+        void retryHistory(historyId);
+      }
+      return;
+    }
+
+    if (action === 'export-history') {
+      const historyId = button.dataset.historyId;
+      if (historyId) {
+        void exportHistory(historyId);
+      }
+      return;
+    }
+
     if (action === 'pick-source' && slotIndex !== null) {
       void runAction(async () => {
         const path = await services.pickDirectory('source', slotIndex);
@@ -528,17 +914,21 @@ export function bindApp(
     }
 
     if (mode) {
-      void runAction(() => services.chooseMode(mode), undefined, null, 'mode');
+      void runSelectionAction('mode', state.mode !== mode, () => services.chooseMode(mode));
       return;
     }
 
     if (format) {
-      void runAction(() => services.chooseLosslessFormat(format), undefined, null, 'format');
+      void runSelectionAction(
+        'format',
+        state.losslessFormat !== format,
+        () => services.chooseLosslessFormat(format),
+      );
       return;
     }
 
     if (action === 'start-all') {
-      void runAction(() => services.startAllSync(), 'all', 'start-all');
+      void openPreview();
       return;
     }
 
@@ -656,9 +1046,10 @@ export function bindApp(
 
   render();
   void runAction(() => services.loadDesktopState());
+  void refreshHistory();
 }
 
-function renderLosslessFormats(state: AppViewState): string {
+function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSelection = null): string {
   const formats: AppLosslessFormat[] = ['wav', 'aiff'];
   return `
     <div class="format-slot">
@@ -667,7 +1058,7 @@ function renderLosslessFormats(state: AppViewState): string {
           ${formats
             .map(
               (format) => `
-                <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}">
+                <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}" ${pendingSelection === 'format' ? 'disabled' : ''}>
                   ${format.toUpperCase()}
                 </button>
               `,
@@ -719,6 +1110,37 @@ function formatProgressText(state: AppSyncSlotViewState, lang: AppLanguage): str
 
 function statusLabel(status: AppStatus, lang: AppLanguage): string {
   return t(status, lang);
+}
+
+function historyStatusLabel(status: AppHistoryStatus, lang: AppLanguage): string {
+  const labels: Record<AppHistoryStatus, { zh: string; en: string }> = {
+    completed: { zh: '已完成', en: 'Completed' },
+    partial: { zh: '部分完成', en: 'Partial' },
+    cancelled: { zh: '已取消', en: 'Cancelled' },
+    error: { zh: '错误', en: 'Error' },
+  };
+  return labels[status][lang];
+}
+
+function modeLabel(mode: AppMode, lang: AppLanguage): string {
+  return mode === 'compat' ? t('compatMode', lang) : t('losslessMode', lang);
+}
+
+function formatBytes(bytes: number | null, lang: AppLanguage): string {
+  if (bytes === null) {
+    return lang === 'zh' ? '无法估算' : 'Unavailable';
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unitIndex = -1;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`;
 }
 
 function aggregateStatus(state: AppViewState): AppStatus {

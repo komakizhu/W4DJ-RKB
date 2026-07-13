@@ -1030,3 +1030,243 @@ h1 {
     animation-iteration-count: 1 !important;
   }
 }
+
+.mode-button:disabled,
+.format-button:disabled,
+.secondary-action:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.history-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: 22px;
+  background: var(--surface);
+  box-shadow: 0 14px 36px var(--shadow);
+}
+
+.history-head,
+.history-entry-head,
+.preview-head,
+.preview-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.history-head h2,
+.preview-head h2,
+.preview-card-head h3 {
+  margin: 3px 0 0;
+  color: var(--text);
+}
+
+.history-count,
+.preview-batch-label {
+  display: inline-flex;
+  align-items: center;
+  min-height: 27px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--cyan-soft);
+  color: var(--cyan);
+  font: 700 10px/1 "SFMono-Regular", Consolas, monospace;
+}
+
+.history-empty,
+.preview-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.history-list,
+.preview-cards {
+  display: grid;
+  gap: 10px;
+}
+
+.history-entry,
+.preview-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: var(--surface-strong);
+}
+
+.history-entry-head > div {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.history-entry-head strong,
+.history-entry-head > span,
+.history-output,
+.history-failures,
+.preview-paths,
+.preview-errors {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.history-status {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--cyan-soft);
+  color: var(--cyan);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.history-status[data-history-status="error"] {
+  background: #fff0ec;
+  color: #b84c36;
+}
+
+.history-output,
+.preview-paths p {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-failures {
+  margin: 0;
+}
+
+.history-failures ul,
+.preview-errors {
+  margin: 8px 0 0;
+  padding-left: 17px;
+}
+
+.history-entry-actions,
+.preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.secondary-action {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.secondary-action:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+.preview-modal {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(19, 27, 29, 0.32);
+  backdrop-filter: blur(9px);
+}
+
+.preview-dialog {
+  display: grid;
+  gap: 18px;
+  width: min(880px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid var(--line-strong);
+  border-radius: 24px;
+  background: var(--surface-strong);
+  box-shadow: 0 24px 80px rgba(13, 28, 30, 0.26);
+}
+
+.preview-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.preview-stats div {
+  display: grid;
+  gap: 4px;
+  padding: 9px 10px;
+  border-radius: 10px;
+  background: var(--surface-muted);
+}
+
+.preview-stats dt,
+.preview-estimate span,
+.preview-paths span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.preview-stats dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.preview-error-count {
+  color: #bd543c !important;
+}
+
+.preview-estimate {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+}
+
+.preview-estimate strong {
+  color: var(--cyan);
+  font-size: 15px;
+}
+
+.preview-paths {
+  display: grid;
+  gap: 5px;
+}
+
+.preview-paths span {
+  display: inline-block;
+  width: 76px;
+}
+
+.preview-errors {
+  color: #b84c36;
+}
+
+@media (max-width: 720px) {
+  .preview-modal {
+    padding: 12px;
+  }
+
+  .preview-dialog {
+    padding: 16px;
+    border-radius: 18px;
+  }
+
+  .preview-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
