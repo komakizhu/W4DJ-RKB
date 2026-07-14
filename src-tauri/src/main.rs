@@ -313,6 +313,19 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
         .collect()
 }
 
+fn collect_processable_previews(previews: Vec<SlotPreview>) -> Result<Vec<SlotPreview>, String> {
+    let processable = previews
+        .into_iter()
+        .filter(|preview| !preview.preview.candidates.is_empty())
+        .collect::<Vec<_>>();
+
+    if processable.is_empty() {
+        return Err(String::from("没有可处理的转换任务"));
+    }
+
+    Ok(processable)
+}
+
 #[tauri::command]
 fn start_confirmed_sync(
     previews: Vec<SlotPreview>,
@@ -337,6 +350,7 @@ fn start_confirmed_sync(
         let mut controller = state.controller.lock().expect("desktop lock poisoned");
         let state_mode = controller.state().mode;
         let state_lossless_format = controller.state().lossless_format;
+        let mut validated_previews = Vec::with_capacity(previews.len());
 
         for slot_preview in previews {
             let slot_index = slot_preview.slot_index;
@@ -361,10 +375,11 @@ fn start_confirmed_sync(
             {
                 return Err(String::from("任务设置在预检后发生变化，请重新扫描"));
             }
-            if slot_preview.preview.candidates.is_empty() {
-                return Err(format!("任务 {} 没有可处理的文件", slot_index + 1));
-            }
+            validated_previews.push(slot_preview);
+        }
 
+        for slot_preview in collect_processable_previews(validated_previews)? {
+            let slot_index = slot_preview.slot_index;
             jobs.push(ConfirmedSyncJob {
                 batch_id: batch_id.clone(),
                 slot_index,
@@ -1007,12 +1022,58 @@ fn fail_sync(
 
 #[cfg(test)]
 mod tests {
+    use super::collect_processable_previews;
     use super::DestinationCoordinator;
     use super::history_status_for;
+    use w4dj::config::Mode;
     use w4dj::history::{FailedFile, HistoryStatus};
+    use w4dj::preview::{PreviewCandidate, SlotPreview, SyncPreview};
     use w4dj::task::TaskController;
     use std::path::Path;
     use std::sync::Arc;
+
+    fn sample_preview(slot_index: usize, has_candidate: bool) -> SlotPreview {
+        SlotPreview {
+            slot_index,
+            mode: Mode::Compat,
+            lossless_format: None,
+            retry_of: None,
+            preview: SyncPreview {
+                source_directory: format!("/music/in-{slot_index}"),
+                destination_directory: format!("/music/out-{slot_index}"),
+                new_count: usize::from(has_candidate),
+                existing_count: usize::from(!has_candidate),
+                skipped_count: 0,
+                error_count: 0,
+                estimated_output_bytes: has_candidate.then_some(1024),
+                candidates: has_candidate
+                    .then(|| {
+                        vec![PreviewCandidate {
+                            name: "song".into(),
+                            source_path: "/music/in/song.mp3".into(),
+                            destination_path: "/music/out/song.mp3".into(),
+                            source_size_bytes: 1024,
+                            estimated_output_bytes: Some(1024),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                skipped: Vec::new(),
+                errors: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn processable_previews_ignore_slots_without_new_files() {
+        let processable = collect_processable_previews(vec![
+            sample_preview(0, false),
+            sample_preview(1, true),
+        ])
+        .expect("a slot with candidates should start even when another slot is already complete");
+
+        assert_eq!(processable.len(), 1);
+        assert_eq!(processable[0].slot_index, 1);
+    }
 
     #[test]
     fn coordinator_reuses_a_lock_for_the_same_destination() {
