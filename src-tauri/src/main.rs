@@ -20,8 +20,8 @@ use w4dj::preview::{
     PreviewCandidate, SlotPreview, SyncPreview, build_retry_preview, build_sync_preview,
 };
 use w4dj::sync::{
-    cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict, get_music_dict,
-    sync_music_library_with_observer,
+    cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
+    get_music_dict_with_scan_issues, sync_music_library_with_observer,
 };
 
 #[cfg(target_os = "macos")]
@@ -928,20 +928,32 @@ fn run_sync_task(
             .push_log(slot_index, format!("Scanning source: {}", source))
             .expect("sync slot index validated before worker start");
     }
-    let mut source_files = get_music_dict(&source);
+    let (mut source_files, scan_issues) = get_music_dict_with_scan_issues(&source);
     let missing_sources = source_files
         .iter()
         .filter(|(_, (_, path))| !path.exists())
         .map(|(name, (_, path))| (name.clone(), path.display().to_string()))
         .collect::<Vec<(String, String)>>();
 
-    if !missing_sources.is_empty() {
+    if !missing_sources.is_empty() || !scan_issues.is_empty() {
         let mut controller = controller.lock().expect("desktop lock poisoned");
         for (name, path) in &missing_sources {
             controller
                 .push_log(
                     slot_index,
                     format!("Failed to read source before sync: {} ({})", name, path),
+                )
+                .expect("sync slot index validated before worker start");
+        }
+        for issue in &scan_issues {
+            controller
+                .push_log(
+                    slot_index,
+                    format!(
+                        "Failed to scan source before sync: {} ({})",
+                        issue.path.display(),
+                        issue.message
+                    ),
                 )
                 .expect("sync slot index validated before worker start");
         }
@@ -972,7 +984,7 @@ fn run_sync_task(
                 slot_index,
                 queued_files.len(),
                 existing_files,
-                missing_sources.len(),
+                missing_sources.len() + scan_issues.len(),
                 None,
             )
             .expect("sync slot index validated before worker start");

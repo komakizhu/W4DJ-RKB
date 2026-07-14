@@ -2,7 +2,7 @@ use crate::config::{LosslessFormat, Mode};
 use crate::history::HistoryEntry;
 use crate::sync::{
     compare_music_dicts, effective_source_extension, find_ffmpeg, get_destination_music_dict,
-    get_music_dict, resolve_output_policy, target_output_path,
+    get_music_dict_with_scan_issues, resolve_output_policy, target_output_path,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -72,7 +72,6 @@ pub fn build_sync_preview(
             path: source_directory.to_string(),
             message: "歌曲下载目录不存在或不可读取".to_string(),
         });
-        preview.error_count = preview.errors.len();
         preview.estimated_output_bytes = None;
         return Ok(preview);
     }
@@ -96,7 +95,14 @@ pub fn build_sync_preview(
         }
     }
 
-    let source_files = get_music_dict(source_directory);
+    let (source_files, scan_issues) = get_music_dict_with_scan_issues(source_directory);
+    for issue in scan_issues {
+        preview.errors.push(PreviewIssue {
+            path: issue.path.display().to_string(),
+            message: issue.message,
+        });
+        preview.error_count += 1;
+    }
     let destination_files = if Path::new(destination_directory).is_dir() {
         get_destination_music_dict(destination_directory)
     } else {
@@ -112,6 +118,7 @@ pub fn build_sync_preview(
                     path: path.display().to_string(),
                     message: "源文件为空，无法转换".to_string(),
                 });
+                preview.error_count += 1;
                 continue;
             }
             Err(error) => {
@@ -119,6 +126,7 @@ pub fn build_sync_preview(
                     path: path.display().to_string(),
                     message: format!("无法读取源文件：{error}"),
                 });
+                preview.error_count += 1;
                 continue;
             }
         };
@@ -126,10 +134,6 @@ pub fn build_sync_preview(
         if !new_songs.contains_key(name) {
             preview.existing_count += 1;
             preview.skipped_count += 1;
-            preview.skipped.push(PreviewIssue {
-                path: path.display().to_string(),
-                message: "输出文件已存在，将跳过转换".to_string(),
-            });
             continue;
         }
 
@@ -168,7 +172,6 @@ pub fn build_sync_preview(
         });
     }
 
-    preview.error_count = preview.errors.len();
     Ok(preview)
 }
 
@@ -203,18 +206,23 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
                 preview.candidates.push(candidate);
                 preview.new_count += 1;
             }
-            Ok(_) => preview.errors.push(PreviewIssue {
-                path: failed_file.source_path.clone(),
-                message: "源文件为空，无法重试".to_string(),
-            }),
-            Err(error) => preview.errors.push(PreviewIssue {
-                path: failed_file.source_path.clone(),
-                message: format!("重试时找不到源文件：{error}"),
-            }),
+            Ok(_) => {
+                preview.errors.push(PreviewIssue {
+                    path: failed_file.source_path.clone(),
+                    message: "源文件为空，无法重试".to_string(),
+                });
+                preview.error_count += 1;
+            }
+            Err(error) => {
+                preview.errors.push(PreviewIssue {
+                    path: failed_file.source_path.clone(),
+                    message: format!("重试时找不到源文件：{error}"),
+                });
+                preview.error_count += 1;
+            }
         }
     }
 
-    preview.error_count = preview.errors.len();
     if preview.candidates.is_empty() && preview.errors.is_empty() {
         preview.estimated_output_bytes = None;
     }

@@ -195,12 +195,24 @@ fn preferred_ffmpeg_candidate_names() -> &'static [&'static str] {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicScanIssue {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+pub fn get_music_dict_with_scan_issues(
+    folder: &str,
+) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
+    collect_music_dict_with_scan_issues(folder, &["mp3", "flac", "ncm", "wav", "aiff"])
+}
+
 pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
-    collect_music_dict(folder, &["mp3", "flac", "ncm", "wav", "aiff"])
+    get_music_dict_with_scan_issues(folder).0
 }
 
 pub fn get_destination_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
-    collect_music_dict(folder, &["mp3", "wav", "aiff"])
+    collect_music_dict_with_scan_issues(folder, &["mp3", "wav", "aiff"]).0
 }
 
 pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
@@ -222,28 +234,37 @@ pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn collect_music_dict(
+fn collect_music_dict_with_scan_issues(
     folder: &str,
     allowed_extensions: &[&str],
-) -> HashMap<String, (String, PathBuf)> {
+) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let mut music_dict = HashMap::new();
+    let mut scan_issues = Vec::new();
 
-    for entry in walkdir::WalkDir::new(folder)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && !is_temporary_artifact(entry.path())
-                && entry
+    for entry_result in walkdir::WalkDir::new(folder) {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                if let Some(path) = error
                     .path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext_str| {
-                        let lower = ext_str.to_lowercase();
-                        allowed_extensions.iter().any(|allowed| *allowed == lower)
-                    })
-        })
-    {
+                    .filter(|path| has_allowed_extension(path, allowed_extensions))
+                {
+                    scan_issues.push(MusicScanIssue {
+                        path: path.to_path_buf(),
+                        message: format!("无法扫描歌曲文件：{error}"),
+                    });
+                }
+                continue;
+            }
+        };
+
+        if !entry.file_type().is_file()
+            || is_temporary_artifact(entry.path())
+            || !has_allowed_extension(entry.path(), allowed_extensions)
+        {
+            continue;
+        }
+
         let path = entry.path().to_path_buf();
         let song_name = derive_song_name(entry.path());
         let size = entry
@@ -261,7 +282,16 @@ fn collect_music_dict(
         }
     }
 
-    music_dict
+    (music_dict, scan_issues)
+}
+
+fn has_allowed_extension(path: &Path, allowed_extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext_str| {
+            let lower = ext_str.to_lowercase();
+            allowed_extensions.iter().any(|allowed| *allowed == lower)
+        })
 }
 
 fn is_temporary_artifact(path: &Path) -> bool {

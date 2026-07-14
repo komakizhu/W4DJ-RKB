@@ -111,7 +111,7 @@ const makePreview = (slotIndex: 0 | 1 = 0): AppPreview => ({
     destination_directory: `/music/out-${slotIndex + 1}`,
     new_count: 2,
     existing_count: 1,
-    skipped_count: 0,
+    skipped_count: 1,
     error_count: 0,
     estimated_output_bytes: 2048,
     candidates: [
