@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - codex/dual-sync-slots
+      - main
 
 jobs:
   build:
