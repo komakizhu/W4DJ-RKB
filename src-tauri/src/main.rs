@@ -378,7 +378,9 @@ fn start_confirmed_sync(
             validated_previews.push(slot_preview);
         }
 
-        for slot_preview in collect_processable_previews(validated_previews)? {
+        let processable_previews = collect_processable_previews(validated_previews.clone())?;
+
+        for slot_preview in processable_previews {
             let slot_index = slot_preview.slot_index;
             jobs.push(ConfirmedSyncJob {
                 batch_id: batch_id.clone(),
@@ -393,12 +395,24 @@ fn start_confirmed_sync(
             });
         }
 
+        for slot_preview in &validated_previews {
+            if slot_preview.preview.candidates.is_empty() {
+                controller.set_preflight_summary(
+                    slot_preview.slot_index,
+                    slot_preview.preview.new_count,
+                    slot_preview.preview.existing_count,
+                    slot_preview.preview.error_count,
+                    slot_preview.preview.estimated_output_bytes,
+                )?;
+            }
+        }
+
         for job in &jobs {
             controller.start_confirmed_sync(job.slot_index, job.candidates.len())?;
-            controller.set_preview_summary(
+            controller.set_preflight_summary(
                 job.slot_index,
+                job.preview.new_count,
                 job.preview.existing_count,
-                job.preview.skipped_count,
                 job.preview.error_count,
                 job.preview.estimated_output_bytes,
             )?;
@@ -748,6 +762,7 @@ fn run_confirmed_sync_task(
             controller_guard.state().slots[job.slot_index].clone(),
         )
     };
+    let error_count = slot.error_tracks;
     let failed_files = slot.failed_files;
     let status = history_status_for(&snapshot, &failed_files);
     let history_entry = HistoryEntry {
@@ -763,8 +778,8 @@ fn run_confirmed_sync_task(
         lossless_format: job.lossless_format,
         new_count: job.preview.new_count,
         existing_count: job.preview.existing_count,
-        skipped_count: job.preview.skipped_count,
-        error_count: job.preview.error_count,
+        skipped_count: job.preview.existing_count,
+        error_count,
         completed_count: snapshot.completed,
         failed_count: failed_files.len(),
         failed_files,
@@ -926,7 +941,7 @@ fn run_sync_task(
             controller
                 .push_log(
                     slot_index,
-                    format!("Skipping unavailable source before sync: {} ({})", name, path),
+                    format!("Failed to read source before sync: {} ({})", name, path),
                 )
                 .expect("sync slot index validated before worker start");
         }
@@ -945,11 +960,21 @@ fn run_sync_task(
     }
     let destination_files = get_destination_music_dict(&destination);
     let queued_files = compare_music_dicts(&source_files, &destination_files, &mode, lossless_format);
+    let existing_files = source_files.len().saturating_sub(queued_files.len());
 
     {
         let mut controller = controller.lock().expect("desktop lock poisoned");
         controller
             .set_progress_total(slot_index, queued_files.len())
+            .expect("sync slot index validated before worker start");
+        controller
+            .set_preflight_summary(
+                slot_index,
+                queued_files.len(),
+                existing_files,
+                missing_sources.len(),
+                None,
+            )
             .expect("sync slot index validated before worker start");
         controller
             .push_log(
@@ -966,7 +991,7 @@ fn run_sync_task(
         }
     }
 
-    let mut skipped_files = 0usize;
+    let mut failed_files = 0usize;
     let result = sync_music_library_with_observer(
         &queued_files,
         &destination,
@@ -975,7 +1000,7 @@ fn run_sync_task(
         &task_controller,
         |name, task, error| {
             if error.is_some() {
-                skipped_files += 1;
+                failed_files += 1;
             }
 
             let mut controller = controller.lock().expect("desktop lock poisoned");
@@ -991,11 +1016,11 @@ fn run_sync_task(
     );
 
     let mut controller = controller.lock().expect("desktop lock poisoned");
-    if skipped_files > 0 {
+    if failed_files > 0 {
         controller
             .push_log(
                 slot_index,
-                format!("Skipped {} file(s) during sync", skipped_files),
+                format!("Failed {} file(s) during sync", failed_files),
             )
             .expect("sync slot index validated before worker start");
     }

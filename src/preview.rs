@@ -125,6 +125,11 @@ pub fn build_sync_preview(
 
         if !new_songs.contains_key(name) {
             preview.existing_count += 1;
+            preview.skipped_count += 1;
+            preview.skipped.push(PreviewIssue {
+                path: path.display().to_string(),
+                message: "输出文件已存在，将跳过转换".to_string(),
+            });
             continue;
         }
 

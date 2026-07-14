@@ -21,6 +21,7 @@ export type AppSyncSlotViewState = {
   progressCompleted: number;
   newTracks: number;
   skippedTracks: number;
+  errorTracks: number;
   progressText: string;
   currentFile: string;
   logExpanded: boolean;
@@ -180,6 +181,7 @@ const translations = {
     completedTracks: '已完成歌曲',
     newTracks: '新增歌曲',
     skippedTracks: '跳过歌曲',
+    errorTracks: '错误文件',
     darkTheme: '切换深色模式',
     lightTheme: '切换浅色模式',
     previewTitle: '转换前确认',
@@ -235,6 +237,7 @@ const translations = {
     completedTracks: 'Tracks completed',
     newTracks: 'New tracks',
     skippedTracks: 'Skipped tracks',
+    errorTracks: 'Error files',
     darkTheme: 'Switch to dark theme',
     lightTheme: 'Switch to light theme',
     previewTitle: 'Confirm conversion',
@@ -272,6 +275,7 @@ function defaultSlot(lang: AppLanguage): AppSyncSlotViewState {
     progressCompleted: 0,
     newTracks: 0,
     skippedTracks: 0,
+    errorTracks: 0,
     progressText: t('idle', lang),
     currentFile: '',
     logExpanded: false,
@@ -352,6 +356,7 @@ export function renderApp(
   const completedTracks = state.slots.reduce((total, slot) => total + slot.progressCompleted, 0);
   const newTracks = state.slots.reduce((total, slot) => total + slot.newTracks, 0);
   const skippedTracks = state.slots.reduce((total, slot) => total + slot.skippedTracks, 0);
+  const errorTracks = state.slots.reduce((total, slot) => total + slot.errorTracks, 0);
   root.innerHTML = `
     <header class="topbar">
       <div class="brand-block">
@@ -399,6 +404,7 @@ export function renderApp(
                 <div><dt>${t('completedTracks', state.lang)}</dt><dd>${completedTracks}</dd></div>
                 <div><dt>${t('newTracks', state.lang)}</dt><dd class="stat-new">${newTracks}</dd></div>
                 <div><dt>${t('skippedTracks', state.lang)}</dt><dd class="stat-skipped">${skippedTracks}</dd></div>
+                <div><dt>${t('errorTracks', state.lang)}</dt><dd class="stat-error">${errorTracks}</dd></div>
               </dl>
             </section>
           </div>
@@ -1083,6 +1089,7 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
       progressCompleted: slot.progress_completed,
       newTracks: slot.new_tracks,
       skippedTracks: slot.skipped_tracks,
+      errorTracks: slot.error_tracks,
       progressText: formatDesktopProgress(slot, lang),
       currentFile: slot.current_file,
       logExpanded: false,

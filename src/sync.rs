@@ -412,7 +412,7 @@ pub fn sync_music_library_with_observer(
 
     let mut queued_files = new_songs.iter().collect::<Vec<_>>();
     queued_files.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
-    let mut skipped_files = 0usize;
+    let mut failed_files = 0usize;
     let mut last_error: Option<io::Error> = None;
 
     for (&name, info) in queued_files {
@@ -435,32 +435,26 @@ pub fn sync_music_library_with_observer(
             }
             Err(err) => {
                 let error_message = err.to_string();
-                skipped_files += 1;
+                failed_files += 1;
                 last_error = Some(io::Error::new(err.kind(), error_message.clone()));
                 bar.inc(1);
                 after_file(name, task_controller, Some(&err));
-                bar.println(format!("Skipped {}: {}", name, error_message));
+                bar.println(format!("Failed {}: {}", name, error_message));
             }
         }
     }
 
     let snapshot = task_controller.snapshot();
-    if snapshot.completed == 0 && skipped_files > 0 {
-        bar.abandon_with_message(format!(
-            "Sync failed after skipping {} files.",
-            skipped_files
-        ));
+    if snapshot.completed == 0 && failed_files > 0 {
+        bar.abandon_with_message(format!("Sync failed after failing {} files.", failed_files));
         return Err(last_error.unwrap_or_else(|| {
-            io::Error::other(format!(
-                "Sync failed after skipping {} files.",
-                skipped_files
-            ))
+            io::Error::other(format!("Sync failed after failing {} files.", failed_files))
         }));
     }
 
     bar.finish_with_message(format!(
-        "Sync processing complete. {}/{} files processed, {} skipped.",
-        snapshot.completed, snapshot.total, skipped_files
+        "Sync processing complete. {}/{} files processed, {} failed.",
+        snapshot.completed, snapshot.total, failed_files
     ));
     Ok(snapshot)
 }

@@ -577,6 +577,10 @@ h1 {
   color: #f3a06b;
 }
 
+.global-status-card dd.stat-error {
+  color: #ee786d;
+}
+
 .app-shell[data-theme="dark"] .global-status-card {
   background: rgba(4, 5, 6, 0.46);
 }

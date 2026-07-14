@@ -159,7 +159,7 @@ impl DesktopController {
         slot.status = DesktopStatus::Running;
         slot.progress_total = total_files;
         slot.progress_completed = 0;
-        slot.new_tracks = 0;
+        slot.new_tracks = total_files;
         slot.skipped_tracks = 0;
         slot.existing_tracks = 0;
         slot.error_tracks = 0;
@@ -178,16 +178,17 @@ impl DesktopController {
         self.start_sync(slot_index, total_files)
     }
 
-    pub fn set_preview_summary(
+    pub fn set_preflight_summary(
         &mut self,
         slot_index: usize,
-        existing_tracks: usize,
+        new_tracks: usize,
         skipped_tracks: usize,
         error_tracks: usize,
         estimated_output_bytes: Option<u64>,
     ) -> Result<(), String> {
         let slot = self.slot_mut(slot_index)?;
-        slot.existing_tracks = existing_tracks;
+        slot.new_tracks = new_tracks;
+        slot.existing_tracks = skipped_tracks;
         slot.skipped_tracks = skipped_tracks;
         slot.error_tracks = error_tracks;
         slot.estimated_output_bytes = estimated_output_bytes;
@@ -230,8 +231,7 @@ impl DesktopController {
         let slot = self.slot_mut(slot_index)?;
         slot.progress_total = total_files;
         slot.progress_completed = 0;
-        slot.new_tracks = 0;
-        slot.skipped_tracks = 0;
+        slot.new_tracks = total_files;
         Ok(())
     }
 
@@ -299,7 +299,6 @@ impl DesktopController {
         let slot = self.slot_mut(slot_index)?;
         slot.current_file = file_name.clone();
         slot.progress_completed = snapshot.completed;
-        slot.new_tracks += 1;
         slot.logs.push(format!("Processed {file_name}"));
         Ok(())
     }
@@ -318,11 +317,10 @@ impl DesktopController {
 
         match error {
             Some(error) => {
-                slot.skipped_tracks += 1;
-                slot.logs.push(format!("Skipped {file_name}: {error}"));
+                slot.error_tracks += 1;
+                slot.logs.push(format!("Failed {file_name}: {error}"));
             }
             None => {
-                slot.new_tracks += 1;
                 slot.logs.push(format!("Processed {file_name}"));
             }
         }

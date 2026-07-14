@@ -16,6 +16,7 @@ fn progress_updates_are_reflected_in_desktop_state() {
         DesktopStatus::Running
     ));
     assert_eq!(controller.state().slots[0].progress_total, 3);
+    assert_eq!(controller.state().slots[0].new_tracks, 3);
     assert_eq!(controller.state().slots[0].progress_completed, 1);
     assert_eq!(controller.state().slots[0].current_file, "track.wav");
 }
@@ -139,6 +140,42 @@ fn confirmed_start_uses_preview_candidate_count() {
         controller.state().slots[0].status,
         DesktopStatus::Running
     ));
+}
+
+#[test]
+fn preflight_counts_keep_their_meaning_during_conversion() {
+    let mut controller = test_controller();
+    controller.start_confirmed_sync(0, 3).unwrap();
+    controller
+        .set_preflight_summary(0, 3, 2, 1, Some(1024))
+        .unwrap();
+
+    assert_eq!(controller.state().slots[0].new_tracks, 3);
+    assert_eq!(controller.state().slots[0].progress_completed, 0);
+    assert_eq!(controller.state().slots[0].skipped_tracks, 2);
+    assert_eq!(controller.state().slots[0].error_tracks, 1);
+
+    let task = controller.task_controller(0).unwrap();
+    task.complete_current_file();
+    controller
+        .record_file_result(0, "converted", task.snapshot(), None)
+        .unwrap();
+    assert_eq!(controller.state().slots[0].new_tracks, 3);
+    assert_eq!(controller.state().slots[0].progress_completed, 1);
+    assert_eq!(controller.state().slots[0].skipped_tracks, 2);
+    assert_eq!(controller.state().slots[0].error_tracks, 1);
+
+    controller
+        .record_file_result(
+            0,
+            "failed",
+            task.snapshot(),
+            Some("conversion failed".into()),
+        )
+        .unwrap();
+    assert_eq!(controller.state().slots[0].new_tracks, 3);
+    assert_eq!(controller.state().slots[0].skipped_tracks, 2);
+    assert_eq!(controller.state().slots[0].error_tracks, 2);
 }
 
 #[test]

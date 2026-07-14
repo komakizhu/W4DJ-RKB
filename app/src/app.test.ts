@@ -67,6 +67,7 @@ const makeViewSlot = (overrides: Partial<AppSyncSlotViewState> = {}): AppSyncSlo
   progressCompleted: 0,
   newTracks: 0,
   skippedTracks: 0,
+  errorTracks: 0,
   progressText: '待命',
   currentFile: '',
   logExpanded: false,
@@ -240,6 +241,37 @@ describe('renderApp', () => {
     expect(status.textContent).toContain('5');
     expect(status.textContent).toContain('跳过歌曲');
     expect(status.textContent).toContain('5');
+  });
+
+  it('keeps planned, completed, skipped, and error counts independent', () => {
+    const root = renderApp(
+      makeViewState({
+        slots: [
+          makeViewSlot({
+            newTracks: 5,
+            progressCompleted: 2,
+            skippedTracks: 3,
+            errorTracks: 1,
+          }),
+          makeViewSlot({
+            newTracks: 4,
+            progressCompleted: 1,
+            skippedTracks: 2,
+            errorTracks: 2,
+          }),
+        ],
+      }),
+    );
+
+    const status = root.querySelector('.global-status-card') as HTMLElement;
+    expect(Array.from(status.querySelectorAll('dd')).map((item) => item.textContent)).toEqual([
+      '2/2',
+      '3',
+      '9',
+      '5',
+      '3',
+    ]);
+    expect(status.textContent).toContain('错误文件');
   });
 
   it('renders the selected color theme and a top-right theme toggle', () => {

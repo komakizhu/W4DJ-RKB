@@ -26,8 +26,9 @@ fn preview_separates_new_existing_and_estimated_bytes() {
 
     assert_eq!(preview.new_count, 1);
     assert_eq!(preview.existing_count, 1);
-    assert_eq!(preview.skipped_count, 0);
+    assert_eq!(preview.skipped_count, 1);
     assert_eq!(preview.error_count, 0);
+    assert_eq!(preview.skipped.len(), 1);
     assert_eq!(preview.candidates[0].source_size_bytes, 120);
     assert_eq!(preview.estimated_output_bytes, Some(120));
 }
