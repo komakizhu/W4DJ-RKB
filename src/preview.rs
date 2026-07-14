@@ -36,6 +36,7 @@ pub struct SyncPreview {
     pub candidates: Vec<PreviewCandidate>,
     pub skipped: Vec<PreviewIssue>,
     pub errors: Vec<PreviewIssue>,
+    pub warnings: Vec<PreviewIssue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,11 +65,12 @@ pub fn build_sync_preview(
         candidates: Vec::new(),
         skipped: Vec::new(),
         errors: Vec::new(),
+        warnings: Vec::new(),
     };
 
     let source_path = Path::new(source_directory);
     if !source_path.is_dir() {
-        preview.errors.push(PreviewIssue {
+        preview.warnings.push(PreviewIssue {
             path: source_directory.to_string(),
             message: "歌曲下载目录不存在或不可读取".to_string(),
         });
@@ -79,7 +81,7 @@ pub fn build_sync_preview(
     if !destination_directory.trim().is_empty() {
         let destination_path = Path::new(destination_directory);
         if destination_path.exists() && !destination_path.is_dir() {
-            preview.errors.push(PreviewIssue {
+            preview.warnings.push(PreviewIssue {
                 path: destination_directory.to_string(),
                 message: "输出路径不是文件夹".to_string(),
             });
@@ -88,7 +90,7 @@ pub fn build_sync_preview(
                 .parent()
                 .is_some_and(|parent| !parent.exists())
         {
-            preview.errors.push(PreviewIssue {
+            preview.warnings.push(PreviewIssue {
                 path: destination_directory.to_string(),
                 message: "输出目录及其父目录不存在".to_string(),
             });
@@ -166,7 +168,7 @@ pub fn build_sync_preview(
             && !matches!(mode, Mode::Lossless if extension == "mp3")
     });
     if requires_ffmpeg && find_ffmpeg().is_none() {
-        preview.errors.push(PreviewIssue {
+        preview.warnings.push(PreviewIssue {
             path: destination_directory.to_string(),
             message: "当前转换需要 FFmpeg，但未找到 FFmpeg".to_string(),
         });
@@ -187,6 +189,7 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
         candidates: Vec::new(),
         skipped: Vec::new(),
         errors: Vec::new(),
+        warnings: Vec::new(),
     };
 
     for failed_file in &entry.failed_files {

@@ -17,7 +17,8 @@ use w4dj::history::{
 };
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
-    PreviewCandidate, SlotPreview, SyncPreview, build_retry_preview, build_sync_preview,
+    PreviewCandidate, PreviewIssue, SlotPreview, SyncPreview, build_retry_preview,
+    build_sync_preview,
 };
 use w4dj::sync::{
     cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
@@ -313,10 +314,18 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
         .collect()
 }
 
-fn collect_processable_previews(previews: Vec<SlotPreview>) -> Result<Vec<SlotPreview>, String> {
+fn collect_processable_previews(
+    previews: Vec<SlotPreview>,
+    allow_error_only_retry: bool,
+) -> Result<Vec<SlotPreview>, String> {
     let processable = previews
         .into_iter()
-        .filter(|preview| !preview.preview.candidates.is_empty())
+        .filter(|preview| {
+            !preview.preview.candidates.is_empty()
+                || (allow_error_only_retry
+                    && preview.retry_of.is_some()
+                    && !preview.preview.errors.is_empty())
+        })
         .collect::<Vec<_>>();
 
     if processable.is_empty() {
@@ -378,7 +387,12 @@ fn start_confirmed_sync(
             validated_previews.push(slot_preview);
         }
 
-        let processable_previews = collect_processable_previews(validated_previews.clone())?;
+        let allow_error_only_retry = retry_of.is_some()
+            || validated_previews
+                .iter()
+                .any(|preview| preview.retry_of.is_some());
+        let processable_previews =
+            collect_processable_previews(validated_previews.clone(), allow_error_only_retry)?;
 
         for slot_preview in processable_previews {
             let slot_index = slot_preview.slot_index;
@@ -396,13 +410,22 @@ fn start_confirmed_sync(
         }
 
         for slot_preview in &validated_previews {
-            if slot_preview.preview.candidates.is_empty() {
+            if slot_preview.preview.candidates.is_empty()
+                && jobs
+                    .iter()
+                    .all(|job| job.slot_index != slot_preview.slot_index)
+            {
                 controller.set_preflight_summary(
                     slot_preview.slot_index,
                     slot_preview.preview.new_count,
                     slot_preview.preview.existing_count,
-                    slot_preview.preview.error_count,
+                    0,
                     slot_preview.preview.estimated_output_bytes,
+                )?;
+                record_preflight_issues(
+                    &mut controller,
+                    slot_preview.slot_index,
+                    &slot_preview.preview.errors,
                 )?;
             }
         }
@@ -413,9 +436,10 @@ fn start_confirmed_sync(
                 job.slot_index,
                 job.preview.new_count,
                 job.preview.existing_count,
-                job.preview.error_count,
+                0,
                 job.preview.estimated_output_bytes,
             )?;
+            record_preflight_issues(&mut controller, job.slot_index, &job.preview.errors)?;
             controller.push_log(job.slot_index, "Confirmed preflight; conversion started")?;
         }
     }
@@ -792,6 +816,31 @@ fn run_confirmed_sync_task(
     }
 }
 
+fn record_preflight_issues(
+    controller: &mut DesktopController,
+    slot_index: usize,
+    issues: &[PreviewIssue],
+) -> Result<(), String> {
+    let task_controller = controller.task_controller(slot_index)?;
+    for issue in issues {
+        controller.record_file_failed(
+            slot_index,
+            FailedFile {
+                name: Path::new(&issue.path)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or(&issue.path)
+                    .to_string(),
+                source_path: issue.path.clone(),
+                destination_path: String::new(),
+                message: issue.message.clone(),
+            },
+            task_controller.snapshot(),
+        )?;
+    }
+    Ok(())
+}
+
 fn record_failed_candidate(
     controller: &Arc<Mutex<DesktopController>>,
     slot_index: usize,
@@ -1062,9 +1111,12 @@ mod tests {
     use super::collect_processable_previews;
     use super::DestinationCoordinator;
     use super::history_status_for;
+    use super::record_preflight_issues;
     use w4dj::config::Mode;
+    use w4dj::desktop::{DesktopController, DesktopState};
     use w4dj::history::{FailedFile, HistoryStatus};
-    use w4dj::preview::{PreviewCandidate, SlotPreview, SyncPreview};
+    use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
+    use w4dj::preview::{PreviewCandidate, PreviewIssue, SlotPreview, SyncPreview};
     use w4dj::task::TaskController;
     use std::path::Path;
     use std::sync::Arc;
@@ -1080,7 +1132,7 @@ mod tests {
                 destination_directory: format!("/music/out-{slot_index}"),
                 new_count: usize::from(has_candidate),
                 existing_count: usize::from(!has_candidate),
-                skipped_count: 0,
+                skipped_count: usize::from(!has_candidate),
                 error_count: 0,
                 estimated_output_bytes: has_candidate.then_some(1024),
                 candidates: has_candidate
@@ -1096,20 +1148,67 @@ mod tests {
                     .unwrap_or_default(),
                 skipped: Vec::new(),
                 errors: Vec::new(),
+                warnings: Vec::new(),
             },
         }
     }
 
     #[test]
     fn processable_previews_ignore_slots_without_new_files() {
-        let processable = collect_processable_previews(vec![
-            sample_preview(0, false),
-            sample_preview(1, true),
-        ])
+        let processable = collect_processable_previews(
+            vec![sample_preview(0, false), sample_preview(1, true)],
+            false,
+        )
         .expect("a slot with candidates should start even when another slot is already complete");
 
         assert_eq!(processable.len(), 1);
         assert_eq!(processable[0].slot_index, 1);
+    }
+
+    #[test]
+    fn retry_previews_with_only_missing_files_can_be_recorded() {
+        let mut preview = sample_preview(0, false);
+        preview.retry_of = Some(String::from("history-1"));
+        preview.preview.error_count = 1;
+        preview.preview.errors.push(PreviewIssue {
+            path: String::from("/music/in/missing.mp3"),
+            message: String::from("重试时找不到源文件"),
+        });
+
+        let processable = collect_processable_previews(vec![preview], true)
+            .expect("a retry should preserve a missing file as a failed task");
+
+        assert_eq!(processable.len(), 1);
+        assert!(processable[0].preview.candidates.is_empty());
+    }
+
+    #[test]
+    fn preflight_file_errors_are_recorded_for_history() {
+        let mut controller = DesktopController::new(DesktopState::from_preferences(AppPreferences {
+            slots: [
+                SyncSlotPreferences::new("/music/in-1", "/music/out-1"),
+                SyncSlotPreferences::new("/music/in-2", "/music/out-2"),
+            ],
+            mode: Mode::Compat,
+            lossless_format: None,
+        }));
+        controller.start_confirmed_sync(0, 1).unwrap();
+        controller
+            .set_preflight_summary(0, 1, 0, 0, None)
+            .unwrap();
+
+        record_preflight_issues(
+            &mut controller,
+            0,
+            &[PreviewIssue {
+                path: String::from("/music/in-1/unreadable.mp3"),
+                message: String::from("无法读取源文件"),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(controller.state().slots[0].error_tracks, 1);
+        assert_eq!(controller.state().slots[0].failed_files.len(), 1);
     }
 
     #[test]

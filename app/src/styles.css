@@ -1264,6 +1264,10 @@ h1 {
   color: #b84c36;
 }
 
+.preview-errors li.preview-warning {
+  color: #9a6a2b;
+}
+
 @media (max-width: 720px) {
   .preview-modal {
     padding: 12px;

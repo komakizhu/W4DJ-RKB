@@ -45,8 +45,8 @@ fn preview_reports_missing_source_and_invalid_destination() {
 
     assert_eq!(preview.new_count, 0);
     assert_eq!(preview.error_count, 0);
-    assert_eq!(preview.errors.len(), 1);
-    assert!(!preview.errors[0].message.is_empty());
+    assert_eq!(preview.warnings.len(), 1);
+    assert!(!preview.warnings[0].message.is_empty());
 }
 
 #[test]
@@ -88,5 +88,5 @@ fn preview_does_not_count_destination_configuration_errors_as_song_files() {
 
     assert_eq!(preview.new_count, 1);
     assert_eq!(preview.error_count, 0);
-    assert_eq!(preview.errors.len(), 1);
+    assert_eq!(preview.warnings.len(), 1);
 }

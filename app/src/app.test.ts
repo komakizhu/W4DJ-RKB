@@ -125,6 +125,7 @@ const makePreview = (slotIndex: 0 | 1 = 0): AppPreview => ({
     ],
     skipped: [],
     errors: [],
+    warnings: [],
   },
 });
 

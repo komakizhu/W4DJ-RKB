@@ -89,6 +89,7 @@ export type AppSyncPreview = {
   candidates: AppPreviewCandidate[];
   skipped: AppPreviewIssue[];
   errors: AppPreviewIssue[];
+  warnings: AppPreviewIssue[];
 };
 
 export type AppPreview = {
@@ -454,7 +455,7 @@ function renderPreviewModal(
     (total, item) => total + item.preview.candidates.length,
     0,
   );
-  const canConfirm = processableCount > 0;
+  const canConfirm = processableCount > 0 || previewHasRetryErrors(modal);
   return `
     <div class="preview-modal" data-role="preview-modal" role="dialog" aria-modal="true" aria-label="${t('previewTitle', lang)}">
       <div class="preview-dialog">
@@ -481,9 +482,14 @@ function renderPreviewModal(
 
 function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
   const preview = item.preview;
-  const errors = preview.errors
-    .map((issue) => `<li>${escapeHtml(issue.path)}：${escapeHtml(issue.message)}</li>`)
-    .join('');
+  const issues = [
+    ...preview.errors.map(
+      (issue) => `<li>${escapeHtml(issue.path)}：${escapeHtml(issue.message)}</li>`,
+    ),
+    ...preview.warnings.map(
+      (issue) => `<li class="preview-warning">${escapeHtml(issue.path)}：${escapeHtml(issue.message)}</li>`,
+    ),
+  ].join('');
   return `
     <article class="preview-card" data-role="preview-card" data-slot="${item.slot_index}">
       <header class="preview-card-head">
@@ -503,9 +509,13 @@ function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
         <p><span>${t('sourcePath', lang)}</span>${escapeHtml(preview.source_directory)}</p>
         <p><span>${t('destinationPath', lang)}</span>${escapeHtml(preview.destination_directory)}</p>
       </div>
-      ${errors ? `<ul class="preview-errors">${errors}</ul>` : ''}
+      ${issues ? `<ul class="preview-errors">${issues}</ul>` : ''}
     </article>
   `;
+}
+
+function previewHasRetryErrors(modal: AppPreviewModalState): boolean {
+  return modal.retryOf !== null && modal.previews.some((item) => item.preview.error_count > 0);
 }
 
 function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage): string {
@@ -749,7 +759,12 @@ export function bindApp(
   };
 
   const confirmPreview = async () => {
-    if (!previewModal || previewModal.previews.every((item) => item.preview.candidates.length === 0)) {
+    if (!previewModal) {
+      return;
+    }
+    const canConfirm = previewModal.previews.some((item) => item.preview.candidates.length > 0)
+      || previewHasRetryErrors(previewModal);
+    if (!canConfirm) {
       return;
     }
     previewBusy = true;
