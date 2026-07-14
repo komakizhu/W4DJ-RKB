@@ -1,7 +1,9 @@
 pub mod config;
 pub mod desktop;
 pub mod gui;
+pub mod history;
 pub mod metadata;
 pub mod preferences;
+pub mod preview;
 pub mod sync;
 pub mod task;

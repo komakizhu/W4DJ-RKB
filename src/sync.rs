@@ -222,7 +222,10 @@ pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn collect_music_dict(folder: &str, allowed_extensions: &[&str]) -> HashMap<String, (String, PathBuf)> {
+fn collect_music_dict(
+    folder: &str,
+    allowed_extensions: &[&str],
+) -> HashMap<String, (String, PathBuf)> {
     let mut music_dict = HashMap::new();
 
     for entry in walkdir::WalkDir::new(folder)
@@ -448,7 +451,10 @@ pub fn sync_music_library_with_observer(
             skipped_files
         ));
         return Err(last_error.unwrap_or_else(|| {
-            io::Error::other(format!("Sync failed after skipping {} files.", skipped_files))
+            io::Error::other(format!(
+                "Sync failed after skipping {} files.",
+                skipped_files
+            ))
         }));
     }
 
@@ -699,7 +705,11 @@ fn process_ncm_file(
     let file = File::open(src_path).map_err(|error| {
         Error::new(
             error.kind(),
-            format!("Failed to open source file {}: {}", src_path.display(), error),
+            format!(
+                "Failed to open source file {}: {}",
+                src_path.display(),
+                error
+            ),
         )
     })?;
     let mut ncm = Ncmdump::from_reader(file).map_err(|e| {
@@ -841,7 +851,11 @@ fn process_ncm_file(
     Ok(())
 }
 
-fn target_output_path(dest_folder: &str, name_stem: &str, output_extension: &str) -> PathBuf {
+pub(crate) fn target_output_path(
+    dest_folder: &str,
+    name_stem: &str,
+    output_extension: &str,
+) -> PathBuf {
     Path::new(dest_folder).join(format!(
         "{}.{}",
         sanitize_filename_component(name_stem),
@@ -849,7 +863,7 @@ fn target_output_path(dest_folder: &str, name_stem: &str, output_extension: &str
     ))
 }
 
-fn effective_source_extension(source_path: &Path) -> String {
+pub(crate) fn effective_source_extension(source_path: &Path) -> String {
     let path = source_path;
     let extension = path
         .extension()

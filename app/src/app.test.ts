@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   bindApp,
   renderApp,
+  type AppHistoryEntry,
+  type AppPreview,
   type AppServices,
   type AppSyncSlotViewState,
   type AppViewState,
@@ -24,6 +26,10 @@ const makeDesktopSlot = (
   progress_completed: 0,
   new_tracks: 0,
   skipped_tracks: 0,
+  existing_tracks: 0,
+  error_tracks: 0,
+  estimated_output_bytes: null,
+  failed_files: [],
   current_file: '',
   logs: ['Ready'],
   ...overrides,
@@ -94,6 +100,65 @@ const makeViewStateWithSlot = (
   return { ...state, slots };
 };
 
+const makePreview = (slotIndex: 0 | 1 = 0): AppPreview => ({
+  slot_index: slotIndex,
+  mode: 'compat',
+  lossless_format: null,
+  retry_of: null,
+  preview: {
+    source_directory: `/music/in-${slotIndex + 1}`,
+    destination_directory: `/music/out-${slotIndex + 1}`,
+    new_count: 2,
+    existing_count: 1,
+    skipped_count: 0,
+    error_count: 0,
+    estimated_output_bytes: 2048,
+    candidates: [
+      {
+        name: 'Song',
+        source_path: `/music/in-${slotIndex + 1}/Song.mp3`,
+        destination_path: `/music/out-${slotIndex + 1}/Song.mp3`,
+        source_size_bytes: 1024,
+        estimated_output_bytes: 1024,
+      },
+    ],
+    skipped: [],
+    errors: [],
+  },
+});
+
+const makePreviewResponse = (): AppPreview[] => [makePreview(0), makePreview(1)];
+
+const makeHistoryEntry = (overrides: Partial<AppHistoryEntry> = {}): AppHistoryEntry => ({
+  id: 'history-1',
+  batch_id: 'batch-1',
+  slot_index: 0,
+  started_at: '2026-07-14 12:00',
+  finished_at: '2026-07-14 12:01',
+  duration_seconds: 60,
+  source_directory: '/music/in-1',
+  destination_directory: '/music/out-1',
+  mode: 'compat',
+  lossless_format: null,
+  new_count: 2,
+  existing_count: 0,
+  skipped_count: 0,
+  error_count: 1,
+  completed_count: 1,
+  failed_count: 1,
+  failed_files: [
+    {
+      name: 'Song',
+      source_path: '/music/in-1/Song.flac',
+      destination_path: '/music/out-1/Song.mp3',
+      message: 'FFmpeg failed',
+    },
+  ],
+  status: 'partial',
+  retry_of: null,
+  ...overrides,
+});
+
 const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => ({
   loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState()),
   pickDirectory: vi.fn().mockResolvedValue(null),
@@ -101,6 +166,16 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   selectDestinationDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseLosslessFormat: vi.fn().mockResolvedValue(makeDesktopState()),
+  previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
+  startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
+    slots: [
+      makeDesktopSlot({ status: 'running', progress_total: 2 }),
+      makeDesktopSlot({ status: 'running', progress_total: 2 }),
+    ],
+  })),
+  loadHistory: vi.fn().mockResolvedValue([]),
+  retryHistoryFailures: vi.fn().mockResolvedValue(makePreview(0)),
+  exportHistoryErrorReport: vi.fn().mockResolvedValue(undefined),
   startAllSync: vi
     .fn()
     .mockResolvedValue(makeDesktopState({
@@ -318,9 +393,77 @@ describe('bindApp', () => {
     });
   });
 
+  it('shows one combined preview modal before starting both slots', async () => {
+    const services = makeMockServices();
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
+      expect(root.querySelector('[data-role="preview-modal"]')?.textContent).toContain('新增文件');
+      expect(root.querySelector('[data-role="preview-modal"]')?.textContent).toContain('预计输出');
+    });
+    expect(services.startConfirmedSync).not.toHaveBeenCalled();
+  });
+
+  it('does not invoke the backend or animation for the already selected mode', async () => {
+    const services = makeMockServices();
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({ mode: 'compat' }), services);
+
+    (root.querySelector('[data-mode="compat"]') as HTMLButtonElement).click();
+    await Promise.resolve();
+
+    expect(services.chooseMode).not.toHaveBeenCalled();
+    expect(root.querySelector('.app-shell')?.dataset.selectionMotion).not.toBe('mode');
+  });
+
+  it('serializes rapid WAV and AIFF selection clicks', async () => {
+    const deferred = createDeferred<DesktopState>();
+    const services = makeMockServices({
+      chooseLosslessFormat: vi.fn().mockReturnValue(deferred.promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({ mode: 'lossless', losslessFormat: 'wav' }), services);
+
+    (root.querySelector('[data-format="aiff"]') as HTMLButtonElement).click();
+    const wavButton = root.querySelector('[data-format="wav"]') as HTMLButtonElement;
+    expect(wavButton.disabled).toBe(true);
+    wavButton.click();
+    expect(services.chooseLosslessFormat).toHaveBeenCalledTimes(1);
+
+    deferred.resolve(makeDesktopState({ mode: 'lossless', lossless_format: 'aiff' }));
+    await vi.waitFor(() => expect(root.querySelector('[data-format="aiff"]')).not.toBeNull());
+  });
+
+  it('renders history and opens the same preview modal for failed retries', async () => {
+    const services = makeMockServices({
+      loadHistory: vi.fn().mockResolvedValue([makeHistoryEntry()]),
+      retryHistoryFailures: vi.fn().mockResolvedValue({
+        ...makePreview(0),
+        retry_of: 'history-1',
+      }),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="history"]')?.textContent).toContain('重试失败项目');
+    });
+    (root.querySelector('[data-action="retry-history"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(services.retryHistoryFailures).toHaveBeenCalledWith('history-1');
+      expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
+    });
+  });
+
   it('starts and pauses both configured tasks from one global button', async () => {
     const services = makeMockServices({
-      startAllSync: vi
+      previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
+      startConfirmedSync: vi
         .fn()
         .mockResolvedValue(makeDesktopState({
           slots: [
@@ -340,7 +483,12 @@ describe('bindApp', () => {
 
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
     await vi.waitFor(() => {
-      expect(services.startAllSync).toHaveBeenCalledTimes(1);
+      expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
+      expect(services.startConfirmedSync).not.toHaveBeenCalled();
+    });
+    (root.querySelector('[data-action="confirm-start"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
       expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
       expect(root.querySelectorAll('[data-status="running"][data-role="sync-slot"]')).toHaveLength(2);
     });
@@ -350,9 +498,9 @@ describe('bindApp', () => {
   });
 
   it('ignores repeated global start clicks while the first start is pending', async () => {
-    const deferred = createDeferred<DesktopState>();
+    const deferred = createDeferred<AppPreview[]>();
     const services = makeMockServices({
-      startAllSync: vi.fn().mockReturnValue(deferred.promise),
+      previewAllSync: vi.fn().mockReturnValue(deferred.promise),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
@@ -362,19 +510,12 @@ describe('bindApp', () => {
     expect(pendingButton.disabled).toBe(true);
     pendingButton.click();
 
-    expect(services.startAllSync).toHaveBeenCalledTimes(1);
+    expect(services.previewAllSync).toHaveBeenCalledTimes(1);
 
-    deferred.resolve(
-      makeDesktopState({
-        slots: [
-          makeDesktopSlot({ status: 'running', progress_total: 10 }),
-          makeDesktopSlot({ status: 'running', progress_total: 8 }),
-        ],
-      }),
-    );
+    deferred.resolve(makePreviewResponse());
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
+      expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
     });
   });
 
@@ -413,7 +554,7 @@ describe('bindApp', () => {
 
   it('reports an action error on only the affected slot', async () => {
     const services = makeMockServices({
-      startAllSync: vi.fn().mockRejectedValue(new Error('Sync failed dramatically')),
+      previewAllSync: vi.fn().mockRejectedValue(new Error('Sync failed dramatically')),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);

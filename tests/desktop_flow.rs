@@ -1,5 +1,6 @@
 use w4dj::config::Mode;
 use w4dj::desktop::{DesktopController, DesktopState, DesktopStatus};
+use w4dj::history::FailedFile;
 use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
 
 #[test]
@@ -126,6 +127,40 @@ fn pausing_all_running_slots_leaves_idle_slots_unchanged() {
         controller.state().slots[1].status,
         DesktopStatus::Idle
     ));
+}
+
+#[test]
+fn confirmed_start_uses_preview_candidate_count() {
+    let mut controller = test_controller();
+    controller.start_confirmed_sync(0, 3).unwrap();
+
+    assert_eq!(controller.state().slots[0].progress_total, 3);
+    assert!(matches!(
+        controller.state().slots[0].status,
+        DesktopStatus::Running
+    ));
+}
+
+#[test]
+fn failed_result_is_available_for_retry_without_increasing_completed_count() {
+    let mut controller = test_controller();
+    controller.start_confirmed_sync(0, 1).unwrap();
+    let snapshot = controller.task_controller(0).unwrap().snapshot();
+    controller
+        .record_file_failed(
+            0,
+            FailedFile {
+                name: "song".into(),
+                source_path: "/in/song.flac".into(),
+                destination_path: "/out/song.mp3".into(),
+                message: "conversion failed".into(),
+            },
+            snapshot,
+        )
+        .unwrap();
+
+    assert_eq!(controller.state().slots[0].progress_completed, 0);
+    assert_eq!(controller.state().slots[0].failed_files.len(), 1);
 }
 
 fn test_controller() -> DesktopController {
