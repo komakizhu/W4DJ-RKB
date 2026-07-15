@@ -63,7 +63,8 @@ button:focus-visible {
   width: 100%;
   min-height: 100vh;
   padding: 18px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background:
     radial-gradient(circle at 13% 5%, rgba(47, 142, 158, 0.16), transparent 24%),
     radial-gradient(circle at 92% 8%, rgba(242, 123, 66, 0.15), transparent 22%),
@@ -267,7 +268,8 @@ h1 {
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 26px;
   padding: 24px 22px 22px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   background:
     radial-gradient(circle at 110% -10%, color-mix(in srgb, var(--cyan) 24%, transparent), transparent 34%),
     linear-gradient(160deg, var(--rail), var(--rail-deep));
@@ -736,6 +738,11 @@ h1 {
   color: var(--orange);
 }
 
+.slot-status[data-status="cancelled"] {
+  background: rgba(130, 120, 116, 0.14);
+  color: var(--quiet);
+}
+
 .path-flow {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 26px minmax(0, 1fr);
@@ -970,6 +977,149 @@ h1 {
   .sync-slots {
     grid-template-rows: auto;
   }
+}
+
+.output-settings {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.output-settings label {
+  display: grid;
+  gap: 6px;
+  color: var(--rail-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.output-settings select {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 30px 0 11px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: var(--rail-deep);
+  color: var(--rail-text);
+  font: 700 11px/1.2 "Avenir Next", "PingFang SC", sans-serif;
+}
+
+.global-action-group {
+  display: grid;
+  gap: 8px;
+}
+
+.cancel-all {
+  color: var(--rail-text);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.slot-head-actions,
+.history-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.slot-cancel {
+  min-height: 28px;
+  padding-inline: 9px;
+  font-size: 10px;
+}
+
+.history-clear,
+.history-delete {
+  color: #b84c36;
+}
+
+.history-failures li {
+  display: grid;
+  gap: 3px;
+  margin-bottom: 8px;
+}
+
+.failure-category {
+  color: var(--cyan);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.disk-space-error {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fff0ec;
+  color: #b84c36;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.about-modal {
+  position: fixed;
+  z-index: 30;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(19, 27, 29, 0.32);
+  backdrop-filter: blur(9px);
+}
+
+.about-dialog {
+  display: grid;
+  gap: 18px;
+  width: min(440px, 100%);
+  padding: 26px;
+  border: 1px solid var(--line-strong);
+  border-radius: 24px;
+  background: var(--surface-strong);
+  box-shadow: 0 24px 80px rgba(13, 28, 30, 0.26);
+}
+
+.about-dialog h2 {
+  margin: -10px 0 0;
+  color: var(--text);
+}
+
+.about-dialog dl {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.about-dialog dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.about-dialog dt {
+  color: var(--muted);
+}
+
+.about-dialog dd {
+  margin: 0;
+  color: var(--text);
+  font-weight: 800;
+}
+
+.about-links {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.about-links a {
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--cyan);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+  text-decoration: none;
 }
 
 @media (max-height: 690px) and (min-width: 721px) {

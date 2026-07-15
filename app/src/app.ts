@@ -4,7 +4,9 @@ import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
 
 export type AppMode = 'compat' | 'lossless';
 export type AppLosslessFormat = 'wav' | 'aiff';
-export type AppStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error';
+export type AppConflictStrategy = 'skip' | 'overwrite' | 'rename' | 'update_metadata';
+export type AppFilenameRule = 'title_artist' | 'artist_title' | 'original';
+export type AppStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error' | 'cancelled';
 export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
@@ -32,6 +34,8 @@ export type AppViewState = {
   slots: [AppSyncSlotViewState, AppSyncSlotViewState];
   mode: AppMode;
   losslessFormat: AppLosslessFormat | null;
+  conflictStrategy: AppConflictStrategy;
+  filenameRule: AppFilenameRule;
   lang: AppLanguage;
   theme: AppTheme;
 };
@@ -56,13 +60,25 @@ export type DesktopState = {
   slots: [DesktopSyncSlotState, DesktopSyncSlotState];
   mode: AppMode;
   lossless_format: AppLosslessFormat | null;
+  conflict_strategy: AppConflictStrategy;
+  filename_rule: AppFilenameRule;
 };
+
+export type AppErrorCategory =
+  | 'file_damaged'
+  | 'unsupported_format'
+  | 'ffmpeg'
+  | 'output_permission'
+  | 'disk_space'
+  | 'invalid_filename'
+  | 'unknown';
 
 export type AppFailedFile = {
   name: string;
   source_path: string;
   destination_path: string;
   message: string;
+  category: AppErrorCategory;
 };
 
 export type AppPreviewCandidate = {
@@ -71,6 +87,7 @@ export type AppPreviewCandidate = {
   destination_path: string;
   source_size_bytes: number;
   estimated_output_bytes: number | null;
+  operation: 'convert' | 'update_metadata';
 };
 
 export type AppPreviewIssue = {
@@ -90,14 +107,25 @@ export type AppSyncPreview = {
   skipped: AppPreviewIssue[];
   errors: AppPreviewIssue[];
   warnings: AppPreviewIssue[];
+  available_space_bytes: number | null;
+  disk_space_sufficient: boolean | null;
 };
 
 export type AppPreview = {
   slot_index: SyncSlotIndex;
   mode: AppMode;
   lossless_format: AppLosslessFormat | null;
+  conflict_strategy: AppConflictStrategy;
+  filename_rule: AppFilenameRule;
   preview: AppSyncPreview;
   retry_of: string | null;
+};
+
+export type AppInfo = {
+  version: string;
+  developer: string;
+  project_url: string;
+  support_url: string;
 };
 
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
@@ -120,8 +148,11 @@ export type AppHistoryEntry = {
   completed_count: number;
   failed_count: number;
   failed_files: AppFailedFile[];
+  pending_files: AppPreviewCandidate[];
   status: AppHistoryStatus;
   retry_of: string | null;
+  conflict_strategy: AppConflictStrategy;
+  filename_rule: AppFilenameRule;
 };
 
 export type AppPreviewModalState = {
@@ -139,13 +170,20 @@ export type AppServices = {
   selectDestinationDirectory: (slotIndex: SyncSlotIndex, path: string) => Promise<DesktopState>;
   chooseMode: (mode: AppMode) => Promise<DesktopState>;
   chooseLosslessFormat: (format: AppLosslessFormat | null) => Promise<DesktopState>;
+  chooseConflictStrategy: (strategy: AppConflictStrategy) => Promise<DesktopState>;
+  chooseFilenameRule: (rule: AppFilenameRule) => Promise<DesktopState>;
   previewAllSync: () => Promise<AppPreview[]>;
   startConfirmedSync: (previews: AppPreview[], retryOf?: string | null) => Promise<DesktopState>;
   loadHistory: () => Promise<AppHistoryEntry[]>;
   retryHistoryFailures: (id: string) => Promise<AppPreview>;
   exportHistoryErrorReport: (id: string, path: string) => Promise<void>;
+  deleteHistoryEntry: (id: string) => Promise<void>;
+  clearHistory: () => Promise<void>;
+  loadAppInfo: () => Promise<AppInfo>;
   startAllSync: () => Promise<DesktopState>;
   pauseAllSync: () => Promise<DesktopState>;
+  cancelSync: (slotIndex: SyncSlotIndex) => Promise<DesktopState>;
+  cancelAllSync: () => Promise<DesktopState>;
 };
 
 const translations = {
@@ -167,6 +205,7 @@ const translations = {
     idle: '待命',
     running: '运行中',
     paused: '已暂停',
+    cancelled: '已取消',
     completed: '已完成',
     error: '错误',
     controlPanel: '控制面板',
@@ -204,6 +243,29 @@ const translations = {
     failedCount: '失败',
     sourcePath: '源目录',
     destinationPath: '输出目录',
+    conflictStrategy: '已存在文件',
+    conflictSkip: '已存在则跳过',
+    conflictOverwrite: '覆盖旧文件',
+    conflictRename: '自动重命名',
+    conflictMetadata: '仅更新元数据',
+    filenameRule: '文件名规则',
+    titleArtist: '标题 - 艺术家（默认）',
+    artistTitle: '艺术家 - 标题',
+    originalName: '保留原文件名',
+    availableSpace: '可用空间',
+    insufficientSpace: '磁盘空间不足，无法开始转换',
+    cancelTask: '取消任务',
+    resumeTasks: '继续未完成任务',
+    deleteHistory: '删除记录',
+    clearHistory: '清空历史',
+    about: '关于',
+    version: '版本',
+    developer: '开发者',
+    projectHome: '项目主页',
+    supportProject: 'Buy Me a Coffee',
+    close: '关闭',
+    pendingCount: '待继续',
+    errorCategory: '错误类型',
   },
   en: {
     eyebrow: 'W4DJ RKB',
@@ -223,6 +285,7 @@ const translations = {
     idle: 'Ready',
     running: 'Running',
     paused: 'Paused',
+    cancelled: 'Cancelled',
     completed: 'Completed',
     error: 'Error',
     controlPanel: 'Control panel',
@@ -260,6 +323,29 @@ const translations = {
     failedCount: 'Failed',
     sourcePath: 'Source',
     destinationPath: 'Output',
+    conflictStrategy: 'Existing files',
+    conflictSkip: 'Skip existing',
+    conflictOverwrite: 'Overwrite',
+    conflictRename: 'Auto rename',
+    conflictMetadata: 'Update metadata only',
+    filenameRule: 'Filename rule',
+    titleArtist: 'Title - Artist (default)',
+    artistTitle: 'Artist - Title',
+    originalName: 'Keep original filename',
+    availableSpace: 'Available space',
+    insufficientSpace: 'Not enough disk space to start',
+    cancelTask: 'Cancel task',
+    resumeTasks: 'Resume unfinished tasks',
+    deleteHistory: 'Delete entry',
+    clearHistory: 'Clear history',
+    about: 'About',
+    version: 'Version',
+    developer: 'Developer',
+    projectHome: 'Project home',
+    supportProject: 'Buy Me a Coffee',
+    close: 'Close',
+    pendingCount: 'Pending',
+    errorCategory: 'Error type',
   },
 } as const;
 
@@ -292,6 +378,8 @@ const defaultState: AppViewState = {
   slots: [defaultSlot(initialLanguage), defaultSlot(initialLanguage)],
   mode: 'compat',
   losslessFormat: null,
+  conflictStrategy: 'skip',
+  filenameRule: 'title_artist',
   lang: initialLanguage,
   theme: initialTheme,
 };
@@ -324,6 +412,9 @@ const defaultServices: AppServices = {
   chooseMode: (mode) => invoke<DesktopState>('choose_mode', { mode }),
   chooseLosslessFormat: (format) =>
     invoke<DesktopState>('choose_lossless_format', { format }),
+  chooseConflictStrategy: (strategy) =>
+    invoke<DesktopState>('choose_conflict_strategy', { strategy }),
+  chooseFilenameRule: (rule) => invoke<DesktopState>('choose_filename_rule', { rule }),
   previewAllSync: () => invoke<AppPreview[]>('preview_all_sync'),
   startConfirmedSync: (previews, retryOf = null) =>
     invoke<DesktopState>('start_confirmed_sync', { previews, retryOf }),
@@ -331,8 +422,13 @@ const defaultServices: AppServices = {
   retryHistoryFailures: (id) => invoke<AppPreview>('retry_history_failures', { id }),
   exportHistoryErrorReport: (id, path) =>
     invoke<void>('export_history_error_report', { id, path }),
+  deleteHistoryEntry: (id) => invoke<void>('delete_history_entry_command', { id }),
+  clearHistory: () => invoke<void>('clear_history_command'),
+  loadAppInfo: () => invoke<AppInfo>('app_info'),
   startAllSync: () => invoke<DesktopState>('start_all_sync'),
   pauseAllSync: () => invoke<DesktopState>('pause_all_sync'),
+  cancelSync: (slotIndex) => invoke<DesktopState>('cancel_sync', { slotIndex }),
+  cancelAllSync: () => invoke<DesktopState>('cancel_all_sync'),
 };
 
 export function renderApp(
@@ -343,6 +439,7 @@ export function renderApp(
   history: AppHistoryEntry[] = [],
   pendingSelection: PendingSelection = null,
   previewBusy = false,
+  aboutInfo: AppInfo | null = null,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -353,6 +450,7 @@ export function renderApp(
     root.dataset.selectionMotion = selectionMotion;
   }
   const isRunning = state.slots.some((slot) => slot.status === 'running');
+  const hasCancelled = state.slots.some((slot) => slot.status === 'cancelled');
   const configuredTasks = state.slots.filter((slot) => slot.sourceDirectory.trim()).length;
   const completedTracks = state.slots.reduce((total, slot) => total + slot.progressCompleted, 0);
   const newTracks = state.slots.reduce((total, slot) => total + slot.newTracks, 0);
@@ -365,6 +463,7 @@ export function renderApp(
         <h1>${t('title', state.lang)}</h1>
       </div>
       <div class="topbar-actions">
+        <button type="button" class="lang-button" data-action="open-about">${t('about', state.lang)}</button>
         <button type="button" class="theme-button" data-action="toggle-theme" aria-label="${
           state.theme === 'light' ? t('darkTheme', state.lang) : t('lightTheme', state.lang)
         }" title="${state.theme === 'light' ? t('darkTheme', state.lang) : t('lightTheme', state.lang)}">
@@ -393,6 +492,7 @@ export function renderApp(
             </button>
           </div>
           ${renderLosslessFormats(state, pendingSelection)}
+          ${renderOutputSettings(state)}
           <div class="rail-lower">
             <div class="rail-note">
               <p>${t('compatNote', state.lang)}</p>
@@ -409,12 +509,15 @@ export function renderApp(
               </dl>
             </section>
           </div>
-          <button type="button" class="global-action" data-action="${isRunning ? 'pause-all' : 'start-all'}" ${
-            configuredTasks === 0 || pendingAction !== null ? 'disabled' : ''
-          } aria-busy="${pendingAction !== null}">
-            ${isRunning ? icon('pause') : icon('play')}
-            ${isRunning ? t('pauseAll', state.lang) : t('startAll', state.lang)}
-          </button>
+          <div class="global-action-group">
+            <button type="button" class="global-action" data-action="${isRunning ? 'pause-all' : 'start-all'}" ${
+              configuredTasks === 0 || pendingAction !== null ? 'disabled' : ''
+            } aria-busy="${pendingAction !== null}">
+              ${isRunning ? icon('pause') : icon('play')}
+              ${isRunning ? t('pauseAll', state.lang) : hasCancelled ? t('resumeTasks', state.lang) : t('startAll', state.lang)}
+            </button>
+            ${isRunning ? `<button type="button" class="secondary-action cancel-all" data-action="cancel-all">${t('cancelTask', state.lang)}</button>` : ''}
+          </div>
         </div>
       </aside>
 
@@ -430,6 +533,7 @@ export function renderApp(
     </section>
     ${renderHistory(history, state.lang)}
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
+    ${renderAboutModal(aboutInfo, state.lang)}
   `;
 
   state.slots.forEach((slot, slotIndex) => {
@@ -455,7 +559,10 @@ function renderPreviewModal(
     (total, item) => total + item.preview.candidates.length,
     0,
   );
-  const canConfirm = processableCount > 0 || previewHasRetryErrors(modal);
+  const hasEnoughSpace = modal.previews.every(
+    (item) => item.preview.disk_space_sufficient !== false,
+  );
+  const canConfirm = hasEnoughSpace && (processableCount > 0 || previewHasRetryErrors(modal));
   return `
     <div class="preview-modal" data-role="preview-modal" role="dialog" aria-modal="true" aria-label="${t('previewTitle', lang)}">
       <div class="preview-dialog">
@@ -508,7 +615,9 @@ function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
       <div class="preview-paths">
         <p><span>${t('sourcePath', lang)}</span>${escapeHtml(preview.source_directory)}</p>
         <p><span>${t('destinationPath', lang)}</span>${escapeHtml(preview.destination_directory)}</p>
+        ${preview.available_space_bytes == null ? '' : `<p><span>${t('availableSpace', lang)}</span>${formatBytes(preview.available_space_bytes, lang)}</p>`}
       </div>
+      ${preview.disk_space_sufficient === false ? `<p class="disk-space-error">${t('insufficientSpace', lang)}</p>` : ''}
       ${issues ? `<ul class="preview-errors">${issues}</ul>` : ''}
     </article>
   `;
@@ -526,7 +635,10 @@ function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage): string {
           <p class="panel-kicker">W4DJ RKB</p>
           <h2>${t('history', lang)}</h2>
         </div>
-        <span class="history-count">${entries.length}</span>
+        <div class="history-head-actions">
+          <span class="history-count">${entries.length}</span>
+          ${entries.length > 0 ? `<button type="button" class="secondary-action history-clear" data-action="clear-history">${t('clearHistory', lang)}</button>` : ''}
+        </div>
       </header>
       ${entries.length === 0
         ? `<p class="history-empty">${t('noHistory', lang)}</p>`
@@ -536,8 +648,9 @@ function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage): string {
 }
 
 function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
+  const pendingFiles = entry.pending_files || [];
   const failures = entry.failed_files
-    .map((failedFile) => `<li><strong>${escapeHtml(failedFile.name)}</strong>：${escapeHtml(failedFile.message)}</li>`)
+    .map((failedFile) => `<li><strong>${escapeHtml(failedFile.name)}</strong><span class="failure-category">${t('errorCategory', lang)}：${errorCategoryLabel(failedFile.category, lang)}</span><span>${escapeHtml(failedFile.message)}</span></li>`)
     .join('');
   return `
     <article class="history-entry" data-history-id="${escapeHtml(entry.id)}">
@@ -546,13 +659,14 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
           <strong>${escapeHtml(entry.started_at)}</strong>
           <span class="history-status" data-history-status="${entry.status}">${historyStatusLabel(entry.status, lang)}</span>
         </div>
-        <span>${entry.completed_count}/${entry.new_count} · ${entry.failed_count} ${t('failedCount', lang)}</span>
+        <span>${entry.completed_count}/${entry.new_count} · ${entry.failed_count} ${t('failedCount', lang)}${pendingFiles.length > 0 ? ` · ${pendingFiles.length} ${t('pendingCount', lang)}` : ''}</span>
       </header>
       <p class="history-output">${escapeHtml(entry.destination_directory)}</p>
       ${failures ? `<details class="history-failures"><summary>${entry.failed_count} ${t('failedCount', lang)}</summary><ul>${failures}</ul></details>` : ''}
       <footer class="history-entry-actions">
-        ${entry.failed_count > 0 ? `<button type="button" class="secondary-action" data-action="retry-history" data-history-id="${escapeHtml(entry.id)}">${t('retryFailures', lang)}</button>` : ''}
+        ${entry.failed_count > 0 || pendingFiles.length > 0 ? `<button type="button" class="secondary-action" data-action="retry-history" data-history-id="${escapeHtml(entry.id)}">${pendingFiles.length > 0 ? t('resumeTasks', lang) : t('retryFailures', lang)}</button>` : ''}
         ${entry.failed_count > 0 ? `<button type="button" class="secondary-action" data-action="export-history" data-history-id="${escapeHtml(entry.id)}">${t('exportReport', lang)}</button>` : ''}
+        <button type="button" class="secondary-action history-delete" data-action="delete-history" data-history-id="${escapeHtml(entry.id)}">${t('deleteHistory', lang)}</button>
       </footer>
     </article>
   `;
@@ -570,7 +684,10 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
         <div>
           <h2>${t('syncSlot', state.lang)} ${slotNumber}</h2>
         </div>
-        <span class="slot-status" data-status="${slot.status}">${statusLabel(slot.status, state.lang)}</span>
+        <div class="slot-head-actions">
+          <span class="slot-status" data-status="${slot.status}">${statusLabel(slot.status, state.lang)}</span>
+          ${slot.status === 'running' ? `<button type="button" class="secondary-action slot-cancel" data-action="cancel-slot" data-slot="${slotIndex}">${t('cancelTask', state.lang)}</button>` : ''}
+        </div>
       </header>
 
       <div class="path-flow">
@@ -635,6 +752,7 @@ export function bindApp(
   let previewModal: AppPreviewModalState | null = null;
   let previewBusy = false;
   let history: AppHistoryEntry[] = [];
+  let aboutInfo: AppInfo | null = null;
 
   const render = () => {
     root.replaceChildren(
@@ -646,6 +764,7 @@ export function bindApp(
         history,
         pendingSelection,
         previewBusy,
+        aboutInfo,
       ),
     );
   };
@@ -762,8 +881,13 @@ export function bindApp(
     if (!previewModal) {
       return;
     }
-    const canConfirm = previewModal.previews.some((item) => item.preview.candidates.length > 0)
-      || previewHasRetryErrors(previewModal);
+    const hasEnoughSpace = previewModal.previews.every(
+      (item) => item.preview.disk_space_sufficient !== false,
+    );
+    const canConfirm = hasEnoughSpace && (
+      previewModal.previews.some((item) => item.preview.candidates.length > 0)
+      || previewHasRetryErrors(previewModal)
+    );
     if (!canConfirm) {
       return;
     }
@@ -807,6 +931,37 @@ export function bindApp(
       if (typeof path === 'string') {
         await services.exportHistoryErrorReport(id, path);
       }
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const deleteHistory = async (id: string) => {
+    try {
+      await services.deleteHistoryEntry(id);
+      await refreshHistory();
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const clearAllHistory = async () => {
+    const message = state.lang === 'zh' ? '确定清空全部转换历史吗？' : 'Clear all conversion history?';
+    if (!window.confirm(message)) {
+      return;
+    }
+    try {
+      await services.clearHistory();
+      await refreshHistory();
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const openAbout = async () => {
+    try {
+      aboutInfo = await services.loadAppInfo();
+      render();
     } catch (error) {
       reportError(error);
     }
@@ -881,6 +1036,17 @@ export function bindApp(
       return;
     }
 
+    if (action === 'open-about') {
+      void openAbout();
+      return;
+    }
+
+    if (action === 'close-about') {
+      aboutInfo = null;
+      render();
+      return;
+    }
+
     if (action === 'toggle-log' && slotIndex !== null) {
       const slots: [AppSyncSlotViewState, AppSyncSlotViewState] = [
         { ...state.slots[0] },
@@ -921,6 +1087,29 @@ export function bindApp(
       return;
     }
 
+    if (action === 'delete-history') {
+      const historyId = button.dataset.historyId;
+      if (historyId) {
+        void deleteHistory(historyId);
+      }
+      return;
+    }
+
+    if (action === 'clear-history') {
+      void clearAllHistory();
+      return;
+    }
+
+    if (action === 'cancel-slot' && slotIndex !== null) {
+      void runAction(() => services.cancelSync(slotIndex), slotIndex);
+      return;
+    }
+
+    if (action === 'cancel-all') {
+      void runAction(() => services.cancelAllSync(), 'all');
+      return;
+    }
+
     if (action === 'pick-source' && slotIndex !== null) {
       void runAction(async () => {
         const path = await services.pickDirectory('source', slotIndex);
@@ -958,6 +1147,28 @@ export function bindApp(
 
     if (action === 'pause-all') {
       void runAction(() => services.pauseAllSync(), 'all', 'pause-all');
+    }
+  });
+
+  root.addEventListener('change', (event) => {
+    const select = (event.target as HTMLElement | null)?.closest<HTMLSelectElement>('select');
+    if (!select) {
+      return;
+    }
+
+    if (select.dataset.action === 'choose-conflict') {
+      const strategy = select.value as AppConflictStrategy;
+      if (strategy !== state.conflictStrategy) {
+        void runAction(() => services.chooseConflictStrategy(strategy), 'all');
+      }
+      return;
+    }
+
+    if (select.dataset.action === 'choose-filename-rule') {
+      const rule = select.value as AppFilenameRule;
+      if (rule !== state.filenameRule) {
+        void runAction(() => services.chooseFilenameRule(rule), 'all');
+      }
     }
   });
 
@@ -1094,6 +1305,54 @@ function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSel
   `;
 }
 
+function renderOutputSettings(state: AppViewState): string {
+  return `
+    <section class="output-settings" aria-label="${t('conflictStrategy', state.lang)}">
+      <label>
+        <span>${t('conflictStrategy', state.lang)}</span>
+        <select data-action="choose-conflict" aria-label="${t('conflictStrategy', state.lang)}">
+          <option value="skip" ${state.conflictStrategy === 'skip' ? 'selected' : ''}>${t('conflictSkip', state.lang)}</option>
+          <option value="overwrite" ${state.conflictStrategy === 'overwrite' ? 'selected' : ''}>${t('conflictOverwrite', state.lang)}</option>
+          <option value="rename" ${state.conflictStrategy === 'rename' ? 'selected' : ''}>${t('conflictRename', state.lang)}</option>
+          <option value="update_metadata" ${state.conflictStrategy === 'update_metadata' ? 'selected' : ''}>${t('conflictMetadata', state.lang)}</option>
+        </select>
+      </label>
+      <label>
+        <span>${t('filenameRule', state.lang)}</span>
+        <select data-action="choose-filename-rule" aria-label="${t('filenameRule', state.lang)}">
+          <option value="title_artist" ${state.filenameRule === 'title_artist' ? 'selected' : ''}>${t('titleArtist', state.lang)}</option>
+          <option value="artist_title" ${state.filenameRule === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
+          <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
+        </select>
+      </label>
+    </section>
+  `;
+}
+
+function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
+  if (!info) {
+    return '';
+  }
+
+  return `
+    <div class="about-modal" data-role="about-modal" role="dialog" aria-modal="true" aria-label="${t('about', lang)}">
+      <section class="about-dialog">
+        <p class="panel-kicker">W4DJ RKB</p>
+        <h2>${t('about', lang)}</h2>
+        <dl>
+          <div><dt>${t('version', lang)}</dt><dd>v${escapeHtml(info.version)}</dd></div>
+          <div><dt>${t('developer', lang)}</dt><dd>${escapeHtml(info.developer)}</dd></div>
+        </dl>
+        <div class="about-links">
+          <a href="${escapeHtml(info.project_url)}" target="_blank" rel="noreferrer">${t('projectHome', lang)}</a>
+          <a href="${escapeHtml(info.support_url)}" target="_blank" rel="noreferrer">${t('supportProject', lang)}</a>
+        </div>
+        <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>
+      </section>
+    </div>
+  `;
+}
+
 function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): AppViewState {
   return {
     slots: state.slots.map((slot) => ({
@@ -1112,6 +1371,8 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
     })) as [AppSyncSlotViewState, AppSyncSlotViewState],
     mode: state.mode,
     losslessFormat: state.lossless_format,
+    conflictStrategy: state.conflict_strategy,
+    filenameRule: state.filename_rule,
     lang,
     theme,
   };
@@ -1147,6 +1408,19 @@ function historyStatusLabel(status: AppHistoryStatus, lang: AppLanguage): string
   return labels[status][lang];
 }
 
+function errorCategoryLabel(category: AppErrorCategory, lang: AppLanguage): string {
+  const labels: Record<AppErrorCategory, { zh: string; en: string }> = {
+    file_damaged: { zh: '文件损坏或无法读取', en: 'Damaged or unreadable file' },
+    unsupported_format: { zh: '格式不支持', en: 'Unsupported format' },
+    ffmpeg: { zh: 'FFmpeg 转换失败', en: 'FFmpeg failure' },
+    output_permission: { zh: '输出目录无权限', en: 'Output permission denied' },
+    disk_space: { zh: '磁盘空间不足', en: 'Insufficient disk space' },
+    invalid_filename: { zh: '文件名非法', en: 'Invalid filename' },
+    unknown: { zh: '其他错误', en: 'Other error' },
+  };
+  return labels[category]?.[lang] || labels.unknown[lang];
+}
+
 function modeLabel(mode: AppMode, lang: AppLanguage): string {
   return mode === 'compat' ? t('compatMode', lang) : t('losslessMode', lang);
 }
@@ -1169,7 +1443,7 @@ function formatBytes(bytes: number | null, lang: AppLanguage): string {
 }
 
 function aggregateStatus(state: AppViewState): AppStatus {
-  const priority: AppStatus[] = ['error', 'running', 'paused', 'completed', 'idle'];
+  const priority: AppStatus[] = ['error', 'running', 'paused', 'cancelled', 'completed', 'idle'];
   return priority.find((status) => state.slots.some((slot) => slot.status === status)) || 'idle';
 }
 

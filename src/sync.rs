@@ -1,4 +1,4 @@
-use crate::config::{LosslessFormat, Mode};
+use crate::config::{FilenameRule, LosslessFormat, Mode};
 use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
@@ -204,7 +204,18 @@ pub struct MusicScanIssue {
 pub fn get_music_dict_with_scan_issues(
     folder: &str,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
-    collect_music_dict_with_scan_issues(folder, &["mp3", "flac", "ncm", "wav", "aiff"])
+    get_music_dict_with_scan_issues_with_rule(folder, FilenameRule::default())
+}
+
+pub fn get_music_dict_with_scan_issues_with_rule(
+    folder: &str,
+    filename_rule: FilenameRule,
+) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
+    collect_music_dict_with_scan_issues(
+        folder,
+        &["mp3", "flac", "ncm", "wav", "aiff"],
+        filename_rule,
+    )
 }
 
 pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
@@ -212,7 +223,14 @@ pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
 }
 
 pub fn get_destination_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
-    collect_music_dict_with_scan_issues(folder, &["mp3", "wav", "aiff"]).0
+    get_destination_music_dict_with_rule(folder, FilenameRule::default())
+}
+
+pub fn get_destination_music_dict_with_rule(
+    folder: &str,
+    filename_rule: FilenameRule,
+) -> HashMap<String, (String, PathBuf)> {
+    collect_music_dict_with_scan_issues(folder, &["mp3", "wav", "aiff"], filename_rule).0
 }
 
 pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
@@ -222,12 +240,11 @@ pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if is_temporary_artifact(&path) {
-            if let Err(error) = fs::remove_file(&path) {
-                if error.kind() != io::ErrorKind::NotFound {
-                    return Err(error);
-                }
-            }
+        if is_temporary_artifact(&path)
+            && let Err(error) = fs::remove_file(&path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error);
         }
     }
 
@@ -237,6 +254,7 @@ pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
 fn collect_music_dict_with_scan_issues(
     folder: &str,
     allowed_extensions: &[&str],
+    filename_rule: FilenameRule,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let mut music_dict = HashMap::new();
     let mut scan_issues = Vec::new();
@@ -266,7 +284,7 @@ fn collect_music_dict_with_scan_issues(
         }
 
         let path = entry.path().to_path_buf();
-        let song_name = derive_song_name(entry.path());
+        let song_name = derive_song_name_with_rule(entry.path(), filename_rule);
         let size = entry
             .metadata()
             .map(|m| m.len().to_string())
@@ -487,6 +505,70 @@ pub fn sync_music_library_with_observer(
         snapshot.completed, snapshot.total, failed_files
     ));
     Ok(snapshot)
+}
+
+#[allow(dead_code)]
+pub fn update_existing_metadata(source_path: &Path, destination_path: &Path) -> io::Result<()> {
+    let source_extension = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let source_tag = match source_extension.as_str() {
+        "flac" => {
+            let tag = metaflac::Tag::read_from_path(source_path).map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("无法读取 FLAC 元数据：{error}"),
+                )
+            })?;
+            build_id3_tag_from_flac(&tag)
+        }
+        "ncm" => {
+            let file = File::open(source_path)?;
+            let mut ncm = Ncmdump::from_reader(file).map_err(|error| {
+                Error::new(ErrorKind::InvalidData, format!("NCM 解析错误：{error}"))
+            })?;
+            let info = ncm.get_info().map_err(|error| {
+                Error::new(ErrorKind::InvalidData, format!("NCM 元数据错误：{error}"))
+            })?;
+            let image = ncm.get_image().map_err(|error| {
+                Error::new(ErrorKind::InvalidData, format!("NCM 封面读取错误：{error}"))
+            })?;
+            build_id3_tag(&info, &image)
+        }
+        _ => id3::Tag::read_from_path(source_path).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("无法读取源文件元数据：{error}"),
+            )
+        })?,
+    };
+
+    let destination_extension = destination_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    #[allow(deprecated)]
+    let result = match destination_extension.as_str() {
+        "wav" => source_tag.write_to_wav_path(destination_path, Version::Id3v24),
+        "aiff" | "aif" => source_tag.write_to_aiff_path(destination_path, Version::Id3v24),
+        "mp3" => source_tag.write_to_path(destination_path, Version::Id3v24),
+        _ => {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                format!("不支持更新此输出格式的元数据：{destination_extension}"),
+            ));
+        }
+    };
+    result.map_err(|error| {
+        Error::other(format!(
+            "无法更新输出文件元数据 {}：{}",
+            destination_path.display(),
+            error
+        ))
+    })
 }
 
 fn process_music_file(
@@ -966,12 +1048,21 @@ fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
+#[allow(dead_code)]
 fn derive_song_name(path: &Path) -> String {
+    derive_song_name_with_rule(path, FilenameRule::default())
+}
+
+fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> String {
     let fallback_name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_string();
+
+    if matches!(filename_rule, FilenameRule::Original) {
+        return sanitize_filename_component(&fallback_name);
+    }
 
     let extension = path
         .extension()
@@ -980,33 +1071,35 @@ fn derive_song_name(path: &Path) -> String {
         .to_lowercase();
 
     let candidate = match extension.as_str() {
-        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path),
-        "flac" => song_name_from_flac(path),
-        "ncm" => song_name_from_ncm(path),
+        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path, filename_rule),
+        "flac" => song_name_from_flac(path, filename_rule),
+        "ncm" => song_name_from_ncm(path, filename_rule),
         _ => None,
     };
 
     candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name))
 }
 
-fn song_name_from_flac(path: &Path) -> Option<String> {
+fn song_name_from_flac(path: &Path, filename_rule: FilenameRule) -> Option<String> {
     let tag = metaflac::Tag::read_from_path(path).ok()?;
     let id3_tag = build_id3_tag_from_flac(&tag);
-    build_song_name(
+    build_song_name_with_rule(
         id3_tag.title().unwrap_or_default(),
         id3_tag.artist().unwrap_or_default(),
+        filename_rule,
     )
 }
 
-fn song_name_from_audio_tag(path: &Path) -> Option<String> {
+fn song_name_from_audio_tag(path: &Path, filename_rule: FilenameRule) -> Option<String> {
     let tag = id3::Tag::read_from_path(path).ok()?;
-    build_song_name(
+    build_song_name_with_rule(
         tag.title().unwrap_or_default(),
         tag.artist().unwrap_or_default(),
+        filename_rule,
     )
 }
 
-fn song_name_from_ncm(path: &Path) -> Option<String> {
+fn song_name_from_ncm(path: &Path, filename_rule: FilenameRule) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut ncm = Ncmdump::from_reader(file).ok()?;
     let info = ncm.get_info().ok()?;
@@ -1016,10 +1109,18 @@ fn song_name_from_ncm(path: &Path) -> Option<String> {
         .map(|item| item.0.as_str())
         .collect::<Vec<&str>>()
         .join(", ");
-    build_song_name(&info.name, &artist)
+    build_song_name_with_rule(&info.name, &artist, filename_rule)
 }
 
 fn build_song_name(title: &str, artist: &str) -> Option<String> {
+    build_song_name_with_rule(title, artist, FilenameRule::default())
+}
+
+fn build_song_name_with_rule(
+    title: &str,
+    artist: &str,
+    filename_rule: FilenameRule,
+) -> Option<String> {
     let title = sanitize_filename_component(&normalize_display_text(title));
     let artist = sanitize_filename_component(&normalize_display_text(artist));
 
@@ -1027,7 +1128,12 @@ fn build_song_name(title: &str, artist: &str) -> Option<String> {
         (true, true) => None,
         (false, true) => Some(title),
         (true, false) => Some(artist),
-        (false, false) => Some(format!("{} - {}", title, artist)),
+        (false, false) => match filename_rule {
+            FilenameRule::TitleArtist | FilenameRule::Original => {
+                Some(format!("{} - {}", title, artist))
+            }
+            FilenameRule::ArtistTitle => Some(format!("{} - {}", artist, title)),
+        },
     }
 }
 
@@ -1369,7 +1475,7 @@ fn sanitize_filename_component(value: &str) -> String {
         return String::new();
     }
 
-    trimmed
+    let cleaned = trimmed
         .chars()
         .map(|ch| match ch {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
@@ -1379,7 +1485,46 @@ fn sanitize_filename_component(value: &str) -> String {
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<&str>>()
-        .join(" ")
+        .join(" ");
+    let cleaned = cleaned.trim_end_matches([' ', '.']).to_string();
+    let cleaned = if cleaned.is_empty() {
+        String::from("未命名")
+    } else {
+        cleaned
+    };
+    let stem = cleaned.split('.').next().unwrap_or_default();
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    let cleaned = if reserved {
+        format!("_{cleaned}")
+    } else {
+        cleaned
+    };
+
+    cleaned.chars().take(180).collect()
 }
 
 fn write_container_tags(
@@ -1425,10 +1570,10 @@ fn write_container_tags_from_flac_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_song_name, compare_music_dicts, derive_song_name, ensure_generated_output,
-        find_ffmpeg_next_to_exe, sanitize_filename_component,
+        build_song_name, build_song_name_with_rule, compare_music_dicts, derive_song_name,
+        ensure_generated_output, find_ffmpeg_next_to_exe, sanitize_filename_component,
     };
-    use crate::config::{LosslessFormat, Mode};
+    use crate::config::{FilenameRule, LosslessFormat, Mode};
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1450,6 +1595,20 @@ mod tests {
     #[test]
     fn sanitizes_invalid_filename_characters() {
         assert_eq!(sanitize_filename_component("A/B:C*D?"), "A-B-C-D-");
+        assert_eq!(sanitize_filename_component("CON"), "_CON");
+        assert_eq!(sanitize_filename_component("Track..."), "Track");
+    }
+
+    #[test]
+    fn filename_rule_defaults_to_title_artist_and_can_be_reversed() {
+        assert_eq!(
+            build_song_name_with_rule("Title", "Artist", FilenameRule::TitleArtist).as_deref(),
+            Some("Title - Artist")
+        );
+        assert_eq!(
+            build_song_name_with_rule("Title", "Artist", FilenameRule::ArtistTitle).as_deref(),
+            Some("Artist - Title")
+        );
     }
 
     #[test]

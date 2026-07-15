@@ -30,7 +30,7 @@ fn pause_requests_wait_for_current_file() {
 
     assert!(matches!(
         controller.state().slots[0].status,
-        DesktopStatus::Paused
+        DesktopStatus::Running
     ));
     assert!(controller.pause_after_current_file(0).unwrap());
     assert_eq!(controller.state().slots[0].progress_total, 3);
@@ -114,7 +114,7 @@ fn global_start_targets_only_configured_idle_slots() {
 }
 
 #[test]
-fn pausing_all_running_slots_leaves_idle_slots_unchanged() {
+fn pause_request_keeps_slot_running_until_the_worker_stops() {
     let mut controller = test_controller();
     controller.start_sync(0, 3).unwrap();
 
@@ -122,11 +122,29 @@ fn pausing_all_running_slots_leaves_idle_slots_unchanged() {
 
     assert!(matches!(
         controller.state().slots[0].status,
-        DesktopStatus::Paused
+        DesktopStatus::Running
     ));
+    assert!(controller.pause_after_current_file(0).unwrap());
     assert!(matches!(
         controller.state().slots[1].status,
         DesktopStatus::Idle
+    ));
+}
+
+#[test]
+fn cancelling_a_running_slot_stops_new_files_and_finishes_as_cancelled() {
+    let mut controller = test_controller();
+    controller.start_sync(0, 3).unwrap();
+
+    controller.cancel_sync(0).unwrap();
+    let task = controller.task_controller(0).unwrap();
+    assert!(task.is_cancelled());
+    assert!(!task.should_start_next_file());
+
+    controller.finish_sync(0, task.snapshot()).unwrap();
+    assert!(matches!(
+        controller.state().slots[0].status,
+        DesktopStatus::Cancelled
     ));
 }
 
@@ -147,11 +165,12 @@ fn preflight_counts_keep_their_meaning_during_conversion() {
     let mut controller = test_controller();
     controller.start_confirmed_sync(0, 3).unwrap();
     controller
-        .set_preflight_summary(0, 3, 2, 1, Some(1024))
+        .set_preflight_summary(0, 3, 2, 2, 1, Some(1024))
         .unwrap();
 
     assert_eq!(controller.state().slots[0].new_tracks, 3);
     assert_eq!(controller.state().slots[0].progress_completed, 0);
+    assert_eq!(controller.state().slots[0].existing_tracks, 2);
     assert_eq!(controller.state().slots[0].skipped_tracks, 2);
     assert_eq!(controller.state().slots[0].error_tracks, 1);
 
@@ -179,6 +198,19 @@ fn preflight_counts_keep_their_meaning_during_conversion() {
 }
 
 #[test]
+fn existing_and_skipped_counts_remain_independent_for_overwrite_plans() {
+    let mut controller = test_controller();
+    controller.start_confirmed_sync(0, 3).unwrap();
+    controller
+        .set_preflight_summary(0, 3, 2, 0, 0, Some(1024))
+        .unwrap();
+
+    assert_eq!(controller.state().slots[0].new_tracks, 3);
+    assert_eq!(controller.state().slots[0].existing_tracks, 2);
+    assert_eq!(controller.state().slots[0].skipped_tracks, 0);
+}
+
+#[test]
 fn failed_result_is_available_for_retry_without_increasing_completed_count() {
     let mut controller = test_controller();
     controller.start_confirmed_sync(0, 1).unwrap();
@@ -191,6 +223,7 @@ fn failed_result_is_available_for_retry_without_increasing_completed_count() {
                 source_path: "/in/song.flac".into(),
                 destination_path: "/out/song.mp3".into(),
                 message: "conversion failed".into(),
+                category: Default::default(),
             },
             snapshot,
         )
@@ -208,5 +241,6 @@ fn test_controller() -> DesktopController {
         ],
         mode: Mode::Compat,
         lossless_format: None,
+        ..AppPreferences::default()
     }))
 }

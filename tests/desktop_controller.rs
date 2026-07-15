@@ -11,6 +11,7 @@ fn desktop_controller_starts_in_idle_state_with_saved_values() {
         ],
         mode: Mode::Lossless,
         lossless_format: Some(LosslessFormat::Aiff),
+        ..AppPreferences::default()
     };
 
     let controller = DesktopController::new(DesktopState::from_preferences(preferences));

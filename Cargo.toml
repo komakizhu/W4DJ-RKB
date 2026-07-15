@@ -1,6 +1,6 @@
 [package]
 name = "w4dj"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 
 [dependencies]
@@ -17,6 +17,7 @@ which = "8.0.0"
 metaflac = "0.2.8"
 id3 = "1.16.3"
 anyhow = "1.0.98"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10.1"

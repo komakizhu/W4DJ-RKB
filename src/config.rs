@@ -14,6 +14,34 @@ pub enum LosslessFormat {
     Aiff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictStrategy {
+    #[default]
+    Skip,
+    Overwrite,
+    Rename,
+    UpdateMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FilenameRule {
+    #[default]
+    TitleArtist,
+    ArtistTitle,
+    Original,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum CandidateOperation {
+    #[default]
+    Convert,
+    UpdateMetadata,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub source: String,
@@ -21,12 +49,16 @@ pub struct Config {
     pub mode: Mode,
     #[serde(default)]
     pub lossless_format: Option<LosslessFormat>,
+    #[serde(default)]
+    pub conflict_strategy: ConflictStrategy,
+    #[serde(default)]
+    pub filename_rule: FilenameRule,
 }
 
 #[derive(clap::Parser)]
 #[command(
     name = "w4dj",
-    version = "2.1.0",
+    version = "2.2.0",
     author = "slipstream",
     about = "网易云音乐曲库同步器"
 )]

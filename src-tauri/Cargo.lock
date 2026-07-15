@@ -4015,12 +4015,13 @@ dependencies = [
 
 [[package]]
 name = "w4dj"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "id3",
  "indicatif",
+ "libc",
  "metaflac",
  "ncmdump",
  "rayon",
@@ -4034,7 +4035,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj-desktop"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "libc",
  "serde",

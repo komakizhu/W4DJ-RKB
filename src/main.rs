@@ -43,6 +43,7 @@ fn main() -> Result<(), Error> {
         destination,
         mode,
         lossless_format,
+        ..
     } = config;
 
     println!(
@@ -56,6 +57,8 @@ fn main() -> Result<(), Error> {
             destination: destination.clone(),
             mode,
             lossless_format,
+            conflict_strategy: Default::default(),
+            filename_rule: Default::default(),
         });
         println!("GUI shell launched: {}", shell.status_summary());
         return Ok(());

@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::tempdir;
-use w4dj::config::{LosslessFormat, Mode};
+use w4dj::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
 use w4dj::preferences::{AppPreferences, SyncSlotPreferences, load_preferences, save_preferences};
 
 #[test]
@@ -15,6 +15,8 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         ],
         mode: Mode::Compat,
         lossless_format: Some(LosslessFormat::Aiff),
+        conflict_strategy: ConflictStrategy::Rename,
+        filename_rule: FilenameRule::ArtistTitle,
     };
 
     save_preferences(&path, &preferences).unwrap();
@@ -26,6 +28,8 @@ fn preferences_roundtrip_persists_both_sync_slots() {
     assert_eq!(loaded.slots[1].destination_directory, "");
     assert!(matches!(loaded.mode, Mode::Compat));
     assert!(matches!(loaded.lossless_format, Some(LosslessFormat::Aiff)));
+    assert_eq!(loaded.conflict_strategy, ConflictStrategy::Rename);
+    assert_eq!(loaded.filename_rule, FilenameRule::ArtistTitle);
 }
 
 #[test]

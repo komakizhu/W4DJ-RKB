@@ -42,6 +42,8 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   ],
   mode: 'compat',
   lossless_format: null,
+  conflict_strategy: 'skip',
+  filename_rule: 'title_artist',
   ...overrides,
 });
 
@@ -82,6 +84,8 @@ const makeViewState = (overrides: Partial<AppViewState> = {}): AppViewState => (
   ],
   mode: 'compat',
   losslessFormat: null,
+  conflictStrategy: 'skip',
+  filenameRule: 'title_artist',
   lang: 'zh',
   theme: 'light',
   ...overrides,
@@ -105,6 +109,8 @@ const makePreview = (slotIndex: 0 | 1 = 0): AppPreview => ({
   slot_index: slotIndex,
   mode: 'compat',
   lossless_format: null,
+  conflict_strategy: 'skip',
+  filename_rule: 'title_artist',
   retry_of: null,
   preview: {
     source_directory: `/music/in-${slotIndex + 1}`,
@@ -121,11 +127,14 @@ const makePreview = (slotIndex: 0 | 1 = 0): AppPreview => ({
         destination_path: `/music/out-${slotIndex + 1}/Song.mp3`,
         source_size_bytes: 1024,
         estimated_output_bytes: 1024,
+        operation: 'convert',
       },
     ],
     skipped: [],
     errors: [],
     warnings: [],
+    available_space_bytes: 10_000,
+    disk_space_sufficient: true,
   },
 });
 
@@ -154,10 +163,14 @@ const makeHistoryEntry = (overrides: Partial<AppHistoryEntry> = {}): AppHistoryE
       source_path: '/music/in-1/Song.flac',
       destination_path: '/music/out-1/Song.mp3',
       message: 'FFmpeg failed',
+      category: 'ffmpeg',
     },
   ],
+  pending_files: [],
   status: 'partial',
   retry_of: null,
+  conflict_strategy: 'skip',
+  filename_rule: 'title_artist',
   ...overrides,
 });
 
@@ -168,6 +181,8 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   selectDestinationDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseLosslessFormat: vi.fn().mockResolvedValue(makeDesktopState()),
+  chooseConflictStrategy: vi.fn().mockResolvedValue(makeDesktopState()),
+  chooseFilenameRule: vi.fn().mockResolvedValue(makeDesktopState()),
   previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
   startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
     slots: [
@@ -178,6 +193,14 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   loadHistory: vi.fn().mockResolvedValue([]),
   retryHistoryFailures: vi.fn().mockResolvedValue(makePreview(0)),
   exportHistoryErrorReport: vi.fn().mockResolvedValue(undefined),
+  deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
+  clearHistory: vi.fn().mockResolvedValue(undefined),
+  loadAppInfo: vi.fn().mockResolvedValue({
+    version: '2.2.0',
+    developer: 'KOMAKI / komakizhu',
+    project_url: 'https://github.com/komakizhu/W4DJ-RKB',
+    support_url: 'https://www.buymeacoffee.com/',
+  }),
   startAllSync: vi
     .fn()
     .mockResolvedValue(makeDesktopState({
@@ -192,6 +215,8 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
       makeDesktopSlot({ status: 'paused' }),
     ],
   })),
+  cancelSync: vi.fn().mockResolvedValue(makeDesktopState()),
+  cancelAllSync: vi.fn().mockResolvedValue(makeDesktopState()),
   ...overrides,
 });
 
@@ -294,6 +319,54 @@ describe('renderApp', () => {
     expect(root.querySelector('.format-slot')).not.toBeNull();
     expect(root.querySelector('[data-format="wav"]')?.classList.contains('selected')).toBe(true);
     expect(root.querySelector('[data-format="aiff"]')?.classList.contains('selected')).toBe(false);
+  });
+
+  it('renders conflict and filename settings with safe defaults', () => {
+    const root = renderApp(makeViewState());
+
+    expect((root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement).value)
+      .toBe('skip');
+    expect((root.querySelector('[data-action="choose-filename-rule"]') as HTMLSelectElement).value)
+      .toBe('title_artist');
+  });
+
+  it('blocks confirmation when the destination disk is too full', () => {
+    const preview = makePreview(0);
+    preview.preview.disk_space_sufficient = false;
+    preview.preview.available_space_bytes = 64;
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      { previews: [preview], retryOf: null },
+    );
+
+    expect((root.querySelector('[data-action="confirm-start"]') as HTMLButtonElement).disabled)
+      .toBe(true);
+    expect(root.querySelector('[data-role="preview-modal"]')?.textContent)
+      .toContain('磁盘空间不足');
+  });
+
+  it('renders version, developer, project, and support details in About', () => {
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      {
+        version: '2.2.0',
+        developer: 'KOMAKI / komakizhu',
+        project_url: 'https://github.com/komakizhu/W4DJ-RKB',
+        support_url: 'https://www.buymeacoffee.com/',
+      },
+    );
+
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.0');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('Buy Me a Coffee');
   });
 
   it('shows slot two running state without changing slot one', () => {
@@ -426,6 +499,29 @@ describe('bindApp', () => {
     });
   });
 
+  it('persists conflict and filename selections through backend services', async () => {
+    const services = makeMockServices({
+      chooseConflictStrategy: vi.fn().mockResolvedValue(
+        makeDesktopState({ conflict_strategy: 'rename' }),
+      ),
+      chooseFilenameRule: vi.fn().mockResolvedValue(
+        makeDesktopState({ filename_rule: 'artist_title' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const conflict = root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement;
+    conflict.value = 'rename';
+    conflict.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => expect(services.chooseConflictStrategy).toHaveBeenCalledWith('rename'));
+
+    const filename = root.querySelector('[data-action="choose-filename-rule"]') as HTMLSelectElement;
+    filename.value = 'artist_title';
+    filename.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => expect(services.chooseFilenameRule).toHaveBeenCalledWith('artist_title'));
+  });
+
   it('shows one combined preview modal before starting both slots', async () => {
     const services = makeMockServices();
     const root = document.createElement('div');
@@ -491,6 +587,51 @@ describe('bindApp', () => {
       expect(services.retryHistoryFailures).toHaveBeenCalledWith('history-1');
       expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
     });
+  });
+
+  it('opens About and can cancel a running slot', async () => {
+    const running = makeDesktopStateWithSlot(0, { status: 'running' });
+    const services = makeMockServices({
+      loadDesktopState: vi.fn().mockResolvedValue(running),
+      cancelSync: vi.fn().mockResolvedValue(
+        makeDesktopStateWithSlot(0, { status: 'cancelled' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => expect(root.querySelector('[data-action="cancel-slot"]')).not.toBeNull());
+    (root.querySelector('[data-action="open-about"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="about-modal"]')).not.toBeNull());
+    (root.querySelector('[data-action="close-about"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="cancel-slot"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.cancelSync).toHaveBeenCalledWith(0));
+  });
+
+  it('deletes one history entry and clears all history', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const services = makeMockServices({
+      loadHistory: vi
+        .fn()
+        .mockResolvedValueOnce([makeHistoryEntry()])
+        .mockResolvedValue([]),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => expect(root.querySelector('[data-action="delete-history"]')).not.toBeNull());
+    (root.querySelector('[data-action="delete-history"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.deleteHistoryEntry).toHaveBeenCalledWith('history-1'));
+
+    // Re-render with an entry so the clear action is visible independently.
+    (services.loadHistory as ReturnType<typeof vi.fn>).mockResolvedValue([makeHistoryEntry()]);
+    await Promise.resolve();
+    const secondRoot = document.createElement('div');
+    bindApp(secondRoot, makeViewState(), services);
+    await vi.waitFor(() => expect(secondRoot.querySelector('[data-action="clear-history"]')).not.toBeNull());
+    (secondRoot.querySelector('[data-action="clear-history"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.clearHistory).toHaveBeenCalledTimes(1));
+    confirm.mockRestore();
   });
 
   it('starts and pauses both configured tasks from one global button', async () => {

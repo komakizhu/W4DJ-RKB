@@ -13,6 +13,8 @@ fn gui_shell_tracks_basic_user_choices() {
         destination: String::from("/music/destination"),
         mode: Mode::Lossless,
         lossless_format: Some(LosslessFormat::Aiff),
+        conflict_strategy: Default::default(),
+        filename_rule: Default::default(),
     };
     let mut shell = launch_shell(&config);
 
