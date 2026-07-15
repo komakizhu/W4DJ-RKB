@@ -796,50 +796,6 @@ h1 {
   padding-right: 46px;
 }
 
-.source-path-control .path-button {
-  padding-right: 112px;
-}
-
-.path-source-file {
-  position: absolute;
-  top: 10px;
-  right: 42px;
-  z-index: 2;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  min-width: 62px;
-  height: 26px;
-  padding: 0 7px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-strong) 76%, transparent);
-  color: var(--muted);
-  cursor: pointer;
-  font-size: 9px;
-  font-weight: 500;
-  white-space: nowrap;
-  transition: color 160ms ease, background 160ms ease, border-color 160ms ease;
-}
-
-.path-source-file:hover {
-  border-color: color-mix(in srgb, var(--slot-accent) 48%, var(--line));
-  background: var(--surface-strong);
-  color: var(--slot-accent);
-}
-
-.path-source-file:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-
-.path-source-file .ui-icon {
-  width: 13px;
-  height: 13px;
-  margin: 0;
-}
-
 .path-clear {
   position: absolute;
   top: 10px;
@@ -938,34 +894,9 @@ h1 {
   padding-top: 0;
 }
 
-.status-toggle {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 7px;
-  width: 100%;
-  min-width: 0;
-  padding: 0;
-  background: transparent;
-  color: var(--slot-accent);
-  cursor: pointer;
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 7px;
-  font-weight: 800;
-  letter-spacing: 0.06em;
-  transition: none;
-}
-
 .status-copy {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
-}
-
-.detail-toggle-copy {
-  min-width: 0;
-  color: var(--quiet);
-  font-weight: 400;
-  letter-spacing: 0.02em;
 }
 
 .progress-track {
@@ -983,33 +914,6 @@ h1 {
   background: linear-gradient(90deg, var(--slot-accent), color-mix(in srgb, var(--slot-accent) 70%, white 30%));
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
   transition: width 200ms ease;
-}
-
-.log-drawer {
-  max-height: 84px;
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 7px 10px;
-  background: var(--surface-muted);
-}
-
-.log-drawer[hidden] {
-  display: none;
-}
-
-.log-drawer p {
-  margin: 3px 0;
-  color: var(--muted);
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 8px;
-  line-height: 1.45;
-}
-
-.log-drawer p.log-current-track {
-  color: var(--text);
-  font-family: "Avenir Next", "PingFang SC", sans-serif;
-  font-weight: 500;
 }
 
 .ui-icon {

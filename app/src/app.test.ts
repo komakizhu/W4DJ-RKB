@@ -72,7 +72,6 @@ const makeViewSlot = (overrides: Partial<AppSyncSlotViewState> = {}): AppSyncSlo
   errorTracks: 0,
   progressText: '待命',
   currentFile: '',
-  logExpanded: false,
   logs: ['Ready'],
   ...overrides,
 });
@@ -177,7 +176,7 @@ const makeHistoryEntry = (overrides: Partial<AppHistoryEntry> = {}): AppHistoryE
 const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => ({
   loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState()),
   pickDirectory: vi.fn().mockResolvedValue(null),
-  pickSourceFile: vi.fn().mockResolvedValue(null),
+  pickSource: vi.fn().mockResolvedValue(null),
   selectSourceDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   selectDestinationDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseMode: vi.fn().mockResolvedValue(makeDesktopState()),
@@ -249,7 +248,7 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-role="mode-switch"]')).not.toBeNull();
     expect(root.querySelectorAll('[data-action="start-all"]')).toHaveLength(1);
     expect(root.querySelectorAll('[data-action="start"]')).toHaveLength(0);
-    expect(root.querySelectorAll('[data-role="log-drawer"][hidden]')).toHaveLength(2);
+    expect(root.querySelectorAll('[data-role="log-drawer"]')).toHaveLength(0);
     expect(root.querySelector('.rail-copy')).toBeNull();
   });
 
@@ -391,10 +390,10 @@ describe('renderApp', () => {
     expect(slotTwo.dataset.status).toBe('running');
     expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
     expect((slotTwo.querySelector('.progress-fill') as HTMLElement).style.width).toBe('45%');
-    expect(slotTwo.querySelector('.detail-toggle-copy')?.textContent).toBe('查看歌曲详情');
-    expect(
-      (slotTwo.querySelector('[data-role="log-drawer"]') as HTMLElement).textContent,
-    ).toContain('track02.wav');
+    expect(slotTwo.querySelector('.progress-copy')?.textContent).toBe('45/100');
+    expect(slotTwo.querySelector('.status-toggle')).toBeNull();
+    expect(slotTwo.querySelector('[data-role="log-drawer"]')).toBeNull();
+    expect(slotTwo.querySelector('.detail-toggle-copy')).toBeNull();
   });
 
   it('shows a localized destination fallback hint for slot two', () => {
@@ -407,40 +406,19 @@ describe('renderApp', () => {
     expect(hint?.textContent).toContain('/music/out-1');
   });
 
-  it('unhides only the selected slot log drawer', () => {
+  it('does not render current-track details or logs in a task card', () => {
     const root = renderApp(
-      makeViewStateWithSlot(1, { logExpanded: true, logs: ['Slot 2 line'] }),
+      makeViewStateWithSlot(0, {
+        currentFile: '悟空传 - MC赵小六.wav',
+        logs: ['Desktop shell ready'],
+      }),
     );
 
-    expect((root.querySelector('[data-role="log-drawer"][data-slot="0"]') as HTMLElement).hidden)
-      .toBe(true);
-    const drawer = root.querySelector(
-      '[data-role="log-drawer"][data-slot="1"]',
-    ) as HTMLElement;
-    expect(drawer.hidden).toBe(false);
-    expect(drawer.textContent).toContain('Slot 2 line');
-    expect(
-      root.querySelector('[data-action="toggle-log"][data-slot="1"]')?.getAttribute(
-        'aria-expanded',
-      ),
-    ).toBe('true');
-  });
-
-  it('defers the current track name until task details are expanded', () => {
-    const root = renderApp(
-      makeViewStateWithSlot(0, { currentFile: '悟空传 - MC赵小六.wav' }),
-    );
-    const toggle = root.querySelector(
-      '[data-action="toggle-log"][data-slot="0"]',
-    ) as HTMLButtonElement;
-    const drawer = root.querySelector(
-      '[data-role="log-drawer"][data-slot="0"]',
-    ) as HTMLElement;
-
-    expect(toggle.textContent).not.toContain('悟空传 - MC赵小六.wav');
-    expect(toggle.textContent).toContain('查看歌曲详情');
-    expect(drawer.hidden).toBe(true);
-    expect(drawer.textContent).toContain('悟空传 - MC赵小六.wav');
+    const slot = root.querySelector('[data-role="sync-slot"][data-slot="0"]') as HTMLElement;
+    expect(slot.querySelector('[data-role="log-drawer"]')).toBeNull();
+    expect(slot.querySelector('.status-toggle')).toBeNull();
+    expect(slot.textContent).not.toContain('悟空传 - MC赵小六.wav');
+    expect(slot.textContent).not.toContain('Desktop shell ready');
   });
 });
 
@@ -463,30 +441,6 @@ describe('bindApp', () => {
     await vi.waitFor(() => {
       expect(root.textContent).toContain('/loaded/source-1');
       expect(root.textContent).toContain('/loaded/source-2');
-    });
-  });
-
-  it('toggles only slot two log drawer', async () => {
-    const root = document.createElement('div');
-    bindApp(root, makeViewState(), makeMockServices());
-
-    const toggle = root.querySelector(
-      '[data-action="toggle-log"][data-slot="1"]',
-    ) as HTMLButtonElement;
-    toggle.click();
-
-    await vi.waitFor(() => {
-      expect(
-        (root.querySelector('[data-role="log-drawer"][data-slot="0"]') as HTMLElement).hidden,
-      ).toBe(true);
-      expect(
-        (root.querySelector('[data-role="log-drawer"][data-slot="1"]') as HTMLElement).hidden,
-      ).toBe(false);
-      expect(
-        root.querySelector('[data-action="toggle-log"][data-slot="1"]')?.getAttribute(
-          'aria-expanded',
-        ),
-      ).toBe('true');
     });
   });
 
@@ -522,9 +476,9 @@ describe('bindApp', () => {
     });
   });
 
-  it('selects slot two source directory with its slot index', async () => {
+  it('selects a slot two source folder through the unified source picker', async () => {
     const services = makeMockServices({
-      pickDirectory: vi.fn().mockResolvedValue('/new/source-2'),
+      pickSource: vi.fn().mockResolvedValue('/new/source-2'),
       selectSourceDirectory: vi.fn().mockResolvedValue(
         makeDesktopStateWithSlot(1, { source_directory: '/new/source-2' }),
       ),
@@ -538,15 +492,15 @@ describe('bindApp', () => {
     button.click();
 
     await vi.waitFor(() => {
-      expect(services.pickDirectory).toHaveBeenCalledWith('source', 1);
+      expect(services.pickSource).toHaveBeenCalledWith(1);
       expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '/new/source-2');
       expect(root.textContent).toContain('/new/source-2');
     });
   });
 
-  it('selects a single track for slot two', async () => {
+  it('selects a file or folder through the unified source picker for slot two', async () => {
     const services = makeMockServices({
-      pickSourceFile: vi.fn().mockResolvedValue('/music/single-track.flac'),
+      pickSource: vi.fn().mockResolvedValue('/music/single-track.flac'),
       selectSourceDirectory: vi.fn().mockResolvedValue(
         makeDesktopStateWithSlot(1, { source_directory: '/music/single-track.flac' }),
       ),
@@ -554,10 +508,12 @@ describe('bindApp', () => {
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
-    (root.querySelector('[data-action="pick-source-file"][data-slot="1"]') as HTMLButtonElement).click();
+    expect(root.querySelectorAll('[data-action="pick-source"][data-slot="1"]')).toHaveLength(1);
+    expect(root.querySelector('[data-action="pick-source-file"][data-slot="1"]')).toBeNull();
+    (root.querySelector('[data-action="pick-source"][data-slot="1"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(services.pickSourceFile).toHaveBeenCalledWith(1);
+      expect(services.pickSource).toHaveBeenCalledWith(1);
       expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '/music/single-track.flac');
       expect(root.textContent).toContain('/music/single-track.flac');
     });
@@ -879,12 +835,8 @@ describe('bindApp', () => {
         (root.querySelector('[data-role="sync-slot"][data-slot="1"]') as HTMLElement).dataset
           .status,
       ).toBe('error');
-      expect(
-        root.querySelector('[data-role="log-drawer"][data-slot="1"]')?.textContent,
-      ).toContain('Sync failed dramatically');
-      expect(
-        (root.querySelector('[data-role="log-drawer"][data-slot="1"]') as HTMLElement).hidden,
-      ).toBe(true);
+      expect(root.querySelector('[data-role="log-drawer"][data-slot="1"]')).toBeNull();
+      expect(root.textContent).not.toContain('Sync failed dramatically');
     });
   });
 });

@@ -26,7 +26,6 @@ export type AppSyncSlotViewState = {
   errorTracks: number;
   progressText: string;
   currentFile: string;
-  logExpanded: boolean;
   logs: string[];
 };
 
@@ -165,7 +164,7 @@ export type AppServices = {
     kind: 'source' | 'destination',
     slotIndex: SyncSlotIndex,
   ) => Promise<string | null>;
-  pickSourceFile: (slotIndex: SyncSlotIndex) => Promise<string | null>;
+  pickSource: (slotIndex: SyncSlotIndex) => Promise<string | null>;
   selectSourceDirectory: (slotIndex: SyncSlotIndex, path: string) => Promise<DesktopState>;
   selectDestinationDirectory: (slotIndex: SyncSlotIndex, path: string) => Promise<DesktopState>;
   chooseMode: (mode: AppMode) => Promise<DesktopState>;
@@ -199,7 +198,7 @@ const translations = {
     clearSource: '清空输入来源',
     clearDestination: '清空输出目录',
     pickFolder: '选择文件夹',
-    pickTrack: '选择单曲',
+    pickSource: '选择来源',
     compatMode: '兼容模式',
     losslessMode: '无损模式',
     compatNote: '兼容模式：最高输出 320kbps MP3',
@@ -214,10 +213,6 @@ const translations = {
     error: '错误',
     controlPanel: '控制面板',
     mode: '输出模式',
-    logs: '日志',
-    showTaskDetails: '查看歌曲详情',
-    hideTaskDetails: '收起歌曲详情',
-    currentTrack: '当前歌曲',
     advancedOptions: '高级选项',
     losslessFormat: '无损格式',
     syncSlot: '任务',
@@ -283,7 +278,7 @@ const translations = {
     clearSource: 'Clear input source',
     clearDestination: 'Clear output folder',
     pickFolder: 'Select Folder',
-    pickTrack: 'Select Track',
+    pickSource: 'Choose Source',
     compatMode: 'Compat Mode',
     losslessMode: 'Lossless Mode',
     compatNote: 'Compat Mode: Max 320kbps MP3 output',
@@ -298,10 +293,6 @@ const translations = {
     error: 'Error',
     controlPanel: 'Control panel',
     mode: 'Output mode',
-    logs: 'Logs',
-    showTaskDetails: 'Show track details',
-    hideTaskDetails: 'Hide track details',
-    currentTrack: 'Current track',
     advancedOptions: 'Advanced options',
     losslessFormat: 'Lossless format',
     syncSlot: 'Task',
@@ -374,7 +365,6 @@ function defaultSlot(lang: AppLanguage): AppSyncSlotViewState {
     errorTracks: 0,
     progressText: t('idle', lang),
     currentFile: '',
-    logExpanded: false,
     logs: ['Desktop shell ready'],
   };
 }
@@ -414,21 +404,27 @@ const defaultServices: AppServices = {
 
     return typeof selected === 'string' ? selected : null;
   },
-  pickSourceFile: async (slotIndex) => {
+  pickSource: async (slotIndex) => {
     const lang = (localStorage.getItem('w4dj_lang') as AppLanguage) || 'zh';
-    const selected = await open({
-      directory: false,
-      multiple: false,
-      title: lang === 'zh' ? `选择单曲 ${slotIndex + 1}` : `Select track ${slotIndex + 1}`,
-      filters: [
-        {
-          name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
-          extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
-        },
-      ],
-    });
+    const title = lang === 'zh' ? `选择来源 ${slotIndex + 1}` : `Choose source ${slotIndex + 1}`;
+    try {
+      return await invoke<string | null>('pick_source_path', { title });
+    } catch (error) {
+      console.warn('Unified source picker unavailable; falling back to file picker.', error);
+      const selected = await open({
+        directory: false,
+        multiple: false,
+        title,
+        filters: [
+          {
+            name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
+            extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
+          },
+        ],
+      });
 
-    return typeof selected === 'string' ? selected : null;
+      return typeof selected === 'string' ? selected : null;
+    }
   },
   selectSourceDirectory: (slotIndex, path) =>
     invoke<DesktopState>('select_source_directory', { slotIndex, path }),
@@ -562,13 +558,6 @@ export function renderApp(
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, state.lang)}
   `;
-
-  state.slots.forEach((slot, slotIndex) => {
-    const drawer = root.querySelector(
-      `[data-role="log-drawer"][data-slot="${slotIndex}"]`,
-    ) as HTMLElement;
-    drawer.hidden = !slot.logExpanded;
-  });
 
   return root;
 }
@@ -705,8 +694,6 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
   const usesFallback = slotIndex === 1 && slot.destinationDirectory.trim() === '';
   const displayedDestination = usesFallback ? fallbackDestination : slot.destinationDirectory;
   const slotNumber = slotIndex + 1;
-  const logDrawerId = `task-log-${slotIndex}`;
-  const detailToggleLabel = t(slot.logExpanded ? 'hideTaskDetails' : 'showTaskDetails', state.lang);
   return `
     <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${slot.status}">
       <header class="sync-slot-head">
@@ -725,11 +712,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
           <div class="path-control source-path-control">
             <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
               ${icon('folder')}
-              <span class="path-copy">${displayPath(slot.sourceDirectory, state.lang)}</span>
-            </button>
-            <button type="button" class="path-source-file" data-action="pick-source-file" data-slot="${slotIndex}" aria-label="${t('pickTrack', state.lang)}" title="${t('pickTrack', state.lang)}">
-              ${icon('music')}
-              <span>${t('pickTrack', state.lang)}</span>
+              <span class="path-copy">${displayPath(slot.sourceDirectory, state.lang, t('pickSource', state.lang))}</span>
             </button>
             <button type="button" class="path-clear" data-action="clear-source" data-slot="${slotIndex}" aria-label="${t('clearSource', state.lang)}" title="${t('clearSource', state.lang)}" ${slot.sourceDirectory.trim() ? '' : 'disabled'}>
               ${icon('trash')}
@@ -763,20 +746,11 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
       </div>
 
       <footer class="slot-status-strip">
-        <button type="button" class="status-toggle" data-action="toggle-log" data-slot="${slotIndex}" aria-expanded="${slot.logExpanded}" aria-controls="${logDrawerId}" aria-label="${detailToggleLabel}" title="${detailToggleLabel}">
-          ${icon('list')}
-          <span class="status-copy progress-copy">${escapeHtml(slot.progressText)}</span>
-          <span class="detail-toggle-copy">${detailToggleLabel}</span>
-        </button>
+        <span class="status-copy progress-copy">${escapeHtml(slot.progressText)}</span>
         <div class="progress-track" aria-hidden="true">
           <div class="progress-fill" style="width: ${progressPercent(slot)}%"></div>
         </div>
       </footer>
-
-      <section id="${logDrawerId}" class="log-drawer" data-role="log-drawer" data-slot="${slotIndex}" aria-label="${t('logs', state.lang)} ${slotNumber}">
-        ${slot.currentFile ? `<p class="log-current-track">${t('currentTrack', state.lang)}：${escapeHtml(slot.currentFile)}</p>` : ''}
-        ${slot.logs.map((line) => `<p>${escapeHtml(line)}</p>`).join('')}
-      </section>
     </article>
   `;
 }
@@ -848,9 +822,6 @@ export function bindApp(
 
   const applyDesktopState = (desktopState: DesktopState) => {
     const nextState = toViewState(desktopState, state.lang, state.theme);
-    nextState.slots.forEach((slot, slotIndex) => {
-      slot.logExpanded = state.slots[slotIndex].logExpanded;
-    });
     state = nextState;
     render();
     void refreshHistory(false);
@@ -1098,17 +1069,6 @@ export function bindApp(
       return;
     }
 
-    if (action === 'toggle-log' && slotIndex !== null) {
-      const slots: [AppSyncSlotViewState, AppSyncSlotViewState] = [
-        { ...state.slots[0] },
-        { ...state.slots[1] },
-      ];
-      slots[slotIndex].logExpanded = !slots[slotIndex].logExpanded;
-      state = { ...state, slots };
-      render();
-      return;
-    }
-
     if (action === 'cancel-preview' || action === 'edit-preview') {
       if (!previewBusy) {
         previewModal = null;
@@ -1163,7 +1123,7 @@ export function bindApp(
 
     if (action === 'pick-source' && slotIndex !== null) {
       void runAction(async () => {
-        const path = await services.pickDirectory('source', slotIndex);
+        const path = await services.pickSource(slotIndex);
         return path ? services.selectSourceDirectory(slotIndex, path) : undefined;
       }, slotIndex);
       return;
@@ -1171,14 +1131,6 @@ export function bindApp(
 
     if (action === 'clear-source' && slotIndex !== null) {
       void runAction(() => services.selectSourceDirectory(slotIndex, ''), slotIndex);
-      return;
-    }
-
-    if (action === 'pick-source-file' && slotIndex !== null) {
-      void runAction(async () => {
-        const path = await services.pickSourceFile(slotIndex);
-        return path ? services.selectSourceDirectory(slotIndex, path) : undefined;
-      }, slotIndex);
       return;
     }
 
@@ -1446,7 +1398,6 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
       errorTracks: slot.error_tracks,
       progressText: formatDesktopProgress(slot, lang),
       currentFile: slot.current_file,
-      logExpanded: false,
       logs: slot.logs,
     })) as [AppSyncSlotViewState, AppSyncSlotViewState],
     mode: state.mode,
@@ -1527,8 +1478,8 @@ function aggregateStatus(state: AppViewState): AppStatus {
   return priority.find((status) => state.slots.some((slot) => slot.status === status)) || 'idle';
 }
 
-function displayPath(path: string, lang: AppLanguage): string {
-  return escapeHtml(path || t('pickFolder', lang));
+function displayPath(path: string, lang: AppLanguage, emptyLabel = t('pickFolder', lang)): string {
+  return escapeHtml(path || emptyLabel);
 }
 
 function progressPercent(state: AppSyncSlotViewState): number {
