@@ -5,6 +5,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -646,6 +647,33 @@ fn app_info() -> AppInfo {
 }
 
 #[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    const PROJECT_URL: &str = "https://github.com/komakizhu/W4DJ-RKB";
+    if url != PROJECT_URL {
+        return Err("不允许打开此外部地址".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status();
+
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd").args(["/C", "start", "", &url]).status();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = Command::new("xdg-open").arg(url).status();
+
+    status
+        .map_err(|error| format!("无法打开项目主页：{error}"))
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("无法打开项目主页（退出码 {:?}）", status.code()))
+            }
+        })
+}
+
+#[tauri::command]
 fn export_history_error_report(
     id: String,
     path: String,
@@ -714,7 +742,8 @@ fn main() {
             export_history_error_report,
             delete_history_entry_command,
             clear_history_command,
-            app_info
+            app_info,
+            open_external_url
         ])
         .setup(|app| {
             let preferences_path = app

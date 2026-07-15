@@ -179,6 +179,7 @@ export type AppServices = {
   deleteHistoryEntry: (id: string) => Promise<void>;
   clearHistory: () => Promise<void>;
   loadAppInfo: () => Promise<AppInfo>;
+  openExternalUrl: (url: string) => Promise<void>;
   startAllSync: () => Promise<DesktopState>;
   pauseAllSync: () => Promise<DesktopState>;
   cancelSync: (slotIndex: SyncSlotIndex) => Promise<DesktopState>;
@@ -424,6 +425,7 @@ const defaultServices: AppServices = {
   deleteHistoryEntry: (id) => invoke<void>('delete_history_entry_command', { id }),
   clearHistory: () => invoke<void>('clear_history_command'),
   loadAppInfo: () => invoke<AppInfo>('app_info'),
+  openExternalUrl: (url) => invoke<void>('open_external_url', { url }),
   startAllSync: () => invoke<DesktopState>('start_all_sync'),
   pauseAllSync: () => invoke<DesktopState>('pause_all_sync'),
   cancelSync: (slotIndex) => invoke<DesktopState>('cancel_sync', { slotIndex }),
@@ -1056,6 +1058,14 @@ export function bindApp(
       return;
     }
 
+    if (action === 'open-project-home') {
+      const url = button.dataset.url;
+      if (url) {
+        void services.openExternalUrl(url);
+      }
+      return;
+    }
+
     if (action === 'toggle-log' && slotIndex !== null) {
       const slots: [AppSyncSlotViewState, AppSyncSlotViewState] = [
         { ...state.slots[0] },
@@ -1362,7 +1372,7 @@ function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
           <div><dt>${t('developer', lang)}</dt><dd>${escapeHtml(info.developer)}</dd></div>
         </dl>
         <div class="about-links">
-          <a href="${escapeHtml(info.project_url)}" target="_blank" rel="noreferrer">${t('projectHome', lang)}</a>
+          <button type="button" class="about-link" data-action="open-project-home" data-url="${escapeHtml(info.project_url)}">${t('projectHome', lang)}</button>
         </div>
         <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>
       </section>

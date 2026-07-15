@@ -200,6 +200,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
+  openExternalUrl: vi.fn().mockResolvedValue(undefined),
   startAllSync: vi
     .fn()
     .mockResolvedValue(makeDesktopState({
@@ -346,7 +347,7 @@ describe('renderApp', () => {
       .toContain('磁盘空间不足');
   });
 
-  it('renders version, developer, project, and support details in About', () => {
+  it('renders version, developer, and project details in About', () => {
     const root = renderApp(
       makeViewState(),
       null,
@@ -364,7 +365,7 @@ describe('renderApp', () => {
 
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.0');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
-    expect(root.querySelector('[data-role="about-modal"] a')?.getAttribute('href')).toBe('https://github.com/komakizhu/W4DJ-RKB');
+    expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
   });
 
   it('shows slot two running state without changing slot one', () => {
