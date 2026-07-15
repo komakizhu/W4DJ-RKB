@@ -322,9 +322,14 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-format="aiff"]')?.classList.contains('selected')).toBe(false);
   });
 
-  it('renders conflict and filename settings with safe defaults', () => {
+  it('keeps secondary output settings collapsed with safe defaults', () => {
     const root = renderApp(makeViewState());
+    const settings = root.querySelector(
+      '[data-role="advanced-output-settings"]',
+    ) as HTMLDetailsElement;
 
+    expect(settings.open).toBe(false);
+    expect(settings.querySelector('summary')?.textContent).toContain('高级选项');
     expect((root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement).value)
       .toBe('skip');
     expect((root.querySelector('[data-action="choose-filename-rule"]') as HTMLSelectElement).value)
@@ -386,7 +391,10 @@ describe('renderApp', () => {
     expect(slotTwo.dataset.status).toBe('running');
     expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
     expect((slotTwo.querySelector('.progress-fill') as HTMLElement).style.width).toBe('45%');
-    expect(slotTwo.querySelector('.current-track')?.textContent).toBe('track02.wav');
+    expect(slotTwo.querySelector('.detail-toggle-copy')?.textContent).toBe('查看歌曲详情');
+    expect(
+      (slotTwo.querySelector('[data-role="log-drawer"]') as HTMLElement).textContent,
+    ).toContain('track02.wav');
   });
 
   it('shows a localized destination fallback hint for slot two', () => {
@@ -411,6 +419,28 @@ describe('renderApp', () => {
     ) as HTMLElement;
     expect(drawer.hidden).toBe(false);
     expect(drawer.textContent).toContain('Slot 2 line');
+    expect(
+      root.querySelector('[data-action="toggle-log"][data-slot="1"]')?.getAttribute(
+        'aria-expanded',
+      ),
+    ).toBe('true');
+  });
+
+  it('defers the current track name until task details are expanded', () => {
+    const root = renderApp(
+      makeViewStateWithSlot(0, { currentFile: '悟空传 - MC赵小六.wav' }),
+    );
+    const toggle = root.querySelector(
+      '[data-action="toggle-log"][data-slot="0"]',
+    ) as HTMLButtonElement;
+    const drawer = root.querySelector(
+      '[data-role="log-drawer"][data-slot="0"]',
+    ) as HTMLElement;
+
+    expect(toggle.textContent).not.toContain('悟空传 - MC赵小六.wav');
+    expect(toggle.textContent).toContain('查看歌曲详情');
+    expect(drawer.hidden).toBe(true);
+    expect(drawer.textContent).toContain('悟空传 - MC赵小六.wav');
   });
 });
 
@@ -452,6 +482,43 @@ describe('bindApp', () => {
       expect(
         (root.querySelector('[data-role="log-drawer"][data-slot="1"]') as HTMLElement).hidden,
       ).toBe(false);
+      expect(
+        root.querySelector('[data-action="toggle-log"][data-slot="1"]')?.getAttribute(
+          'aria-expanded',
+        ),
+      ).toBe('true');
+    });
+  });
+
+  it('keeps advanced output settings open while a selection refreshes', async () => {
+    const services = makeMockServices({
+      chooseConflictStrategy: vi.fn().mockResolvedValue(
+        makeDesktopState({ conflict_strategy: 'overwrite' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="advanced-output-settings"]')).not.toBeNull();
+    });
+
+    const settings = root.querySelector(
+      '[data-role="advanced-output-settings"]',
+    ) as HTMLDetailsElement;
+    settings.open = true;
+    settings.dispatchEvent(new Event('toggle', { bubbles: true }));
+
+    const select = root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement;
+    select.value = 'overwrite';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+
+    await vi.waitFor(() => {
+      expect(
+        (root.querySelector('[data-role="advanced-output-settings"]') as HTMLDetailsElement).open,
+      ).toBe(true);
+      expect((root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement).value)
+        .toBe('overwrite');
     });
   });
 
@@ -815,6 +882,9 @@ describe('bindApp', () => {
       expect(
         root.querySelector('[data-role="log-drawer"][data-slot="1"]')?.textContent,
       ).toContain('Sync failed dramatically');
+      expect(
+        (root.querySelector('[data-role="log-drawer"][data-slot="1"]') as HTMLElement).hidden,
+      ).toBe(true);
     });
   });
 });

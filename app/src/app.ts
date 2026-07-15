@@ -215,11 +215,14 @@ const translations = {
     controlPanel: '控制面板',
     mode: '输出模式',
     logs: '日志',
+    showTaskDetails: '查看歌曲详情',
+    hideTaskDetails: '收起歌曲详情',
+    currentTrack: '当前歌曲',
+    advancedOptions: '高级选项',
     losslessFormat: '无损格式',
     syncSlot: '任务',
     fallback: '未单独设置，使用输出目录 1',
     fallbackMissing: '输出目录 1 也未设置',
-    noCurrentFile: '等待处理文件',
     globalStatus: '全局状态',
     configuredTasks: '已配置任务',
     completedTracks: '已完成歌曲',
@@ -296,11 +299,14 @@ const translations = {
     controlPanel: 'Control panel',
     mode: 'Output mode',
     logs: 'Logs',
+    showTaskDetails: 'Show track details',
+    hideTaskDetails: 'Hide track details',
+    currentTrack: 'Current track',
+    advancedOptions: 'Advanced options',
     losslessFormat: 'Lossless format',
     syncSlot: 'Task',
     fallback: 'Use output directory 1 when empty',
     fallbackMissing: 'Output directory 1 is also empty',
-    noCurrentFile: 'Waiting for a track',
     globalStatus: 'Global status',
     configuredTasks: 'Configured tasks',
     completedTracks: 'Tracks completed',
@@ -460,6 +466,7 @@ export function renderApp(
   pendingSelection: PendingSelection = null,
   previewBusy = false,
   aboutInfo: AppInfo | null = null,
+  outputSettingsExpanded = false,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -512,7 +519,7 @@ export function renderApp(
             </button>
           </div>
           ${renderLosslessFormats(state, pendingSelection)}
-          ${renderOutputSettings(state)}
+          ${renderOutputSettings(state, outputSettingsExpanded)}
           <div class="rail-lower">
             <div class="rail-note">
               <p>${t('compatNote', state.lang)}</p>
@@ -698,6 +705,8 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
   const usesFallback = slotIndex === 1 && slot.destinationDirectory.trim() === '';
   const displayedDestination = usesFallback ? fallbackDestination : slot.destinationDirectory;
   const slotNumber = slotIndex + 1;
+  const logDrawerId = `task-log-${slotIndex}`;
+  const detailToggleLabel = t(slot.logExpanded ? 'hideTaskDetails' : 'showTaskDetails', state.lang);
   return `
     <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${slot.status}">
       <header class="sync-slot-head">
@@ -754,19 +763,18 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
       </div>
 
       <footer class="slot-status-strip">
-        <button type="button" class="status-toggle" data-action="toggle-log" data-slot="${slotIndex}">
+        <button type="button" class="status-toggle" data-action="toggle-log" data-slot="${slotIndex}" aria-expanded="${slot.logExpanded}" aria-controls="${logDrawerId}" aria-label="${detailToggleLabel}" title="${detailToggleLabel}">
           ${icon('list')}
           <span class="status-copy progress-copy">${escapeHtml(slot.progressText)}</span>
-          <span class="current-track">${escapeHtml(
-            slot.currentFile || latestLog(slot.logs, state.lang),
-          )}</span>
+          <span class="detail-toggle-copy">${detailToggleLabel}</span>
         </button>
         <div class="progress-track" aria-hidden="true">
           <div class="progress-fill" style="width: ${progressPercent(slot)}%"></div>
         </div>
       </footer>
 
-      <section class="log-drawer" data-role="log-drawer" data-slot="${slotIndex}" aria-label="${t('logs', state.lang)} ${slotNumber}">
+      <section id="${logDrawerId}" class="log-drawer" data-role="log-drawer" data-slot="${slotIndex}" aria-label="${t('logs', state.lang)} ${slotNumber}">
+        ${slot.currentFile ? `<p class="log-current-track">${t('currentTrack', state.lang)}：${escapeHtml(slot.currentFile)}</p>` : ''}
         ${slot.logs.map((line) => `<p>${escapeHtml(line)}</p>`).join('')}
       </section>
     </article>
@@ -787,6 +795,7 @@ export function bindApp(
   let previewBusy = false;
   let history: AppHistoryEntry[] = [];
   let aboutInfo: AppInfo | null = null;
+  let outputSettingsExpanded = false;
 
   const render = () => {
     root.replaceChildren(
@@ -799,6 +808,7 @@ export function bindApp(
         pendingSelection,
         previewBusy,
         aboutInfo,
+        outputSettingsExpanded,
       ),
     );
   };
@@ -859,7 +869,6 @@ export function bindApp(
         ...slots[slotIndex],
         status: 'error',
         progressText: t('error', state.lang),
-        logExpanded: true,
         logs: [...slots[slotIndex].logs, message],
       };
     });
@@ -1210,6 +1219,16 @@ export function bindApp(
     }
   });
 
+  root.addEventListener('toggle', (event) => {
+    const settings = event.target;
+    if (
+      settings instanceof HTMLDetailsElement
+      && settings.dataset.role === 'advanced-output-settings'
+    ) {
+      outputSettingsExpanded = settings.open;
+    }
+  }, true);
+
   root.addEventListener('change', (event) => {
     const select = (event.target as HTMLElement | null)?.closest<HTMLSelectElement>('select');
     if (!select) {
@@ -1365,26 +1384,29 @@ function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSel
   `;
 }
 
-function renderOutputSettings(state: AppViewState): string {
+function renderOutputSettings(state: AppViewState, expanded = false): string {
   return `
-    <section class="output-settings" aria-label="${t('conflictStrategy', state.lang)}">
-      <label>
-        <span>${t('conflictStrategy', state.lang)}</span>
-        <select data-action="choose-conflict" aria-label="${t('conflictStrategy', state.lang)}">
-          <option value="skip" ${state.conflictStrategy === 'skip' ? 'selected' : ''}>${t('conflictSkip', state.lang)}</option>
-          <option value="overwrite" ${state.conflictStrategy === 'overwrite' ? 'selected' : ''}>${t('conflictOverwrite', state.lang)}</option>
-          <option value="update_metadata" ${state.conflictStrategy === 'update_metadata' ? 'selected' : ''}>${t('conflictMetadata', state.lang)}</option>
-        </select>
-      </label>
-      <label>
-        <span>${t('filenameRule', state.lang)}</span>
-        <select data-action="choose-filename-rule" aria-label="${t('filenameRule', state.lang)}">
-          <option value="title_artist" ${state.filenameRule === 'title_artist' ? 'selected' : ''}>${t('titleArtist', state.lang)}</option>
-          <option value="artist_title" ${state.filenameRule === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
-          <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
-        </select>
-      </label>
-    </section>
+    <details class="output-settings" data-role="advanced-output-settings" aria-label="${t('advancedOptions', state.lang)}" ${expanded ? 'open' : ''}>
+      <summary>${t('advancedOptions', state.lang)}</summary>
+      <div class="output-settings-content">
+        <label>
+          <span>${t('conflictStrategy', state.lang)}</span>
+          <select data-action="choose-conflict" aria-label="${t('conflictStrategy', state.lang)}">
+            <option value="skip" ${state.conflictStrategy === 'skip' ? 'selected' : ''}>${t('conflictSkip', state.lang)}</option>
+            <option value="overwrite" ${state.conflictStrategy === 'overwrite' ? 'selected' : ''}>${t('conflictOverwrite', state.lang)}</option>
+            <option value="update_metadata" ${state.conflictStrategy === 'update_metadata' ? 'selected' : ''}>${t('conflictMetadata', state.lang)}</option>
+          </select>
+        </label>
+        <label>
+          <span>${t('filenameRule', state.lang)}</span>
+          <select data-action="choose-filename-rule" aria-label="${t('filenameRule', state.lang)}">
+            <option value="title_artist" ${state.filenameRule === 'title_artist' ? 'selected' : ''}>${t('titleArtist', state.lang)}</option>
+            <option value="artist_title" ${state.filenameRule === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
+            <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
+          </select>
+        </label>
+      </div>
+    </details>
   `;
 }
 
@@ -1503,10 +1525,6 @@ function formatBytes(bytes: number | null, lang: AppLanguage): string {
 function aggregateStatus(state: AppViewState): AppStatus {
   const priority: AppStatus[] = ['error', 'running', 'paused', 'cancelled', 'completed', 'idle'];
   return priority.find((status) => state.slots.some((slot) => slot.status === status)) || 'idle';
-}
-
-function latestLog(logs: string[], lang: AppLanguage): string {
-  return logs.length > 0 ? logs[logs.length - 1] : t('noCurrentFile', lang);
 }
 
 function displayPath(path: string, lang: AppLanguage): string {
