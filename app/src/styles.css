@@ -981,27 +981,68 @@ h1 {
 
 .output-settings {
   display: grid;
-  gap: 10px;
-  margin-top: 12px;
+  gap: 9px;
+  margin-top: 14px;
+  padding: 12px 0 13px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .output-settings label {
   display: grid;
-  gap: 6px;
+  gap: 7px;
   color: var(--rail-muted);
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .output-settings select {
   width: 100%;
-  min-height: 36px;
-  padding: 0 30px 0 11px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 10px;
-  background: var(--rail-deep);
+  min-height: 38px;
+  padding: 0 34px 0 12px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 11px;
+  background-color: rgba(2, 20, 25, 0.28);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23e0f6f3' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-position: right 13px center;
+  background-repeat: no-repeat;
   color: var(--rail-text);
   font: 700 11px/1.2 "Avenir Next", "PingFang SC", sans-serif;
+  cursor: pointer;
+  transition: border-color 180ms ease, background-color 180ms ease, box-shadow 180ms ease;
+}
+
+.output-settings select:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  background-color: rgba(2, 20, 25, 0.46);
+}
+
+.output-settings select:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-color: transparent;
+  box-shadow: 0 0 0 4px rgba(21, 149, 170, 0.16);
+}
+
+.app-shell[data-theme="light"][data-light-palette="c"] .output-settings select {
+  background-color: rgba(12, 10, 9, 0.3);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23fffaf6' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5'/%3E%3C/svg%3E");
+}
+
+.app-shell[data-theme="light"][data-light-palette="c"] .output-settings select:hover {
+  background-color: rgba(12, 10, 9, 0.46);
+}
+
+.app-shell[data-theme="dark"] .output-settings select {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.app-shell[data-theme="dark"] .output-settings select:hover {
+  background-color: rgba(255, 255, 255, 0.1);
 }
 
 .global-action-group {
