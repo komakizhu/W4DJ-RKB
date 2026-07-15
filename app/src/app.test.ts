@@ -249,7 +249,23 @@ describe('renderApp', () => {
     expect(root.querySelectorAll('[data-action="start-all"]')).toHaveLength(1);
     expect(root.querySelectorAll('[data-action="start"]')).toHaveLength(0);
     expect(root.querySelectorAll('[data-role="log-drawer"]')).toHaveLength(0);
+    expect(root.querySelectorAll('.slot-status-strip .progress-copy')).toHaveLength(0);
     expect(root.querySelector('.rail-copy')).toBeNull();
+  });
+
+  it('keeps progress text for active tasks without showing idle footer text', () => {
+    const root = renderApp(
+      makeViewStateWithSlot(0, {
+        status: 'running',
+        progressTotal: 4,
+        progressCompleted: 2,
+        progressText: '2/4',
+      }),
+    );
+
+    expect(root.querySelector('[data-role="sync-slot"][data-slot="0"] .progress-copy')?.textContent)
+      .toBe('2/4');
+    expect(root.querySelector('[data-role="sync-slot"][data-slot="1"] .progress-copy')).toBeNull();
   });
 
   it('renders new and skipped track counts in the global status card', () => {
@@ -693,6 +709,30 @@ describe('bindApp', () => {
     await vi.waitFor(() => {
       expect(services.retryHistoryFailures).toHaveBeenCalledWith('history-1');
       expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
+    });
+  });
+
+  it('places conversion history below the task cards and lets it collapse', async () => {
+    const services = makeMockServices({
+      loadHistory: vi.fn().mockResolvedValue([makeHistoryEntry()]),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => {
+      const history = root.querySelector('[data-role="history"]') as HTMLDetailsElement;
+      expect(history).not.toBeNull();
+      expect(history.parentElement?.classList.contains('workbench-main')).toBe(true);
+      expect(history.open).toBe(false);
+    });
+
+    const history = root.querySelector('[data-role="history"]') as HTMLDetailsElement;
+    (history.querySelector('summary') as HTMLElement).click();
+    expect(history.open).toBe(true);
+
+    (root.querySelector('[data-action="toggle-theme"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect((root.querySelector('[data-role="history"]') as HTMLDetailsElement).open).toBe(true);
     });
   });
 

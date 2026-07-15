@@ -612,7 +612,7 @@ h1 {
 
 .workbench-main {
   display: grid;
-  grid-template-rows: auto auto;
+  grid-template-rows: auto auto auto;
   align-content: start;
   gap: 12px;
   min-width: 0;
@@ -1319,6 +1319,48 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.history-head {
+  min-height: 44px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.history-head::-webkit-details-marker {
+  display: none;
+}
+
+.history-head::after {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  color: var(--quiet);
+  content: "";
+  transform: rotate(45deg) translate(-2px, -2px);
+  transition: transform 180ms ease;
+}
+
+.history-panel[open] .history-head::after {
+  transform: rotate(225deg) translate(-2px, -2px);
+}
+
+.history-head:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
+.history-body {
+  display: grid;
+  gap: 14px;
+}
+
+.history-body-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .history-head h2,

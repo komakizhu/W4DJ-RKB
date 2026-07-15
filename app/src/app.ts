@@ -461,6 +461,7 @@ export function renderApp(
   previewBusy = false,
   aboutInfo: AppInfo | null = null,
   outputSettingsExpanded = false,
+  historyExpanded = false,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -550,9 +551,9 @@ export function renderApp(
           ${renderSyncSlot(state, 0)}
           ${renderSyncSlot(state, 1)}
         </div>
+        ${renderHistory(history, state.lang, historyExpanded)}
       </div>
     </section>
-    ${renderHistory(history, state.lang)}
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, state.lang)}
   `;
@@ -641,23 +642,25 @@ function previewHasRetryErrors(modal: AppPreviewModalState): boolean {
   return modal.retryOf !== null && modal.previews.some((item) => item.preview.error_count > 0);
 }
 
-function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage): string {
+function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage, expanded = false): string {
   return `
-    <section class="history-panel" data-role="history">
-      <header class="history-head">
+    <details class="history-panel" data-role="history" ${expanded ? 'open' : ''}>
+      <summary class="history-head">
         <div>
           <p class="panel-kicker">W4DJ RKB</p>
           <h2>${t('history', lang)}</h2>
         </div>
         <div class="history-head-actions">
           <span class="history-count">${entries.length}</span>
-          ${entries.length > 0 ? `<button type="button" class="secondary-action history-clear" data-action="clear-history">${t('clearHistory', lang)}</button>` : ''}
         </div>
-      </header>
-      ${entries.length === 0
-        ? `<p class="history-empty">${t('noHistory', lang)}</p>`
-        : `<div class="history-list">${entries.map((entry) => renderHistoryEntry(entry, lang)).join('')}</div>`}
-    </section>
+      </summary>
+      <div class="history-body">
+        ${entries.length > 0 ? `<div class="history-body-actions"><button type="button" class="secondary-action history-clear" data-action="clear-history">${t('clearHistory', lang)}</button></div>` : ''}
+        ${entries.length === 0
+          ? `<p class="history-empty">${t('noHistory', lang)}</p>`
+          : `<div class="history-list">${entries.map((entry) => renderHistoryEntry(entry, lang)).join('')}</div>`}
+      </div>
+    </details>
   `;
 }
 
@@ -692,6 +695,8 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
   const usesFallback = slotIndex === 1 && slot.destinationDirectory.trim() === '';
   const displayedDestination = usesFallback ? fallbackDestination : slot.destinationDirectory;
   const slotNumber = slotIndex + 1;
+  const showProgressText =
+    slot.status !== 'idle' && slot.progressText !== t('idle', state.lang);
   return `
     <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${slot.status}">
       <header class="sync-slot-head">
@@ -744,7 +749,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
       </div>
 
       <footer class="slot-status-strip">
-        <span class="status-copy progress-copy">${escapeHtml(slot.progressText)}</span>
+        ${showProgressText ? `<span class="status-copy progress-copy">${escapeHtml(slot.progressText)}</span>` : ''}
         <div class="progress-track" aria-hidden="true">
           <div class="progress-fill" style="width: ${progressPercent(slot)}%"></div>
         </div>
@@ -768,6 +773,7 @@ export function bindApp(
   let history: AppHistoryEntry[] = [];
   let aboutInfo: AppInfo | null = null;
   let outputSettingsExpanded = false;
+  let historyExpanded = false;
 
   const render = () => {
     root.replaceChildren(
@@ -781,8 +787,14 @@ export function bindApp(
         previewBusy,
         aboutInfo,
         outputSettingsExpanded,
+        historyExpanded,
       ),
     );
+
+    const historyDetails = root.querySelector<HTMLDetailsElement>('[data-role="history"]');
+    historyDetails?.querySelector('summary')?.addEventListener('click', () => {
+      historyExpanded = !historyDetails.open;
+    });
   };
 
   const triggerLocalMotion = (motion: SelectionMotion) => {
@@ -1173,9 +1185,12 @@ export function bindApp(
     const settings = event.target;
     if (
       settings instanceof HTMLDetailsElement
-      && settings.dataset.role === 'advanced-output-settings'
     ) {
-      outputSettingsExpanded = settings.open;
+      if (settings.dataset.role === 'advanced-output-settings') {
+        outputSettingsExpanded = settings.open;
+      } else if (settings.dataset.role === 'history') {
+        historyExpanded = settings.open;
+      }
     }
   }, true);
 
