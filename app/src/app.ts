@@ -161,7 +161,7 @@ export type AppPreviewModalState = {
 export type AppServices = {
   loadDesktopState: () => Promise<DesktopState>;
   pickDirectory: (
-    kind: 'source' | 'destination',
+    kind: 'destination',
     slotIndex: SyncSlotIndex,
   ) => Promise<string | null>;
   pickSource: (slotIndex: SyncSlotIndex) => Promise<string | null>;
@@ -385,17 +385,10 @@ const defaultState: AppViewState = {
 
 const defaultServices: AppServices = {
   loadDesktopState: () => invoke<DesktopState>('load_desktop_state'),
-  pickDirectory: async (kind, slotIndex) => {
+  pickDirectory: async (_kind, slotIndex) => {
     const lang = (localStorage.getItem('w4dj_lang') as AppLanguage) || 'zh';
     const slotNumber = slotIndex + 1;
-    const title =
-      kind === 'source'
-        ? lang === 'zh'
-          ? `选择歌曲下载目录 ${slotNumber}`
-          : `Select song folder ${slotNumber}`
-        : lang === 'zh'
-          ? `选择输出目录 ${slotNumber}`
-          : `Select output folder ${slotNumber}`;
+    const title = lang === 'zh' ? `选择输出目录 ${slotNumber}` : `Select output folder ${slotNumber}`;
     const selected = await open({
       directory: true,
       multiple: false,
@@ -410,6 +403,11 @@ const defaultServices: AppServices = {
     try {
       return await invoke<string | null>('pick_source_path', { title });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes('unified source picker is only available on macOS')) {
+        throw error;
+      }
+
       console.warn('Unified source picker unavailable; falling back to file picker.', error);
       const selected = await open({
         directory: false,
@@ -839,7 +837,7 @@ export function bindApp(
       slots[slotIndex] = {
         ...slots[slotIndex],
         status: 'error',
-        progressText: t('error', state.lang),
+        progressText: `${t('error', state.lang)}: ${message}`,
         logs: [...slots[slotIndex].logs, message],
       };
     });

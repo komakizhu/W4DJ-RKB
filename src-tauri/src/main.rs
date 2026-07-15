@@ -1575,6 +1575,16 @@ fn validate_source_input(source: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
+fn source_picker_result(confirmed: bool, path: Option<String>) -> Result<Option<String>, String> {
+    if !confirmed {
+        return Ok(None);
+    }
+
+    path.map(Some)
+        .ok_or_else(|| String::from("the selected source has no readable path"))
+}
+
+#[cfg(target_os = "macos")]
 fn selected_source_path_from_open_panel(title: &str) -> Result<Option<String>, String> {
     let marker = MainThreadMarker::new()
         .ok_or_else(|| String::from("source picker must run on the macOS main thread"))?;
@@ -1586,16 +1596,17 @@ fn selected_source_path_from_open_panel(title: &str) -> Result<Option<String>, S
     panel.setAllowsMultipleSelection(false);
     panel.setTitle(Some(&title));
 
-    if panel.runModal() != NSModalResponseOK {
-        return Ok(None);
-    }
+    let confirmed = panel.runModal() == NSModalResponseOK;
+    let path = if confirmed {
+        panel
+            .URL()
+            .and_then(|url| url.path())
+            .map(|path| path.to_string())
+    } else {
+        None
+    };
 
-    panel
-        .URL()
-        .and_then(|url| url.path())
-        .map(|path| path.to_string())
-        .map(Some)
-        .ok_or_else(|| String::from("the selected source has no readable path"))
+    source_picker_result(confirmed, path)
 }
 
 #[tauri::command]
@@ -1719,6 +1730,24 @@ mod tests {
         let _ = fs::remove_file(&source);
 
         assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_picker_helper_returns_none_when_cancelled() {
+        assert_eq!(super::source_picker_result(false, None), Ok(None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn source_picker_helper_returns_selected_path() {
+        let path = String::from("/music/single-track.flac");
+
+        assert_eq!(
+            super::source_picker_result(true, Some(path.clone())),
+            Ok(Some(path)),
+        );
+        assert!(super::source_picker_result(true, None).is_err());
     }
 
     #[test]

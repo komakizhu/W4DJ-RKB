@@ -519,6 +519,22 @@ describe('bindApp', () => {
     });
   });
 
+  it('shows a source picker failure in the affected task status', async () => {
+    const services = makeMockServices({
+      pickSource: vi.fn().mockRejectedValue(new Error('无法打开来源选择窗口')),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="pick-source"][data-slot="0"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      const slot = root.querySelector('[data-role="sync-slot"][data-slot="0"]') as HTMLElement;
+      expect(slot.dataset.status).toBe('error');
+      expect(slot.querySelector('.progress-copy')?.textContent).toContain('无法打开来源选择窗口');
+    });
+  });
+
   it('accepts a single track dropped onto a source slot', async () => {
     const services = makeMockServices({
       selectSourceDirectory: vi.fn().mockResolvedValue(
@@ -836,7 +852,12 @@ describe('bindApp', () => {
           .status,
       ).toBe('error');
       expect(root.querySelector('[data-role="log-drawer"][data-slot="1"]')).toBeNull();
-      expect(root.textContent).not.toContain('Sync failed dramatically');
+      expect(
+        root.querySelector('[data-role="sync-slot"][data-slot="0"] .progress-copy')?.textContent,
+      ).toContain('Sync failed dramatically');
+      expect(
+        root.querySelector('[data-role="sync-slot"][data-slot="1"] .progress-copy')?.textContent,
+      ).toContain('Sync failed dramatically');
     });
   });
 });
