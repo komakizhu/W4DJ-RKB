@@ -993,7 +993,7 @@ h1 {
   gap: 7px;
   color: var(--rail-muted);
   font-size: 9px;
-  font-weight: 700;
+  font-weight: 500;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -1011,7 +1011,7 @@ h1 {
   background-position: right 13px center;
   background-repeat: no-repeat;
   color: var(--rail-text);
-  font: 700 11px/1.2 "Avenir Next", "PingFang SC", sans-serif;
+  font: 500 11px/1.2 "Avenir Next", "PingFang SC", sans-serif;
   cursor: pointer;
   transition: border-color 180ms ease, background-color 180ms ease, box-shadow 180ms ease;
 }
