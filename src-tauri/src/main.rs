@@ -55,7 +55,6 @@ struct AppInfo {
     version: &'static str,
     developer: &'static str,
     project_url: &'static str,
-    support_url: &'static str,
 }
 
 #[derive(Clone, Default)]
@@ -641,9 +640,8 @@ fn clear_history_command(state: tauri::State<'_, AppState>) -> Result<(), String
 fn app_info() -> AppInfo {
     AppInfo {
         version: env!("CARGO_PKG_VERSION"),
-        developer: "KOMAKI / komakizhu",
+        developer: "komakizhu",
         project_url: "https://github.com/komakizhu/W4DJ-RKB",
-        support_url: "https://www.buymeacoffee.com/",
     }
 }
 

@@ -197,9 +197,8 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
     version: '2.2.0',
-    developer: 'KOMAKI / komakizhu',
+    developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
-    support_url: 'https://www.buymeacoffee.com/',
   }),
   startAllSync: vi
     .fn()
@@ -357,16 +356,15 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '2.2.0',
-        developer: 'KOMAKI / komakizhu',
+      version: '2.2.0',
+        developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
-        support_url: 'https://www.buymeacoffee.com/',
       },
     );
 
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.0');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('Buy Me a Coffee');
+    expect(root.querySelector('[data-role="about-modal"] a')?.getAttribute('href')).toBe('https://github.com/komakizhu/W4DJ-RKB');
   });
 
   it('shows slot two running state without changing slot one', () => {

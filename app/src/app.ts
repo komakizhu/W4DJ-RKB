@@ -125,7 +125,6 @@ export type AppInfo = {
   version: string;
   developer: string;
   project_url: string;
-  support_url: string;
 };
 
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
@@ -262,7 +261,6 @@ const translations = {
     version: '版本',
     developer: '开发者',
     projectHome: '项目主页',
-    supportProject: 'Buy Me a Coffee',
     close: '关闭',
     pendingCount: '待继续',
     errorCategory: '错误类型',
@@ -342,7 +340,6 @@ const translations = {
     version: 'Version',
     developer: 'Developer',
     projectHome: 'Project home',
-    supportProject: 'Buy Me a Coffee',
     close: 'Close',
     pendingCount: 'Pending',
     errorCategory: 'Error type',
@@ -1345,7 +1342,6 @@ function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
         </dl>
         <div class="about-links">
           <a href="${escapeHtml(info.project_url)}" target="_blank" rel="noreferrer">${t('projectHome', lang)}</a>
-          <a href="${escapeHtml(info.support_url)}" target="_blank" rel="noreferrer">${t('supportProject', lang)}</a>
         </div>
         <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>
       </section>
