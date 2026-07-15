@@ -28,6 +28,12 @@ use w4dj::sync::{
 };
 
 #[cfg(target_os = "macos")]
+use objc2::MainThreadMarker;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
+#[cfg(target_os = "macos")]
+use objc2_foundation::NSString;
+#[cfg(target_os = "macos")]
 use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState, apply_vibrancy};
 
 struct AppState {
@@ -797,6 +803,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             load_desktop_state,
+            pick_source_path,
             select_source_directory,
             select_destination_directory,
             choose_mode,
@@ -1565,6 +1572,56 @@ fn validate_source_input(source: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn selected_source_path_from_open_panel(title: &str) -> Result<Option<String>, String> {
+    let marker = MainThreadMarker::new()
+        .ok_or_else(|| String::from("source picker must run on the macOS main thread"))?;
+    let panel = NSOpenPanel::openPanel(marker);
+    let title = NSString::from_str(title);
+
+    panel.setCanChooseFiles(true);
+    panel.setCanChooseDirectories(true);
+    panel.setAllowsMultipleSelection(false);
+    panel.setTitle(Some(&title));
+
+    if panel.runModal() != NSModalResponseOK {
+        return Ok(None);
+    }
+
+    panel
+        .URL()
+        .and_then(|url| url.path())
+        .map(|path| path.to_string())
+        .map(Some)
+        .ok_or_else(|| String::from("the selected source has no readable path"))
+}
+
+#[tauri::command]
+async fn pick_source_path(window: tauri::Window, title: String) -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        window
+            .run_on_main_thread(move || {
+                let result = selected_source_path_from_open_panel(&title);
+                let _ = sender.send(result);
+            })
+            .map_err(|error| format!("failed to open source picker: {error}"))?;
+
+        receiver
+            .recv()
+            .map_err(|error| format!("source picker did not return a result: {error}"))?
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, title);
+        Err(String::from(
+            "unified source picker is only available on macOS",
+        ))
+    }
 }
 
 fn fail_sync(
