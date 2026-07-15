@@ -1185,12 +1185,9 @@ export function bindApp(
     const settings = event.target;
     if (
       settings instanceof HTMLDetailsElement
+      && settings.dataset.role === 'advanced-output-settings'
     ) {
-      if (settings.dataset.role === 'advanced-output-settings') {
-        outputSettingsExpanded = settings.open;
-      } else if (settings.dataset.role === 'history') {
-        historyExpanded = settings.open;
-      }
+      outputSettingsExpanded = settings.open;
     }
   }, true);
 
