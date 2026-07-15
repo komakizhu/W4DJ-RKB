@@ -245,10 +245,9 @@ const translations = {
     sourcePath: '源目录',
     destinationPath: '输出目录',
     conflictStrategy: '已存在文件',
-    conflictSkip: '已存在则跳过',
-    conflictOverwrite: '覆盖旧文件',
-    conflictRename: '自动重命名',
-    conflictMetadata: '仅更新元数据',
+    conflictSkip: '已存在文件：跳过',
+    conflictOverwrite: '已存在文件：覆盖',
+    conflictMetadata: '高级选项：仅更新元数据',
     filenameRule: '文件名规则',
     titleArtist: '标题 - 艺术家（默认）',
     artistTitle: '艺术家 - 标题',
@@ -326,10 +325,9 @@ const translations = {
     sourcePath: 'Source',
     destinationPath: 'Output',
     conflictStrategy: 'Existing files',
-    conflictSkip: 'Skip existing',
-    conflictOverwrite: 'Overwrite',
-    conflictRename: 'Auto rename',
-    conflictMetadata: 'Update metadata only',
+    conflictSkip: 'Existing file: skip',
+    conflictOverwrite: 'Existing file: overwrite',
+    conflictMetadata: 'Advanced: update metadata only',
     filenameRule: 'Filename rule',
     titleArtist: 'Title - Artist (default)',
     artistTitle: 'Artist - Title',
@@ -1334,7 +1332,6 @@ function renderOutputSettings(state: AppViewState): string {
         <select data-action="choose-conflict" aria-label="${t('conflictStrategy', state.lang)}">
           <option value="skip" ${state.conflictStrategy === 'skip' ? 'selected' : ''}>${t('conflictSkip', state.lang)}</option>
           <option value="overwrite" ${state.conflictStrategy === 'overwrite' ? 'selected' : ''}>${t('conflictOverwrite', state.lang)}</option>
-          <option value="rename" ${state.conflictStrategy === 'rename' ? 'selected' : ''}>${t('conflictRename', state.lang)}</option>
           <option value="update_metadata" ${state.conflictStrategy === 'update_metadata' ? 'selected' : ''}>${t('conflictMetadata', state.lang)}</option>
         </select>
       </label>

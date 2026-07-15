@@ -523,7 +523,7 @@ describe('bindApp', () => {
   it('persists conflict and filename selections through backend services', async () => {
     const services = makeMockServices({
       chooseConflictStrategy: vi.fn().mockResolvedValue(
-        makeDesktopState({ conflict_strategy: 'rename' }),
+        makeDesktopState({ conflict_strategy: 'overwrite' }),
       ),
       chooseFilenameRule: vi.fn().mockResolvedValue(
         makeDesktopState({ filename_rule: 'artist_title' }),
@@ -533,9 +533,9 @@ describe('bindApp', () => {
     bindApp(root, makeViewState(), services);
 
     const conflict = root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement;
-    conflict.value = 'rename';
+    conflict.value = 'overwrite';
     conflict.dispatchEvent(new Event('change', { bubbles: true }));
-    await vi.waitFor(() => expect(services.chooseConflictStrategy).toHaveBeenCalledWith('rename'));
+    await vi.waitFor(() => expect(services.chooseConflictStrategy).toHaveBeenCalledWith('overwrite'));
 
     const filename = root.querySelector('[data-action="choose-filename-rule"]') as HTMLSelectElement;
     filename.value = 'artist_title';
