@@ -650,9 +650,6 @@ function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage, expanded =
           <p class="panel-kicker">W4DJ RKB</p>
           <h2>${t('history', lang)}</h2>
         </div>
-        <div class="history-head-actions">
-          <span class="history-count">${entries.length}</span>
-        </div>
       </summary>
       <div class="history-body">
         ${entries.length > 0 ? `<div class="history-body-actions"><button type="button" class="secondary-action history-clear" data-action="clear-history">${t('clearHistory', lang)}</button></div>` : ''}

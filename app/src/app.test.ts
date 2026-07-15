@@ -724,6 +724,8 @@ describe('bindApp', () => {
       expect(history).not.toBeNull();
       expect(history.parentElement?.classList.contains('workbench-main')).toBe(true);
       expect(history.open).toBe(false);
+      expect(history.querySelector('.history-count')).toBeNull();
+      expect(history.querySelector('summary')?.textContent).not.toContain('0');
     });
 
     const history = root.querySelector('[data-role="history"]') as HTMLDetailsElement;
