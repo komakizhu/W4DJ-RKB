@@ -798,7 +798,7 @@ h1 {
 
 .path-clear {
   position: absolute;
-  top: 10px;
+  top: 50%;
   right: 10px;
   z-index: 2;
   display: grid;
@@ -811,6 +811,7 @@ h1 {
   color: var(--quiet);
   cursor: pointer;
   opacity: 0.72;
+  transform: translateY(-50%);
   transition: color 160ms ease, background 160ms ease, border-color 160ms ease, opacity 160ms ease;
 }
 
