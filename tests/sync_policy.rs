@@ -156,6 +156,24 @@ fn get_music_dict_prefers_higher_quality_duplicate_stem() {
 }
 
 #[test]
+fn get_music_dict_accepts_a_single_audio_file_path() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "w4dj-sync-policy-single-file-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let source_path = temp_dir.join("single-track.flac");
+    fs::write(&source_path, b"flac-placeholder").unwrap();
+
+    let dict = sync::get_music_dict(source_path.to_str().unwrap());
+
+    assert_eq!(dict.len(), 1);
+    assert_eq!(dict.get("single-track").unwrap().1, source_path);
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn get_music_dict_prefers_wav_over_mp3_for_same_stem() {
     let temp_dir = std::env::temp_dir().join(format!(
         "w4dj-sync-policy-wav-over-mp3-{}",

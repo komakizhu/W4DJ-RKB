@@ -2,7 +2,8 @@ use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, Lossless
 use crate::history::HistoryEntry;
 use crate::sync::{
     effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
-    get_music_dict_with_scan_issues_with_rule, resolve_output_policy, target_output_path,
+    get_music_dict_with_scan_issues_with_rule, is_supported_source_file, resolve_output_policy,
+    target_output_path,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -103,10 +104,29 @@ pub fn build_sync_preview_with_settings(
     };
 
     let source_path = Path::new(source_directory);
-    if !source_path.is_dir() {
+    if !source_path.exists() {
         preview.warnings.push(PreviewIssue {
             path: source_directory.to_string(),
-            message: "歌曲下载目录不存在或不可读取".to_string(),
+            message: "输入来源不存在或不可读取".to_string(),
+        });
+        preview.estimated_output_bytes = None;
+        return Ok(preview);
+    }
+
+    if source_path.is_file() && !is_supported_source_file(source_path) {
+        preview.errors.push(PreviewIssue {
+            path: source_directory.to_string(),
+            message: "不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件".to_string(),
+        });
+        preview.error_count = 1;
+        preview.estimated_output_bytes = None;
+        return Ok(preview);
+    }
+
+    if !source_path.is_dir() && !source_path.is_file() {
+        preview.warnings.push(PreviewIssue {
+            path: source_directory.to_string(),
+            message: "输入来源不是文件夹或音频文件".to_string(),
         });
         preview.estimated_output_bytes = None;
         return Ok(preview);
@@ -179,6 +199,11 @@ pub fn build_sync_preview_with_settings(
         let expected_path = target_output_path(destination_directory, name, output_extension);
         let existing_path = destination_files
             .get(name)
+            .filter(|(_, path)| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case(output_extension))
+            })
             .map(|(_, path)| path.clone())
             .or_else(|| expected_path.exists().then_some(expected_path.clone()));
         let has_existing = existing_path.is_some();
@@ -242,6 +267,14 @@ pub fn build_sync_preview_with_settings(
         } else {
             target_output_path(destination_directory, &candidate_name, output_extension)
         };
+        if paths_refer_to_same_file(path, &destination_path) {
+            preview.errors.push(PreviewIssue {
+                path: path.display().to_string(),
+                message: "输出文件与源文件相同；请选择其他输出目录，避免覆盖原曲".to_string(),
+            });
+            preview.error_count += 1;
+            continue;
+        }
         preview.candidates.push(PreviewCandidate {
             name: candidate_name.clone(),
             source_path: path.display().to_string(),
@@ -294,6 +327,17 @@ pub fn build_sync_preview_with_settings(
     }
 
     Ok(preview)
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
@@ -481,4 +525,36 @@ fn available_disk_space(path: &Path) -> Option<u64> {
 #[cfg(not(any(unix, target_os = "windows")))]
 fn available_disk_space(_path: &Path) -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_sync_preview;
+    use crate::config::Mode;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn previews_a_single_supported_audio_file() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source_file = source_dir.path().join("single-track.mp3");
+        fs::write(&source_file, b"not-empty-audio-placeholder").unwrap();
+
+        let preview = build_sync_preview(
+            source_file.to_str().unwrap(),
+            destination_dir.path().to_str().unwrap(),
+            Mode::Compat,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(preview.new_count, 1);
+        assert_eq!(preview.error_count, 0);
+        assert_eq!(preview.candidates.len(), 1);
+        assert_eq!(
+            preview.candidates[0].source_path,
+            source_file.display().to_string()
+        );
+    }
 }

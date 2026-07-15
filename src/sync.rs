@@ -15,6 +15,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "ncm", "wav", "aiff"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputPolicy {
     pub output_extension: &'static str,
@@ -211,11 +214,18 @@ pub fn get_music_dict_with_scan_issues_with_rule(
     folder: &str,
     filename_rule: FilenameRule,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
-    collect_music_dict_with_scan_issues(
-        folder,
-        &["mp3", "flac", "ncm", "wav", "aiff"],
-        filename_rule,
-    )
+    let source_path = Path::new(folder);
+    if source_path.is_file() && !is_supported_source_file(source_path) {
+        return (HashMap::new(), Vec::new());
+    }
+
+    collect_music_dict_with_scan_issues(folder, SUPPORTED_SOURCE_EXTENSIONS, filename_rule)
+}
+
+pub fn is_supported_source_file(path: &Path) -> bool {
+    path.is_file()
+        && !is_temporary_artifact(path)
+        && has_allowed_extension(path, SUPPORTED_SOURCE_EXTENSIONS)
 }
 
 pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
@@ -611,7 +621,12 @@ fn process_music_file(
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
                     strip_163_key_from_mp3(&output_path)?;
                 }
-                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+                remove_conflicting_outputs(
+                    dest_folder,
+                    name,
+                    output_policy.output_extension,
+                    src_path,
+                )?;
             }
 
             result
@@ -632,7 +647,12 @@ fn process_music_file(
             };
 
             if result.is_ok() {
-                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+                remove_conflicting_outputs(
+                    dest_folder,
+                    name,
+                    output_policy.output_extension,
+                    src_path,
+                )?;
             }
 
             result
@@ -662,7 +682,12 @@ fn process_music_file(
                         output_policy.target_profile,
                     )?;
                 }
-                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+                remove_conflicting_outputs(
+                    dest_folder,
+                    name,
+                    output_policy.output_extension,
+                    src_path,
+                )?;
             }
 
             result
@@ -679,7 +704,12 @@ fn process_music_file(
                         target_output_path(dest_folder, name, output_policy.output_extension);
                     strip_163_key_from_mp3(&output_path)?;
                 }
-                remove_conflicting_outputs(dest_folder, name, output_policy.output_extension)?;
+                remove_conflicting_outputs(
+                    dest_folder,
+                    name,
+                    output_policy.output_extension,
+                    src_path,
+                )?;
             }
             result
         }
@@ -1006,6 +1036,7 @@ fn remove_conflicting_outputs(
     dest_folder: &str,
     name_stem: &str,
     keep_extension: &str,
+    protected_source_path: &Path,
 ) -> io::Result<()> {
     for extension in ["mp3", "flac", "wav", "aiff"] {
         if extension == keep_extension {
@@ -1013,12 +1044,26 @@ fn remove_conflicting_outputs(
         }
 
         let candidate_path = target_output_path(dest_folder, name_stem, extension);
+        if paths_refer_to_same_file(&candidate_path, protected_source_path) {
+            continue;
+        }
         if candidate_path.exists() {
             fs::remove_file(candidate_path)?;
         }
     }
 
     Ok(())
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
@@ -1571,7 +1616,8 @@ fn write_container_tags_from_flac_source(
 mod tests {
     use super::{
         build_song_name, build_song_name_with_rule, compare_music_dicts, derive_song_name,
-        ensure_generated_output, find_ffmpeg_next_to_exe, sanitize_filename_component,
+        ensure_generated_output, find_ffmpeg_next_to_exe, remove_conflicting_outputs,
+        sanitize_filename_component,
     };
     use crate::config::{FilenameRule, LosslessFormat, Mode};
     use std::collections::HashMap;
@@ -1792,6 +1838,20 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(error.to_string().contains("missing.aiff"));
+    }
+
+    #[test]
+    fn conflicting_output_cleanup_never_deletes_the_source_file() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("Song.flac");
+        let stale_output = dir.path().join("Song.wav");
+        fs::write(&source, b"source-audio").unwrap();
+        fs::write(&stale_output, b"stale-output").unwrap();
+
+        remove_conflicting_outputs(dir.path().to_str().unwrap(), "Song", "mp3", &source).unwrap();
+
+        assert!(source.exists());
+        assert!(!stale_output.exists());
     }
 
     #[cfg(not(target_os = "windows"))]

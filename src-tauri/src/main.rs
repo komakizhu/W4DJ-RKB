@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -23,7 +23,8 @@ use w4dj::preview::{
 };
 use w4dj::sync::{
     cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
-    get_music_dict_with_scan_issues, sync_music_library_with_observer, update_existing_metadata,
+    get_music_dict_with_scan_issues, is_supported_source_file, sync_music_library_with_observer,
+    update_existing_metadata,
 };
 
 #[cfg(target_os = "macos")]
@@ -236,7 +237,7 @@ fn start_sync(
         }
 
         controller.start_sync(slot_index, 0)?;
-        controller.push_log(slot_index, "Scanning folders")?;
+        controller.push_log(slot_index, "Scanning input source")?;
     }
 
     thread::spawn(move || run_sync_task(controller, destination_coordinator, slot_index));
@@ -284,12 +285,12 @@ fn start_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, Str
             }) {
                 return Ok(controller.state().clone());
             }
-            return Err(String::from("请至少选择一个歌曲下载目录"));
+            return Err(String::from("请至少选择一个歌曲文件夹或单曲"));
         }
 
         for &slot_index in &slot_indexes {
             controller.start_sync(slot_index, 0)?;
-            controller.push_log(slot_index, "Scanning folders")?;
+            controller.push_log(slot_index, "Scanning input source")?;
         }
 
         slot_indexes
@@ -354,10 +355,10 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
     };
 
     if slot_indexes.is_empty() {
-        return Err(String::from("请至少选择一个歌曲下载目录"));
+        return Err(String::from("请至少选择一个歌曲文件夹或单曲"));
     }
 
-    slots
+    let mut previews = slots
         .into_iter()
         .map(|(slot_index, source, destination)| {
             let preview = build_sync_preview_with_settings(
@@ -379,7 +380,78 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
                 retry_of: None,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    deduplicate_cross_slot_candidates(&mut previews);
+    Ok(previews)
+}
+
+fn deduplicate_cross_slot_candidates(previews: &mut [SlotPreview]) {
+    let mut planned_outputs = HashMap::<String, usize>::new();
+
+    for slot_preview in previews {
+        let mut retained = Vec::with_capacity(slot_preview.preview.candidates.len());
+        for candidate in std::mem::take(&mut slot_preview.preview.candidates) {
+            let key = planned_output_key(&candidate.destination_path);
+            if let Some(owner_slot) = planned_outputs.get(&key) {
+                slot_preview.preview.new_count = slot_preview.preview.new_count.saturating_sub(1);
+                slot_preview.preview.skipped_count += 1;
+                slot_preview.preview.estimated_output_bytes = match (
+                    slot_preview.preview.estimated_output_bytes,
+                    candidate.estimated_output_bytes,
+                ) {
+                    (Some(total), Some(candidate_bytes)) => {
+                        Some(total.saturating_sub(candidate_bytes))
+                    }
+                    _ => None,
+                };
+                let issue = PreviewIssue {
+                    path: candidate.source_path,
+                    message: format!(
+                        "与任务 {} 的输出文件重复，已交由任务 {} 处理",
+                        owner_slot + 1,
+                        owner_slot + 1
+                    ),
+                };
+                slot_preview.preview.skipped.push(issue.clone());
+                slot_preview.preview.warnings.push(issue);
+                continue;
+            }
+
+            planned_outputs.insert(key, slot_preview.slot_index);
+            retained.push(candidate);
+        }
+        slot_preview.preview.candidates = retained;
+    }
+}
+
+fn validate_unique_planned_outputs(previews: &[SlotPreview]) -> Result<(), String> {
+    let mut planned_outputs = HashSet::new();
+    for preview in previews {
+        for candidate in &preview.preview.candidates {
+            if !planned_outputs.insert(planned_output_key(&candidate.destination_path)) {
+                return Err(String::from(
+                    "两个任务包含相同的输出文件，请重新预检后再开始",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn planned_output_key(path: &str) -> String {
+    let path = Path::new(path);
+    let normalized = path
+        .parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or_else(|| path.to_path_buf());
+    let key = normalized.to_string_lossy().into_owned();
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    return key.to_lowercase();
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    key
 }
 
 fn collect_processable_previews(
@@ -466,6 +538,8 @@ fn start_confirmed_sync(
             }
             validated_previews.push(slot_preview);
         }
+
+        validate_unique_planned_outputs(&validated_previews)?;
 
         let allow_error_only_retry = retry_of.is_some()
             || validated_previews
@@ -892,10 +966,8 @@ fn run_confirmed_sync_task(
     persist_recovery_entry(&history_path, &history_write_lock, &recovery_entry);
 
     let mut setup_error: Option<String> = None;
-    if job.source.trim().is_empty() {
-        setup_error = Some(String::from("请选择歌曲下载目录"));
-    } else if !Path::new(&job.source).is_dir() {
-        setup_error = Some(format!("歌曲下载目录不存在：{}", job.source));
+    if let Err(error) = validate_source_input(&job.source) {
+        setup_error = Some(error);
     } else if let Err(error) = fs::create_dir_all(&job.destination) {
         setup_error = Some(format!("无法创建输出目录：{error}"));
     }
@@ -1310,22 +1382,13 @@ fn run_sync_task(
         )
     };
 
-    if source.trim().is_empty() {
-        fail_sync(&controller, slot_index, "请选择歌曲下载目录");
-        return;
-    }
-
     if destination.trim().is_empty() {
         fail_sync(&controller, slot_index, "请选择输出目录");
         return;
     }
 
-    if !Path::new(&source).exists() {
-        fail_sync(
-            &controller,
-            slot_index,
-            format!("歌曲下载目录不存在：{}", source),
-        );
+    if let Err(error) = validate_source_input(&source) {
+        fail_sync(&controller, slot_index, error);
         return;
     }
 
@@ -1483,6 +1546,27 @@ fn run_sync_task(
     }
 }
 
+fn validate_source_input(source: &str) -> Result<(), String> {
+    if source.trim().is_empty() {
+        return Err(String::from("请选择歌曲文件夹或单曲"));
+    }
+
+    let path = Path::new(source);
+    if !path.exists() {
+        return Err(format!("输入来源不存在：{source}"));
+    }
+    if path.is_file() && !is_supported_source_file(path) {
+        return Err(String::from(
+            "不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件",
+        ));
+    }
+    if !path.is_dir() && !path.is_file() {
+        return Err(String::from("输入来源不是文件夹或音频文件"));
+    }
+
+    Ok(())
+}
+
 fn fail_sync(
     controller: &Arc<Mutex<DesktopController>>,
     slot_index: usize,
@@ -1498,8 +1582,12 @@ fn fail_sync(
 mod tests {
     use super::DestinationCoordinator;
     use super::collect_processable_previews;
+    use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
     use super::record_preflight_issues;
+    use super::validate_source_input;
+    use super::validate_unique_planned_outputs;
+    use std::fs;
     use std::path::Path;
     use std::sync::Arc;
     use w4dj::config::Mode;
@@ -1544,6 +1632,50 @@ mod tests {
                 disk_space_sufficient: None,
             },
         }
+    }
+
+    #[test]
+    fn source_validation_accepts_a_single_audio_file() {
+        let source = std::env::temp_dir().join(format!(
+            "w4dj-single-source-{}-{}.mp3",
+            std::process::id(),
+            super::unique_timestamp()
+        ));
+        fs::write(&source, b"single-track").unwrap();
+
+        let result = validate_source_input(source.to_str().unwrap());
+        let _ = fs::remove_file(&source);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn source_validation_rejects_an_unsupported_single_file() {
+        let source = std::env::temp_dir().join(format!(
+            "w4dj-single-source-{}-{}.txt",
+            std::process::id(),
+            super::unique_timestamp()
+        ));
+        fs::write(&source, b"not-a-track").unwrap();
+
+        let result = validate_source_input(source.to_str().unwrap());
+        let _ = fs::remove_file(&source);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_outputs_across_slots_are_only_planned_once() {
+        let mut previews = vec![sample_preview(0, true), sample_preview(1, true)];
+
+        assert!(validate_unique_planned_outputs(&previews).is_err());
+        deduplicate_cross_slot_candidates(&mut previews);
+
+        assert_eq!(previews[0].preview.candidates.len(), 1);
+        assert!(previews[1].preview.candidates.is_empty());
+        assert_eq!(previews[1].preview.new_count, 0);
+        assert_eq!(previews[1].preview.skipped_count, 1);
+        assert!(validate_unique_planned_outputs(&previews).is_ok());
     }
 
     #[test]

@@ -74,6 +74,115 @@ fn preview_counts_unreadable_song_files_as_errors() {
 }
 
 #[test]
+fn preview_reports_an_unsupported_single_file_as_an_error() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_file = source.path().join("notes.txt");
+    write_file(&source_file, 120);
+
+    let preview = build_sync_preview(
+        source_file.to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.new_count, 0);
+    assert_eq!(preview.error_count, 1);
+    assert!(preview.candidates.is_empty());
+    assert!(preview.errors[0].message.contains("不支持"));
+}
+
+#[test]
+fn preview_reports_an_empty_single_audio_file_as_an_error() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_file = source.path().join("empty.mp3");
+    write_file(&source_file, 0);
+
+    let preview = build_sync_preview(
+        source_file.to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.new_count, 0);
+    assert_eq!(preview.error_count, 1);
+    assert!(preview.candidates.is_empty());
+}
+
+#[test]
+fn preview_blocks_overwriting_a_single_source_file_in_place() {
+    let source = tempdir().unwrap();
+    let source_file = source.path().join("single.mp3");
+    write_file(&source_file, 120);
+
+    let preview = build_sync_preview_with_settings(
+        source_file.to_str().unwrap(),
+        source.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+        ConflictStrategy::Overwrite,
+        FilenameRule::TitleArtist,
+    )
+    .unwrap();
+
+    assert_eq!(preview.new_count, 0);
+    assert_eq!(preview.error_count, 1);
+    assert!(preview.candidates.is_empty());
+    assert!(preview.errors[0].message.contains("源文件"));
+}
+
+#[test]
+fn preview_blocks_updating_metadata_on_the_input_file_itself() {
+    let source = tempdir().unwrap();
+    let source_file = source.path().join("single.mp3");
+    write_file(&source_file, 120);
+
+    let preview = build_sync_preview_with_settings(
+        source_file.to_str().unwrap(),
+        source.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+        ConflictStrategy::UpdateMetadata,
+        FilenameRule::TitleArtist,
+    )
+    .unwrap();
+
+    assert_eq!(preview.new_count, 0);
+    assert_eq!(preview.error_count, 1);
+    assert!(preview.candidates.is_empty());
+    assert!(preview.errors[0].message.contains("源文件"));
+}
+
+#[test]
+fn single_track_in_output_folder_is_not_skipped_when_target_format_differs() {
+    let source = tempdir().unwrap();
+    let source_file = source.path().join("single.wav");
+    write_file(&source_file, 120);
+
+    let preview = build_sync_preview(
+        source_file.to_str().unwrap(),
+        source.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.new_count, 1);
+    assert_eq!(preview.existing_count, 0);
+    assert_eq!(preview.skipped_count, 0);
+    assert!(
+        preview.candidates[0]
+            .destination_path
+            .ends_with("single.mp3")
+    );
+}
+
+#[test]
 fn preview_does_not_count_destination_configuration_errors_as_song_files() {
     let source = tempdir().unwrap();
     let destination_parent = tempdir().unwrap();

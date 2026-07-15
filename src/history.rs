@@ -196,7 +196,7 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     let mut report = String::new();
     report.push_str("W4DJ RKB 错误报告\n");
     report.push_str(&format!("任务时间：{}\n", entry.started_at));
-    report.push_str(&format!("源目录：{}\n", entry.source_directory));
+    report.push_str(&format!("输入来源：{}\n", entry.source_directory));
     report.push_str(&format!("输出目录：{}\n", entry.destination_directory));
     report.push_str(&format!("失败数量：{}\n\n", entry.failed_count));
 

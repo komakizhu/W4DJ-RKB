@@ -165,6 +165,7 @@ export type AppServices = {
     kind: 'source' | 'destination',
     slotIndex: SyncSlotIndex,
   ) => Promise<string | null>;
+  pickSourceFile: (slotIndex: SyncSlotIndex) => Promise<string | null>;
   selectSourceDirectory: (slotIndex: SyncSlotIndex, path: string) => Promise<DesktopState>;
   selectDestinationDirectory: (slotIndex: SyncSlotIndex, path: string) => Promise<DesktopState>;
   chooseMode: (mode: AppMode) => Promise<DesktopState>;
@@ -191,13 +192,14 @@ const translations = {
     eyebrow: 'W4DJ RKB',
     title: '如果我是DJ',
     railLead: '输出模式',
-    sourceKicker: '歌曲下载目录（网易云、SoundCloud 等）',
+    sourceKicker: '歌曲文件夹或单曲（网易云、SoundCloud 等）',
     destKicker: '任务 1 / 任务 2 独立运行，窗口较小时可滚动',
-    sourceLabel: '歌曲下载目录',
+    sourceLabel: '歌曲文件夹或单曲',
     destLabel: '输出目录',
-    clearSource: '清空输入目录',
+    clearSource: '清空输入来源',
     clearDestination: '清空输出目录',
     pickFolder: '选择文件夹',
+    pickTrack: '选择单曲',
     compatMode: '兼容模式',
     losslessMode: '无损模式',
     compatNote: '兼容模式：最高输出 320kbps MP3',
@@ -243,7 +245,7 @@ const translations = {
     exportReport: '导出错误报告',
     completedCount: '完成',
     failedCount: '失败',
-    sourcePath: '源目录',
+    sourcePath: '输入来源',
     destinationPath: '输出目录',
     conflictStrategy: '已存在文件',
     conflictSkip: '已存在文件：跳过',
@@ -271,13 +273,14 @@ const translations = {
     eyebrow: 'W4DJ RKB',
     title: 'If I Were a DJ',
     railLead: 'Output mode',
-    sourceKicker: 'Song folders (NetEase, SoundCloud, etc.)',
+    sourceKicker: 'Music folders or tracks (NetEase, SoundCloud, etc.)',
     destKicker: 'Task 1 and Task 2 run independently. Scroll when the window is short.',
-    sourceLabel: 'Song Folder',
+    sourceLabel: 'Music Folder or Track',
     destLabel: 'Output Folder',
-    clearSource: 'Clear input folder',
+    clearSource: 'Clear input source',
     clearDestination: 'Clear output folder',
     pickFolder: 'Select Folder',
+    pickTrack: 'Select Track',
     compatMode: 'Compat Mode',
     losslessMode: 'Lossless Mode',
     compatNote: 'Compat Mode: Max 320kbps MP3 output',
@@ -323,7 +326,7 @@ const translations = {
     exportReport: 'Export error report',
     completedCount: 'Completed',
     failedCount: 'Failed',
-    sourcePath: 'Source',
+    sourcePath: 'Input source',
     destinationPath: 'Output',
     conflictStrategy: 'Existing files',
     conflictSkip: 'Existing file: skip',
@@ -401,6 +404,22 @@ const defaultServices: AppServices = {
       directory: true,
       multiple: false,
       title,
+    });
+
+    return typeof selected === 'string' ? selected : null;
+  },
+  pickSourceFile: async (slotIndex) => {
+    const lang = (localStorage.getItem('w4dj_lang') as AppLanguage) || 'zh';
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      title: lang === 'zh' ? `选择单曲 ${slotIndex + 1}` : `Select track ${slotIndex + 1}`,
+      filters: [
+        {
+          name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
+          extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
+        },
+      ],
     });
 
     return typeof selected === 'string' ? selected : null;
@@ -694,10 +713,14 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
       <div class="path-flow">
           <div class="path-field" data-role="source-picker" data-drop-kind="source" data-slot="${slotIndex}">
           <span>${t('sourceLabel', state.lang)}</span>
-          <div class="path-control">
+          <div class="path-control source-path-control">
             <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
               ${icon('folder')}
               <span class="path-copy">${displayPath(slot.sourceDirectory, state.lang)}</span>
+            </button>
+            <button type="button" class="path-source-file" data-action="pick-source-file" data-slot="${slotIndex}" aria-label="${t('pickTrack', state.lang)}" title="${t('pickTrack', state.lang)}">
+              ${icon('music')}
+              <span>${t('pickTrack', state.lang)}</span>
             </button>
             <button type="button" class="path-clear" data-action="clear-source" data-slot="${slotIndex}" aria-label="${t('clearSource', state.lang)}" title="${t('clearSource', state.lang)}" ${slot.sourceDirectory.trim() ? '' : 'disabled'}>
               ${icon('trash')}
@@ -1142,6 +1165,14 @@ export function bindApp(
       return;
     }
 
+    if (action === 'pick-source-file' && slotIndex !== null) {
+      void runAction(async () => {
+        const path = await services.pickSourceFile(slotIndex);
+        return path ? services.selectSourceDirectory(slotIndex, path) : undefined;
+      }, slotIndex);
+      return;
+    }
+
     if (action === 'pick-destination' && slotIndex !== null) {
       void runAction(async () => {
         const path = await services.pickDirectory('destination', slotIndex);
@@ -1303,7 +1334,7 @@ export function bindApp(
 
       handleDirectoryDrop(target, payload.paths[0]);
     });
-    void listener.catch((error) => console.error('Failed to register folder drag-and-drop:', error));
+    void listener.catch((error) => console.error('Failed to register path drag-and-drop:', error));
   } catch {
     // Tauri drag-and-drop is unavailable in the browser test environment.
   }
@@ -1503,9 +1534,10 @@ function parseSlotIndex(value: string | undefined): SyncSlotIndex | null {
   return null;
 }
 
-function icon(name: 'folder' | 'export' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow'): string {
+function icon(name: 'folder' | 'music' | 'export' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow'): string {
   const icons = {
     folder: '<path d="M2.5 5.1h3.4l1.1 1.2h6.5v5.2H2.5z"/><path d="M2.5 4.5h3.2l1.3 1.2"/>',
+    music: '<path d="M6.2 11.2V4.6l6-1.2v6.4"/><path d="M6.2 6.5l6-1.2"/><circle cx="4.5" cy="11.5" r="1.7"/><circle cx="10.5" cy="10.1" r="1.7"/>',
     export: '<path d="M3 12.2h10"/><path d="M8 4v6.1"/><path d="M5.6 6.4 8 4l2.4 2.4"/>',
     trash: '<path d="M3.8 5.2h8.4"/><path d="M6.2 5.2V3.8h3.6v1.4"/><path d="m5 5.2.5 7.2h5l.5-7.2"/><path d="M6.8 7.1v3.7M9.2 7.1v3.7"/>',
     check: '<path d="M3.3 8.5 6.4 11.4 12.8 4.7"/>',

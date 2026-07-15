@@ -177,6 +177,7 @@ const makeHistoryEntry = (overrides: Partial<AppHistoryEntry> = {}): AppHistoryE
 const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => ({
   loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState()),
   pickDirectory: vi.fn().mockResolvedValue(null),
+  pickSourceFile: vi.fn().mockResolvedValue(null),
   selectSourceDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   selectDestinationDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseMode: vi.fn().mockResolvedValue(makeDesktopState()),
@@ -473,6 +474,51 @@ describe('bindApp', () => {
       expect(services.pickDirectory).toHaveBeenCalledWith('source', 1);
       expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '/new/source-2');
       expect(root.textContent).toContain('/new/source-2');
+    });
+  });
+
+  it('selects a single track for slot two', async () => {
+    const services = makeMockServices({
+      pickSourceFile: vi.fn().mockResolvedValue('/music/single-track.flac'),
+      selectSourceDirectory: vi.fn().mockResolvedValue(
+        makeDesktopStateWithSlot(1, { source_directory: '/music/single-track.flac' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="pick-source-file"][data-slot="1"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(services.pickSourceFile).toHaveBeenCalledWith(1);
+      expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '/music/single-track.flac');
+      expect(root.textContent).toContain('/music/single-track.flac');
+    });
+  });
+
+  it('accepts a single track dropped onto a source slot', async () => {
+    const services = makeMockServices({
+      selectSourceDirectory: vi.fn().mockResolvedValue(
+        makeDesktopStateWithSlot(0, { source_directory: '/music/dropped-track.wav' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+    const sourcePicker = root.querySelector(
+      '[data-role="source-picker"][data-slot="0"]',
+    ) as HTMLElement;
+    const file = new File(['audio'], 'dropped-track.wav', { type: 'audio/wav' });
+    Object.defineProperty(file, 'path', { value: '/music/dropped-track.wav' });
+    const event = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'dataTransfer', {
+      value: { files: [file], getData: vi.fn().mockReturnValue('') },
+    });
+
+    sourcePicker.dispatchEvent(event);
+
+    await vi.waitFor(() => {
+      expect(services.selectSourceDirectory).toHaveBeenCalledWith(0, '/music/dropped-track.wav');
+      expect(root.textContent).toContain('/music/dropped-track.wav');
     });
   });
 
