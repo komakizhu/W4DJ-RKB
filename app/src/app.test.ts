@@ -475,6 +475,29 @@ describe('bindApp', () => {
     });
   });
 
+  it('clears slot two source and destination paths without touching files', async () => {
+    const services = makeMockServices({
+      selectSourceDirectory: vi.fn().mockResolvedValue(
+        makeDesktopStateWithSlot(1, { source_directory: '' }),
+      ),
+      selectDestinationDirectory: vi.fn().mockResolvedValue(
+        makeDesktopStateWithSlot(1, { destination_directory: '' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="clear-source"][data-slot="1"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '');
+    });
+
+    (root.querySelector('[data-action="clear-destination"][data-slot="1"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(services.selectDestinationDirectory).toHaveBeenCalledWith(1, '');
+    });
+  });
+
   it('updates global mode and lossless format', async () => {
     const services = makeMockServices({
       chooseMode: vi

@@ -785,6 +785,56 @@ h1 {
   transition: none;
 }
 
+.path-control {
+  position: relative;
+  min-width: 0;
+}
+
+.path-control .path-button {
+  padding-right: 46px;
+}
+
+.path-clear {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--quiet);
+  cursor: pointer;
+  opacity: 0.72;
+  transition: color 160ms ease, background 160ms ease, border-color 160ms ease, opacity 160ms ease;
+}
+
+.path-clear:hover:not(:disabled) {
+  border-color: rgba(216, 70, 55, 0.22);
+  background: rgba(216, 70, 55, 0.1);
+  color: #c95645;
+  opacity: 1;
+}
+
+.path-clear:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.path-clear:disabled {
+  cursor: default;
+  opacity: 0.18;
+}
+
+.path-clear .ui-icon {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
 .path-button:hover {
   border-color: var(--slot-accent);
   background: var(--surface-strong);

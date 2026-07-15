@@ -194,6 +194,8 @@ const translations = {
     destKicker: '任务 1 / 任务 2 独立运行，窗口较小时可滚动',
     sourceLabel: '歌曲下载目录',
     destLabel: '输出目录',
+    clearSource: '清空输入目录',
+    clearDestination: '清空输出目录',
     pickFolder: '选择文件夹',
     compatMode: '兼容模式',
     losslessMode: '无损模式',
@@ -273,6 +275,8 @@ const translations = {
     destKicker: 'Task 1 and Task 2 run independently. Scroll when the window is short.',
     sourceLabel: 'Song Folder',
     destLabel: 'Output Folder',
+    clearSource: 'Clear input folder',
+    clearDestination: 'Clear output folder',
     pickFolder: 'Select Folder',
     compatMode: 'Compat Mode',
     losslessMode: 'Lossless Mode',
@@ -688,22 +692,32 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
       </header>
 
       <div class="path-flow">
-          <label class="path-field" data-role="source-picker" data-drop-kind="source" data-slot="${slotIndex}">
+          <div class="path-field" data-role="source-picker" data-drop-kind="source" data-slot="${slotIndex}">
           <span>${t('sourceLabel', state.lang)}</span>
-          <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
-            ${icon('folder')}
-            <span class="path-copy">${displayPath(slot.sourceDirectory, state.lang)}</span>
-          </button>
-        </label>
+          <div class="path-control">
+            <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
+              ${icon('folder')}
+              <span class="path-copy">${displayPath(slot.sourceDirectory, state.lang)}</span>
+            </button>
+            <button type="button" class="path-clear" data-action="clear-source" data-slot="${slotIndex}" aria-label="${t('clearSource', state.lang)}" title="${t('clearSource', state.lang)}" ${slot.sourceDirectory.trim() ? '' : 'disabled'}>
+              ${icon('trash')}
+            </button>
+          </div>
+        </div>
 
         <span class="path-arrow" aria-hidden="true">${icon('arrow')}</span>
 
-          <label class="path-field" data-role="destination-picker" data-drop-kind="destination" data-slot="${slotIndex}">
+          <div class="path-field" data-role="destination-picker" data-drop-kind="destination" data-slot="${slotIndex}">
           <span>${t('destLabel', state.lang)}</span>
-          <button type="button" class="path-button ${usesFallback ? 'is-fallback' : ''}" data-action="pick-destination" data-slot="${slotIndex}">
-            ${icon('export')}
-            <span class="path-copy">${displayPath(displayedDestination, state.lang)}</span>
-          </button>
+          <div class="path-control">
+            <button type="button" class="path-button ${usesFallback ? 'is-fallback' : ''}" data-action="pick-destination" data-slot="${slotIndex}">
+              ${icon('export')}
+              <span class="path-copy">${displayPath(displayedDestination, state.lang)}</span>
+            </button>
+            <button type="button" class="path-clear" data-action="clear-destination" data-slot="${slotIndex}" aria-label="${t('clearDestination', state.lang)}" title="${t('clearDestination', state.lang)}" ${slot.destinationDirectory.trim() ? '' : 'disabled'}>
+              ${icon('trash')}
+            </button>
+          </div>
           ${
             usesFallback
               ? `<small class="fallback-hint" data-role="fallback-hint" data-slot="1">
@@ -713,7 +727,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
                 </small>`
               : ''
           }
-        </label>
+        </div>
       </div>
 
       <footer class="slot-status-strip">
@@ -1115,11 +1129,21 @@ export function bindApp(
       return;
     }
 
+    if (action === 'clear-source' && slotIndex !== null) {
+      void runAction(() => services.selectSourceDirectory(slotIndex, ''), slotIndex);
+      return;
+    }
+
     if (action === 'pick-destination' && slotIndex !== null) {
       void runAction(async () => {
         const path = await services.pickDirectory('destination', slotIndex);
         return path ? services.selectDestinationDirectory(slotIndex, path) : undefined;
       }, slotIndex);
+      return;
+    }
+
+    if (action === 'clear-destination' && slotIndex !== null) {
+      void runAction(() => services.selectDestinationDirectory(slotIndex, ''), slotIndex);
       return;
     }
 
@@ -1472,10 +1496,11 @@ function parseSlotIndex(value: string | undefined): SyncSlotIndex | null {
   return null;
 }
 
-function icon(name: 'folder' | 'export' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow'): string {
+function icon(name: 'folder' | 'export' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow'): string {
   const icons = {
     folder: '<path d="M2.5 5.1h3.4l1.1 1.2h6.5v5.2H2.5z"/><path d="M2.5 4.5h3.2l1.3 1.2"/>',
     export: '<path d="M3 12.2h10"/><path d="M8 4v6.1"/><path d="M5.6 6.4 8 4l2.4 2.4"/>',
+    trash: '<path d="M3.8 5.2h8.4"/><path d="M6.2 5.2V3.8h3.6v1.4"/><path d="m5 5.2.5 7.2h5l.5-7.2"/><path d="M6.8 7.1v3.7M9.2 7.1v3.7"/>',
     check: '<path d="M3.3 8.5 6.4 11.4 12.8 4.7"/>',
     disc: '<circle cx="8" cy="8" r="5.1"/><circle cx="8" cy="8" r="1"/>',
     play: '<path d="M5.2 4v8l6.6-4z"/>',
