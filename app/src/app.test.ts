@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   bindApp,
+  humanizeError,
+  resolveDropTargetAt,
   renderApp,
   type AppHistoryEntry,
   type AppPreview,
@@ -196,7 +198,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '2.2.0',
+    version: '2.2.1',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -378,13 +380,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-      version: '2.2.0',
+        version: '2.2.1',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.0');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.1');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
   });
@@ -436,9 +438,39 @@ describe('renderApp', () => {
     expect(slot.textContent).not.toContain('悟空传 - MC赵小六.wav');
     expect(slot.textContent).not.toContain('Desktop shell ready');
   });
+
+  it('shows a first-use onboarding guide with the four core steps', () => {
+    const root = renderApp(makeViewState(), null, null, null, [], null, false, null, false, false, true);
+
+    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('拖入文件夹或单曲');
+    expect(root.querySelectorAll('[data-role="onboarding-step"]')).toHaveLength(4);
+  });
+
+  it('turns technical conversion errors into recovery-focused user messages', () => {
+    expect(humanizeError('Permission denied while writing output', 'zh')).toBe(
+      '没有权限写入这个文件夹，请换一个输出目录。',
+    );
+    expect(humanizeError('FFmpeg conversion failed', 'en')).toBe(
+      'Conversion failed. Check the file or try again.',
+    );
+  });
 });
 
 describe('bindApp', () => {
+  it('shows onboarding only on first use and remembers dismissing it', async () => {
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), makeMockServices());
+
+    await vi.waitFor(() => expect(root.querySelector('[data-role="onboarding-modal"]')).not.toBeNull());
+    (root.querySelector('[data-action="dismiss-onboarding"]') as HTMLButtonElement).click();
+    expect(root.querySelector('[data-role="onboarding-modal"]')).toBeNull();
+    expect(localStorage.getItem('w4dj_onboarding_seen')).toBe('1');
+
+    const secondRoot = document.createElement('div');
+    bindApp(secondRoot, makeViewState(), makeMockServices());
+    await vi.waitFor(() => expect(secondRoot.querySelector('[data-role="onboarding-modal"]')).toBeNull());
+  });
+
   it('loads and renders both resolved backend slots', async () => {
     const services = makeMockServices({
       loadDesktopState: vi.fn().mockResolvedValue(
@@ -575,6 +607,17 @@ describe('bindApp', () => {
       expect(services.selectSourceDirectory).toHaveBeenCalledWith(0, '/music/dropped-track.wav');
       expect(root.textContent).toContain('/music/dropped-track.wav');
     });
+  });
+
+  it('routes native drops to the exact task and path field under the pointer', () => {
+    const targets = [
+      { value: { id: 'source-1' }, rect: { left: 0, top: 0, right: 200, bottom: 80 } },
+      { value: { id: 'destination-1' }, rect: { left: 220, top: 0, right: 420, bottom: 80 } },
+      { value: { id: 'source-2' }, rect: { left: 0, top: 100, right: 200, bottom: 180 } },
+      { value: { id: 'destination-2' }, rect: { left: 220, top: 100, right: 420, bottom: 180 } },
+    ];
+
+    expect(resolveDropTargetAt(targets, { x: 700, y: 300 }, 2)?.id).toBe('destination-2');
   });
 
   it('clears slot two source and destination paths without touching files', async () => {
@@ -771,6 +814,7 @@ describe('bindApp', () => {
     await vi.waitFor(() => expect(root.querySelector('[data-action="delete-history"]')).not.toBeNull());
     (root.querySelector('[data-action="delete-history"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(services.deleteHistoryEntry).toHaveBeenCalledWith('history-1'));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('不会被删除'));
 
     // Re-render with an entry so the clear action is visible independently.
     (services.loadHistory as ReturnType<typeof vi.fn>).mockResolvedValue([makeHistoryEntry()]);

@@ -4037,7 +4037,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4057,7 +4057,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj-desktop"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "libc",
  "objc2",

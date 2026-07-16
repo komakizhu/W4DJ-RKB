@@ -1172,6 +1172,75 @@ h1 {
   backdrop-filter: blur(9px);
 }
 
+.onboarding-modal {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(19, 27, 29, 0.42);
+  backdrop-filter: blur(9px);
+}
+
+.onboarding-dialog {
+  width: min(460px, 100%);
+  display: grid;
+  gap: 16px;
+  padding: 28px;
+  border: 1px solid var(--line-strong);
+  border-radius: 24px;
+  background: var(--surface);
+  box-shadow: 0 24px 70px var(--shadow);
+}
+
+.onboarding-dialog h2,
+.onboarding-dialog p {
+  margin: 0;
+}
+
+.onboarding-intro {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.onboarding-steps {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.onboarding-steps li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-strong);
+}
+
+.onboarding-steps li > span {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border-radius: 50%;
+  background: var(--cyan-soft);
+  color: var(--cyan);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.onboarding-steps strong {
+  font-size: 13px;
+}
+
 .about-dialog {
   display: grid;
   gap: 18px;

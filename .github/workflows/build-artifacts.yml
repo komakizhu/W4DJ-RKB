@@ -30,12 +30,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: app/package-lock.json
 
@@ -70,12 +70,12 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/ffmpeg-win32-x64" -OutFile "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
 
       - name: Build Tauri package
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         with:
           args: ${{ matrix.args }}
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_path }}

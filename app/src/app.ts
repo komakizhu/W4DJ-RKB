@@ -186,6 +186,33 @@ export type AppServices = {
   cancelAllSync: () => Promise<DesktopState>;
 };
 
+export type DropTargetRect = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+};
+
+export function resolveDropTargetAt<T>(
+  targets: Array<{ value: T; rect: DropTargetRect }>,
+  position: { x: number; y: number },
+  scaleFactor = 1,
+): T | null {
+  const safeScaleFactor = Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
+  const x = position.x / safeScaleFactor;
+  const y = position.y / safeScaleFactor;
+
+  return (
+    targets.find(
+      ({ rect }) =>
+        x >= rect.left &&
+        x <= rect.right &&
+        y >= rect.top &&
+        y <= rect.bottom,
+    )?.value ?? null
+  );
+}
+
 const translations = {
   zh: {
     eyebrow: 'W4DJ RKB',
@@ -266,6 +293,14 @@ const translations = {
     close: '关闭',
     pendingCount: '待继续',
     errorCategory: '错误类型',
+    onboardingTitle: '第一次使用？看这里',
+    onboardingIntro: '四步完成一次转换，文件夹和单曲会自动识别。',
+    onboardingStepOne: '选择输出模式',
+    onboardingStepTwo: '拖入文件夹或单曲',
+    onboardingStepThree: '选择输出目录',
+    onboardingStepFour: '点击“同时开始”',
+    onboardingDismiss: '我知道了',
+    usageGuide: '重新查看使用引导',
   },
   en: {
     eyebrow: 'W4DJ RKB',
@@ -346,11 +381,49 @@ const translations = {
     close: 'Close',
     pendingCount: 'Pending',
     errorCategory: 'Error type',
+    onboardingTitle: 'New to W4DJ?',
+    onboardingIntro: 'Four steps to convert. Folders and single tracks are detected automatically.',
+    onboardingStepOne: 'Choose an output mode',
+    onboardingStepTwo: 'Drop in a folder or track',
+    onboardingStepThree: 'Choose an output folder',
+    onboardingStepFour: 'Click “Start both”',
+    onboardingDismiss: 'Got it',
+    usageGuide: 'View usage guide again',
   },
 } as const;
 
 function t(key: keyof typeof translations.zh, lang: AppLanguage): string {
   return translations[lang][key];
+}
+
+export function humanizeError(
+  message: string,
+  lang: AppLanguage,
+  category?: AppErrorCategory,
+): string {
+  const normalized = message.toLowerCase();
+  const isZh = lang === 'zh';
+
+  if (category === 'file_damaged' || normalized.includes('no such file') || normalized.includes('无法读取')) {
+    return isZh ? '歌曲文件无法读取，可能已损坏。' : 'The song file could not be read and may be damaged.';
+  }
+  if (category === 'unsupported_format' || normalized.includes('unsupported')) {
+    return isZh ? '暂不支持这个音频格式。' : 'This audio format is not supported yet.';
+  }
+  if (category === 'output_permission' || normalized.includes('permission denied')) {
+    return isZh ? '没有权限写入这个文件夹，请换一个输出目录。' : 'You cannot write to this folder. Choose another output folder.';
+  }
+  if (category === 'disk_space' || normalized.includes('no space')) {
+    return isZh ? '磁盘空间不足，请清理空间后重试。' : 'There is not enough disk space. Free up space and try again.';
+  }
+  if (category === 'invalid_filename' || normalized.includes('invalid filename')) {
+    return isZh ? '歌曲文件名无法使用，软件会尝试自动修正。' : 'The song filename is not allowed. W4DJ will try to fix it.';
+  }
+  if (category === 'ffmpeg' || normalized.includes('ffmpeg') || normalized.includes('conversion failed')) {
+    return isZh ? '歌曲转换失败，请检查文件或重试。' : 'Conversion failed. Check the file or try again.';
+  }
+
+  return message;
 }
 
 function defaultSlot(lang: AppLanguage): AppSyncSlotViewState {
@@ -462,6 +535,7 @@ export function renderApp(
   aboutInfo: AppInfo | null = null,
   outputSettingsExpanded = false,
   historyExpanded = false,
+  onboardingVisible = false,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -556,6 +630,7 @@ export function renderApp(
     </section>
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, state.lang)}
+    ${renderOnboardingModal(onboardingVisible, state.lang)}
   `;
 
   return root;
@@ -606,10 +681,10 @@ function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
   const preview = item.preview;
   const issues = [
     ...preview.errors.map(
-      (issue) => `<li>${escapeHtml(issue.path)}：${escapeHtml(issue.message)}</li>`,
+      (issue) => `<li>${escapeHtml(issue.path)}：${escapeHtml(humanizeError(issue.message, lang))}</li>`,
     ),
     ...preview.warnings.map(
-      (issue) => `<li class="preview-warning">${escapeHtml(issue.path)}：${escapeHtml(issue.message)}</li>`,
+      (issue) => `<li class="preview-warning">${escapeHtml(issue.path)}：${escapeHtml(humanizeError(issue.message, lang))}</li>`,
     ),
   ].join('');
   return `
@@ -664,7 +739,7 @@ function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage, expanded =
 function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
   const pendingFiles = entry.pending_files || [];
   const failures = entry.failed_files
-    .map((failedFile) => `<li><strong>${escapeHtml(failedFile.name)}</strong><span class="failure-category">${t('errorCategory', lang)}：${errorCategoryLabel(failedFile.category, lang)}</span><span>${escapeHtml(failedFile.message)}</span></li>`)
+    .map((failedFile) => `<li><strong>${escapeHtml(failedFile.name)}</strong><span class="failure-category">${t('errorCategory', lang)}：${errorCategoryLabel(failedFile.category, lang)}</span><span>${escapeHtml(humanizeError(failedFile.message, lang, failedFile.category))}</span></li>`)
     .join('');
   return `
     <article class="history-entry" data-history-id="${escapeHtml(entry.id)}">
@@ -771,6 +846,7 @@ export function bindApp(
   let aboutInfo: AppInfo | null = null;
   let outputSettingsExpanded = false;
   let historyExpanded = false;
+  let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
 
   const render = () => {
     root.replaceChildren(
@@ -785,6 +861,7 @@ export function bindApp(
         aboutInfo,
         outputSettingsExpanded,
         historyExpanded,
+        onboardingVisible,
       ),
     );
 
@@ -846,7 +923,7 @@ export function bindApp(
       slots[slotIndex] = {
         ...slots[slotIndex],
         status: 'error',
-        progressText: `${t('error', state.lang)}: ${message}`,
+        progressText: `${t('error', state.lang)}: ${humanizeError(message, state.lang)}`,
         logs: [...slots[slotIndex].logs, message],
       };
     });
@@ -958,6 +1035,12 @@ export function bindApp(
   };
 
   const deleteHistory = async (id: string) => {
+    const message = state.lang === 'zh'
+      ? '确定删除这条转换记录吗？已经生成的音频文件不会被删除。'
+      : 'Delete this conversion record? Generated audio files will not be deleted.';
+    if (!window.confirm(message)) {
+      return;
+    }
     try {
       await services.deleteHistoryEntry(id);
       await refreshHistory();
@@ -967,7 +1050,9 @@ export function bindApp(
   };
 
   const clearAllHistory = async () => {
-    const message = state.lang === 'zh' ? '确定清空全部转换历史吗？' : 'Clear all conversion history?';
+    const message = state.lang === 'zh'
+      ? '确定清空全部转换历史吗？已经生成的音频文件不会被删除。'
+      : 'Clear all conversion history? Generated audio files will not be deleted.';
     if (!window.confirm(message)) {
       return;
     }
@@ -1059,6 +1144,20 @@ export function bindApp(
 
     if (action === 'open-about') {
       void openAbout();
+      return;
+    }
+
+    if (action === 'dismiss-onboarding') {
+      onboardingVisible = false;
+      localStorage.setItem('w4dj_onboarding_seen', '1');
+      render();
+      return;
+    }
+
+    if (action === 'reopen-onboarding') {
+      aboutInfo = null;
+      onboardingVisible = true;
+      render();
       return;
     }
 
@@ -1216,21 +1315,23 @@ export function bindApp(
     });
   };
 
-  const dropTargetAt = (position: { x: number; y: number }) => {
-    const scale = window.devicePixelRatio || 1;
-    const points = [
-      [position.x / scale, position.y / scale],
-      [position.x, position.y],
-    ];
+  const dropTargetAt = (position: { x: number; y: number }, scaleFactor: number) => {
+    const targets = Array.from(root.querySelectorAll<HTMLElement>('[data-drop-kind]')).map(
+      (target) => {
+        const rect = target.getBoundingClientRect();
+        return {
+          value: target,
+          rect: {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+          },
+        };
+      },
+    );
 
-    for (const [x, y] of points) {
-      const target = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-drop-kind]');
-      if (target) {
-        return target;
-      }
-    }
-
-    return null;
+    return resolveDropTargetAt(targets, position, scaleFactor);
   };
 
   const pathFromBrowserDrop = (event: DragEvent): string | null => {
@@ -1296,13 +1397,17 @@ export function bindApp(
   });
 
   try {
-    const listener = getCurrentWindow().onDragDropEvent(({ payload }: { payload: DragDropEvent }) => {
+    const currentWindow = getCurrentWindow();
+    const scaleFactorPromise = currentWindow
+      .scaleFactor()
+      .catch(() => window.devicePixelRatio || 1);
+    const listener = currentWindow.onDragDropEvent(async ({ payload }: { payload: DragDropEvent }) => {
       if (payload.type === 'leave') {
         clearDropTargets();
         return;
       }
 
-      const target = dropTargetAt(payload.position);
+      const target = dropTargetAt(payload.position, await scaleFactorPromise);
       clearDropTargets();
       target?.classList.add('is-drag-over');
 
@@ -1385,8 +1490,36 @@ function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
         </dl>
         <div class="about-links">
           <button type="button" class="about-link" data-action="open-project-home" data-url="${escapeHtml(info.project_url)}">${t('projectHome', lang)}</button>
+          <button type="button" class="about-link" data-action="reopen-onboarding">${t('usageGuide', lang)}</button>
         </div>
         <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>
+      </section>
+    </div>
+  `;
+}
+
+function renderOnboardingModal(visible: boolean, lang: AppLanguage): string {
+  if (!visible) {
+    return '';
+  }
+
+  const steps = [
+    t('onboardingStepOne', lang),
+    t('onboardingStepTwo', lang),
+    t('onboardingStepThree', lang),
+    t('onboardingStepFour', lang),
+  ];
+
+  return `
+    <div class="onboarding-modal" data-role="onboarding-modal" role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
+      <section class="onboarding-dialog">
+        <p class="panel-kicker">W4DJ RKB</p>
+        <h2 id="onboarding-title">${t('onboardingTitle', lang)}</h2>
+        <p class="onboarding-intro">${t('onboardingIntro', lang)}</p>
+        <ol class="onboarding-steps">
+          ${steps.map((step, index) => `<li data-role="onboarding-step"><span>${index + 1}</span><strong>${step}</strong></li>`).join('')}
+        </ol>
+        <button type="button" class="global-action" data-action="dismiss-onboarding">${t('onboardingDismiss', lang)}</button>
       </section>
     </div>
   `;
