@@ -617,7 +617,21 @@ describe('bindApp', () => {
       { value: { id: 'destination-2' }, rect: { left: 220, top: 100, right: 420, bottom: 180 } },
     ];
 
-    expect(resolveDropTargetAt(targets, { x: 700, y: 300 }, 2)?.id).toBe('destination-2');
+    expect(resolveDropTargetAt(targets, { x: 700, y: 300 }, 2, 'physical')?.id).toBe('destination-2');
+  });
+
+  it('keeps macOS native drop coordinates in the webview coordinate system', () => {
+    const targets = [
+      { value: { id: 'source-1' }, rect: { left: 280, top: 180, right: 570, bottom: 285 } },
+      { value: { id: 'destination-1' }, rect: { left: 610, top: 180, right: 885, bottom: 285 } },
+      { value: { id: 'source-2' }, rect: { left: 280, top: 390, right: 570, bottom: 465 } },
+      { value: { id: 'destination-2' }, rect: { left: 610, top: 390, right: 885, bottom: 465 } },
+    ];
+
+    // Wry on macOS reports a webview-relative point even though Tauri types it
+    // as a PhysicalPosition. Dividing this point by the Retina scale lands on
+    // task 1's source field instead of task 2's destination field.
+    expect(resolveDropTargetAt(targets, { x: 700, y: 415 }, 2)?.id).toBe('destination-2');
   });
 
   it('clears slot two source and destination paths without touching files', async () => {

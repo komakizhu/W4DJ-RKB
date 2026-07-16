@@ -193,12 +193,18 @@ export type DropTargetRect = {
   bottom: number;
 };
 
+export type DropCoordinateSpace = 'logical' | 'physical';
+
 export function resolveDropTargetAt<T>(
   targets: Array<{ value: T; rect: DropTargetRect }>,
   position: { x: number; y: number },
   scaleFactor = 1,
+  coordinateSpace: DropCoordinateSpace = 'logical',
 ): T | null {
-  const safeScaleFactor = Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1;
+  const safeScaleFactor =
+    coordinateSpace === 'physical' && Number.isFinite(scaleFactor) && scaleFactor > 0
+      ? scaleFactor
+      : 1;
   const x = position.x / safeScaleFactor;
   const y = position.y / safeScaleFactor;
 
@@ -211,6 +217,10 @@ export function resolveDropTargetAt<T>(
         y <= rect.bottom,
     )?.value ?? null
   );
+}
+
+function nativeDropCoordinatesArePhysical(): boolean {
+  return /Windows/i.test(navigator.userAgent);
 }
 
 const translations = {
@@ -1331,7 +1341,12 @@ export function bindApp(
       },
     );
 
-    return resolveDropTargetAt(targets, position, scaleFactor);
+    return resolveDropTargetAt(
+      targets,
+      position,
+      scaleFactor,
+      nativeDropCoordinatesArePhysical() ? 'physical' : 'logical',
+    );
   };
 
   const pathFromBrowserDrop = (event: DragEvent): string | null => {
