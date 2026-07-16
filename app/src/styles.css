@@ -296,6 +296,7 @@ h1 {
 }
 
 .global-controls {
+  --format-slot-height: 55px;
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -431,10 +432,12 @@ h1 {
 
 .format-row {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  height: var(--format-slot-height);
 }
 
 .format-slot {
-  min-height: 53px;
+  height: var(--format-slot-height);
+  min-height: var(--format-slot-height);
 }
 
 .mode-button,
