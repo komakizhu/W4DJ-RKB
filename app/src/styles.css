@@ -58,7 +58,8 @@ button:focus-visible {
   position: relative;
   isolation: isolate;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  align-content: start;
   gap: 14px;
   width: 100%;
   min-height: 100vh;
@@ -267,7 +268,7 @@ h1 {
   min-width: 0;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 26px;
-  padding: 24px 22px 22px;
+  padding: 24px 22px 18px;
   overflow-x: hidden;
   overflow-y: auto;
   background:
@@ -528,7 +529,7 @@ h1 {
 .rail-lower {
   display: grid;
   gap: 12px;
-  margin-top: auto;
+  margin-top: 0;
 }
 
 .rail-note p {
@@ -1048,6 +1049,11 @@ h1 {
 
 .output-settings:not([open]) .output-settings-content {
   display: none;
+}
+
+.output-settings:not([open]) {
+  margin-top: 0;
+  padding-top: 0;
 }
 
 .output-settings label {
