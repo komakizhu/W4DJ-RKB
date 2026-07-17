@@ -1371,6 +1371,18 @@ export function bindApp(
     }
   };
 
+  const browserDropTargetAt = (event: DragEvent): HTMLElement | null => {
+    // WKWebView may keep dispatching drag events from the element first entered.
+    // Hit-test the live pointer coordinates so moving in either direction can
+    // switch between all four source/destination fields.
+    const hasPointerPosition = Number.isFinite(event.clientX) && Number.isFinite(event.clientY);
+    if (hasPointerPosition) {
+      return dropTargetAt({ x: event.clientX, y: event.clientY }, 1);
+    }
+    return (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-drop-kind]')
+      ?? null;
+  };
+
   const handleDirectoryDrop = (target: HTMLElement, path: string | null) => {
     target.classList.remove('is-drag-over');
     if (!path) {
@@ -1392,18 +1404,19 @@ export function bindApp(
   };
 
   root.addEventListener('dragover', (event) => {
-    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-drop-kind]');
+    const target = browserDropTargetAt(event);
+    clearDropTargets();
     if (!target) {
       return;
     }
 
     event.preventDefault();
-    clearDropTargets();
     target.classList.add('is-drag-over');
   });
 
   root.addEventListener('drop', (event) => {
-    const target = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-drop-kind]');
+    const target = browserDropTargetAt(event);
+    clearDropTargets();
     if (!target) {
       return;
     }

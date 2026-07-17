@@ -610,7 +610,89 @@ describe('bindApp', () => {
     });
   });
 
-  it('routes native drops to the exact task and path field under the pointer', () => {
+  it('routes a continuous browser drag by live pointer position after entering task two', async () => {
+    const services = makeMockServices();
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+    const taskOneSource = root.querySelector(
+      '[data-role="source-picker"][data-slot="0"]',
+    ) as HTMLElement;
+    const taskTwoSource = root.querySelector(
+      '[data-role="source-picker"][data-slot="1"]',
+    ) as HTMLElement;
+    vi.spyOn(taskOneSource, 'getBoundingClientRect').mockReturnValue({
+      left: 100,
+      top: 100,
+      right: 300,
+      bottom: 200,
+      width: 200,
+      height: 100,
+      x: 100,
+      y: 100,
+      toJSON: () => ({}),
+    });
+    vi.spyOn(taskTwoSource, 'getBoundingClientRect').mockReturnValue({
+      left: 100,
+      top: 300,
+      right: 300,
+      bottom: 400,
+      width: 200,
+      height: 100,
+      x: 100,
+      y: 300,
+      toJSON: () => ({}),
+    });
+
+    taskTwoSource.dispatchEvent(new MouseEvent('dragover', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 150,
+      clientY: 350,
+    }));
+    expect(taskTwoSource.classList.contains('is-drag-over')).toBe(true);
+
+    // WKWebView can keep the original event target while the pointer moves.
+    taskTwoSource.dispatchEvent(new MouseEvent('dragover', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 150,
+      clientY: 150,
+    }));
+
+    expect(taskOneSource.classList.contains('is-drag-over')).toBe(true);
+    expect(taskTwoSource.classList.contains('is-drag-over')).toBe(false);
+
+    taskTwoSource.dispatchEvent(new MouseEvent('dragover', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 350,
+      clientY: 250,
+    }));
+    expect(taskOneSource.classList.contains('is-drag-over')).toBe(false);
+    expect(taskTwoSource.classList.contains('is-drag-over')).toBe(false);
+
+    const folder = new File([], 'music');
+    Object.defineProperty(folder, 'path', { value: '/music/from-task-two-to-one' });
+    const drop = new MouseEvent('drop', {
+      bubbles: true,
+      cancelable: true,
+      clientX: 150,
+      clientY: 150,
+    });
+    Object.defineProperty(drop, 'dataTransfer', {
+      value: { files: [folder], getData: vi.fn().mockReturnValue('') },
+    });
+    taskTwoSource.dispatchEvent(drop);
+
+    await vi.waitFor(() => {
+      expect(services.selectSourceDirectory).toHaveBeenCalledWith(
+        0,
+        '/music/from-task-two-to-one',
+      );
+    });
+  });
+
+  it('routes native drops to all four task fields independent of traversal direction', () => {
     const targets = [
       { value: { id: 'source-1' }, rect: { left: 0, top: 0, right: 200, bottom: 80 } },
       { value: { id: 'destination-1' }, rect: { left: 220, top: 0, right: 420, bottom: 80 } },
@@ -618,7 +700,23 @@ describe('bindApp', () => {
       { value: { id: 'destination-2' }, rect: { left: 220, top: 100, right: 420, bottom: 180 } },
     ];
 
-    expect(resolveDropTargetAt(targets, { x: 700, y: 300 }, 2, 'physical')?.id).toBe('destination-2');
+    const route = (x: number, y: number) =>
+      resolveDropTargetAt(targets, { x: x * 2, y: y * 2 }, 2, 'physical')?.id;
+    const downward = [
+      route(100, 40),
+      route(320, 40),
+      route(100, 140),
+      route(320, 140),
+    ];
+    const upward = [
+      route(320, 140),
+      route(100, 140),
+      route(320, 40),
+      route(100, 40),
+    ];
+
+    expect(downward).toEqual(['source-1', 'destination-1', 'source-2', 'destination-2']);
+    expect(upward).toEqual(['destination-2', 'source-2', 'destination-1', 'source-1']);
   });
 
   it('keeps macOS native drop coordinates in the webview coordinate system', () => {
