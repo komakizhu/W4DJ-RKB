@@ -179,6 +179,35 @@ fn select_destination_directory(
     Ok(snapshot)
 }
 
+fn validate_destination_directory(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(String::from("输出目录为空"));
+    }
+    if !path.is_dir() {
+        return Err(format!("输出目录不存在或不是文件夹：{}", path.display()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn open_destination(path: String) -> Result<(), String> {
+    let destination = PathBuf::from(path.trim());
+    validate_destination_directory(&destination)?;
+
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = Command::new("explorer");
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = Command::new("xdg-open");
+
+    command
+        .arg(&destination)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开输出目录：{error}"))
+}
+
 #[tauri::command]
 fn choose_mode(mode: Mode, state: tauri::State<'_, AppState>) -> DesktopState {
     let snapshot = {
@@ -808,7 +837,8 @@ fn main() {
             delete_history_entry_command,
             clear_history_command,
             app_info,
-            open_external_url
+            open_external_url,
+            open_destination
         ])
         .setup(|app| {
             let preferences_path = app
@@ -1694,6 +1724,7 @@ mod tests {
     use super::collect_processable_previews;
     use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
+    use super::validate_destination_directory;
     use super::validate_source_input;
     use super::validate_unique_planned_outputs;
     use std::fs;
@@ -1879,6 +1910,21 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn validates_output_directories_before_opening_them() {
+        let directory = std::env::temp_dir().join(format!(
+            "w4dj-open-destination-{}",
+            super::unique_timestamp()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        assert!(validate_destination_directory(&directory).is_ok());
+
+        let missing = directory.join("missing");
+        assert!(validate_destination_directory(&missing).is_err());
+        assert!(validate_destination_directory(Path::new("")).is_err());
+        let _ = fs::remove_dir(&directory);
     }
 
     #[test]

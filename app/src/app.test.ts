@@ -204,6 +204,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
   openExternalUrl: vi.fn().mockResolvedValue(undefined),
+  openDestination: vi.fn().mockResolvedValue(undefined),
   startAllSync: vi
     .fn()
     .mockResolvedValue(makeDesktopState({
@@ -254,6 +255,33 @@ describe('renderApp', () => {
     expect(root.querySelectorAll('[data-role="log-drawer"]')).toHaveLength(0);
     expect(root.querySelectorAll('.slot-status-strip .progress-copy')).toHaveLength(0);
     expect(root.querySelector('.rail-copy')).toBeNull();
+  });
+
+  it('refreshes conversion history after the desktop reports completion', async () => {
+    const history = makeHistoryEntry({ status: 'completed', failed_count: 0, error_count: 0 });
+    const services = makeMockServices({
+      loadHistory: vi
+        .fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([history]),
+      loadDesktopState: vi.fn().mockResolvedValue(
+        makeDesktopState({
+          slots: [
+            makeDesktopSlot({ status: 'completed', progress_total: 1, progress_completed: 1 }),
+            makeDesktopSlot({ status: 'running' }),
+          ],
+        }),
+      ),
+    });
+    const root = document.createElement('div');
+
+    bindApp(root, makeViewState({
+      slots: [makeViewSlot({ status: 'running' }), makeViewSlot()],
+    }), services);
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="history"] article')).not.toBeNull();
+    });
   });
 
   it('keeps progress text for active tasks without showing idle footer text', () => {
@@ -545,6 +573,25 @@ describe('bindApp', () => {
       expect(services.pickSource).toHaveBeenCalledWith(1);
       expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '/new/source-2');
       expect(root.textContent).toContain('/new/source-2');
+    });
+  });
+
+  it('opens each task output folder, including task two fallback output', async () => {
+    const services = makeMockServices();
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({
+      slots: [
+        makeViewSlot({ destinationDirectory: '/music/out-1' }),
+        makeViewSlot({ destinationDirectory: '' }),
+      ],
+    }), services);
+
+    (root.querySelector('[data-action="open-destination"][data-slot="0"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="open-destination"][data-slot="1"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(services.openDestination).toHaveBeenNthCalledWith(1, '/music/out-1');
+      expect(services.openDestination).toHaveBeenNthCalledWith(2, '/music/out-1');
     });
   });
 

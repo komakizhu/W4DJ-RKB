@@ -1070,12 +1070,23 @@ fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
             )
         })
         .collect::<Vec<(String, String, String)>>();
+    let extended_texts_to_remove = tag
+        .extended_texts()
+        .filter(|text| text.description == "163 key" || text.description.starts_with("163 key("))
+        .map(|text| text.description.clone())
+        .collect::<Vec<String>>();
+
+    if comments_to_remove.is_empty() && extended_texts_to_remove.is_empty() {
+        return Ok(());
+    }
 
     for (_, description, text) in comments_to_remove {
         tag.remove_comment(Some(&description), Some(&text));
     }
 
-    tag.remove_extended_text(Some("163 key"), None);
+    for description in extended_texts_to_remove {
+        tag.remove_extended_text(Some(&description), None);
+    }
     tag.write_to_path(path, Version::Id3v24)
         .map_err(io::Error::other)
 }
@@ -1604,9 +1615,10 @@ mod tests {
     use super::{
         build_song_name, build_song_name_with_rule, compare_music_dicts, derive_song_name,
         ensure_generated_output, find_ffmpeg_next_to_exe, remove_conflicting_outputs,
-        sanitize_filename_component,
+        sanitize_filename_component, strip_163_key_from_mp3,
     };
     use crate::config::{FilenameRule, LosslessFormat, Mode};
+    use id3::{Tag, TagLike, Version};
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1825,6 +1837,59 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(error.to_string().contains("missing.aiff"));
+    }
+
+    #[test]
+    fn does_not_rewrite_an_mp3_without_163_metadata() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cover-song.mp3");
+        fs::write(&path, b"audio").unwrap();
+        let mut tag = Tag::new();
+        tag.set_title("Cover Song");
+        tag.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".into(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe1, 0x01, 0x02],
+        });
+        tag.write_to_path(&path, Version::Id3v23).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        strip_163_key_from_mp3(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(Tag::read_from_path(&path).unwrap().pictures().count(), 1);
+    }
+
+    #[test]
+    fn removes_163_metadata_while_preserving_the_cover_frame() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("netease-song.mp3");
+        fs::write(&path, b"audio").unwrap();
+        let mut tag = Tag::new();
+        tag.add_frame(id3::frame::Comment {
+            lang: "eng".into(),
+            description: "163 key".into(),
+            text: "163 key(secret)".into(),
+        });
+        tag.add_frame(id3::frame::ExtendedText {
+            description: "163 key".into(),
+            value: "secret".into(),
+        });
+        tag.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".into(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe1, 0x01, 0x02],
+        });
+        tag.write_to_path(&path, Version::Id3v24).unwrap();
+
+        strip_163_key_from_mp3(&path).unwrap();
+
+        let cleaned = Tag::read_from_path(&path).unwrap();
+        assert_eq!(cleaned.comments().count(), 0);
+        assert_eq!(cleaned.extended_texts().count(), 0);
+        assert_eq!(cleaned.pictures().count(), 1);
     }
 
     #[test]

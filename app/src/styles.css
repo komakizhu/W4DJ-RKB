@@ -800,10 +800,13 @@ h1 {
   padding-right: 46px;
 }
 
-.path-clear {
+.destination-path-control .path-button {
+  padding-right: 82px;
+}
+
+.path-action {
   position: absolute;
   top: 10px;
-  right: 10px;
   z-index: 2;
   display: grid;
   place-items: center;
@@ -819,27 +822,42 @@ h1 {
   transition: color 160ms ease, background 160ms ease, border-color 160ms ease, opacity 160ms ease;
 }
 
+.path-open {
+  right: 42px;
+}
+
+.path-open:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--slot-accent) 32%, transparent);
+  background: color-mix(in srgb, var(--slot-soft) 58%, transparent);
+  color: var(--slot-accent);
+  opacity: 1;
+}
+
+.path-action:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.path-action:disabled {
+  cursor: default;
+  opacity: 0.18;
+}
+
+.path-action .ui-icon {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
+.path-clear {
+  right: 10px;
+}
+
 .path-clear:hover:not(:disabled) {
   border-color: rgba(216, 70, 55, 0.22);
   background: rgba(216, 70, 55, 0.1);
   color: #c95645;
   opacity: 1;
-}
-
-.path-clear:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 2px;
-}
-
-.path-clear:disabled {
-  cursor: default;
-  opacity: 0.18;
-}
-
-.path-clear .ui-icon {
-  width: 15px;
-  height: 15px;
-  margin: 0;
 }
 
 .path-button:hover {

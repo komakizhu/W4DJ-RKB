@@ -181,6 +181,7 @@ export type AppServices = {
   clearHistory: () => Promise<void>;
   loadAppInfo: () => Promise<AppInfo>;
   openExternalUrl: (url: string) => Promise<void>;
+  openDestination: (path: string) => Promise<void>;
   startAllSync: () => Promise<DesktopState>;
   pauseAllSync: () => Promise<DesktopState>;
   cancelSync: (slotIndex: SyncSlotIndex) => Promise<DesktopState>;
@@ -235,6 +236,7 @@ const translations = {
     destLabel: '输出目录',
     clearSource: '清空输入来源',
     clearDestination: '清空输出目录',
+    openDestination: '打开输出目录',
     pickFolder: '选择文件夹',
     pickSource: '选择来源',
     compatMode: '兼容模式',
@@ -323,6 +325,7 @@ const translations = {
     destLabel: 'Output Folder',
     clearSource: 'Clear input source',
     clearDestination: 'Clear output folder',
+    openDestination: 'Open output folder',
     pickFolder: 'Select Folder',
     pickSource: 'Choose Source',
     compatMode: 'Compat Mode',
@@ -529,6 +532,7 @@ const defaultServices: AppServices = {
   clearHistory: () => invoke<void>('clear_history_command'),
   loadAppInfo: () => invoke<AppInfo>('app_info'),
   openExternalUrl: (url) => invoke<void>('open_external_url', { url }),
+  openDestination: (path) => invoke<void>('open_destination', { path }),
   startAllSync: () => invoke<DesktopState>('start_all_sync'),
   pauseAllSync: () => invoke<DesktopState>('pause_all_sync'),
   cancelSync: (slotIndex) => invoke<DesktopState>('cancel_sync', { slotIndex }),
@@ -801,7 +805,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
               ${icon('folder')}
               <span class="path-copy">${displayPath(slot.sourceDirectory, state.lang, t('pickSource', state.lang))}</span>
             </button>
-            <button type="button" class="path-clear" data-action="clear-source" data-slot="${slotIndex}" aria-label="${t('clearSource', state.lang)}" title="${t('clearSource', state.lang)}" ${slot.sourceDirectory.trim() ? '' : 'disabled'}>
+            <button type="button" class="path-action path-clear" data-action="clear-source" data-slot="${slotIndex}" aria-label="${t('clearSource', state.lang)}" title="${t('clearSource', state.lang)}" ${slot.sourceDirectory.trim() ? '' : 'disabled'}>
               ${icon('trash')}
             </button>
           </div>
@@ -811,12 +815,15 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
 
           <div class="path-field" data-role="destination-picker" data-drop-kind="destination" data-slot="${slotIndex}">
           <span>${t('destLabel', state.lang)}</span>
-          <div class="path-control">
+          <div class="path-control destination-path-control">
             <button type="button" class="path-button ${usesFallback ? 'is-fallback' : ''}" data-action="pick-destination" data-slot="${slotIndex}">
               ${icon('export')}
               <span class="path-copy">${displayPath(displayedDestination, state.lang)}</span>
             </button>
-            <button type="button" class="path-clear" data-action="clear-destination" data-slot="${slotIndex}" aria-label="${t('clearDestination', state.lang)}" title="${t('clearDestination', state.lang)}" ${slot.destinationDirectory.trim() ? '' : 'disabled'}>
+            <button type="button" class="path-action path-open" data-action="open-destination" data-slot="${slotIndex}" aria-label="${t('openDestination', state.lang)}" title="${t('openDestination', state.lang)}" ${displayedDestination.trim() ? '' : 'disabled'}>
+              ${icon('open')}
+            </button>
+            <button type="button" class="path-action path-clear" data-action="clear-destination" data-slot="${slotIndex}" aria-label="${t('clearDestination', state.lang)}" title="${t('clearDestination', state.lang)}" ${slot.destinationDirectory.trim() ? '' : 'disabled'}>
               ${icon('trash')}
             </button>
           </div>
@@ -918,9 +925,12 @@ export function bindApp(
 
   const applyDesktopState = (desktopState: DesktopState) => {
     const nextState = toViewState(desktopState, state.lang, state.theme);
+    const finishedRunningTask = state.slots.some(
+      (slot, index) => slot.status === 'running' && nextState.slots[index].status !== 'running',
+    );
     state = nextState;
     render();
-    void refreshHistory(false);
+    void refreshHistory(finishedRunningTask);
     queueRefresh();
   };
 
@@ -1257,6 +1267,16 @@ export function bindApp(
         const path = await services.pickDirectory('destination', slotIndex);
         return path ? services.selectDestinationDirectory(slotIndex, path) : undefined;
       }, slotIndex);
+      return;
+    }
+
+    if (action === 'open-destination' && slotIndex !== null) {
+      const slot = state.slots[slotIndex];
+      const destination = slot.destinationDirectory.trim()
+        || (slotIndex === 1 ? state.slots[0].destinationDirectory.trim() : '');
+      if (destination) {
+        void runAction(() => services.openDestination(destination), slotIndex);
+      }
       return;
     }
 
@@ -1673,11 +1693,12 @@ function parseSlotIndex(value: string | undefined): SyncSlotIndex | null {
   return null;
 }
 
-function icon(name: 'folder' | 'music' | 'export' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow'): string {
+function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow'): string {
   const icons = {
     folder: '<path d="M2.5 5.1h3.4l1.1 1.2h6.5v5.2H2.5z"/><path d="M2.5 4.5h3.2l1.3 1.2"/>',
     music: '<path d="M6.2 11.2V4.6l6-1.2v6.4"/><path d="M6.2 6.5l6-1.2"/><circle cx="4.5" cy="11.5" r="1.7"/><circle cx="10.5" cy="10.1" r="1.7"/>',
     export: '<path d="M3 12.2h10"/><path d="M8 4v6.1"/><path d="M5.6 6.4 8 4l2.4 2.4"/>',
+    open: '<path d="M9.2 3H13v3.8"/><path d="m13 3-6 6"/><path d="M11 8.5v4H3V4.2h4"/>',
     trash: '<path d="M3.8 5.2h8.4"/><path d="M6.2 5.2V3.8h3.6v1.4"/><path d="m5 5.2.5 7.2h5l.5-7.2"/><path d="M6.8 7.1v3.7M9.2 7.1v3.7"/>',
     check: '<path d="M3.3 8.5 6.4 11.4 12.8 4.7"/>',
     disc: '<circle cx="8" cy="8" r="5.1"/><circle cx="8" cy="8" r="1"/>',
