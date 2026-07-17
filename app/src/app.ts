@@ -780,6 +780,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
   const slotNumber = slotIndex + 1;
   const showProgressText =
     slot.status !== 'idle' && slot.progressText !== t('idle', state.lang);
+  const isNumericProgress = /^\d+\/\d+$/.test(slot.progressText);
   return `
     <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${slot.status}">
       <header class="sync-slot-head">
@@ -832,7 +833,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
       </div>
 
       <footer class="slot-status-strip">
-        ${showProgressText ? `<span class="status-copy progress-copy">${escapeHtml(slot.progressText)}</span>` : ''}
+        ${showProgressText ? `<span class="status-copy progress-copy ${isNumericProgress ? 'progress-copy--numeric' : ''}">${escapeHtml(slot.progressText)}</span>` : ''}
         <div class="progress-track" aria-hidden="true">
           <div class="progress-fill" style="width: ${progressPercent(slot)}%"></div>
         </div>

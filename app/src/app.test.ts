@@ -410,6 +410,7 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
     expect((slotTwo.querySelector('.progress-fill') as HTMLElement).style.width).toBe('45%');
     expect(slotTwo.querySelector('.progress-copy')?.textContent).toBe('45/100');
+    expect(slotTwo.querySelector('.progress-copy--numeric')).not.toBeNull();
     expect(slotTwo.querySelector('.status-toggle')).toBeNull();
     expect(slotTwo.querySelector('[data-role="log-drawer"]')).toBeNull();
     expect(slotTwo.querySelector('.detail-toggle-copy')).toBeNull();
@@ -581,6 +582,7 @@ describe('bindApp', () => {
       const slot = root.querySelector('[data-role="sync-slot"][data-slot="0"]') as HTMLElement;
       expect(slot.dataset.status).toBe('error');
       expect(slot.querySelector('.progress-copy')?.textContent).toContain('无法打开来源选择窗口');
+      expect(slot.querySelector('.progress-copy--numeric')).toBeNull();
     });
   });
 

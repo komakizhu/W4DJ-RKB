@@ -904,6 +904,15 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
+.progress-copy--numeric {
+  color: var(--quiet);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1;
+}
+
 .progress-track {
   height: 7px;
   overflow: hidden;
