@@ -147,6 +147,7 @@ export type AppHistoryEntry = {
   failed_count: number;
   failed_files: AppFailedFile[];
   pending_files: AppPreviewCandidate[];
+  logs: string[];
   status: AppHistoryStatus;
   retry_of: string | null;
   conflict_strategy: AppConflictStrategy;
@@ -277,7 +278,7 @@ const translations = {
     history: '转换历史',
     noHistory: '还没有转换记录',
     retryFailures: '重试失败项目',
-    exportReport: '导出错误报告',
+    exportReport: '导出完整错误报告',
     completedCount: '完成',
     failedCount: '失败',
     sourcePath: '输入来源',
@@ -365,7 +366,7 @@ const translations = {
     history: 'Conversion history',
     noHistory: 'No conversion history yet',
     retryFailures: 'Retry failed files',
-    exportReport: 'Export error report',
+    exportReport: 'Export full error report',
     completedCount: 'Completed',
     failedCount: 'Failed',
     sourcePath: 'Input source',
@@ -764,7 +765,7 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
       ${failures ? `<details class="history-failures"><summary>${entry.failed_count} ${t('failedCount', lang)}</summary><ul>${failures}</ul></details>` : ''}
       <footer class="history-entry-actions">
         ${entry.failed_count > 0 || pendingFiles.length > 0 ? `<button type="button" class="secondary-action" data-action="retry-history" data-history-id="${escapeHtml(entry.id)}">${pendingFiles.length > 0 ? t('resumeTasks', lang) : t('retryFailures', lang)}</button>` : ''}
-        ${entry.failed_count > 0 ? `<button type="button" class="secondary-action" data-action="export-history" data-history-id="${escapeHtml(entry.id)}">${t('exportReport', lang)}</button>` : ''}
+        ${entry.failed_count > 0 || pendingFiles.length > 0 ? `<button type="button" class="secondary-action" data-action="export-history" data-history-id="${escapeHtml(entry.id)}">${t('exportReport', lang)}</button>` : ''}
         <button type="button" class="secondary-action history-delete" data-action="delete-history" data-history-id="${escapeHtml(entry.id)}">${t('deleteHistory', lang)}</button>
       </footer>
     </article>
@@ -1033,8 +1034,8 @@ export function bindApp(
   const exportHistory = async (id: string) => {
     try {
       const path = await save({
-        defaultPath: 'W4DJ-error-report.txt',
-        title: state.lang === 'zh' ? '保存错误报告' : 'Save error report',
+        defaultPath: 'W4DJ-complete-error-report.txt',
+        title: state.lang === 'zh' ? '保存完整错误报告' : 'Save full error report',
       });
       if (typeof path === 'string') {
         await services.exportHistoryErrorReport(id, path);

@@ -189,6 +189,7 @@ impl DesktopController {
         slot.estimated_output_bytes = None;
         slot.failed_files.clear();
         slot.current_file.clear();
+        slot.logs.clear();
         slot.logs.push(String::from("Sync started"));
         Ok(())
     }

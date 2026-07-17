@@ -577,33 +577,17 @@ fn start_confirmed_sync(
                     .iter()
                     .all(|job| job.slot_index != slot_preview.slot_index)
             {
-                controller.set_preflight_summary(
-                    slot_preview.slot_index,
-                    slot_preview.preview.new_count,
-                    slot_preview.preview.existing_count,
-                    slot_preview.preview.skipped_count,
-                    slot_preview.preview.error_count,
-                    slot_preview.preview.estimated_output_bytes,
-                )?;
-                record_preflight_issues(
+                apply_preflight_summary(
                     &mut controller,
                     slot_preview.slot_index,
-                    &slot_preview.preview.errors,
+                    &slot_preview.preview,
                 )?;
             }
         }
 
         for job in &jobs {
             controller.start_confirmed_sync(job.slot_index, job.candidates.len())?;
-            controller.set_preflight_summary(
-                job.slot_index,
-                job.preview.new_count,
-                job.preview.existing_count,
-                job.preview.skipped_count,
-                job.preview.error_count,
-                job.preview.estimated_output_bytes,
-            )?;
-            record_preflight_issues(&mut controller, job.slot_index, &job.preview.errors)?;
+            apply_preflight_summary(&mut controller, job.slot_index, &job.preview)?;
             controller.push_log(job.slot_index, "Confirmed preflight; conversion started")?;
         }
     }
@@ -936,11 +920,10 @@ fn run_confirmed_sync_task(
             .task_controller(job.slot_index)
             .expect("confirmed slot index should be valid")
     };
-    let initial_failed_files = {
+    let (initial_failed_files, initial_logs) = {
         let controller_guard = controller.lock().expect("desktop lock poisoned");
-        controller_guard.state().slots[job.slot_index]
-            .failed_files
-            .clone()
+        let slot = &controller_guard.state().slots[job.slot_index];
+        (slot.failed_files.clone(), slot.logs.clone())
     };
     let recovery_entry = Arc::new(Mutex::new(HistoryEntry {
         id: history_id,
@@ -965,6 +948,7 @@ fn run_confirmed_sync_task(
             .iter()
             .map(pending_file_from_candidate)
             .collect(),
+        logs: initial_logs,
         status: HistoryStatus::Partial,
         retry_of: job.retry_of.clone(),
         conflict_strategy: job.conflict_strategy,
@@ -1206,6 +1190,7 @@ fn run_confirmed_sync_task(
         failed_count: failed_files.len(),
         failed_files,
         pending_files,
+        logs: slot.logs,
         status,
         retry_of: job.retry_of,
         conflict_strategy: job.conflict_strategy,
@@ -1265,6 +1250,13 @@ fn mark_recovery_processed(
             .retain(|candidate| candidate.name != name);
         entry.completed_count = completed_count;
         entry.finished_at = timestamp_string();
+        match failed_file.as_ref() {
+            Some(failed_file) => entry.logs.push(format!(
+                "Failed {}: {}",
+                failed_file.name, failed_file.message
+            )),
+            None => entry.logs.push(format!("Processed {name}")),
+        }
         if let Some(failed_file) = failed_file
             && !entry
                 .failed_files
@@ -1303,6 +1295,24 @@ fn record_preflight_issues(
         )?;
     }
     Ok(())
+}
+
+fn apply_preflight_summary(
+    controller: &mut DesktopController,
+    slot_index: usize,
+    preview: &SyncPreview,
+) -> Result<(), String> {
+    // Preserve the failed-file details first, then set the authoritative preview counts.
+    // Otherwise record_file_failed would add the same preflight errors a second time.
+    record_preflight_issues(controller, slot_index, &preview.errors)?;
+    controller.set_preflight_summary(
+        slot_index,
+        preview.new_count,
+        preview.existing_count,
+        preview.skipped_count,
+        preview.error_count,
+        preview.estimated_output_bytes,
+    )
 }
 
 fn record_failed_candidate(
@@ -1680,10 +1690,10 @@ fn fail_sync(
 #[cfg(test)]
 mod tests {
     use super::DestinationCoordinator;
+    use super::apply_preflight_summary;
     use super::collect_processable_previews;
     use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
-    use super::record_preflight_issues;
     use super::validate_source_input;
     use super::validate_unique_planned_outputs;
     use std::fs;
@@ -1846,19 +1856,14 @@ mod tests {
                 ..AppPreferences::default()
             }));
         controller.start_confirmed_sync(0, 1).unwrap();
-        controller
-            .set_preflight_summary(0, 1, 0, 0, 0, None)
-            .unwrap();
+        let mut preview = sample_preview(0, true).preview;
+        preview.error_count = 1;
+        preview.errors = vec![PreviewIssue {
+            path: String::from("/music/in-1/unreadable.mp3"),
+            message: String::from("无法读取源文件"),
+        }];
 
-        record_preflight_issues(
-            &mut controller,
-            0,
-            &[PreviewIssue {
-                path: String::from("/music/in-1/unreadable.mp3"),
-                message: String::from("无法读取源文件"),
-            }],
-        )
-        .unwrap();
+        apply_preflight_summary(&mut controller, 0, &preview).unwrap();
 
         assert_eq!(controller.state().slots[0].error_tracks, 1);
         assert_eq!(controller.state().slots[0].failed_files.len(), 1);

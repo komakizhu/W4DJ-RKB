@@ -161,6 +161,19 @@ fn confirmed_start_uses_preview_candidate_count() {
 }
 
 #[test]
+fn starting_a_new_task_discards_logs_from_the_previous_task() {
+    let mut controller = test_controller();
+    controller.start_confirmed_sync(0, 1).unwrap();
+    controller
+        .push_log(0, "Old task failed: private-old-path.flac")
+        .unwrap();
+
+    controller.start_confirmed_sync(0, 1).unwrap();
+
+    assert_eq!(controller.state().slots[0].logs, vec!["Sync started"]);
+}
+
+#[test]
 fn preflight_counts_keep_their_meaning_during_conversion() {
     let mut controller = test_controller();
     controller.start_confirmed_sync(0, 3).unwrap();

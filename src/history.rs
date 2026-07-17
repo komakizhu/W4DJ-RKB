@@ -123,6 +123,8 @@ pub struct HistoryEntry {
     pub failed_files: Vec<FailedFile>,
     #[serde(default)]
     pub pending_files: Vec<PendingFile>,
+    #[serde(default)]
+    pub logs: Vec<String>,
     pub status: HistoryStatus,
     pub retry_of: Option<String>,
     #[serde(default)]
@@ -194,15 +196,87 @@ fn write_history(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
 
 pub fn format_error_report(entry: &HistoryEntry) -> String {
     let mut report = String::new();
-    report.push_str("W4DJ RKB 错误报告\n");
-    report.push_str(&format!("任务时间：{}\n", entry.started_at));
-    report.push_str(&format!("输入来源：{}\n", entry.source_directory));
-    report.push_str(&format!("输出目录：{}\n", entry.destination_directory));
-    report.push_str(&format!("失败数量：{}\n\n", entry.failed_count));
+    report.push_str("W4DJ RKB 完整错误报告\n");
+    report.push_str("报告格式版本：1\n\n");
 
-    for failed_file in &entry.failed_files {
+    report.push_str("[软件与系统]\n");
+    report.push_str(&format!("软件版本：{}\n", env!("CARGO_PKG_VERSION")));
+    report.push_str(&format!(
+        "构建类型：{}\n",
+        if cfg!(debug_assertions) {
+            "Debug"
+        } else {
+            "Release"
+        }
+    ));
+    report.push_str(&format!("操作系统：{}\n", std::env::consts::OS));
+    report.push_str(&format!("系统家族：{}\n", std::env::consts::FAMILY));
+    report.push_str(&format!("CPU 架构：{}\n", std::env::consts::ARCH));
+    report.push_str(&format!(
+        "程序路径：{}\n",
+        std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|error| format!("无法读取（{error}）"))
+    ));
+    report.push_str(&format!(
+        "FFmpeg 路径：{}\n\n",
+        crate::sync::find_ffmpeg().unwrap_or_else(|| "未找到".to_string())
+    ));
+    report.push_str("隐私提醒：本报告包含完整本地路径和运行日志，仅在你主动发送时分享。\n\n");
+
+    report.push_str("[任务信息]\n");
+    report.push_str(&format!("任务 ID：{}\n", entry.id));
+    report.push_str(&format!("批次 ID：{}\n", entry.batch_id));
+    report.push_str(&format!("任务编号：{}\n", entry.slot_index + 1));
+    report.push_str(&format!(
+        "任务状态：{}\n",
+        history_status_label(&entry.status)
+    ));
+    report.push_str(&format!("开始时间：{}\n", entry.started_at));
+    report.push_str(&format!("结束时间：{}\n", entry.finished_at));
+    report.push_str(&format!("运行时长：{} 秒\n", entry.duration_seconds));
+    report.push_str(&format!(
+        "重试来源：{}\n\n",
+        entry.retry_of.as_deref().unwrap_or("无")
+    ));
+
+    report.push_str("[任务配置]\n");
+    report.push_str(&format!("输出模式：{}\n", mode_label(entry.mode)));
+    report.push_str(&format!(
+        "无损格式：{}\n",
+        lossless_format_label(entry.lossless_format)
+    ));
+    report.push_str(&format!(
+        "冲突策略：{}\n",
+        conflict_strategy_label(entry.conflict_strategy)
+    ));
+    report.push_str(&format!(
+        "文件名规则：{}\n\n",
+        filename_rule_label(entry.filename_rule)
+    ));
+
+    report.push_str("[路径]\n");
+    report.push_str(&format!("输入来源：{}\n", entry.source_directory));
+    report.push_str(&format!("输出目录：{}\n\n", entry.destination_directory));
+
+    report.push_str("[统计]\n");
+    report.push_str(&format!("新增文件：{}\n", entry.new_count));
+    report.push_str(&format!("已存在文件：{}\n", entry.existing_count));
+    report.push_str(&format!("跳过文件：{}\n", entry.skipped_count));
+    report.push_str(&format!("错误文件：{}\n", entry.error_count));
+    report.push_str(&format!("完成文件：{}\n", entry.completed_count));
+    report.push_str(&format!("失败文件：{}\n", entry.failed_count));
+    report.push_str(&format!("待处理文件：{}\n\n", entry.pending_files.len()));
+
+    report.push_str("[失败文件详情]\n");
+    if entry.failed_files.is_empty() {
+        report.push_str("无\n\n");
+    }
+
+    for (index, failed_file) in entry.failed_files.iter().enumerate() {
         report.push_str(&format!(
-            "歌曲：{}\n源文件：{}\n目标文件：{}\n错误类型：{}\n原因：{}\n\n",
+            "{}. 歌曲：{}\n源文件：{}\n目标文件：{}\n错误类型：{}\n原因：{}\n\n",
+            index + 1,
             failed_file.name,
             failed_file.source_path,
             failed_file.destination_path,
@@ -211,5 +285,84 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
         ));
     }
 
+    report.push_str("[待处理文件详情]\n");
+    if entry.pending_files.is_empty() {
+        report.push_str("无\n\n");
+    }
+    for (index, pending_file) in entry.pending_files.iter().enumerate() {
+        report.push_str(&format!(
+            "{}. 歌曲：{}\n源文件：{}\n目标文件：{}\n源文件大小：{} bytes\n预计输出大小：{}\n操作：{}\n\n",
+            index + 1,
+            pending_file.name,
+            pending_file.source_path,
+            pending_file.destination_path,
+            pending_file.source_size_bytes,
+            pending_file
+                .estimated_output_bytes
+                .map(|value| format!("{value} bytes"))
+                .unwrap_or_else(|| "未知".to_string()),
+            candidate_operation_label(pending_file.operation),
+        ));
+    }
+
+    report.push_str("[运行日志]\n");
+    if entry.logs.is_empty() {
+        report.push_str("未记录\n");
+    } else {
+        for line in &entry.logs {
+            report.push_str("- ");
+            report.push_str(line);
+            report.push('\n');
+        }
+    }
+
     report
+}
+
+fn history_status_label(status: &HistoryStatus) -> &'static str {
+    match status {
+        HistoryStatus::Completed => "已完成",
+        HistoryStatus::Partial => "部分完成",
+        HistoryStatus::Cancelled => "已取消",
+        HistoryStatus::Error => "错误",
+    }
+}
+
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Compat => "兼容模式",
+        Mode::Lossless => "无损模式",
+    }
+}
+
+fn lossless_format_label(format: Option<LosslessFormat>) -> &'static str {
+    match format {
+        Some(LosslessFormat::Wav) => "WAV",
+        Some(LosslessFormat::Aiff) => "AIFF",
+        None => "不适用",
+    }
+}
+
+fn conflict_strategy_label(strategy: ConflictStrategy) -> &'static str {
+    match strategy {
+        ConflictStrategy::Skip => "跳过",
+        ConflictStrategy::Overwrite => "覆盖",
+        ConflictStrategy::Rename => "自动重命名",
+        ConflictStrategy::UpdateMetadata => "仅更新元数据",
+    }
+}
+
+fn filename_rule_label(rule: FilenameRule) -> &'static str {
+    match rule {
+        FilenameRule::TitleArtist => "标题 - 艺术家",
+        FilenameRule::ArtistTitle => "艺术家 - 标题",
+        FilenameRule::Original => "保留原文件名",
+    }
+}
+
+fn candidate_operation_label(operation: CandidateOperation) -> &'static str {
+    match operation {
+        CandidateOperation::Convert => "转换",
+        CandidateOperation::UpdateMetadata => "更新元数据",
+    }
 }

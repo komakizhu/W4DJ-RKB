@@ -1,8 +1,9 @@
 use tempfile::tempdir;
-use w4dj::config::Mode;
+use w4dj::config::{CandidateOperation, Mode};
 use w4dj::history::{
-    ErrorCategory, FailedFile, HistoryEntry, HistoryStatus, append_history, classify_error,
-    clear_history, delete_history_entry, format_error_report, load_history, upsert_history,
+    ErrorCategory, FailedFile, HistoryEntry, HistoryStatus, PendingFile, append_history,
+    classify_error, clear_history, delete_history_entry, format_error_report, load_history,
+    upsert_history,
 };
 
 fn test_entry(index: usize) -> HistoryEntry {
@@ -25,6 +26,7 @@ fn test_entry(index: usize) -> HistoryEntry {
         failed_count: 0,
         failed_files: Vec::new(),
         pending_files: Vec::new(),
+        logs: Vec::new(),
         status: HistoryStatus::Completed,
         retry_of: None,
         conflict_strategy: Default::default(),
@@ -64,6 +66,74 @@ fn error_report_contains_failed_path_and_reason() {
 
     assert!(report.contains("/music/in/song.flac"));
     assert!(report.contains("FFmpeg failed"));
+}
+
+#[test]
+fn complete_error_report_contains_environment_settings_and_all_counts() {
+    let entry = test_entry(1);
+
+    let report = format_error_report(&entry);
+
+    assert!(report.contains("W4DJ RKB 完整错误报告"));
+    assert!(report.contains("报告格式版本：1"));
+    assert!(report.contains(&format!("软件版本：{}", env!("CARGO_PKG_VERSION"))));
+    assert!(report.contains("操作系统："));
+    assert!(report.contains("CPU 架构："));
+    assert!(report.contains("程序路径："));
+    assert!(report.contains("FFmpeg 路径："));
+    assert!(report.contains("任务 ID：history-1"));
+    assert!(report.contains("批次 ID：batch-1"));
+    assert!(report.contains("输出模式：兼容模式"));
+    assert!(report.contains("冲突策略：跳过"));
+    assert!(report.contains("文件名规则：标题 - 艺术家"));
+    assert!(report.contains("新增文件：1"));
+    assert!(report.contains("已存在文件：0"));
+    assert!(report.contains("跳过文件：0"));
+    assert!(report.contains("错误文件：0"));
+    assert!(!report.contains("预检错误："));
+    assert!(report.contains("完成文件：1"));
+    assert!(report.contains("失败文件：0"));
+    assert!(report.contains("待处理文件：0"));
+}
+
+#[test]
+fn complete_error_report_lists_pending_files() {
+    let mut entry = test_entry(1);
+    entry.pending_files.push(PendingFile {
+        name: "Pending Song".into(),
+        source_path: "/music/in/pending.flac".into(),
+        destination_path: "/music/out/pending.mp3".into(),
+        source_size_bytes: 4_096,
+        estimated_output_bytes: Some(2_048),
+        operation: CandidateOperation::Convert,
+    });
+
+    let report = format_error_report(&entry);
+
+    assert!(report.contains("待处理文件详情"));
+    assert!(report.contains("Pending Song"));
+    assert!(report.contains("/music/in/pending.flac"));
+    assert!(report.contains("/music/out/pending.mp3"));
+    assert!(report.contains("源文件大小：4096 bytes"));
+}
+
+#[test]
+fn diagnostic_logs_survive_history_reload_and_appear_in_report() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("history.json");
+    let mut serialized = serde_json::to_value(test_entry(1)).unwrap();
+    serialized["logs"] = serde_json::json!([
+        "Scanning source: /music/in",
+        "Failed Song: FFmpeg conversion failed"
+    ]);
+    std::fs::write(&path, serde_json::to_vec_pretty(&vec![serialized]).unwrap()).unwrap();
+
+    let entry = load_history(&path).unwrap().remove(0);
+    let report = format_error_report(&entry);
+
+    assert!(report.contains("运行日志"));
+    assert!(report.contains("Scanning source: /music/in"));
+    assert!(report.contains("Failed Song: FFmpeg conversion failed"));
 }
 
 #[test]

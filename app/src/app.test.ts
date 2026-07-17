@@ -168,6 +168,7 @@ const makeHistoryEntry = (overrides: Partial<AppHistoryEntry> = {}): AppHistoryE
     },
   ],
   pending_files: [],
+  logs: ['Scanning source: /music/in-1'],
   status: 'partial',
   retry_of: null,
   conflict_strategy: 'skip',
@@ -760,6 +761,8 @@ describe('bindApp', () => {
 
     await vi.waitFor(() => {
       expect(root.querySelector('[data-role="history"]')?.textContent).toContain('重试失败项目');
+      expect(root.querySelector('[data-action="export-history"]')?.textContent)
+        .toContain('导出完整错误报告');
     });
     (root.querySelector('[data-action="retry-history"]') as HTMLButtonElement).click();
 
@@ -792,6 +795,25 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="toggle-theme"]') as HTMLButtonElement).click();
     await vi.waitFor(() => {
       expect((root.querySelector('[data-role="history"]') as HTMLDetailsElement).open).toBe(true);
+    });
+  });
+
+  it('allows an interrupted task with pending files to export a full report', async () => {
+    const pending = makePreview(0).preview.candidates[0];
+    const services = makeMockServices({
+      loadHistory: vi.fn().mockResolvedValue([makeHistoryEntry({
+        failed_count: 0,
+        failed_files: [],
+        pending_files: [pending],
+        status: 'partial',
+      })]),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-action="export-history"]')?.textContent)
+        .toContain('导出完整错误报告');
     });
   });
 
