@@ -2,7 +2,7 @@ use std::fs;
 
 use tempfile::tempdir;
 use w4dj::config::{ConflictStrategy, FilenameRule, Mode};
-use w4dj::history::{HistoryEntry, HistoryStatus, PendingFile};
+use w4dj::history::{ErrorCategory, FailedFile, HistoryEntry, HistoryStatus, PendingFile};
 use w4dj::preview::{
     PreviewOperation, build_retry_preview, build_sync_preview, build_sync_preview_with_settings,
 };
@@ -327,4 +327,58 @@ fn retry_preview_restores_pending_files_saved_before_app_exit() {
         preview.candidates[0].destination_path,
         destination_path.display().to_string()
     );
+}
+
+#[test]
+fn retry_preview_ignores_old_macos_appledouble_failures_and_pending_files() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let sidecar_path = source.path().join("._Song.flac");
+    fs::write(&sidecar_path, b"\x00\x05\x16\x07macos-metadata").unwrap();
+    let entry = HistoryEntry {
+        id: "history-appledouble".into(),
+        batch_id: "batch-appledouble".into(),
+        slot_index: 0,
+        started_at: "1".into(),
+        finished_at: "1".into(),
+        duration_seconds: 0,
+        source_directory: source.path().display().to_string(),
+        destination_directory: destination.path().display().to_string(),
+        mode: Mode::Compat,
+        lossless_format: None,
+        new_count: 1,
+        existing_count: 0,
+        skipped_count: 0,
+        error_count: 1,
+        completed_count: 0,
+        failed_count: 1,
+        failed_files: vec![FailedFile {
+            name: ". Song".into(),
+            source_path: sidecar_path.display().to_string(),
+            destination_path: destination.path().join(". Song.mp3").display().to_string(),
+            message: "FFmpeg 转换失败".into(),
+            category: ErrorCategory::Ffmpeg,
+        }],
+        pending_files: vec![PendingFile {
+            name: ". Song".into(),
+            source_path: sidecar_path.display().to_string(),
+            destination_path: destination
+                .path()
+                .join(". Song-pending.mp3")
+                .display()
+                .to_string(),
+            source_size_bytes: 120,
+            estimated_output_bytes: Some(120),
+            operation: PreviewOperation::Convert,
+        }],
+        status: HistoryStatus::Error,
+        retry_of: None,
+        conflict_strategy: ConflictStrategy::Skip,
+        filename_rule: FilenameRule::TitleArtist,
+    };
+
+    let preview = build_retry_preview(&entry);
+
+    assert!(preview.candidates.is_empty());
+    assert!(preview.errors.is_empty());
 }

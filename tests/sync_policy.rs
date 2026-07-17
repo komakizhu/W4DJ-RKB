@@ -174,6 +174,46 @@ fn get_music_dict_accepts_a_single_audio_file_path() {
 }
 
 #[test]
+fn get_music_dict_ignores_macos_appledouble_sidecars() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "w4dj-sync-policy-appledouble-ignore-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_path = temp_dir.join("Song.flac");
+    let sidecar_path = temp_dir.join("._Song.flac");
+    fs::write(&source_path, b"real-audio-placeholder").unwrap();
+    fs::write(&sidecar_path, b"\x00\x05\x16\x07macos-metadata").unwrap();
+
+    let dict = sync::get_music_dict(temp_dir.to_str().unwrap());
+
+    assert_eq!(dict.len(), 1);
+    assert_eq!(dict.get("Song").unwrap().1, source_path);
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn get_music_dict_keeps_non_appledouble_track_with_dot_underscore_name() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "w4dj-sync-policy-dot-underscore-track-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_path = temp_dir.join("._Song.flac");
+    fs::write(&source_path, b"real-audio-placeholder").unwrap();
+
+    let dict = sync::get_music_dict(temp_dir.to_str().unwrap());
+
+    assert_eq!(dict.len(), 1);
+    assert!(dict.values().any(|(_, path)| path == &source_path));
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn get_music_dict_prefers_wav_over_mp3_for_same_stem() {
     let temp_dir = std::env::temp_dir().join(format!(
         "w4dj-sync-policy-wav-over-mp3-{}",
@@ -216,6 +256,27 @@ fn destination_music_dict_ignores_temporary_w4dj_files() {
 }
 
 #[test]
+fn destination_music_dict_ignores_macos_appledouble_sidecars() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "w4dj-sync-policy-destination-appledouble-ignore-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let final_path = temp_dir.join("Song.wav");
+    let sidecar_path = temp_dir.join("._Song.wav");
+    fs::write(&final_path, b"final").unwrap();
+    fs::write(&sidecar_path, b"\x00\x05\x16\x07macos-metadata").unwrap();
+
+    let dict = get_destination_music_dict(temp_dir.to_str().unwrap());
+
+    assert_eq!(dict.len(), 1);
+    assert_eq!(dict.get("Song").unwrap().1, final_path);
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn destination_music_dict_ignores_non_output_flac_files() {
     let temp_dir = std::env::temp_dir().join(format!(
         "w4dj-sync-policy-ignore-flac-{}",
@@ -237,7 +298,7 @@ fn destination_music_dict_ignores_non_output_flac_files() {
 }
 
 #[test]
-fn cleanup_temporary_outputs_removes_internal_temp_files() {
+fn cleanup_temporary_outputs_never_deletes_user_files_by_prefix() {
     let temp_dir = std::env::temp_dir().join(format!(
         "w4dj-sync-policy-temp-cleanup-{}",
         std::process::id()
@@ -249,7 +310,25 @@ fn cleanup_temporary_outputs_removes_internal_temp_files() {
 
     cleanup_temporary_outputs(temp_dir.to_str().unwrap()).unwrap();
 
-    assert!(!temp_path.exists());
+    assert!(temp_path.exists());
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn cleanup_temporary_outputs_preserves_macos_appledouble_sidecars() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "w4dj-sync-policy-preserve-appledouble-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let sidecar_path = temp_dir.join("._Song.wav");
+    fs::write(&sidecar_path, b"\x00\x05\x16\x07macos-metadata").unwrap();
+
+    cleanup_temporary_outputs(temp_dir.to_str().unwrap()).unwrap();
+
+    assert!(sidecar_path.exists());
 
     let _ = fs::remove_dir_all(temp_dir);
 }

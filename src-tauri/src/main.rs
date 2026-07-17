@@ -1359,7 +1359,38 @@ fn unique_timestamp() -> u128 {
 }
 
 fn timestamp_string() -> String {
-    unique_timestamp().to_string()
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    format_unix_timestamp(seconds)
+}
+
+fn format_unix_timestamp(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    let second = seconds_of_day % 60;
+
+    // Convert days since the Unix epoch to a Gregorian calendar date.
+    let shifted_days = days + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
 }
 
 fn run_sync_task(
@@ -1730,6 +1761,15 @@ mod tests {
         let _ = fs::remove_file(&source);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn history_timestamps_are_human_readable_utc() {
+        assert_eq!(super::format_unix_timestamp(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(
+            super::format_unix_timestamp(1_784_210_712),
+            "2026-07-16 14:05:12 UTC"
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -8,7 +8,7 @@ use ncmdump::Ncmdump;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Error, ErrorKind, Write};
+use std::io::{self, Error, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "windows")]
@@ -224,7 +224,7 @@ pub fn get_music_dict_with_scan_issues_with_rule(
 
 pub fn is_supported_source_file(path: &Path) -> bool {
     path.is_file()
-        && !is_temporary_artifact(path)
+        && !is_ignored_music_file(path)
         && has_allowed_extension(path, SUPPORTED_SOURCE_EXTENSIONS)
 }
 
@@ -244,20 +244,9 @@ pub fn get_destination_music_dict_with_rule(
 }
 
 pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
-    let Ok(entries) = fs::read_dir(folder) else {
-        return Ok(());
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if is_temporary_artifact(&path)
-            && let Err(error) = fs::remove_file(&path)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            return Err(error);
-        }
-    }
-
+    // Kept as a compatibility no-op. Prefix-only cleanup could delete a user's
+    // legitimate hidden audio file. New temporary files are self-cleaning.
+    let _ = folder;
     Ok(())
 }
 
@@ -273,10 +262,9 @@ fn collect_music_dict_with_scan_issues(
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
-                if let Some(path) = error
-                    .path()
-                    .filter(|path| has_allowed_extension(path, allowed_extensions))
-                {
+                if let Some(path) = error.path().filter(|path| {
+                    !is_ignored_music_file(path) && has_allowed_extension(path, allowed_extensions)
+                }) {
                     scan_issues.push(MusicScanIssue {
                         path: path.to_path_buf(),
                         message: format!("无法扫描歌曲文件：{error}"),
@@ -287,7 +275,7 @@ fn collect_music_dict_with_scan_issues(
         };
 
         if !entry.file_type().is_file()
-            || is_temporary_artifact(entry.path())
+            || is_ignored_music_file(entry.path())
             || !has_allowed_extension(entry.path(), allowed_extensions)
         {
             continue;
@@ -326,6 +314,26 @@ fn is_temporary_artifact(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with(".w4dj-"))
+}
+
+pub(crate) fn is_ignored_music_file(path: &Path) -> bool {
+    is_temporary_artifact(path) || is_macos_appledouble_file(path)
+}
+
+fn is_macos_appledouble_file(path: &Path) -> bool {
+    let has_appledouble_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("._"));
+    if !has_appledouble_name {
+        return false;
+    }
+
+    let mut magic = [0_u8; 4];
+    match File::open(path) {
+        Ok(mut file) => file.read_exact(&mut magic).is_ok() && magic == [0x00, 0x05, 0x16, 0x07],
+        Err(_) => true,
+    }
 }
 
 fn should_prefer_file(
@@ -888,16 +896,6 @@ fn process_ncm_file(
     } else {
         "flac"
     };
-    let temp_source_name = format!(
-        ".w4dj-{}.{}",
-        sanitize_filename_component(name_stem),
-        temp_source_extension
-    );
-    let temp_source_path = Path::new(dest_folder).join(&temp_source_name);
-    if let Some(parent) = temp_source_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let temp_data = match file_format.as_str() {
         "mp3" => Mp3Metadata::new(&ncm_metadata, &image_data, &music_data)
             .inject_metadata(music_data.clone())
@@ -918,26 +916,30 @@ fn process_ncm_file(
         _ => music_data,
     };
 
-    let mut temp_file = File::create(&temp_source_path).map_err(|error| {
-        Error::new(
-            error.kind(),
-            format!(
-                "Failed to create temporary file {}: {}",
-                temp_source_path.display(),
-                error
-            ),
-        )
-    })?;
+    let temp_suffix = format!(".{temp_source_extension}");
+    let mut temp_file = tempfile::Builder::new()
+        .prefix("w4dj-rkb-")
+        .suffix(&temp_suffix)
+        .tempfile()
+        .map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!("Failed to create a temporary audio file: {error}"),
+            )
+        })?;
     temp_file.write_all(&temp_data).map_err(|error| {
         Error::new(
             error.kind(),
-            format!(
-                "Failed to write temporary file {}: {}",
-                temp_source_path.display(),
-                error
-            ),
+            format!("Failed to write temporary audio data: {error}"),
         )
     })?;
+    temp_file.flush().map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!("Failed to flush temporary audio data: {error}"),
+        )
+    })?;
+    let temp_source_path = temp_file.into_temp_path();
 
     match output_policy.target_profile {
         TargetProfile::CompatMp3 => {
@@ -966,21 +968,6 @@ fn process_ncm_file(
                 &ncm_metadata,
                 &image_data,
             )?;
-        }
-    }
-
-    match fs::remove_file(&temp_source_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(Error::new(
-                error.kind(),
-                format!(
-                    "Failed to remove temporary file {}: {}",
-                    temp_source_path.display(),
-                    error
-                ),
-            ));
         }
     }
 

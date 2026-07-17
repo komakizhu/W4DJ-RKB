@@ -18,6 +18,4 @@ metaflac = "0.2.8"
 id3 = "1.16.3"
 anyhow = "1.0.98"
 libc = "0.2"
-
-[dev-dependencies]
 tempfile = "3.10.1"

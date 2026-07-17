@@ -2,8 +2,8 @@ use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, Lossless
 use crate::history::HistoryEntry;
 use crate::sync::{
     effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
-    get_music_dict_with_scan_issues_with_rule, is_supported_source_file, resolve_output_policy,
-    target_output_path,
+    get_music_dict_with_scan_issues_with_rule, is_ignored_music_file, is_supported_source_file,
+    resolve_output_policy, target_output_path,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -359,6 +359,9 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
 
     for pending_file in &entry.pending_files {
         let source_path = Path::new(&pending_file.source_path);
+        if is_ignored_music_file(source_path) {
+            continue;
+        }
         match fs::metadata(source_path) {
             Ok(metadata) if metadata.len() > 0 => {
                 let estimated = pending_file.estimated_output_bytes.or(Some(metadata.len()));
@@ -395,6 +398,9 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
 
     for failed_file in &entry.failed_files {
         let source_path = Path::new(&failed_file.source_path);
+        if is_ignored_music_file(source_path) {
+            continue;
+        }
         match fs::metadata(source_path) {
             Ok(metadata) if metadata.len() > 0 => {
                 let candidate = PreviewCandidate {
