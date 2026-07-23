@@ -16,6 +16,7 @@ import {
 
 beforeEach(() => {
   localStorage.clear();
+  localStorage.setItem('w4dj_onboarding_seen', '1');
 });
 
 const makeDesktopSlot = (
@@ -472,8 +473,47 @@ describe('renderApp', () => {
   it('shows a first-use onboarding guide with the four core steps', () => {
     const root = renderApp(makeViewState(), null, null, null, [], null, false, null, false, false, true);
 
-    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('拖入文件夹或单曲');
-    expect(root.querySelectorAll('[data-role="onboarding-step"]')).toHaveLength(4);
+    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('先选输出模式');
+    expect(root.querySelector('[data-role="onboarding-modal"]')?.getAttribute('data-step')).toBe('0');
+    expect(root.querySelector('[data-action="onboarding-next"]')?.textContent).toBe('下一步');
+    expect(root.querySelector('[data-onboarding-target="mode"]')).not.toBeNull();
+  });
+
+  it('keeps exactly one relevant control clear in every onboarding step', () => {
+    const steps = [
+      { step: 0, target: 'mode' },
+      { step: 1, target: 'source' },
+      { step: 2, target: 'destination' },
+      { step: 3, target: 'start' },
+    ] as const;
+
+    steps.forEach(({ step, target }) => {
+      const root = renderApp(
+        makeViewState(),
+        null,
+        null,
+        null,
+        [],
+        null,
+        false,
+        null,
+        false,
+        false,
+        true,
+        step,
+      );
+
+      expect(root.dataset.onboardingActive).toBe('true');
+      expect(root.dataset.onboardingStep).toBe(String(step));
+      expect(root.querySelectorAll(`[data-onboarding-target="${target}"]`)).toHaveLength(1);
+      expect(root.querySelectorAll('[data-onboarding-target]')).toHaveLength(1);
+      if (target === 'source' || target === 'destination') {
+        expect(root.querySelector(`[data-onboarding-target="${target}"]`)?.closest('[data-slot="0"]')).not.toBeNull();
+      }
+    });
+
+    const inactiveRoot = renderApp(makeViewState());
+    expect(inactiveRoot.querySelectorAll('[data-onboarding-target]')).toHaveLength(0);
   });
 
   it('turns technical conversion errors into recovery-focused user messages', () => {
@@ -488,6 +528,7 @@ describe('renderApp', () => {
 
 describe('bindApp', () => {
   it('shows onboarding only on first use and remembers dismissing it', async () => {
+    localStorage.removeItem('w4dj_onboarding_seen');
     const root = document.createElement('div');
     bindApp(root, makeViewState(), makeMockServices());
 
@@ -499,6 +540,23 @@ describe('bindApp', () => {
     const secondRoot = document.createElement('div');
     bindApp(secondRoot, makeViewState(), makeMockServices());
     await vi.waitFor(() => expect(secondRoot.querySelector('[data-role="onboarding-modal"]')).toBeNull());
+  });
+
+  it('moves through the highlighted onboarding targets without triggering app actions', async () => {
+    localStorage.removeItem('w4dj_onboarding_seen');
+    const services = makeMockServices();
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => expect(root.querySelector('[data-role="onboarding-modal"]')).not.toBeNull());
+    (root.querySelector('[data-action="onboarding-next"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="onboarding-modal"]')?.getAttribute('data-step')).toBe('1');
+    });
+    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('拖入来源');
+    expect(services.chooseMode).not.toHaveBeenCalled();
+    expect(services.previewAllSync).not.toHaveBeenCalled();
   });
 
   it('loads and renders both resolved backend slots', async () => {

@@ -12,6 +12,10 @@ export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
 type SelectionMotion = 'mode' | 'format' | 'theme' | 'lang' | null;
 type PendingSelection = 'mode' | 'format' | null;
+type OnboardingStep = 0 | 1 | 2 | 3;
+type OnboardingTarget = 'mode' | 'source' | 'destination' | 'start';
+
+const ONBOARDING_STEP_COUNT = 4;
 
 const LIGHT_PALETTE = 'c' as const;
 
@@ -308,11 +312,18 @@ const translations = {
     errorCategory: '错误类型',
     onboardingTitle: '第一次使用？看这里',
     onboardingIntro: '四步完成一次转换，文件夹和单曲会自动识别。',
-    onboardingStepOne: '选择输出模式',
-    onboardingStepTwo: '拖入文件夹或单曲',
-    onboardingStepThree: '选择输出目录',
-    onboardingStepFour: '点击“同时开始”',
-    onboardingDismiss: '我知道了',
+    onboardingStepOneTitle: '先选输出模式',
+    onboardingStepOneBody: '兼容模式导出 MP3；无损模式可以选择 WAV 或 AIFF。',
+    onboardingStepTwoTitle: '拖入来源',
+    onboardingStepTwoBody: '把文件夹或单曲拖到任意任务的左侧来源框，软件会自动识别。',
+    onboardingStepThreeTitle: '指定输出目录',
+    onboardingStepThreeBody: '设置转换后的文件保存在哪里；任务 2 没有单独目录时会沿用任务 1。',
+    onboardingStepFourTitle: '开始转换',
+    onboardingStepFourBody: '准备好后点击这里，软件会先扫描并让你确认，再正式转换。',
+    onboardingNext: '下一步',
+    onboardingPrevious: '上一步',
+    onboardingSkip: '跳过教程',
+    onboardingFinish: '完成',
     usageGuide: '重新查看使用引导',
   },
   en: {
@@ -397,11 +408,18 @@ const translations = {
     errorCategory: 'Error type',
     onboardingTitle: 'New to W4DJ?',
     onboardingIntro: 'Four steps to convert. Folders and single tracks are detected automatically.',
-    onboardingStepOne: 'Choose an output mode',
-    onboardingStepTwo: 'Drop in a folder or track',
-    onboardingStepThree: 'Choose an output folder',
-    onboardingStepFour: 'Click “Start both”',
-    onboardingDismiss: 'Got it',
+    onboardingStepOneTitle: 'Choose an output mode',
+    onboardingStepOneBody: 'Compat mode exports MP3. Lossless mode lets you choose WAV or AIFF.',
+    onboardingStepTwoTitle: 'Drop in a source',
+    onboardingStepTwoBody: 'Drop a folder or a single track into any task source box. W4DJ detects it automatically.',
+    onboardingStepThreeTitle: 'Choose an output folder',
+    onboardingStepThreeBody: 'Set where converted files are saved. Task 2 uses Task 1’s folder when left empty.',
+    onboardingStepFourTitle: 'Start converting',
+    onboardingStepFourBody: 'When ready, click here. W4DJ scans the tasks first and asks you to confirm.',
+    onboardingNext: 'Next',
+    onboardingPrevious: 'Back',
+    onboardingSkip: 'Skip tour',
+    onboardingFinish: 'Done',
     usageGuide: 'View usage guide again',
   },
 } as const;
@@ -551,18 +569,24 @@ export function renderApp(
   outputSettingsExpanded = false,
   historyExpanded = false,
   onboardingVisible = false,
+  onboardingStep: OnboardingStep = 0,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
   root.dataset.status = aggregateStatus(state);
   root.dataset.theme = state.theme;
   root.dataset.lightPalette = LIGHT_PALETTE;
+  root.dataset.onboardingActive = onboardingVisible ? 'true' : 'false';
+  root.dataset.onboardingStep = String(onboardingStep);
   if (selectionMotion) {
     root.dataset.selectionMotion = selectionMotion;
   }
   const isRunning = state.slots.some((slot) => slot.status === 'running');
   const hasCancelled = state.slots.some((slot) => slot.status === 'cancelled');
   const configuredTasks = state.slots.filter((slot) => slot.sourceDirectory.trim()).length;
+  const onboardingTarget: OnboardingTarget | null = onboardingVisible
+    ? (['mode', 'source', 'destination', 'start'] as const)[onboardingStep]
+    : null;
   const completedTracks = state.slots.reduce((total, slot) => total + slot.progressCompleted, 0);
   const newTracks = state.slots.reduce((total, slot) => total + slot.newTracks, 0);
   const skippedTracks = state.slots.reduce((total, slot) => total + slot.skippedTracks, 0);
@@ -592,7 +616,7 @@ export function renderApp(
           <div class="global-control-head">
             <span>${t('mode', state.lang)}</span>
           </div>
-          <div class="mode-row" data-role="mode-switch" data-selected-mode="${state.mode}" aria-label="${t('mode', state.lang)}">
+          <div class="mode-row" data-role="mode-switch"${onboardingTarget === 'mode' ? ' data-onboarding-target="mode"' : ''} data-selected-mode="${state.mode}" aria-label="${t('mode', state.lang)}">
             <button type="button" class="mode-button ${state.mode === 'compat' ? 'selected' : ''}" data-mode="compat" ${pendingSelection === 'mode' ? 'disabled' : ''}>
               ${icon('check')}
               ${t('compatMode', state.lang)}
@@ -621,7 +645,7 @@ export function renderApp(
             </section>
           </div>
           <div class="global-action-group">
-            <button type="button" class="global-action" data-action="${isRunning ? 'pause-all' : 'start-all'}" ${
+            <button type="button" class="global-action"${onboardingTarget === 'start' ? ' data-onboarding-target="start"' : ''} data-action="${isRunning ? 'pause-all' : 'start-all'}" ${
               configuredTasks === 0 || pendingAction !== null ? 'disabled' : ''
             } aria-busy="${pendingAction !== null}">
               ${isRunning ? icon('pause') : icon('play')}
@@ -637,7 +661,11 @@ export function renderApp(
           <p class="panel-kicker">${t('sourceKicker', state.lang)}</p>
         </div>
         <div class="sync-slots">
-          ${renderSyncSlot(state, 0)}
+          ${renderSyncSlot(
+            state,
+            0,
+            onboardingTarget === 'source' || onboardingTarget === 'destination' ? onboardingTarget : null,
+          )}
           ${renderSyncSlot(state, 1)}
         </div>
         ${renderHistory(history, state.lang, historyExpanded)}
@@ -645,7 +673,7 @@ export function renderApp(
     </section>
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, state.lang)}
-    ${renderOnboardingModal(onboardingVisible, state.lang)}
+    ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
   `;
 
   return root;
@@ -776,7 +804,11 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
   `;
 }
 
-function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
+function renderSyncSlot(
+  state: AppViewState,
+  slotIndex: SyncSlotIndex,
+  onboardingTarget: 'source' | 'destination' | null = null,
+): string {
   const slot = state.slots[slotIndex];
   const fallbackDestination = state.slots[0].destinationDirectory;
   const usesFallback = slotIndex === 1 && slot.destinationDirectory.trim() === '';
@@ -798,7 +830,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
       </header>
 
       <div class="path-flow">
-          <div class="path-field" data-role="source-picker" data-drop-kind="source" data-slot="${slotIndex}">
+          <div class="path-field" data-role="source-picker"${onboardingTarget === 'source' ? ' data-onboarding-target="source"' : ''} data-drop-kind="source" data-slot="${slotIndex}">
           <span>${t('sourceLabel', state.lang)}</span>
           <div class="path-control source-path-control">
             <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
@@ -813,7 +845,7 @@ function renderSyncSlot(state: AppViewState, slotIndex: SyncSlotIndex): string {
 
         <span class="path-arrow" aria-hidden="true">${icon('arrow')}</span>
 
-          <div class="path-field" data-role="destination-picker" data-drop-kind="destination" data-slot="${slotIndex}">
+          <div class="path-field" data-role="destination-picker"${onboardingTarget === 'destination' ? ' data-onboarding-target="destination"' : ''} data-drop-kind="destination" data-slot="${slotIndex}">
           <span>${t('destLabel', state.lang)}</span>
           <div class="path-control destination-path-control">
             <button type="button" class="path-button ${usesFallback ? 'is-fallback' : ''}" data-action="pick-destination" data-slot="${slotIndex}">
@@ -866,6 +898,7 @@ export function bindApp(
   let outputSettingsExpanded = false;
   let historyExpanded = false;
   let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
+  let onboardingStep: OnboardingStep = 0;
 
   const render = () => {
     root.replaceChildren(
@@ -881,8 +914,13 @@ export function bindApp(
         outputSettingsExpanded,
         historyExpanded,
         onboardingVisible,
+        onboardingStep,
       ),
     );
+
+    if (onboardingVisible) {
+      root.querySelector<HTMLButtonElement>('[data-action="onboarding-next"]')?.focus();
+    }
 
     const historyDetails = root.querySelector<HTMLDetailsElement>('[data-role="history"]');
     historyDetails?.querySelector('summary')?.addEventListener('click', () => {
@@ -1146,6 +1184,13 @@ export function bindApp(
     const mode = button.dataset.mode as AppMode | undefined;
     const format = button.dataset.format as AppLosslessFormat | undefined;
     const slotIndex = parseSlotIndex(button.dataset.slot);
+    const isOnboardingAction = action === 'onboarding-next'
+      || action === 'onboarding-previous'
+      || action === 'dismiss-onboarding';
+
+    if (onboardingVisible && !isOnboardingAction) {
+      return;
+    }
 
     if (action === 'toggle-lang') {
       state = { ...state, lang: state.lang === 'zh' ? 'en' : 'zh' };
@@ -1171,14 +1216,36 @@ export function bindApp(
 
     if (action === 'dismiss-onboarding') {
       onboardingVisible = false;
+      onboardingStep = 0;
       localStorage.setItem('w4dj_onboarding_seen', '1');
       render();
+      return;
+    }
+
+    if (action === 'onboarding-next') {
+      if (onboardingStep === ONBOARDING_STEP_COUNT - 1) {
+        onboardingVisible = false;
+        onboardingStep = 0;
+        localStorage.setItem('w4dj_onboarding_seen', '1');
+      } else {
+        onboardingStep = (onboardingStep + 1) as OnboardingStep;
+      }
+      render();
+      return;
+    }
+
+    if (action === 'onboarding-previous') {
+      if (onboardingStep > 0) {
+        onboardingStep = (onboardingStep - 1) as OnboardingStep;
+        render();
+      }
       return;
     }
 
     if (action === 'reopen-onboarding') {
       aboutInfo = null;
       onboardingVisible = true;
+      onboardingStep = 0;
       render();
       return;
     }
@@ -1306,6 +1373,40 @@ export function bindApp(
 
     if (action === 'pause-all') {
       void runAction(() => services.pauseAllSync(), 'all', 'pause-all');
+    }
+  });
+
+  root.addEventListener('keydown', (event) => {
+    if (!onboardingVisible) {
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      onboardingVisible = false;
+      onboardingStep = 0;
+      localStorage.setItem('w4dj_onboarding_seen', '1');
+      render();
+      return;
+    }
+
+    if (event.key === 'ArrowLeft' && onboardingStep > 0) {
+      event.preventDefault();
+      onboardingStep = (onboardingStep - 1) as OnboardingStep;
+      render();
+      return;
+    }
+
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      if (onboardingStep === ONBOARDING_STEP_COUNT - 1) {
+        onboardingVisible = false;
+        onboardingStep = 0;
+        localStorage.setItem('w4dj_onboarding_seen', '1');
+      } else {
+        onboardingStep = (onboardingStep + 1) as OnboardingStep;
+      }
+      render();
     }
   });
 
@@ -1548,28 +1649,39 @@ function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
   `;
 }
 
-function renderOnboardingModal(visible: boolean, lang: AppLanguage): string {
+function renderOnboardingModal(visible: boolean, lang: AppLanguage, step: OnboardingStep = 0): string {
   if (!visible) {
     return '';
   }
 
   const steps = [
-    t('onboardingStepOne', lang),
-    t('onboardingStepTwo', lang),
-    t('onboardingStepThree', lang),
-    t('onboardingStepFour', lang),
-  ];
+    { target: 'mode', title: t('onboardingStepOneTitle', lang), body: t('onboardingStepOneBody', lang) },
+    { target: 'source', title: t('onboardingStepTwoTitle', lang), body: t('onboardingStepTwoBody', lang) },
+    { target: 'destination', title: t('onboardingStepThreeTitle', lang), body: t('onboardingStepThreeBody', lang) },
+    { target: 'start', title: t('onboardingStepFourTitle', lang), body: t('onboardingStepFourBody', lang) },
+  ] as const;
+  const currentStep = steps[step];
+  const isLastStep = step === ONBOARDING_STEP_COUNT - 1;
 
   return `
-    <div class="onboarding-modal" data-role="onboarding-modal" role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
-      <section class="onboarding-dialog">
-        <p class="panel-kicker">W4DJ RKB</p>
-        <h2 id="onboarding-title">${t('onboardingTitle', lang)}</h2>
-        <p class="onboarding-intro">${t('onboardingIntro', lang)}</p>
-        <ol class="onboarding-steps">
-          ${steps.map((step, index) => `<li data-role="onboarding-step"><span>${index + 1}</span><strong>${step}</strong></li>`).join('')}
-        </ol>
-        <button type="button" class="global-action" data-action="dismiss-onboarding">${t('onboardingDismiss', lang)}</button>
+    <div class="onboarding-modal" data-role="onboarding-modal" data-step="${step}" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-body">
+      <section class="onboarding-callout" data-role="onboarding-step">
+        <div class="onboarding-callout-head">
+          <div>
+            <p class="panel-kicker">W4DJ RKB</p>
+            <h2 id="onboarding-title">${currentStep.title}</h2>
+          </div>
+          <span class="onboarding-counter">${step + 1}/${ONBOARDING_STEP_COUNT}</span>
+        </div>
+        <p id="onboarding-body" class="onboarding-intro">${currentStep.body}</p>
+        <div class="onboarding-progress" aria-hidden="true"><span style="width: ${((step + 1) / ONBOARDING_STEP_COUNT) * 100}%"></span></div>
+        <footer class="onboarding-actions">
+          <button type="button" class="onboarding-skip" data-action="dismiss-onboarding">${t('onboardingSkip', lang)}</button>
+          <div>
+            <button type="button" class="secondary-action" data-action="onboarding-previous" ${step === 0 ? 'disabled' : ''}>${t('onboardingPrevious', lang)}</button>
+            <button type="button" class="global-action" data-action="onboarding-next">${isLastStep ? t('onboardingFinish', lang) : t('onboardingNext', lang)}</button>
+          </div>
+        </footer>
       </section>
     </div>
   `;

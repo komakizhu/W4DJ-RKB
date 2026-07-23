@@ -1114,35 +1114,46 @@ fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> Strin
         .to_lowercase();
 
     let candidate = match extension.as_str() {
-        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path, filename_rule),
-        "flac" => song_name_from_flac(path, filename_rule),
-        "ncm" => song_name_from_ncm(path, filename_rule),
+        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path, filename_rule, &fallback_name),
+        "flac" => song_name_from_flac(path, filename_rule, &fallback_name),
+        "ncm" => song_name_from_ncm(path, filename_rule, &fallback_name),
         _ => None,
     };
 
-    candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name))
+    candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name, filename_rule))
 }
 
-fn song_name_from_flac(path: &Path, filename_rule: FilenameRule) -> Option<String> {
+fn song_name_from_flac(
+    path: &Path,
+    filename_rule: FilenameRule,
+    fallback_name: &str,
+) -> Option<String> {
     let tag = metaflac::Tag::read_from_path(path).ok()?;
-    let id3_tag = build_id3_tag_from_flac(&tag);
-    build_song_name_with_rule(
-        id3_tag.title().unwrap_or_default(),
-        id3_tag.artist().unwrap_or_default(),
-        filename_rule,
-    )
+    let comments = tag.vorbis_comments();
+    let title = comments.and_then(|comments| first_non_empty(comments.title()));
+    let artist = comments.and_then(|comments| {
+        join_non_empty(comments.artist()).or_else(|| join_non_empty(comments.album_artist()))
+    });
+    let identity = infer_song_identity(fallback_name, title, artist.as_deref());
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
-fn song_name_from_audio_tag(path: &Path, filename_rule: FilenameRule) -> Option<String> {
+fn song_name_from_audio_tag(
+    path: &Path,
+    filename_rule: FilenameRule,
+    fallback_name: &str,
+) -> Option<String> {
     let tag = id3::Tag::read_from_path(path).ok()?;
-    build_song_name_with_rule(
-        tag.title().unwrap_or_default(),
-        tag.artist().unwrap_or_default(),
-        filename_rule,
-    )
+    let artist = tag.artist().or_else(|| tag.album_artist());
+    let identity = infer_song_identity(fallback_name, tag.title(), artist);
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
-fn song_name_from_ncm(path: &Path, filename_rule: FilenameRule) -> Option<String> {
+fn song_name_from_ncm(
+    path: &Path,
+    filename_rule: FilenameRule,
+    fallback_name: &str,
+) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut ncm = Ncmdump::from_reader(file).ok()?;
     let info = ncm.get_info().ok()?;
@@ -1152,9 +1163,63 @@ fn song_name_from_ncm(path: &Path, filename_rule: FilenameRule) -> Option<String
         .map(|item| item.0.as_str())
         .collect::<Vec<&str>>()
         .join(", ");
-    build_song_name_with_rule(&info.name, &artist, filename_rule)
+    let identity = infer_song_identity(fallback_name, Some(&info.name), Some(&artist));
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SongIdentity {
+    title: String,
+    artist: String,
+}
+
+fn infer_song_identity(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+) -> SongIdentity {
+    let (fallback_title, fallback_artist) = parse_filename_identity(fallback_name);
+    let title = normalize_filename_part(metadata_title).unwrap_or(fallback_title);
+    let artist = normalize_filename_part(metadata_artist).unwrap_or(fallback_artist);
+
+    SongIdentity { title, artist }
+}
+
+fn parse_filename_identity(fallback_name: &str) -> (String, String) {
+    let display = normalize_display_text(fallback_name);
+    display
+        .split_once(" - ")
+        .map(|(artist, title)| (title.to_string(), artist.to_string()))
+        .unwrap_or((display, String::new()))
+}
+
+fn normalize_filename_part(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let normalized = sanitize_filename_component(&normalize_display_text(value));
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn first_non_empty(values: Option<&Vec<String>>) -> Option<&str> {
+    values.and_then(|values| {
+        values
+            .iter()
+            .map(String::as_str)
+            .find(|value| !value.trim().is_empty())
+    })
+}
+
+fn join_non_empty(values: Option<&Vec<String>>) -> Option<String> {
+    let values = values?;
+    let joined = values
+        .iter()
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<&str>>()
+        .join(", ");
+    (!joined.is_empty()).then_some(joined)
+}
+
+#[cfg(test)]
 fn build_song_name(title: &str, artist: &str) -> Option<String> {
     build_song_name_with_rule(title, artist, FilenameRule::default())
 }
@@ -1180,19 +1245,10 @@ fn build_song_name_with_rule(
     }
 }
 
-fn normalize_fallback_song_name(fallback_name: &str) -> String {
-    let display = normalize_display_text(fallback_name);
-
-    if looks_like_soundcloud_text(fallback_name)
-        && let Some((artist, title)) = display.split_once(" - ")
-    {
-        let reordered = build_song_name(title, artist);
-        if let Some(song_name) = reordered {
-            return song_name;
-        }
-    }
-
-    display
+fn normalize_fallback_song_name(fallback_name: &str, filename_rule: FilenameRule) -> String {
+    let identity = infer_song_identity(fallback_name, None, None);
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
+        .unwrap_or_else(|| normalize_display_text(fallback_name))
 }
 
 fn normalize_display_text(value: &str) -> String {
@@ -1613,8 +1669,9 @@ fn write_container_tags_from_flac_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_song_name, build_song_name_with_rule, compare_music_dicts, derive_song_name,
-        ensure_generated_output, find_ffmpeg_next_to_exe, remove_conflicting_outputs,
+        SongIdentity, build_song_name, build_song_name_with_rule, compare_music_dicts,
+        derive_song_name, derive_song_name_with_rule, ensure_generated_output,
+        find_ffmpeg_next_to_exe, infer_song_identity, remove_conflicting_outputs,
         sanitize_filename_component, strip_163_key_from_mp3,
     };
     use crate::config::{FilenameRule, LosslessFormat, Mode};
@@ -1721,6 +1778,57 @@ mod tests {
                 "/tmp/Skrillex_ft_ISOxo_Zeina_Logan_olm_-_Take_It_All_Whisper_ID_ID_2023_unreleased.mp3"
             )),
             "Take It All Whisper - Skrillex feat. ISOxo Zeina Logan olm"
+        );
+    }
+
+    #[test]
+    fn applies_title_artist_rule_to_plain_artist_first_filename_fallback() {
+        let path = std::path::Path::new("/tmp/Mr Wankerman - Mystic State, Third Degree.mp3");
+
+        assert_eq!(
+            derive_song_name_with_rule(path, FilenameRule::TitleArtist),
+            "Mystic State, Third Degree - Mr Wankerman"
+        );
+        assert_eq!(
+            derive_song_name_with_rule(path, FilenameRule::ArtistTitle),
+            "Mr Wankerman - Mystic State, Third Degree"
+        );
+    }
+
+    #[test]
+    fn completes_partial_metadata_from_the_filename_identity() {
+        let fallback = "Mr Wankerman - Mystic State, Third Degree";
+
+        assert_eq!(
+            infer_song_identity(fallback, Some("Mystic State, Third Degree"), None),
+            SongIdentity {
+                title: "Mystic State, Third Degree".to_string(),
+                artist: "Mr Wankerman".to_string(),
+            }
+        );
+        assert_eq!(
+            infer_song_identity(fallback, None, Some("Mr Wankerman")),
+            SongIdentity {
+                title: "Mystic State, Third Degree".to_string(),
+                artist: "Mr Wankerman".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn combines_audio_metadata_with_filename_identity_before_applying_rule() {
+        let directory = tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("Mr Wankerman - Mystic State, Third Degree.mp3");
+        fs::write(&path, b"audio-placeholder").unwrap();
+        let mut tag = Tag::new();
+        tag.set_title("Mystic State, Third Degree");
+        tag.write_to_path(&path, Version::Id3v24).unwrap();
+
+        assert_eq!(
+            derive_song_name_with_rule(&path, FilenameRule::TitleArtist),
+            "Mystic State, Third Degree - Mr Wankerman"
         );
     }
 

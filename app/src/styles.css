@@ -1203,26 +1203,38 @@ h1 {
   position: fixed;
   z-index: 40;
   inset: 0;
-  display: grid;
-  place-items: center;
-  padding: 24px;
+  pointer-events: auto;
   background: rgba(19, 27, 29, 0.42);
   backdrop-filter: blur(9px);
 }
 
-.onboarding-dialog {
-  width: min(460px, 100%);
+.onboarding-callout {
+  position: absolute;
+  z-index: 42;
+  right: 24px;
+  bottom: 24px;
+  left: 50%;
+  width: min(520px, calc(100% - 48px));
   display: grid;
   gap: 16px;
   padding: 28px;
   border: 1px solid var(--line-strong);
   border-radius: 24px;
-  background: var(--surface);
+  background: var(--surface-strong);
   box-shadow: 0 24px 70px var(--shadow);
+  transform: translateX(-50%);
 }
 
-.onboarding-dialog h2,
-.onboarding-dialog p {
+.onboarding-callout-head,
+.onboarding-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.onboarding-callout h2,
+.onboarding-callout p {
   margin: 0;
 }
 
@@ -1232,40 +1244,92 @@ h1 {
   line-height: 1.55;
 }
 
-.onboarding-steps {
-  display: grid;
-  gap: 10px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.onboarding-steps li {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-height: 44px;
-  padding: 8px 12px;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--surface-strong);
-}
-
-.onboarding-steps li > span {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  flex: 0 0 28px;
-  border-radius: 50%;
+.onboarding-counter {
+  flex: 0 0 auto;
+  padding: 6px 9px;
+  border-radius: 999px;
   background: var(--cyan-soft);
   color: var(--cyan);
-  font-size: 12px;
-  font-weight: 800;
+  font: 800 11px/1 "SFMono-Regular", Consolas, monospace;
 }
 
-.onboarding-steps strong {
-  font-size: 13px;
+.onboarding-progress {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.onboarding-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--cyan);
+  transition: width 220ms ease;
+}
+
+.onboarding-actions > div {
+  display: flex;
+  gap: 8px;
+}
+
+.onboarding-skip {
+  min-height: 44px;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.onboarding-skip:hover {
+  color: var(--text);
+}
+
+.app-shell[data-onboarding-active="true"] [data-onboarding-target] {
+  position: relative;
+  z-index: 41;
+  pointer-events: none;
+}
+
+/* backdrop-filter creates a stacking context that would hide the source and
+   destination fields behind the tour overlay. The overlay supplies the blur
+   while the active target needs to remain in the foreground. */
+.app-shell[data-onboarding-active="true"][data-onboarding-step="1"] .workbench-main,
+.app-shell[data-onboarding-active="true"][data-onboarding-step="2"] .workbench-main {
+  backdrop-filter: none;
+}
+
+.app-shell[data-onboarding-active="true"][data-onboarding-step="0"] [data-onboarding-target="mode"],
+.app-shell[data-onboarding-active="true"][data-onboarding-step="1"] [data-onboarding-target="source"],
+.app-shell[data-onboarding-active="true"][data-onboarding-step="2"] [data-onboarding-target="destination"],
+.app-shell[data-onboarding-active="true"][data-onboarding-step="3"] [data-onboarding-target="start"] {
+  filter: saturate(1.04) brightness(1.04);
+  outline: none;
+  box-shadow: none;
+}
+
+.app-shell[data-onboarding-active="true"][data-onboarding-step="3"] [data-onboarding-target="start"]:disabled {
+  opacity: 1;
+}
+
+.app-shell[data-onboarding-active="true"][data-onboarding-step="3"] .onboarding-callout {
+  right: auto;
+  bottom: 178px;
+  left: 24px;
+  width: min(360px, calc(100% - 48px));
+  transform: none;
+}
+
+@media (max-width: 720px) {
+  .onboarding-callout {
+    right: 12px;
+    bottom: 12px;
+    left: 12px;
+    width: auto;
+    transform: none;
+  }
 }
 
 .about-dialog {
