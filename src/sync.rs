@@ -3,6 +3,7 @@ use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
 use crate::task::{TaskController, TaskSnapshot};
+use id3::frame::Picture;
 use id3::{TagLike, Version};
 use ncmdump::Ncmdump;
 use std::collections::HashMap;
@@ -626,6 +627,7 @@ fn process_music_file(
             };
 
             if result.is_ok() {
+                ensure_output_metadata(src_path, &output_path)?;
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
                     strip_163_key_from_mp3(&output_path)?;
                 }
@@ -655,6 +657,7 @@ fn process_music_file(
             };
 
             if result.is_ok() {
+                ensure_output_metadata(src_path, &output_path)?;
                 remove_conflicting_outputs(
                     dest_folder,
                     name,
@@ -680,16 +683,7 @@ fn process_music_file(
             };
 
             if result.is_ok() {
-                if matches!(
-                    output_policy.target_profile,
-                    TargetProfile::LosslessWav | TargetProfile::LosslessAiff
-                ) {
-                    write_container_tags_from_flac_source(
-                        src_path,
-                        &output_path,
-                        output_policy.target_profile,
-                    )?;
-                }
+                ensure_output_metadata(src_path, &output_path)?;
                 remove_conflicting_outputs(
                     dest_folder,
                     name,
@@ -707,9 +701,10 @@ fn process_music_file(
                 let file_format =
                     detect_ncm_output_extension(src_path).unwrap_or_else(|_| "flac".to_string());
                 let output_policy = resolve_output_policy(*mode, lossless_format, &file_format);
+                let output_path =
+                    target_output_path(dest_folder, name, output_policy.output_extension);
+                ensure_output_metadata(src_path, &output_path)?;
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
-                    let output_path =
-                        target_output_path(dest_folder, name, output_policy.output_extension);
                     strip_163_key_from_mp3(&output_path)?;
                 }
                 remove_conflicting_outputs(
@@ -828,6 +823,123 @@ fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()
     }
 
     Ok(())
+}
+
+fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<()> {
+    let source_tag = source_metadata_as_id3(source_path);
+    let mut output_tag = read_id3_tag_or_empty(output_path);
+    let fallback_name = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+
+    if !fill_missing_metadata(&mut output_tag, &source_tag, fallback_name) {
+        return Ok(());
+    }
+
+    write_id3_tag_for_output(&output_tag, output_path)
+}
+
+fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
+    let extension = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "flac" => metaflac::Tag::read_from_path(source_path)
+            .map(|tag| build_id3_tag_from_flac(&tag))
+            .unwrap_or_else(|_| id3::Tag::new()),
+        "ncm" => {
+            let Ok(file) = File::open(source_path) else {
+                return id3::Tag::new();
+            };
+            let Ok(mut ncm) = Ncmdump::from_reader(file) else {
+                return id3::Tag::new();
+            };
+            let Ok(info) = ncm.get_info() else {
+                return id3::Tag::new();
+            };
+            let image = ncm.get_image().unwrap_or_default();
+            build_id3_tag(&info, &image)
+        }
+        _ => read_id3_tag_or_empty(source_path),
+    }
+}
+
+fn read_id3_tag_or_empty(path: &Path) -> id3::Tag {
+    id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new())
+}
+
+fn fill_missing_metadata(
+    output_tag: &mut id3::Tag,
+    source_tag: &id3::Tag,
+    fallback_name: &str,
+) -> bool {
+    let source_artist = source_tag.artist().or_else(|| source_tag.album_artist());
+    let identity = infer_song_identity(fallback_name, source_tag.title(), source_artist);
+    let mut changed = false;
+
+    if is_blank(output_tag.title()) && !identity.title.is_empty() {
+        output_tag.set_title(&identity.title);
+        changed = true;
+    }
+
+    if is_blank(output_tag.artist()) {
+        let artist = normalize_filename_part(source_artist).unwrap_or(identity.artist);
+        if !artist.is_empty() {
+            output_tag.set_artist(&artist);
+            changed = true;
+        }
+    }
+
+    if is_blank(output_tag.album())
+        && let Some(album) = non_empty(source_tag.album())
+    {
+        output_tag.set_album(album);
+        changed = true;
+    }
+
+    if output_tag.pictures().next().is_none() {
+        for picture in source_tag.pictures() {
+            output_tag.add_frame(Picture {
+                mime_type: picture.mime_type.clone(),
+                picture_type: picture.picture_type,
+                description: picture.description.clone(),
+                data: picture.data.clone(),
+            });
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn write_id3_tag_for_output(tag: &id3::Tag, output_path: &Path) -> io::Result<()> {
+    let extension = output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    #[allow(deprecated)]
+    let result = match extension.as_str() {
+        "mp3" => tag.write_to_path(output_path, Version::Id3v24),
+        "wav" => tag.write_to_wav_path(output_path, Version::Id3v24),
+        "aiff" | "aif" => tag.write_to_aiff_path(output_path, Version::Id3v24),
+        _ => return Ok(()),
+    };
+
+    result.map_err(io::Error::other)
+}
+
+fn is_blank(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim().is_empty())
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(target_os = "windows")]
@@ -1646,33 +1758,14 @@ fn write_container_tags(
     }
 }
 
-fn write_container_tags_from_flac_source(
-    source_path: &Path,
-    output_path: &Path,
-    target_profile: TargetProfile,
-) -> io::Result<()> {
-    let tag = metaflac::Tag::read_from_path(source_path).map_err(io::Error::other)?;
-    let id3_tag = build_id3_tag_from_flac(&tag);
-
-    #[allow(deprecated)]
-    match target_profile {
-        TargetProfile::LosslessWav => id3_tag
-            .write_to_wav_path(output_path, Version::Id3v24)
-            .map_err(io::Error::other),
-        TargetProfile::LosslessAiff => id3_tag
-            .write_to_aiff_path(output_path, Version::Id3v24)
-            .map_err(io::Error::other),
-        _ => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         SongIdentity, build_song_name, build_song_name_with_rule, compare_music_dicts,
         derive_song_name, derive_song_name_with_rule, ensure_generated_output,
-        find_ffmpeg_next_to_exe, infer_song_identity, remove_conflicting_outputs,
-        sanitize_filename_component, strip_163_key_from_mp3,
+        ensure_output_metadata, fill_missing_metadata, find_ffmpeg_next_to_exe,
+        infer_song_identity, remove_conflicting_outputs, sanitize_filename_component,
+        strip_163_key_from_mp3,
     };
     use crate::config::{FilenameRule, LosslessFormat, Mode};
     use id3::{Tag, TagLike, Version};
@@ -1998,6 +2091,66 @@ mod tests {
         assert_eq!(cleaned.comments().count(), 0);
         assert_eq!(cleaned.extended_texts().count(), 0);
         assert_eq!(cleaned.pictures().count(), 1);
+    }
+
+    #[test]
+    fn fills_missing_metadata_from_the_original_filename() {
+        let mut output = Tag::new();
+        let source = Tag::new();
+
+        assert!(fill_missing_metadata(
+            &mut output,
+            &source,
+            "Mr Wankerman - Mystic State, Third Degree"
+        ));
+
+        assert_eq!(output.title(), Some("Mystic State, Third Degree"));
+        assert_eq!(output.artist(), Some("Mr Wankerman"));
+    }
+
+    #[test]
+    fn writes_fallback_metadata_to_an_untagged_mp3_output() {
+        let dir = tempdir().unwrap();
+        let source_path = dir
+            .path()
+            .join("Mr Wankerman - Mystic State, Third Degree.mp3");
+        let output_path = dir
+            .path()
+            .join("Mystic State, Third Degree - Mr Wankerman.mp3");
+        fs::write(&source_path, b"audio").unwrap();
+        fs::copy(&source_path, &output_path).unwrap();
+
+        ensure_output_metadata(&source_path, &output_path).unwrap();
+
+        let tag = Tag::read_from_path(&output_path).unwrap();
+        assert_eq!(tag.title(), Some("Mystic State, Third Degree"));
+        assert_eq!(tag.artist(), Some("Mr Wankerman"));
+    }
+
+    #[test]
+    fn backfills_only_missing_fields_and_preserves_source_cover() {
+        let mut source = Tag::new();
+        source.set_album("Existing Album");
+        source.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".into(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02],
+        });
+
+        let mut output = Tag::new();
+        output.set_title("Existing Title");
+
+        assert!(fill_missing_metadata(
+            &mut output,
+            &source,
+            "Artist - Fallback Title"
+        ));
+
+        assert_eq!(output.title(), Some("Existing Title"));
+        assert_eq!(output.artist(), Some("Artist"));
+        assert_eq!(output.album(), Some("Existing Album"));
+        assert_eq!(output.pictures().count(), 1);
     }
 
     #[test]
