@@ -319,6 +319,7 @@ fn retry_preview_restores_pending_files_saved_before_app_exit() {
         retry_of: None,
         conflict_strategy: ConflictStrategy::Skip,
         filename_rule: FilenameRule::TitleArtist,
+        report_path: None,
     };
 
     let preview = build_retry_preview(&entry);
@@ -377,6 +378,7 @@ fn retry_preview_ignores_old_macos_appledouble_failures_and_pending_files() {
         retry_of: None,
         conflict_strategy: ConflictStrategy::Skip,
         filename_rule: FilenameRule::TitleArtist,
+        report_path: None,
     };
 
     let preview = build_retry_preview(&entry);

@@ -47,6 +47,7 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   lossless_format: null,
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
+  report_path: null,
   ...overrides,
 });
 

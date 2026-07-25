@@ -31,6 +31,7 @@ fn test_entry(index: usize) -> HistoryEntry {
         retry_of: None,
         conflict_strategy: Default::default(),
         filename_rule: Default::default(),
+        report_path: None,
     }
 }
 
@@ -69,13 +70,22 @@ fn error_report_contains_failed_path_and_reason() {
 }
 
 #[test]
+fn conversion_report_is_generic_for_successful_tasks() {
+    let report = format_error_report(&test_entry(2));
+    assert!(report.starts_with("W4DJ RKB 转换报告\n"));
+    assert!(report.contains("任务状态：已完成"));
+    assert!(report.contains("错误文件：0"));
+    assert!(report.contains("失败文件：0"));
+}
+
+#[test]
 fn complete_error_report_contains_environment_settings_and_all_counts() {
     let entry = test_entry(1);
 
     let report = format_error_report(&entry);
 
-    assert!(report.contains("W4DJ RKB 完整错误报告"));
-    assert!(report.contains("报告格式版本：1"));
+    assert!(report.contains("W4DJ RKB 转换报告"));
+    assert!(report.contains("报告格式版本：2"));
     assert!(report.contains(&format!("软件版本：{}", env!("CARGO_PKG_VERSION"))));
     assert!(report.contains("操作系统："));
     assert!(report.contains("CPU 架构："));

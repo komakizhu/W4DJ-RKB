@@ -983,6 +983,7 @@ fn run_confirmed_sync_task(
         retry_of: job.retry_of.clone(),
         conflict_strategy: job.conflict_strategy,
         filename_rule: job.filename_rule,
+        report_path: None,
     }));
     persist_recovery_entry(&history_path, &history_write_lock, &recovery_entry);
 
@@ -1201,7 +1202,7 @@ fn run_confirmed_sync_task(
     } else {
         Vec::new()
     };
-    let history_entry = HistoryEntry {
+    let mut history_entry = HistoryEntry {
         id: format!("{}-slot{}", job.batch_id, job.slot_index + 1),
         batch_id: job.batch_id,
         slot_index: job.slot_index,
@@ -1225,7 +1226,22 @@ fn run_confirmed_sync_task(
         retry_of: job.retry_of,
         conflict_strategy: job.conflict_strategy,
         filename_rule: job.filename_rule,
+        report_path: None,
     };
+
+    let report_path = automatic_report_path(&history_path, &history_entry);
+    history_entry.report_path = Some(report_path.display().to_string());
+    if let Err(error) = fs::create_dir_all(
+        report_path
+            .parent()
+            .expect("automatic report path should have a parent"),
+    ) {
+        history_entry.report_path = None;
+        eprintln!("Failed to create automatic report directory: {error}");
+    } else if let Err(error) = fs::write(&report_path, format_error_report(&history_entry)) {
+        history_entry.report_path = None;
+        eprintln!("Failed to save automatic conversion report: {error}");
+    }
 
     let _history_guard = history_write_lock
         .lock()
@@ -1233,6 +1249,28 @@ fn run_confirmed_sync_task(
     if let Err(error) = upsert_history(history_path, history_entry) {
         eprintln!("Failed to save conversion history: {}", error);
     }
+}
+
+fn automatic_report_path(history_path: &Path, entry: &HistoryEntry) -> PathBuf {
+    let report_directory = history_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("conversion-reports");
+    let safe_id: String = entry
+        .id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    report_directory.join(format!(
+        "W4DJ-RKB-{safe_id}-task-{}.txt",
+        entry.slot_index + 1
+    ))
 }
 
 fn pending_file_from_candidate(candidate: &PreviewCandidate) -> PendingFile {

@@ -131,6 +131,8 @@ pub struct HistoryEntry {
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
+    #[serde(default)]
+    pub report_path: Option<String>,
 }
 
 pub fn load_history(path: impl AsRef<Path>) -> io::Result<Vec<HistoryEntry>> {
@@ -196,8 +198,8 @@ fn write_history(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
 
 pub fn format_error_report(entry: &HistoryEntry) -> String {
     let mut report = String::new();
-    report.push_str("W4DJ RKB 完整错误报告\n");
-    report.push_str("报告格式版本：1\n\n");
+    report.push_str("W4DJ RKB 转换报告\n");
+    report.push_str("报告格式版本：2\n\n");
 
     report.push_str("[软件与系统]\n");
     report.push_str(&format!("软件版本：{}\n", env!("CARGO_PKG_VERSION")));
@@ -258,6 +260,12 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     report.push_str("[路径]\n");
     report.push_str(&format!("输入来源：{}\n", entry.source_directory));
     report.push_str(&format!("输出目录：{}\n\n", entry.destination_directory));
+
+    report.push_str("[报告文件]\n");
+    report.push_str(&format!(
+        "自动保存位置：{}\n\n",
+        entry.report_path.as_deref().unwrap_or("未自动保存")
+    ));
 
     report.push_str("[统计]\n");
     report.push_str(&format!("新增文件：{}\n", entry.new_count));
