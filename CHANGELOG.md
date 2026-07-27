@@ -1,5 +1,18 @@
 # W4DJ RKB 更新日志
 
+## Unreleased
+
+### Added
+
+- 接入 Essentia.js 音频分析，可扫描输出目录并保存 BPM、Key、节拍位置、LUFS、Energy、Danceability 等结果。
+- 新增 Rekordbox XML 导出：BPM、Key 和节拍网格写入标准字段，响度、能量、舞动性和 Key 置信度写入 Comments。
+- 新增本地音乐分析库，分析结果独立于转换历史保存，重复分析同一首歌会更新而不会产生重复记录。
+
+### Notes
+
+- Rekordbox XML 只引用音频文件路径，不会复制音频文件；导入后请确保原输出目录保持不变。
+- Essentia.js 使用 AGPL-3.0 授权，分发包含该模块的安装包时需要遵守对应许可证。
+
 ## v2.2.3
 
 ### Added

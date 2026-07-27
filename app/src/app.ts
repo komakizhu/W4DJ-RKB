@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
+import { analyzeAudioFile, type TrackAnalysis, type TrackMetadata } from './analysis';
 
 export type AppMode = 'compat' | 'lossless';
 export type AppLosslessFormat = 'wav' | 'aiff';
@@ -130,6 +131,15 @@ export type AppInfo = {
   project_url: string;
 };
 
+export type AppAnalysisState = {
+  status: 'idle' | 'running' | 'completed' | 'error';
+  completed: number;
+  total: number;
+  resultCount: number;
+  failedCount: number;
+  message: string;
+};
+
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
 
 export type AppHistoryEntry = {
@@ -191,6 +201,12 @@ export type AppServices = {
   pauseAllSync: () => Promise<DesktopState>;
   cancelSync: (slotIndex: SyncSlotIndex) => Promise<DesktopState>;
   cancelAllSync: () => Promise<DesktopState>;
+  listAudioFiles: (path: string) => Promise<string[]>;
+  readAudioFile: (path: string) => Promise<number[]>;
+  readTrackMetadata: (path: string) => Promise<TrackMetadata>;
+  loadTrackAnalyses: () => Promise<TrackAnalysis[]>;
+  saveTrackAnalyses: (entries: TrackAnalysis[]) => Promise<number>;
+  exportRekordboxXml: (path: string) => Promise<void>;
 };
 
 export type DropTargetRect = {
@@ -326,6 +342,15 @@ const translations = {
     onboardingSkip: '跳过教程',
     onboardingFinish: '完成',
     usageGuide: '重新查看使用引导',
+    analysisTitle: '音乐分析',
+    analysisBody: '用 Essentia 扫描输出目录，写入 BPM、Key、响度和能量。',
+    analyzeLibrary: '分析音乐库',
+    exportRekordbox: '导出 Rekordbox XML',
+    analysisIdle: '先设置输出目录，再开始分析。',
+    analysisRunning: '正在分析音乐库…',
+    analysisComplete: '已保存 {count} 首分析结果，可导入 Rekordbox。',
+    analysisPartial: '完成 {done}/{total} 首，{failed} 首失败。',
+    analysisNoResults: '没有成功的分析结果。',
   },
   en: {
     eyebrow: 'W4DJ RKB',
@@ -422,6 +447,15 @@ const translations = {
     onboardingSkip: 'Skip tour',
     onboardingFinish: 'Done',
     usageGuide: 'View usage guide again',
+    analysisTitle: 'Music analysis',
+    analysisBody: 'Scan output folders with Essentia and write BPM, key, loudness, and energy.',
+    analyzeLibrary: 'Analyze library',
+    exportRekordbox: 'Export Rekordbox XML',
+    analysisIdle: 'Choose an output folder before analyzing.',
+    analysisRunning: 'Analyzing music library…',
+    analysisComplete: '{count} results saved. Ready for Rekordbox.',
+    analysisPartial: 'Completed {done}/{total}; {failed} failed.',
+    analysisNoResults: 'No analysis result was completed.',
   },
 } as const;
 
@@ -487,6 +521,15 @@ const defaultState: AppViewState = {
   filenameRule: 'title_artist',
   lang: initialLanguage,
   theme: initialTheme,
+};
+
+const defaultAnalysisState: AppAnalysisState = {
+  status: 'idle',
+  completed: 0,
+  total: 0,
+  resultCount: 0,
+  failedCount: 0,
+  message: '',
 };
 
 const defaultServices: AppServices = {
@@ -556,6 +599,12 @@ const defaultServices: AppServices = {
   pauseAllSync: () => invoke<DesktopState>('pause_all_sync'),
   cancelSync: (slotIndex) => invoke<DesktopState>('cancel_sync', { slotIndex }),
   cancelAllSync: () => invoke<DesktopState>('cancel_all_sync'),
+  listAudioFiles: (path) => invoke<string[]>('list_audio_files', { path }),
+  readAudioFile: (path) => invoke<number[]>('read_audio_file', { path }),
+  readTrackMetadata: (path) => invoke<TrackMetadata>('read_audio_metadata', { path }),
+  loadTrackAnalyses: () => invoke<TrackAnalysis[]>('load_track_analyses'),
+  saveTrackAnalyses: (entries) => invoke<number>('save_track_analyses', { entries }),
+  exportRekordboxXml: (path) => invoke<void>('export_rekordbox_xml', { path }),
 };
 
 export function renderApp(
@@ -571,6 +620,7 @@ export function renderApp(
   historyExpanded = false,
   onboardingVisible = false,
   onboardingStep: OnboardingStep = 0,
+  analysisState: AppAnalysisState = defaultAnalysisState,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -629,6 +679,7 @@ export function renderApp(
           </div>
           ${renderLosslessFormats(state, pendingSelection)}
           ${renderOutputSettings(state, outputSettingsExpanded)}
+          ${renderAnalysisPanel(state, analysisState)}
           <div class="rail-lower">
             <div class="rail-note">
               <p>${t('compatNote', state.lang)}</p>
@@ -900,6 +951,7 @@ export function bindApp(
   let historyExpanded = false;
   let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
   let onboardingStep: OnboardingStep = 0;
+  let analysisState: AppAnalysisState = { ...defaultAnalysisState };
 
   const render = () => {
     root.replaceChildren(
@@ -916,6 +968,7 @@ export function bindApp(
         historyExpanded,
         onboardingVisible,
         onboardingStep,
+        analysisState,
       ),
     );
 
@@ -1125,6 +1178,141 @@ export function bindApp(
     }
   };
 
+  const yieldToUi = async () => {
+    await new Promise<void>((resolve) => {
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => resolve());
+      } else {
+        setTimeout(resolve, 0);
+      }
+    });
+  };
+
+  const analysisTargets = () => {
+    const firstDestination = state.slots[0].destinationDirectory.trim();
+    return Array.from(new Set(
+      state.slots
+        .map((slot, index) => {
+          const destination = slot.destinationDirectory.trim();
+          return destination || (index === 1 ? firstDestination : '');
+        })
+        .filter(Boolean),
+    ));
+  };
+
+  const analyzeLibrary = async () => {
+    if (analysisState.status === 'running') {
+      return;
+    }
+
+    const targets = analysisTargets();
+    if (targets.length === 0) {
+      analysisState = { ...defaultAnalysisState, status: 'error', message: t('analysisIdle', state.lang) };
+      render();
+      return;
+    }
+
+    analysisState = {
+      status: 'running',
+      completed: 0,
+      total: 0,
+      resultCount: analysisState.resultCount,
+      failedCount: 0,
+      message: t('analysisRunning', state.lang),
+    };
+    render();
+
+    try {
+      const allPaths = (await Promise.all(targets.map((target) => services.listAudioFiles(target))))
+        .flat();
+      const paths = Array.from(new Set(allPaths));
+      analysisState = { ...analysisState, total: paths.length };
+      render();
+
+      if (paths.length === 0) {
+        analysisState = { ...analysisState, status: 'error', message: t('analysisNoResults', state.lang) };
+        render();
+        return;
+      }
+
+      const results: TrackAnalysis[] = [];
+      let failedCount = 0;
+      for (const path of paths) {
+        try {
+          const bytes = await services.readAudioFile(path);
+          let metadata: TrackMetadata | undefined;
+          try {
+            metadata = await services.readTrackMetadata(path);
+          } catch {
+            // Analysis can still continue for files without readable tags.
+          }
+          results.push(await analyzeAudioFile(path, Uint8Array.from(bytes), metadata));
+        } catch (error) {
+          failedCount += 1;
+          console.warn(`Essentia analysis failed for ${path}`, error);
+        }
+        analysisState = {
+          ...analysisState,
+          completed: analysisState.completed + 1,
+          failedCount,
+          message: t('analysisRunning', state.lang),
+        };
+        render();
+        await yieldToUi();
+      }
+
+      if (results.length === 0) {
+        analysisState = {
+          ...analysisState,
+          status: 'error',
+          failedCount,
+          message: t('analysisNoResults', state.lang),
+        };
+      } else {
+        const resultCount = await services.saveTrackAnalyses(results);
+        analysisState = {
+          ...analysisState,
+          status: 'completed',
+          resultCount,
+          failedCount,
+          message: failedCount > 0
+            ? t('analysisPartial', state.lang)
+              .replace('{done}', String(results.length))
+              .replace('{total}', String(paths.length))
+              .replace('{failed}', String(failedCount))
+            : t('analysisComplete', state.lang).replace('{count}', String(resultCount)),
+        };
+      }
+    } catch (error) {
+      analysisState = {
+        ...analysisState,
+        status: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+    render();
+  };
+
+  const exportRekordbox = async () => {
+    try {
+      const path = await save({
+        defaultPath: 'W4DJ-RKB-essentia.xml',
+        title: state.lang === 'zh' ? '保存 Rekordbox XML' : 'Save Rekordbox XML',
+        filters: [{ name: 'Rekordbox XML', extensions: ['xml'] }],
+      });
+      if (typeof path === 'string') {
+        await services.exportRekordboxXml(path);
+        analysisState = {
+          ...analysisState,
+          message: state.lang === 'zh' ? `已导出：${path}` : `Exported: ${path}`,
+        };
+        render();
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
   const openAbout = async () => {
     try {
       aboutInfo = await services.loadAppInfo();
@@ -1304,6 +1492,16 @@ export function bindApp(
 
     if (action === 'clear-history') {
       void clearAllHistory();
+      return;
+    }
+
+    if (action === 'analyze-library') {
+      void analyzeLibrary();
+      return;
+    }
+
+    if (action === 'export-rekordbox') {
+      void exportRekordbox();
       return;
     }
 
@@ -1577,6 +1775,38 @@ export function bindApp(
   render();
   void runAction(() => services.loadDesktopState());
   void refreshHistory();
+  void services.loadTrackAnalyses()
+    .then((entries) => {
+      analysisState = { ...analysisState, resultCount: entries.length };
+      render();
+    })
+    .catch((error) => console.warn('Failed to load music analysis:', error));
+}
+
+function renderAnalysisPanel(state: AppViewState, analysisState: AppAnalysisState): string {
+  const hasDestination = state.slots.some((slot, index) =>
+    slot.destinationDirectory.trim() || (index === 1 && state.slots[0].destinationDirectory.trim()),
+  );
+  const progress = analysisState.total > 0
+    ? `${analysisState.completed}/${analysisState.total}`
+    : analysisState.resultCount > 0 ? String(analysisState.resultCount) : '';
+  const status = analysisState.message || (analysisState.status === 'idle'
+    ? t('analysisIdle', state.lang)
+    : analysisState.status === 'running' ? t('analysisRunning', state.lang) : '');
+  return `
+    <section class="analysis-panel" data-role="analysis-panel">
+      <div class="analysis-panel-head">
+        <p class="global-control-head">${t('analysisTitle', state.lang)}</p>
+        ${progress ? `<span class="analysis-count" data-role="analysis-count">${progress}</span>` : ''}
+      </div>
+      <p class="analysis-panel-copy">${t('analysisBody', state.lang)}</p>
+      <div class="analysis-actions">
+        <button type="button" class="secondary-action" data-action="analyze-library" ${!hasDestination || analysisState.status === 'running' ? 'disabled' : ''}>${t('analyzeLibrary', state.lang)}</button>
+        <button type="button" class="secondary-action" data-action="export-rekordbox" ${analysisState.resultCount === 0 || analysisState.status === 'running' ? 'disabled' : ''}>${t('exportRekordbox', state.lang)}</button>
+      </div>
+      <p class="analysis-status" data-role="analysis-status">${escapeHtml(status)}</p>
+    </section>
+  `;
 }
 
 function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSelection = null): string {

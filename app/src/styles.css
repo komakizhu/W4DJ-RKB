@@ -441,6 +441,51 @@ h1 {
   min-height: var(--format-slot-height);
 }
 
+.analysis-panel {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 12px;
+}
+
+.analysis-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.analysis-count {
+  color: var(--cyan);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.analysis-panel-copy,
+.analysis-status {
+  margin: 0;
+  color: var(--rail-muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.analysis-actions {
+  display: grid;
+  gap: 7px;
+}
+
+.analysis-actions .secondary-action {
+  min-height: 32px;
+  padding-inline: 9px;
+  font-size: 10px;
+}
+
+.analysis-status {
+  min-height: 15px;
+  color: var(--rail-text);
+}
+
 .mode-button,
 .format-button {
   position: relative;

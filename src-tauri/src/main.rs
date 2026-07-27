@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+use w4dj::analysis::{
+    TrackAnalysis, TrackMetadata, analysis_file_path, build_rekordbox_xml, load_analysis_file,
+    merge_analysis_entries, read_track_metadata, save_analysis_file,
+};
 use w4dj::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
 use w4dj::desktop::{DesktopController, DesktopState};
 use w4dj::history::{
@@ -206,6 +210,152 @@ fn open_destination(path: String) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("无法打开输出目录：{error}"))
+}
+
+fn is_analyzable_audio_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "mp3" | "flac" | "wav" | "aiff" | "aif"
+                )
+            })
+}
+
+fn collect_analyzable_audio_files(path: &Path, output: &mut Vec<String>) -> io::Result<()> {
+    if is_analyzable_audio_file(path) {
+        output.push(path.to_string_lossy().into_owned());
+        return Ok(());
+    }
+
+    if !path.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if entry_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            continue;
+        }
+        collect_analyzable_audio_files(&entry_path, output)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn list_audio_files(path: String) -> Result<Vec<String>, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("音乐目录为空"));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return Err(format!("音乐目录不存在：{}", path.display()));
+    }
+
+    let mut files = Vec::new();
+    collect_analyzable_audio_files(&path, &mut files)
+        .map_err(|error| format!("扫描音乐目录失败：{error}"))?;
+    files.sort();
+    Ok(files)
+}
+
+#[tauri::command]
+fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("音频路径为空"));
+    }
+    let path = PathBuf::from(trimmed);
+    if !is_analyzable_audio_file(&path) {
+        return Err(format!("暂不支持分析此音频文件：{}", path.display()));
+    }
+    fs::read(&path).map_err(|error| format!("读取音频文件失败：{error}"))
+}
+
+#[tauri::command]
+fn read_audio_metadata(path: String) -> Result<TrackMetadata, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("音频路径为空"));
+    }
+    let path = PathBuf::from(trimmed);
+    if !is_analyzable_audio_file(&path) {
+        return Err(format!("暂不支持读取此音频元数据：{}", path.display()));
+    }
+    Ok(read_track_metadata(&path))
+}
+
+fn current_analysis_path(state: &tauri::State<'_, AppState>) -> PathBuf {
+    let history_path = state
+        .history_path
+        .lock()
+        .expect("history path lock poisoned")
+        .clone();
+    analysis_file_path(&history_path)
+}
+
+#[tauri::command]
+fn load_track_analyses(state: tauri::State<'_, AppState>) -> Result<Vec<TrackAnalysis>, String> {
+    let path = current_analysis_path(&state);
+    let _guard = state
+        .history_write_lock
+        .lock()
+        .expect("history write lock poisoned");
+    load_analysis_file(&path)
+}
+
+#[tauri::command]
+fn save_track_analyses(
+    entries: Vec<TrackAnalysis>,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let path = current_analysis_path(&state);
+    let _guard = state
+        .history_write_lock
+        .lock()
+        .expect("history write lock poisoned");
+    let existing = load_analysis_file(&path)?;
+    let merged = merge_analysis_entries(existing, entries);
+    let count = merged.len();
+    save_analysis_file(&path, &merged)?;
+    Ok(count)
+}
+
+#[tauri::command]
+fn export_rekordbox_xml(
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("请指定 Rekordbox XML 保存位置"));
+    }
+    let output_path = PathBuf::from(trimmed);
+    let analysis_path = current_analysis_path(&state);
+
+    let _guard = state
+        .history_write_lock
+        .lock()
+        .expect("history write lock poisoned");
+    let entries = load_analysis_file(&analysis_path)?;
+    if entries.is_empty() {
+        return Err(String::from("还没有音乐分析结果，请先分析音乐库"));
+    }
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建 XML 保存目录失败：{error}"))?;
+    }
+    let xml = build_rekordbox_xml(&entries, env!("CARGO_PKG_VERSION"));
+    fs::write(output_path, xml).map_err(|error| format!("写入 Rekordbox XML 失败：{error}"))
 }
 
 #[tauri::command]
@@ -838,7 +988,13 @@ fn main() {
             clear_history_command,
             app_info,
             open_external_url,
-            open_destination
+            open_destination,
+            list_audio_files,
+            read_audio_file,
+            read_audio_metadata,
+            load_track_analyses,
+            save_track_analyses,
+            export_rekordbox_xml
         ])
         .setup(|app| {
             let preferences_path = app

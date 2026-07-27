@@ -73,6 +73,19 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 - 只重试失败歌曲，不重复处理已完成歌曲；
 - 将失败明细导出为 UTF-8 错误报告。
 
+### Essentia 音乐分析与 Rekordbox XML
+
+在设置输出目录并完成转换后，左侧“音乐分析”面板可以使用 Essentia.js 扫描输出目录，保存每首歌的：
+
+- BPM 和节拍位置；
+- Key、大小调和 Key 置信度；
+- EBU R128 Integrated Loudness（LUFS）与响度范围；
+- Energy 和 Danceability。
+
+点击“导出 Rekordbox XML”后，会生成一个可以导入 Rekordbox XML 库的文件。BPM、Key 和节拍网格写入 Rekordbox 的对应字段；Loudness、Energy、Danceability 和 Key 置信度写入 Comments，因此可以在 Rekordbox 的评论列查看。
+
+导入方式：在 Rekordbox 中打开“文件 → Preferences → Bridge → Imported Library”，选择 W4DJ 导出的 XML 文件。XML 只保存音乐文件的位置和分析数据，不会复制或移动音频文件。
+
 ### 冲突与文件名策略
 
 输出文件已经存在时，可以选择：
@@ -95,7 +108,7 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 ## 基本使用流程
 
 1. 打开 W4DJ RKB。
-2. 为任务 1 和任务 2 选择歌曲文件夹，或点击“选择单曲”；也可以直接拖入文件夹或单曲。
+2. 为任务 1 和任务 2 选择歌曲文件夹或单曲；也可以直接拖入任意来源框，软件会自动识别。
 3. 选择输出目录；两个任务可以共用一个目录。
 4. 选择输出模式：兼容模式或无损模式。
 5. 无损模式下选择 WAV 或 AIFF。
@@ -103,6 +116,7 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 7. 点击“同时开始”。
 8. 在汇总确认窗口检查文件数量、预计大小和磁盘可用空间，点击“确认并开始转换”。
 9. 将输出目录导入 Rekordbox，或复制到 DJ 设备使用的存储介质。
+10. 如需分析数据，在左侧“音乐分析”中扫描输出目录并导出 Rekordbox XML，再按上面的方式导入。
 
 ## 支持的平台
 
@@ -115,9 +129,9 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 
 从 Releases 下载对应架构的安装包：
 
-- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v2.2.1.dmg`
-- Intel：`W4DJ-RKB-macOS-Intel-v2.2.1.dmg`
-- Windows：`W4DJ-RKB-Windows-Installer-v2.2.1-setup.exe`
+- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v2.2.3.dmg`
+- Intel：`W4DJ-RKB-macOS-Intel-v2.2.3.dmg`
+- Windows：`W4DJ-RKB-Windows-Installer-v2.2.3-setup.exe`
 
 首次打开时，如果 macOS 提示应用无法验证：
 
@@ -172,3 +186,6 @@ W4DJ-RKB/
 - [Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj) —— 原始同步引擎
 - [anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump) —— NCM 解密实现
 - [iqiziqi/ncmdump.rs](https://github.com/iqiziqi/ncmdump.rs) —— Rust NCM 解密库
+- [MTG/essentia.js](https://github.com/MTG/essentia.js) —— 浏览器端音频分析引擎
+
+Essentia.js 使用 AGPL-3.0 授权。发布包含该分析模块的 W4DJ 安装包时，需要同时遵守其许可证义务；如果后续要做闭源商业分发，应改用 Essentia 的商业授权或采用独立分析服务。

@@ -223,6 +223,12 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   })),
   cancelSync: vi.fn().mockResolvedValue(makeDesktopState()),
   cancelAllSync: vi.fn().mockResolvedValue(makeDesktopState()),
+  listAudioFiles: vi.fn().mockResolvedValue([]),
+  readAudioFile: vi.fn().mockResolvedValue([]),
+  readTrackMetadata: vi.fn().mockResolvedValue({ title: '', artist: '', album: '' }),
+  loadTrackAnalyses: vi.fn().mockResolvedValue([]),
+  saveTrackAnalyses: vi.fn().mockResolvedValue(0),
+  exportRekordboxXml: vi.fn().mockResolvedValue(undefined),
   ...overrides,
 });
 
@@ -420,6 +426,36 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.1');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
+  });
+
+  it('renders the Essentia analysis actions and keeps XML export disabled without results', () => {
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      null,
+      false,
+      false,
+      false,
+      0,
+      {
+        status: 'idle',
+        completed: 0,
+        total: 0,
+        resultCount: 0,
+        failedCount: 0,
+        message: '',
+      },
+    );
+
+    expect(root.querySelector('[data-role="analysis-panel"]')?.textContent).toContain('音乐分析');
+    expect(root.querySelector('[data-action="analyze-library"]')).not.toBeNull();
+    expect((root.querySelector('[data-action="export-rekordbox"]') as HTMLButtonElement).disabled)
+      .toBe(true);
   });
 
   it('shows slot two running state without changing slot one', () => {
