@@ -126,9 +126,13 @@ jobs:
           osascript <<APPLESCRIPT
           tell application "Finder"
             tell folder (POSIX file "$mountpoint" as alias)
-              set position of item "W4DJ RKB.app" to {300, 300}
-              set position of item "解决文件已损坏问题（双击）.command" to {600, 300}
-              set position of item "Applications" to {900, 300}
+              set bounds of container window to {100, 100, 900, 600}
+              set current view of container window to icon view
+              set icon size of icon view options of container window to 128
+              set arrangement of icon view options of container window to not arranged
+              set position of item "W4DJ RKB.app" to {150, 240}
+              set position of item "解决文件已损坏问题（双击）.command" to {410, 240}
+              set position of item "Applications" to {670, 240}
               close
             end tell
           end tell
