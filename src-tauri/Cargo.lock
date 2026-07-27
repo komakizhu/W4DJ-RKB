@@ -4103,6 +4103,7 @@ name = "w4dj-desktop"
 version = "2.2.4"
 dependencies = [
  "libc",
+ "ncmdump",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

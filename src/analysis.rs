@@ -2,9 +2,11 @@ use id3::TagLike;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as FmtWrite;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+use ncmdump::Ncmdump;
 
 /// Music-analysis data produced by Essentia.js.
 ///
@@ -74,6 +76,21 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
                     .unwrap_or_default()
                     .to_string(),
                 album: tag.album().unwrap_or_default().to_string(),
+            })
+            .unwrap_or_default(),
+        "ncm" => File::open(path)
+            .ok()
+            .and_then(|file| Ncmdump::from_reader(file).ok())
+            .and_then(|mut ncm| ncm.get_info().ok())
+            .map(|info| TrackMetadata {
+                title: info.name.to_string(),
+                artist: info
+                    .artist
+                    .iter()
+                    .map(|item| item.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                album: info.album.to_string(),
             })
             .unwrap_or_default(),
         _ => TrackMetadata::default(),

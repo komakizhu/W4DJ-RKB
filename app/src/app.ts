@@ -10,7 +10,7 @@ export type AppConflictStrategy = 'skip' | 'overwrite' | 'rename' | 'update_meta
 export type AppFilenameRule = 'title_artist' | 'artist_title' | 'original';
 export type AppStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error' | 'cancelled';
 export type AppScanStatus = 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
-export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destination' | 'checking' | 'completed' | 'cancelled' | 'error';
+export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destination' | 'checking' | 'analyzing' | 'completed' | 'cancelled' | 'error';
 export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
@@ -207,7 +207,11 @@ export type AppServices = {
   loadScanState: () => Promise<AppScanProgress>;
   loadScanResult: () => Promise<AppPreview[]>;
   cancelScan: () => Promise<AppScanProgress>;
-  startConfirmedSync: (previews: AppPreview[], retryOf?: string | null) => Promise<DesktopState>;
+  startConfirmedSync: (
+    previews: AppPreview[],
+    retryOf?: string | null,
+    analyses?: TrackAnalysis[],
+  ) => Promise<DesktopState>;
   loadHistory: () => Promise<AppHistoryEntry[]>;
   retryHistoryFailures: (id: string) => Promise<AppPreview>;
   exportHistoryErrorReport: (id: string, path: string) => Promise<void>;
@@ -378,6 +382,7 @@ const translations = {
     scanSource: '正在扫描输入目录',
     scanDestination: '正在扫描输出目录',
     scanChecking: '正在检查转换条件',
+    scanAnalyzing: '正在分析歌曲并写入元数据',
     scanCompleted: '扫描完成',
     scanCancelled: '扫描已取消',
     scanError: '扫描失败',
@@ -497,6 +502,7 @@ const translations = {
     scanSource: 'Scanning input folders',
     scanDestination: 'Scanning output folders',
     scanChecking: 'Checking conversion conditions',
+    scanAnalyzing: 'Analyzing tracks and writing metadata',
     scanCompleted: 'Scan complete',
     scanCancelled: 'Scan cancelled',
     scanError: 'Scan failed',
@@ -638,8 +644,8 @@ const defaultServices: AppServices = {
   loadScanState: () => invoke<AppScanProgress>('load_scan_state'),
   loadScanResult: () => invoke<AppPreview[]>('load_scan_result'),
   cancelScan: () => invoke<AppScanProgress>('cancel_scan'),
-  startConfirmedSync: (previews, retryOf = null) =>
-    invoke<DesktopState>('start_confirmed_sync', { previews, retryOf }),
+  startConfirmedSync: (previews, retryOf = null, analyses = []) =>
+    invoke<DesktopState>('start_confirmed_sync', { previews, retryOf, analyses }),
   loadHistory: () => invoke<AppHistoryEntry[]>('load_history'),
   retryHistoryFailures: (id) => invoke<AppPreview>('retry_history_failures', { id }),
   exportHistoryErrorReport: (id, path) =>
@@ -747,7 +753,6 @@ export function renderApp(
           </div>
           ${renderLosslessFormats(state, pendingSelection)}
           ${renderOutputSettings(state, outputSettingsExpanded)}
-          ${renderAnalysisPanel(state, analysisState)}
           <div class="rail-lower">
             <div class="rail-note">
               <p>${t('compatNote', state.lang)}</p>
@@ -814,6 +819,8 @@ function renderScanModal(progress: AppScanProgress | null, lang: AppLanguage): s
       ? 'scanDestination'
       : progress.phase === 'checking'
         ? 'scanChecking'
+        : progress.phase === 'analyzing'
+          ? 'scanAnalyzing'
         : progress.status === 'completed'
           ? 'scanCompleted'
           : progress.status === 'cancelled'
@@ -1073,6 +1080,7 @@ export function bindApp(
   let historyExpanded = false;
   let scanProgress: AppScanProgress | null = null;
   let scanTimer: ReturnType<typeof setTimeout> | null = null;
+  let analysisCancelRequested = false;
   let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
   let onboardingStep: OnboardingStep = 0;
   let analysisState: AppAnalysisState = { ...defaultAnalysisState };
@@ -1240,7 +1248,11 @@ export function bindApp(
 
       previewBusy = true;
       render();
-      const nextState = await services.startConfirmedSync(previews, null);
+      const analyses = await analyzePreviewCandidates(previews);
+      if (analysisCancelRequested) {
+        return;
+      }
+      const nextState = await services.startConfirmedSync(previews, null, analyses);
       applyDesktopState(nextState);
     } catch (error) {
       scanProgress = {
@@ -1322,6 +1334,18 @@ export function bindApp(
     if (!scanProgress || scanProgress.status !== 'running') {
       return;
     }
+    if (scanProgress.phase === 'analyzing') {
+      analysisCancelRequested = true;
+      scanProgress = {
+        ...scanProgress,
+        status: 'cancelled',
+        phase: 'cancelled',
+        message: t('scanCancelled', state.lang),
+      };
+      pendingGlobalAction = null;
+      render();
+      return;
+    }
     try {
       scanProgress = await services.cancelScan();
       render();
@@ -1350,9 +1374,14 @@ export function bindApp(
     pendingGlobalAction = 'start-all';
     render();
     try {
+      const analyses = await analyzePreviewCandidates(previewModal.previews);
+      if (analysisCancelRequested) {
+        return;
+      }
       const nextState = await services.startConfirmedSync(
         previewModal.previews,
         previewModal.retryOf,
+        analyses,
       );
       previewModal = null;
       applyDesktopState(nextState);
@@ -1431,129 +1460,107 @@ export function bindApp(
     });
   };
 
-  const analysisTargets = () => {
-    const firstDestination = state.slots[0].destinationDirectory.trim();
-    return Array.from(new Set(
-      state.slots
-        .map((slot, index) => {
-          const destination = slot.destinationDirectory.trim();
-          return destination || (index === 1 ? firstDestination : '');
-        })
-        .filter(Boolean),
-    ));
-  };
-
-  const analyzeLibrary = async () => {
-    if (analysisState.status === 'running') {
-      return;
+  const analyzePreviewCandidates = async (
+    previews: AppPreview[],
+  ): Promise<TrackAnalysis[]> => {
+    const candidates = Array.from(new Map(
+      previews
+        .flatMap((item) => item.preview.candidates)
+        .map((candidate) => [candidate.source_path, candidate]),
+    ).values());
+    if (candidates.length === 0) {
+      return [];
     }
 
-    const targets = analysisTargets();
-    if (targets.length === 0) {
-      analysisState = { ...defaultAnalysisState, status: 'error', message: t('analysisIdle', state.lang) };
-      render();
-      return;
-    }
-
+    analysisCancelRequested = false;
     analysisState = {
       status: 'running',
       completed: 0,
-      total: 0,
+      total: candidates.length,
       resultCount: analysisState.resultCount,
       failedCount: 0,
-      message: t('analysisRunning', state.lang),
+      message: t('scanAnalyzing', state.lang),
+    };
+    scanProgress = {
+      status: 'running',
+      phase: 'analyzing',
+      processed: 0,
+      total: candidates.length,
+      current_file: '',
+      message: t('scanAnalyzing', state.lang),
     };
     render();
 
-    try {
-      const allPaths = (await Promise.all(targets.map((target) => services.listAudioFiles(target))))
-        .flat();
-      const paths = Array.from(new Set(allPaths));
-      analysisState = { ...analysisState, total: paths.length };
-      render();
-
-      if (paths.length === 0) {
-        analysisState = { ...analysisState, status: 'error', message: t('analysisNoResults', state.lang) };
-        render();
-        return;
-      }
-
-      const results: TrackAnalysis[] = [];
-      let failedCount = 0;
-      for (const path of paths) {
-        try {
-          const bytes = await services.readAudioFile(path);
-          let metadata: TrackMetadata | undefined;
-          try {
-            metadata = await services.readTrackMetadata(path);
-          } catch {
-            // Analysis can still continue for files without readable tags.
-          }
-          results.push(await analyzeAudioFile(path, Uint8Array.from(bytes), metadata));
-        } catch (error) {
-          failedCount += 1;
-          console.warn(`Essentia analysis failed for ${path}`, error);
-        }
-        analysisState = {
-          ...analysisState,
-          completed: analysisState.completed + 1,
-          failedCount,
-          message: t('analysisRunning', state.lang),
-        };
-        render();
-        await yieldToUi();
-      }
-
-      if (results.length === 0) {
+    const results: TrackAnalysis[] = [];
+    let failedCount = 0;
+    for (const candidate of candidates) {
+      if (analysisCancelRequested) {
         analysisState = {
           ...analysisState,
           status: 'error',
-          failedCount,
-          message: t('analysisNoResults', state.lang),
+          message: t('scanCancelled', state.lang),
         };
-      } else {
-        const resultCount = await services.saveTrackAnalyses(results);
-        analysisState = {
-          ...analysisState,
-          status: 'completed',
-          resultCount,
-          failedCount,
-          message: failedCount > 0
-            ? t('analysisPartial', state.lang)
-              .replace('{done}', String(results.length))
-              .replace('{total}', String(paths.length))
-              .replace('{failed}', String(failedCount))
-            : t('analysisComplete', state.lang).replace('{count}', String(resultCount)),
-        };
-      }
-    } catch (error) {
-      analysisState = {
-        ...analysisState,
-        status: 'error',
-        message: error instanceof Error ? error.message : String(error),
-      };
-    }
-    render();
-  };
-
-  const exportRekordbox = async () => {
-    try {
-      const path = await save({
-        defaultPath: 'W4DJ-RKB-essentia.xml',
-        title: state.lang === 'zh' ? '保存 Rekordbox XML' : 'Save Rekordbox XML',
-        filters: [{ name: 'Rekordbox XML', extensions: ['xml'] }],
-      });
-      if (typeof path === 'string') {
-        await services.exportRekordboxXml(path);
-        analysisState = {
-          ...analysisState,
-          message: state.lang === 'zh' ? `已导出：${path}` : `Exported: ${path}`,
+        scanProgress = {
+          ...scanProgress!,
+          status: 'cancelled',
+          phase: 'cancelled',
+          message: t('scanCancelled', state.lang),
         };
         render();
+        return [];
       }
-    } catch (error) {
-      reportError(error);
+      try {
+        const bytes = await services.readAudioFile(candidate.source_path);
+        let metadata: TrackMetadata | undefined;
+        try {
+          metadata = await services.readTrackMetadata(candidate.source_path);
+        } catch {
+          // Analysis can continue using the filename identity.
+        }
+        results.push(
+          await analyzeAudioFile(candidate.source_path, Uint8Array.from(bytes), metadata),
+        );
+      } catch (error) {
+        failedCount += 1;
+        console.warn(`Essentia analysis failed for ${candidate.source_path}`, error);
+      }
+      analysisState = {
+        ...analysisState,
+        completed: analysisState.completed + 1,
+        failedCount,
+        message: t('scanAnalyzing', state.lang),
+      };
+      scanProgress = {
+        ...scanProgress!,
+        processed: analysisState.completed,
+        current_file: candidate.source_path,
+      };
+      render();
+      await yieldToUi();
     }
+
+    analysisState = {
+      ...analysisState,
+      status: results.length > 0 ? 'completed' : 'error',
+      resultCount: results.length,
+      failedCount,
+      message: failedCount > 0
+        ? t('analysisPartial', state.lang)
+          .replace('{done}', String(results.length))
+          .replace('{total}', String(candidates.length))
+          .replace('{failed}', String(failedCount))
+        : t('analysisComplete', state.lang).replace('{count}', String(results.length)),
+    };
+    if (results.length > 0) {
+      try {
+        await services.saveTrackAnalyses(results);
+      } catch (error) {
+        console.warn('Failed to save Essentia analysis cache:', error);
+      }
+    }
+    scanProgress = null;
+    render();
+    return results;
   };
 
   const openAbout = async () => {
@@ -1750,16 +1757,6 @@ export function bindApp(
 
     if (action === 'clear-history') {
       void clearAllHistory();
-      return;
-    }
-
-    if (action === 'analyze-library') {
-      void analyzeLibrary();
-      return;
-    }
-
-    if (action === 'export-rekordbox') {
-      void exportRekordbox();
       return;
     }
 
@@ -2042,38 +2039,6 @@ export function bindApp(
   render();
   void runAction(() => services.loadDesktopState());
   void refreshHistory();
-  void services.loadTrackAnalyses()
-    .then((entries) => {
-      analysisState = { ...analysisState, resultCount: entries.length };
-      render();
-    })
-    .catch((error) => console.warn('Failed to load music analysis:', error));
-}
-
-function renderAnalysisPanel(state: AppViewState, analysisState: AppAnalysisState): string {
-  const hasDestination = state.slots.some((slot, index) =>
-    slot.destinationDirectory.trim() || (index === 1 && state.slots[0].destinationDirectory.trim()),
-  );
-  const progress = analysisState.total > 0
-    ? `${analysisState.completed}/${analysisState.total}`
-    : analysisState.resultCount > 0 ? String(analysisState.resultCount) : '';
-  const status = analysisState.message || (analysisState.status === 'idle'
-    ? t('analysisIdle', state.lang)
-    : analysisState.status === 'running' ? t('analysisRunning', state.lang) : '');
-  return `
-    <section class="analysis-panel" data-role="analysis-panel">
-      <div class="analysis-panel-head">
-        <p class="global-control-head">${t('analysisTitle', state.lang)}</p>
-        ${progress ? `<span class="analysis-count" data-role="analysis-count">${progress}</span>` : ''}
-      </div>
-      <p class="analysis-panel-copy">${t('analysisBody', state.lang)}</p>
-      <div class="analysis-actions">
-        <button type="button" class="secondary-action" data-action="analyze-library" ${!hasDestination || analysisState.status === 'running' ? 'disabled' : ''}>${t('analyzeLibrary', state.lang)}</button>
-        <button type="button" class="secondary-action" data-action="export-rekordbox" ${analysisState.resultCount === 0 || analysisState.status === 'running' ? 'disabled' : ''}>${t('exportRekordbox', state.lang)}</button>
-      </div>
-      <p class="analysis-status" data-role="analysis-status">${escapeHtml(status)}</p>
-    </section>
-  `;
 }
 
 function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSelection = null): string {

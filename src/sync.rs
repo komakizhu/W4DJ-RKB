@@ -3,7 +3,7 @@ use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
 use crate::task::{TaskController, TaskSnapshot};
-use id3::frame::Picture;
+use id3::frame::{Comment, ExtendedText, Picture};
 use id3::{TagLike, Version};
 use ncmdump::Ncmdump;
 use std::collections::HashMap;
@@ -27,6 +27,26 @@ pub enum ScanPhase {
 }
 
 pub type ScanObserver<'a> = dyn FnMut(ScanPhase, &Path) -> bool + 'a;
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub struct EmbeddedAnalysis {
+    pub path: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub bpm: Option<f64>,
+    pub key: Option<String>,
+    pub scale: Option<String>,
+    pub key_strength: Option<f64>,
+    pub integrated_loudness_lufs: Option<f64>,
+    pub loudness_range_lu: Option<f64>,
+    pub energy: Option<f64>,
+    pub danceability: Option<f64>,
+    pub beat_positions: Vec<f64>,
+    pub analyzer: String,
+    pub analysis_version: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputPolicy {
@@ -944,6 +964,169 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
     }
 
     write_id3_tag_for_output(&output_tag, output_path)
+}
+
+/// Writes Essentia's analysis into the native metadata of a converted file.
+///
+/// BPM and key use the standard ID3 text frames (`TBPM` and `TKEY`) so DJ
+/// applications can discover them directly. The richer values are kept in
+/// named `TXXX` frames and a readable comment for applications that do not
+/// expose custom tags in their library columns.
+#[allow(dead_code)]
+pub fn apply_track_analysis_metadata(
+    output_path: &Path,
+    analysis: &EmbeddedAnalysis,
+) -> io::Result<()> {
+    let mut tag = read_id3_tag_or_empty(output_path);
+
+    if is_blank(tag.title()) && !analysis.title.trim().is_empty() {
+        tag.set_title(analysis.title.trim());
+    }
+    if is_blank(tag.artist()) && !analysis.artist.trim().is_empty() {
+        tag.set_artist(analysis.artist.trim());
+    }
+    if is_blank(tag.album()) && !analysis.album.trim().is_empty() {
+        tag.set_album(analysis.album.trim());
+    }
+
+    if let Some(bpm) = analysis
+        .bpm
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        tag.set_text("TBPM", format!("{bpm:.2}"));
+    }
+    if let Some(key) = analysis_key(analysis) {
+        tag.set_text("TKEY", key);
+    }
+
+    let custom_values = [
+        (
+            "W4DJ-Loudness-LUFS",
+            analysis
+                .integrated_loudness_lufs
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:.2}")),
+        ),
+        (
+            "W4DJ-Loudness-Range-LU",
+            analysis
+                .loudness_range_lu
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:.2}")),
+        ),
+        (
+            "W4DJ-Energy",
+            analysis
+                .energy
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:.4}")),
+        ),
+        (
+            "W4DJ-Danceability",
+            analysis
+                .danceability
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:.4}")),
+        ),
+        (
+            "W4DJ-Key-Confidence",
+            analysis
+                .key_strength
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:.4}")),
+        ),
+        (
+            "W4DJ-Beat-Positions",
+            (!analysis.beat_positions.is_empty()).then(|| {
+                serde_json::to_string(
+                    &analysis
+                        .beat_positions
+                        .iter()
+                        .copied()
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .take(2000)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_default()
+            }),
+        ),
+        ("W4DJ-Analyzer", Some(analysis.analyzer.clone())),
+        (
+            "W4DJ-Analysis-Version",
+            Some(analysis.analysis_version.clone()),
+        ),
+    ];
+
+    for (description, value) in custom_values {
+        tag.remove_extended_text(Some(description), None);
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            tag.add_frame(ExtendedText {
+                description: description.to_string(),
+                value,
+            });
+        }
+    }
+
+    tag.remove_comment(Some("W4DJ Essentia"), None);
+    tag.add_frame(Comment {
+        lang: String::from("eng"),
+        description: String::from("W4DJ Essentia"),
+        text: analysis_summary(analysis),
+    });
+
+    write_id3_tag_for_output(&tag, output_path)
+}
+
+#[allow(dead_code)]
+fn analysis_key(analysis: &EmbeddedAnalysis) -> Option<String> {
+    let key = analysis
+        .key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .replace('♯', "#")
+        .replace('♭', "b");
+    let key = if analysis
+        .scale
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("minor"))
+    {
+        format!("{key}m")
+    } else {
+        key
+    };
+    Some(key)
+}
+
+#[allow(dead_code)]
+fn analysis_summary(analysis: &EmbeddedAnalysis) -> String {
+    let mut values = Vec::new();
+    if let Some(value) = analysis
+        .bpm
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        values.push(format!("BPM {value:.2}"));
+    }
+    if let Some(value) = analysis_key(analysis) {
+        values.push(format!("Key {value}"));
+    }
+    if let Some(value) = analysis
+        .integrated_loudness_lufs
+        .filter(|value| value.is_finite())
+    {
+        values.push(format!("Loudness {value:.2} LUFS"));
+    }
+    if let Some(value) = analysis.energy.filter(|value| value.is_finite()) {
+        values.push(format!("Energy {value:.4}"));
+    }
+    if let Some(value) = analysis.danceability.filter(|value| value.is_finite()) {
+        values.push(format!("Danceability {value:.4}"));
+    }
+    if values.is_empty() {
+        String::from("W4DJ Essentia analysis")
+    } else {
+        format!("W4DJ Essentia | {}", values.join(" | "))
+    }
 }
 
 fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
@@ -1867,11 +2050,11 @@ fn write_container_tags(
 #[cfg(test)]
 mod tests {
     use super::{
-        SongIdentity, build_song_name, build_song_name_with_rule, compare_music_dicts,
-        derive_song_name, derive_song_name_with_rule, ensure_generated_output,
-        ensure_output_metadata, fill_missing_metadata, find_ffmpeg_next_to_exe,
-        infer_song_identity, remove_conflicting_outputs, sanitize_filename_component,
-        strip_163_key_from_mp3,
+        EmbeddedAnalysis, SongIdentity, apply_track_analysis_metadata, build_song_name,
+        build_song_name_with_rule, compare_music_dicts, derive_song_name,
+        derive_song_name_with_rule, ensure_generated_output, ensure_output_metadata,
+        fill_missing_metadata, find_ffmpeg_next_to_exe, infer_song_identity,
+        remove_conflicting_outputs, sanitize_filename_component, strip_163_key_from_mp3,
     };
     use crate::config::{FilenameRule, LosslessFormat, Mode};
     use id3::{Tag, TagLike, Version};
@@ -2231,6 +2414,48 @@ mod tests {
         let tag = Tag::read_from_path(&output_path).unwrap();
         assert_eq!(tag.title(), Some("Mystic State, Third Degree"));
         assert_eq!(tag.artist(), Some("Mr Wankerman"));
+    }
+
+    #[test]
+    fn writes_essentia_analysis_to_native_output_metadata() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Song.mp3");
+        fs::write(&path, b"audio").unwrap();
+        let mut tag = Tag::new();
+        tag.set_title("Song");
+        tag.write_to_path(&path, Version::Id3v24).unwrap();
+
+        let analysis = EmbeddedAnalysis {
+            path: "/music/Song.mp3".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            bpm: Some(140.25),
+            key: Some("F#".into()),
+            scale: Some("minor".into()),
+            key_strength: Some(0.92),
+            integrated_loudness_lufs: Some(-7.3),
+            loudness_range_lu: Some(4.2),
+            energy: Some(0.81),
+            danceability: Some(0.76),
+            beat_positions: vec![0.0, 0.428],
+            analyzer: "Essentia.js".into(),
+            analysis_version: "0.1.3".into(),
+        };
+
+        apply_track_analysis_metadata(&path, &analysis).unwrap();
+
+        let tag = Tag::read_from_path(&path).unwrap();
+        assert_eq!(tag.text_for_frame_id("TBPM"), Some("140.25"));
+        assert_eq!(tag.text_for_frame_id("TKEY"), Some("F#m"));
+        assert!(
+            tag.extended_texts()
+                .any(|frame| frame.description == "W4DJ-Energy" && frame.value == "0.8100")
+        );
+        assert!(
+            tag.comments()
+                .any(|comment| comment.description == "W4DJ Essentia")
+        );
     }
 
     #[test]

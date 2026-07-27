@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use ncmdump::Ncmdump;
 use tauri::Manager;
 use w4dj::analysis::{
     TrackAnalysis, TrackMetadata, analysis_file_path, build_rekordbox_xml, load_analysis_file,
@@ -28,7 +29,9 @@ use w4dj::preview::{
     build_sync_preview_with_settings_observed,
 };
 use w4dj::sync::{
-    cleanup_temporary_outputs, compare_music_dicts, count_music_files_with_cancel,
+    apply_track_analysis_metadata, cleanup_temporary_outputs, compare_music_dicts,
+    count_music_files_with_cancel,
+    EmbeddedAnalysis,
     get_destination_music_dict, get_music_dict_with_scan_issues, is_supported_source_file,
     sync_music_library_with_observer, update_existing_metadata, ScanPhase,
 };
@@ -108,6 +111,7 @@ struct ConfirmedSyncJob {
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
     candidates: Vec<PreviewCandidate>,
+    analyses: Vec<EmbeddedAnalysis>,
     preview: SyncPreview,
     retry_of: Option<String>,
 }
@@ -279,7 +283,7 @@ fn is_analyzable_audio_file(path: &Path) -> bool {
             .is_some_and(|extension| {
                 matches!(
                     extension.to_ascii_lowercase().as_str(),
-                    "mp3" | "flac" | "wav" | "aiff" | "aif"
+                    "mp3" | "flac" | "ncm" | "wav" | "aiff" | "aif"
                 )
             })
 }
@@ -337,6 +341,17 @@ fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
     let path = PathBuf::from(trimmed);
     if !is_analyzable_audio_file(&path) {
         return Err(format!("暂不支持分析此音频文件：{}", path.display()));
+    }
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
+    {
+        let file = fs::File::open(&path).map_err(|error| format!("读取 NCM 文件失败：{error}"))?;
+        let mut ncm = Ncmdump::from_reader(file).map_err(|error| format!("解析 NCM 文件失败：{error}"))?;
+        return ncm
+            .get_data()
+            .map_err(|error| format!("提取 NCM 音频数据失败：{error}"));
     }
     fs::read(&path).map_err(|error| format!("读取音频文件失败：{error}"))
 }
@@ -1032,6 +1047,7 @@ fn collect_processable_previews(
 fn start_confirmed_sync(
     previews: Vec<SlotPreview>,
     retry_of: Option<String>,
+    analyses: Option<Vec<TrackAnalysis>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
     if previews.is_empty() {
@@ -1046,6 +1062,7 @@ fn start_confirmed_sync(
         .clone();
     let history_write_lock = Arc::clone(&state.history_write_lock);
     let destination_coordinator = state.destination_coordinator.clone();
+    let analyses = analyses.unwrap_or_default();
     let mut jobs = Vec::with_capacity(previews.len());
     let mut seen_slots = Vec::with_capacity(previews.len());
 
@@ -1113,6 +1130,10 @@ fn start_confirmed_sync(
                 conflict_strategy: slot_preview.conflict_strategy,
                 filename_rule: slot_preview.filename_rule,
                 candidates: slot_preview.preview.candidates.clone(),
+                analyses: analyses
+                    .iter()
+                    .map(embedded_analysis_from_track)
+                    .collect(),
                 preview: slot_preview.preview,
                 retry_of: retry_of.clone().or(slot_preview.retry_of),
             });
@@ -1466,6 +1487,36 @@ fn persist_preferences(state: &tauri::State<'_, AppState>) {
     }
 }
 
+fn apply_analysis_for_candidate(
+    candidate: &PreviewCandidate,
+    analyses: &HashMap<String, EmbeddedAnalysis>,
+) -> io::Result<()> {
+    let Some(analysis) = analyses.get(&candidate.source_path) else {
+        return Ok(());
+    };
+    apply_track_analysis_metadata(Path::new(&candidate.destination_path), analysis)
+}
+
+fn embedded_analysis_from_track(analysis: &TrackAnalysis) -> EmbeddedAnalysis {
+    EmbeddedAnalysis {
+        path: analysis.path.clone(),
+        title: analysis.title.clone(),
+        artist: analysis.artist.clone(),
+        album: analysis.album.clone(),
+        bpm: analysis.bpm,
+        key: analysis.key.clone(),
+        scale: analysis.scale.clone(),
+        key_strength: analysis.key_strength,
+        integrated_loudness_lufs: analysis.integrated_loudness_lufs,
+        loudness_range_lu: analysis.loudness_range_lu,
+        energy: analysis.energy,
+        danceability: analysis.danceability,
+        beat_positions: analysis.beat_positions.clone(),
+        analyzer: analysis.analyzer.clone(),
+        analysis_version: analysis.analysis_version.clone(),
+    }
+}
+
 fn run_confirmed_sync_task(
     controller: Arc<Mutex<DesktopController>>,
     destination_coordinator: DestinationCoordinator,
@@ -1536,6 +1587,11 @@ fn run_confirmed_sync_task(
             setup_error = Some(format!("无法清理临时文件：{error}"));
         } else {
             let mut candidate_lookup = HashMap::new();
+            let analysis_lookup = job
+                .analyses
+                .into_iter()
+                .map(|analysis| (analysis.path.clone(), analysis))
+                .collect::<HashMap<String, EmbeddedAnalysis>>();
             let mut source_files: HashMap<String, (String, PathBuf)> = HashMap::new();
 
             for candidate in &job.candidates {
@@ -1590,7 +1646,8 @@ fn run_confirmed_sync_task(
                 let result = update_existing_metadata(
                     Path::new(&candidate.source_path),
                     Path::new(&candidate.destination_path),
-                );
+                )
+                .and_then(|()| apply_analysis_for_candidate(candidate, &analysis_lookup));
                 let mut controller_guard = controller.lock().expect("desktop lock poisoned");
                 let failed_file = match result {
                     Ok(()) => {
@@ -1646,8 +1703,15 @@ fn run_confirmed_sync_task(
                     job.lossless_format,
                     &task_controller,
                     |name, task, error| {
-                        let failed_file = if let Some(error) = error {
-                            let candidate = candidate_lookup.get(name);
+                        let candidate = candidate_lookup.get(name);
+                        let analysis_error = if error.is_none() {
+                            candidate.and_then(|candidate| {
+                                apply_analysis_for_candidate(candidate, &analysis_lookup).err()
+                            })
+                        } else {
+                            None
+                        };
+                        let failed_file = if let Some(error) = error.or(analysis_error.as_ref()) {
                             let failed_file = FailedFile {
                                 name: name.to_string(),
                                 source_path: candidate

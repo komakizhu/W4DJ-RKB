@@ -73,18 +73,18 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 - 只重试失败歌曲，不重复处理已完成歌曲；
 - 将失败明细导出为 UTF-8 错误报告。
 
-### Essentia 音乐分析与 Rekordbox XML
+### Essentia 自动分析与 Rekordbox 元数据
 
-在设置输出目录并完成转换后，左侧“音乐分析”面板可以使用 Essentia.js 扫描输出目录，保存每首歌的：
+Essentia.js 已内置在转换流程中。点击确认并开始转换后，W4DJ 会在后台逐首分析待处理歌曲，并把结果直接写入输出音频，不需要另外点击“分析音乐库”：
 
 - BPM 和节拍位置；
 - Key、大小调和 Key 置信度；
 - EBU R128 Integrated Loudness（LUFS）与响度范围；
 - Energy 和 Danceability。
 
-点击“导出 Rekordbox XML”后，会生成一个可以导入 Rekordbox XML 库的文件。BPM、Key 和节拍网格写入 Rekordbox 的对应字段；Loudness、Energy、Danceability 和 Key 置信度写入 Comments，因此可以在 Rekordbox 的评论列查看。
+其中 BPM 和 Key 使用标准音频标签，Rekordbox 导入音频后可以直接读取；节拍位置、响度、Energy、Danceability 和 Key 置信度同时写入 W4DJ 自定义标签与 Comment。不同版本的 Rekordbox 对自定义标签的显示方式可能不同，但不会影响标准 BPM/Key。
 
-导入方式：在 Rekordbox 中打开“文件 → Preferences → Bridge → Imported Library”，选择 W4DJ 导出的 XML 文件。XML 只保存音乐文件的位置和分析数据，不会复制或移动音频文件。
+分析进度会显示在转换进度窗口中；某一首分析失败不会阻断整批转换，失败会进入本次转换记录。旧版 Rekordbox XML 导出接口仍保留用于兼容，但当前桌面界面不再提供独立的分析按钮。
 
 ### 冲突与文件名策略
 
@@ -116,7 +116,7 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 7. 点击“同时开始”。
 8. 在汇总确认窗口检查文件数量、预计大小和磁盘可用空间，点击“确认并开始转换”。
 9. 将输出目录导入 Rekordbox，或复制到 DJ 设备使用的存储介质。
-10. 如需分析数据，在左侧“音乐分析”中扫描输出目录并导出 Rekordbox XML，再按上面的方式导入。
+10. 转换过程中 W4DJ 会自动分析歌曲并写入元数据；完成后将输出目录导入 Rekordbox 即可。
 
 ## 支持的平台
 

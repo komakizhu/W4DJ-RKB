@@ -457,7 +457,7 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
   });
 
-  it('renders the Essentia analysis actions and keeps XML export disabled without results', () => {
+  it('keeps Essentia analysis embedded in conversion instead of rendering a separate panel', () => {
     const root = renderApp(
       makeViewState(),
       null,
@@ -481,10 +481,9 @@ describe('renderApp', () => {
       },
     );
 
-    expect(root.querySelector('[data-role="analysis-panel"]')?.textContent).toContain('音乐分析');
-    expect(root.querySelector('[data-action="analyze-library"]')).not.toBeNull();
-    expect((root.querySelector('[data-action="export-rekordbox"]') as HTMLButtonElement).disabled)
-      .toBe(true);
+    expect(root.querySelector('[data-role="analysis-panel"]')).toBeNull();
+    expect(root.querySelector('[data-action="analyze-library"]')).toBeNull();
+    expect(root.querySelector('[data-action="export-rekordbox"]')).toBeNull();
   });
 
   it('shows slot two running state without changing slot one', () => {
