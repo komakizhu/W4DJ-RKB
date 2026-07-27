@@ -133,4 +133,6 @@ jobs:
           asset_name='${{ matrix.asset_name }}'
           asset_name="${asset_name//\[version\]/$version}"
           asset_name="${asset_name//\[ext\]/dmg}"
-          gh release upload "$GITHUB_REF_NAME" "$dmg#$asset_name" --clobber
+          renamed_dmg="$workdir/$asset_name"
+          mv "$dmg" "$renamed_dmg"
+          gh release upload "$GITHUB_REF_NAME" "$renamed_dmg" --clobber
