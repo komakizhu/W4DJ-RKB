@@ -99,3 +99,38 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
           releaseAssetNamePattern: ${{ matrix.asset_name }}
+
+      - name: Add macOS Gatekeeper repair helper to DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          if [[ -z "$dmg" ]]; then
+            echo "找不到待处理的 DMG" >&2
+            exit 1
+          fi
+
+          helper='packaging/macos/解决文件已损坏问题（双击）.command'
+          workdir="$(mktemp -d)"
+          rw_image="$workdir/w4dj-rw.dmg"
+          mountpoint="$workdir/mount"
+          mkdir -p "$mountpoint"
+
+          hdiutil convert "$dmg" -format UDRW -o "$rw_image"
+          hdiutil attach "$rw_image" -mountpoint "$mountpoint" -nobrowse -noautoopen
+          cp "$helper" "$mountpoint/解决文件已损坏问题（双击）.command"
+          chmod +x "$mountpoint/解决文件已损坏问题（双击）.command"
+          hdiutil detach "$mountpoint"
+
+          rebuilt="$workdir/w4dj-final.dmg"
+          hdiutil convert "$rw_image" -format UDZO -o "$rebuilt"
+          mv "$rebuilt" "$dmg"
+
+          version="${GITHUB_REF_NAME#v}"
+          asset_name='${{ matrix.asset_name }}'
+          asset_name="${asset_name//\[version\]/$version}"
+          asset_name="${asset_name//\[ext\]/dmg}"
+          gh release upload "$GITHUB_REF_NAME" "$dmg#$asset_name" --clobber
