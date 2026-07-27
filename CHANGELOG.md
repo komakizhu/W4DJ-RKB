@@ -1,5 +1,12 @@
 # W4DJ RKB 更新日志
 
+## v2.2.3
+
+### Added
+
+- 测试版本：每次转换自动生成转换报告。
+- 支持直接测试 macOS Apple Silicon `.app` 应用。
+
 ## v2.2.2
 
 ### Fixed
