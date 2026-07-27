@@ -20,6 +20,15 @@ use std::process::Command;
 pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "ncm", "wav", "aiff"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ScanPhase {
+    Source,
+    Destination,
+}
+
+pub type ScanObserver<'a> = dyn FnMut(ScanPhase, &Path) -> bool + 'a;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputPolicy {
     pub output_extension: &'static str,
     pub target_profile: TargetProfile,
@@ -223,6 +232,30 @@ pub fn get_music_dict_with_scan_issues_with_rule(
     collect_music_dict_with_scan_issues(folder, SUPPORTED_SOURCE_EXTENSIONS, filename_rule)
 }
 
+#[allow(dead_code)]
+pub fn get_music_dict_with_scan_issues_with_rule_and_observer(
+    folder: &str,
+    filename_rule: FilenameRule,
+    observer: &mut ScanObserver<'_>,
+) -> (
+    HashMap<String, (String, PathBuf)>,
+    Vec<MusicScanIssue>,
+    bool,
+) {
+    let source_path = Path::new(folder);
+    if source_path.is_file() && !is_supported_source_file(source_path) {
+        return (HashMap::new(), Vec::new(), false);
+    }
+
+    collect_music_dict_with_scan_issues_observed(
+        folder,
+        SUPPORTED_SOURCE_EXTENSIONS,
+        filename_rule,
+        Some(observer),
+        ScanPhase::Source,
+    )
+}
+
 pub fn is_supported_source_file(path: &Path) -> bool {
     path.is_file()
         && !is_ignored_music_file(path)
@@ -244,6 +277,54 @@ pub fn get_destination_music_dict_with_rule(
     collect_music_dict_with_scan_issues(folder, &["mp3", "wav", "aiff"], filename_rule).0
 }
 
+#[allow(dead_code)]
+pub fn get_destination_music_dict_with_rule_and_observer(
+    folder: &str,
+    filename_rule: FilenameRule,
+    observer: &mut ScanObserver<'_>,
+) -> (HashMap<String, (String, PathBuf)>, bool) {
+    let (music_dict, _issues, cancelled) = collect_music_dict_with_scan_issues_observed(
+        folder,
+        &["mp3", "wav", "aiff"],
+        filename_rule,
+        Some(observer),
+        ScanPhase::Destination,
+    );
+    (music_dict, cancelled)
+}
+
+#[allow(dead_code)]
+pub fn count_music_files(folder: &str, allowed_extensions: &[&str]) -> usize {
+    count_music_files_with_cancel(folder, allowed_extensions, || false).0
+}
+
+#[allow(dead_code)]
+pub fn count_music_files_with_cancel<F: FnMut() -> bool>(
+    folder: &str,
+    allowed_extensions: &[&str],
+    mut should_cancel: F,
+) -> (usize, bool) {
+    if folder.trim().is_empty() {
+        return (0, false);
+    }
+    let mut count = 0;
+    for entry in walkdir::WalkDir::new(folder)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if should_cancel() {
+            return (count, true);
+        }
+        if entry.file_type().is_file()
+            && !is_ignored_music_file(entry.path())
+            && has_allowed_extension(entry.path(), allowed_extensions)
+        {
+            count += 1;
+        }
+    }
+    (count, false)
+}
+
 pub fn cleanup_temporary_outputs(folder: &str) -> io::Result<()> {
     // Kept as a compatibility no-op. Prefix-only cleanup could delete a user's
     // legitimate hidden audio file. New temporary files are self-cleaning.
@@ -256,6 +337,27 @@ fn collect_music_dict_with_scan_issues(
     allowed_extensions: &[&str],
     filename_rule: FilenameRule,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
+    let (music_dict, scan_issues, _cancelled) = collect_music_dict_with_scan_issues_observed(
+        folder,
+        allowed_extensions,
+        filename_rule,
+        None,
+        ScanPhase::Source,
+    );
+    (music_dict, scan_issues)
+}
+
+fn collect_music_dict_with_scan_issues_observed(
+    folder: &str,
+    allowed_extensions: &[&str],
+    filename_rule: FilenameRule,
+    mut observer: Option<&mut ScanObserver<'_>>,
+    phase: ScanPhase,
+) -> (
+    HashMap<String, (String, PathBuf)>,
+    Vec<MusicScanIssue>,
+    bool,
+) {
     let mut music_dict = HashMap::new();
     let mut scan_issues = Vec::new();
 
@@ -263,9 +365,7 @@ fn collect_music_dict_with_scan_issues(
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
-                if let Some(path) = error.path().filter(|path| {
-                    !is_ignored_music_file(path) && has_allowed_extension(path, allowed_extensions)
-                }) {
+                if let Some(path) = error.path().filter(|path| !is_ignored_music_file(path)) {
                     scan_issues.push(MusicScanIssue {
                         path: path.to_path_buf(),
                         message: format!("无法扫描歌曲文件：{error}"),
@@ -280,6 +380,12 @@ fn collect_music_dict_with_scan_issues(
             || !has_allowed_extension(entry.path(), allowed_extensions)
         {
             continue;
+        }
+
+        if let Some(observer) = observer.as_deref_mut()
+            && !observer(phase, entry.path())
+        {
+            return (music_dict, scan_issues, true);
         }
 
         let path = entry.path().to_path_buf();
@@ -299,7 +405,7 @@ fn collect_music_dict_with_scan_issues(
         }
     }
 
-    (music_dict, scan_issues)
+    (music_dict, scan_issues, false)
 }
 
 fn has_allowed_extension(path: &Path, allowed_extensions: &[&str]) -> bool {

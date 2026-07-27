@@ -174,6 +174,67 @@ fn get_music_dict_accepts_a_single_audio_file_path() {
 }
 
 #[test]
+fn observed_scan_reports_each_song_and_supports_cancellation() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("w4dj-sync-policy-observer-{}", std::process::id()));
+    fs::create_dir_all(temp_dir.join("nested")).unwrap();
+    fs::write(temp_dir.join("one.mp3"), b"mp3").unwrap();
+    fs::write(temp_dir.join("nested/two.flac"), b"flac").unwrap();
+
+    let mut phases = Vec::new();
+    let (dict, issues, cancelled) = sync::get_music_dict_with_scan_issues_with_rule_and_observer(
+        temp_dir.to_str().unwrap(),
+        config::FilenameRule::default(),
+        &mut |phase, _path| {
+            phases.push(phase);
+            true
+        },
+    );
+
+    assert!(!cancelled);
+    assert!(issues.is_empty());
+    assert_eq!(dict.len(), 2);
+    assert_eq!(phases.len(), 2);
+    assert!(
+        phases
+            .iter()
+            .all(|phase| matches!(phase, sync::ScanPhase::Source))
+    );
+
+    let (count, cancelled) = sync::count_music_files_with_cancel(
+        temp_dir.to_str().unwrap(),
+        sync::SUPPORTED_SOURCE_EXTENSIONS,
+        || true,
+    );
+    assert_eq!(count, 0);
+    assert!(cancelled);
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn scan_counter_handles_a_hundreds_track_library() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "w4dj-sync-policy-large-library-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).unwrap();
+    for index in 0..300 {
+        fs::write(temp_dir.join(format!("track-{index:03}.mp3")), b"mp3").unwrap();
+    }
+
+    let (count, cancelled) = sync::count_music_files_with_cancel(
+        temp_dir.to_str().unwrap(),
+        sync::SUPPORTED_SOURCE_EXTENSIONS,
+        || false,
+    );
+    assert_eq!(count, 300);
+    assert!(!cancelled);
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn get_music_dict_ignores_macos_appledouble_sidecars() {
     let temp_dir = std::env::temp_dir().join(format!(
         "w4dj-sync-policy-appledouble-ignore-{}",

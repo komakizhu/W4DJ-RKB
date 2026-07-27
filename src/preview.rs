@@ -1,9 +1,10 @@
 use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode};
 use crate::history::HistoryEntry;
 use crate::sync::{
-    effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
-    get_music_dict_with_scan_issues_with_rule, is_ignored_music_file, is_supported_source_file,
-    resolve_output_policy, target_output_path,
+    ScanObserver, effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
+    get_destination_music_dict_with_rule_and_observer, get_music_dict_with_scan_issues_with_rule,
+    get_music_dict_with_scan_issues_with_rule_and_observer, is_ignored_music_file,
+    is_supported_source_file, resolve_output_policy, target_output_path,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -87,6 +88,27 @@ pub fn build_sync_preview_with_settings(
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
 ) -> io::Result<SyncPreview> {
+    build_sync_preview_with_settings_observed(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        None,
+    )?
+    .ok_or_else(|| io::Error::other("扫描被取消"))
+}
+
+pub fn build_sync_preview_with_settings_observed(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    mut observer: Option<&mut ScanObserver<'_>>,
+) -> io::Result<Option<SyncPreview>> {
     let mut preview = SyncPreview {
         source_directory: source_directory.to_string(),
         destination_directory: destination_directory.to_string(),
@@ -110,7 +132,7 @@ pub fn build_sync_preview_with_settings(
             message: "输入来源不存在或不可读取".to_string(),
         });
         preview.estimated_output_bytes = None;
-        return Ok(preview);
+        return Ok(Some(preview));
     }
 
     if source_path.is_file() && !is_supported_source_file(source_path) {
@@ -120,7 +142,7 @@ pub fn build_sync_preview_with_settings(
         });
         preview.error_count = 1;
         preview.estimated_output_bytes = None;
-        return Ok(preview);
+        return Ok(Some(preview));
     }
 
     if !source_path.is_dir() && !source_path.is_file() {
@@ -129,7 +151,7 @@ pub fn build_sync_preview_with_settings(
             message: "输入来源不是文件夹或音频文件".to_string(),
         });
         preview.estimated_output_bytes = None;
-        return Ok(preview);
+        return Ok(Some(preview));
     }
 
     if !destination_directory.trim().is_empty() {
@@ -151,8 +173,20 @@ pub fn build_sync_preview_with_settings(
         }
     }
 
-    let (source_files, scan_issues) =
-        get_music_dict_with_scan_issues_with_rule(source_directory, filename_rule);
+    let (source_files, scan_issues, cancelled) = if let Some(observer) = observer.as_deref_mut() {
+        get_music_dict_with_scan_issues_with_rule_and_observer(
+            source_directory,
+            filename_rule,
+            observer,
+        )
+    } else {
+        let (files, issues) =
+            get_music_dict_with_scan_issues_with_rule(source_directory, filename_rule);
+        (files, issues, false)
+    };
+    if cancelled {
+        return Ok(None);
+    }
     for issue in scan_issues {
         preview.errors.push(PreviewIssue {
             path: issue.path.display().to_string(),
@@ -160,10 +194,25 @@ pub fn build_sync_preview_with_settings(
         });
         preview.error_count += 1;
     }
-    let destination_files = if Path::new(destination_directory).is_dir() {
-        get_destination_music_dict_with_rule(destination_directory, filename_rule)
-    } else {
-        Default::default()
+    let (destination_files, cancelled) =
+        if !destination_directory.trim().is_empty() && Path::new(destination_directory).is_dir() {
+            if let Some(observer) = observer.as_mut() {
+                get_destination_music_dict_with_rule_and_observer(
+                    destination_directory,
+                    filename_rule,
+                    observer,
+                )
+            } else {
+                (
+                    get_destination_music_dict_with_rule(destination_directory, filename_rule),
+                    false,
+                )
+            }
+        } else {
+            (Default::default(), false)
+        };
+    if cancelled {
+        return Ok(None);
     };
     let mut occupied_paths = destination_files
         .values()
@@ -326,7 +375,7 @@ pub fn build_sync_preview_with_settings(
         }
     }
 
-    Ok(preview)
+    Ok(Some(preview))
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {

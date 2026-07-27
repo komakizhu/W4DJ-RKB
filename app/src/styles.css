@@ -316,6 +316,7 @@ h1 {
 }
 
 .mode-row,
+.conversion-mode-row,
 .format-row {
   position: relative;
   display: grid;
@@ -328,6 +329,7 @@ h1 {
 }
 
 .mode-row::before,
+.conversion-mode-row::before,
 .format-row::before {
   position: absolute;
   z-index: 0;
@@ -344,6 +346,16 @@ h1 {
   inset: 8px 8px auto;
   height: 37px;
   transform: translateY(0);
+}
+
+.conversion-mode-row::before {
+  inset: 8px 8px auto;
+  height: 37px;
+  transform: translateY(0);
+}
+
+.conversion-mode-row[data-selected-conversion-mode="direct"]::before {
+  transform: translateY(44px);
 }
 
 .mode-row[data-selected-mode="lossless"]::before {
@@ -367,6 +379,16 @@ h1 {
 }
 
 @keyframes mode-slide-up {
+  from { transform: translateY(44px); }
+  to { transform: translateY(0); }
+}
+
+@keyframes conversion-slide-down {
+  from { transform: translateY(0); }
+  to { transform: translateY(44px); }
+}
+
+@keyframes conversion-slide-up {
   from { transform: translateY(44px); }
   to { transform: translateY(0); }
 }
@@ -410,6 +432,16 @@ h1 {
 
 .app-shell[data-selection-motion="mode"] .mode-row[data-selected-mode="compat"]::before {
   animation: mode-slide-up 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
+}
+
+.app-shell[data-selection-motion="conversion-mode"] .conversion-mode-row[data-selected-conversion-mode="direct"]::before {
+  animation: conversion-slide-down 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
+}
+
+.app-shell[data-selection-motion="conversion-mode"] .conversion-mode-row[data-selected-conversion-mode="scan_then_convert"]::before {
+  animation: conversion-slide-up 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
   animation-fill-mode: both;
 }
 
@@ -536,6 +568,7 @@ h1 {
 }
 
 .app-shell[data-theme="light"][data-light-palette="c"] .mode-row,
+.app-shell[data-theme="light"][data-light-palette="c"] .conversion-mode-row,
 .app-shell[data-theme="light"][data-light-palette="c"] .format-row {
   background: rgba(12, 10, 9, 0.3);
 }
@@ -558,6 +591,7 @@ h1 {
 }
 
 .app-shell[data-theme="dark"] .mode-row::before,
+.app-shell[data-theme="dark"] .conversion-mode-row::before,
 .app-shell[data-theme="dark"] .format-row::before {
   border-color: rgba(195, 75, 80, 0.34);
   background: #2d171a;
@@ -1692,6 +1726,105 @@ h1 {
   color: var(--cyan);
 }
 
+.scan-modal {
+  position: fixed;
+  z-index: 25;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(19, 27, 29, 0.32);
+  backdrop-filter: blur(9px);
+}
+
+.scan-dialog {
+  display: grid;
+  gap: 18px;
+  width: min(620px, 100%);
+  padding: 28px;
+  border: 1px solid var(--line-strong);
+  border-radius: 24px;
+  background: var(--surface-strong);
+  box-shadow: 0 24px 80px rgba(13, 28, 30, 0.26);
+}
+
+.scan-dialog-head,
+.scan-progress-summary,
+.scan-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.scan-dialog-head h2,
+.scan-message,
+.scan-current-file {
+  margin: 0;
+}
+
+.scan-stage {
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: var(--cyan-soft);
+  color: var(--cyan);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.scan-message {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.scan-progress-summary strong {
+  color: var(--text);
+  font: 800 24px/1 "SFMono-Regular", Consolas, monospace;
+}
+
+.scan-progress-summary span {
+  color: var(--cyan);
+  font: 800 13px/1 "SFMono-Regular", Consolas, monospace;
+}
+
+.scan-progress-track {
+  height: 9px;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+
+.scan-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--orange), var(--cyan));
+  transition: width 180ms ease;
+}
+
+.scan-current-file {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface-muted);
+}
+
+.scan-current-file span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.scan-current-file strong {
+  overflow: hidden;
+  color: var(--text);
+  font: 12px/1.35 "SFMono-Regular", Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .preview-modal {
   position: fixed;
   z-index: 20;
@@ -1779,6 +1912,15 @@ h1 {
 }
 
 @media (max-width: 720px) {
+  .scan-modal {
+    padding: 12px;
+  }
+
+  .scan-dialog {
+    padding: 18px;
+    border-radius: 18px;
+  }
+
   .preview-modal {
     padding: 12px;
   }

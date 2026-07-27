@@ -1,4 +1,4 @@
-use crate::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::config::{ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode};
 use crate::history::FailedFile;
 use crate::preferences::{AppPreferences, SYNC_SLOT_COUNT, SyncSlotPreferences};
 use crate::task::{TaskController, TaskSnapshot};
@@ -37,6 +37,7 @@ pub struct DesktopState {
     pub slots: [SyncSlotState; SYNC_SLOT_COUNT],
     pub mode: Mode,
     pub lossless_format: Option<LosslessFormat>,
+    pub conversion_mode: ConversionMode,
     pub conflict_strategy: ConflictStrategy,
     pub filename_rule: FilenameRule,
 }
@@ -73,6 +74,7 @@ impl DesktopState {
             slots,
             mode,
             lossless_format,
+            conversion_mode,
             conflict_strategy,
             filename_rule,
         } = preferences;
@@ -81,6 +83,7 @@ impl DesktopState {
             slots: slots.map(SyncSlotState::from_preferences),
             mode,
             lossless_format,
+            conversion_mode,
             conflict_strategy,
             filename_rule,
         }
@@ -94,6 +97,7 @@ impl DesktopState {
             }),
             mode: self.mode,
             lossless_format: self.lossless_format,
+            conversion_mode: self.conversion_mode,
             conflict_strategy: self.conflict_strategy,
             filename_rule: self.filename_rule,
         }
@@ -113,6 +117,7 @@ impl DesktopController {
             slots,
             mode,
             lossless_format,
+            conversion_mode,
             conflict_strategy,
             filename_rule,
         } = preferences;
@@ -123,6 +128,7 @@ impl DesktopController {
         }
         self.state.mode = mode;
         self.state.lossless_format = lossless_format;
+        self.state.conversion_mode = conversion_mode;
         self.state.conflict_strategy = conflict_strategy;
         self.state.filename_rule = filename_rule;
     }
@@ -162,6 +168,11 @@ impl DesktopController {
     pub fn choose_lossless_format(&mut self, format: Option<LosslessFormat>) {
         self.state.lossless_format = format;
         self.push_log_to_all("Lossless format updated");
+    }
+
+    pub fn choose_conversion_mode(&mut self, mode: ConversionMode) {
+        self.state.conversion_mode = mode;
+        self.push_log_to_all("Conversion mode updated");
     }
 
     pub fn choose_conflict_strategy(&mut self, strategy: ConflictStrategy) {

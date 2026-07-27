@@ -6,6 +6,7 @@ import {
   renderApp,
   type AppHistoryEntry,
   type AppPreview,
+  type AppScanProgress,
   type AppServices,
   type AppSyncSlotViewState,
   type AppViewState,
@@ -45,6 +46,7 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   ],
   mode: 'compat',
   lossless_format: null,
+  conversion_mode: 'scan_then_convert',
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
   report_path: null,
@@ -87,6 +89,7 @@ const makeViewState = (overrides: Partial<AppViewState> = {}): AppViewState => (
   ],
   mode: 'compat',
   losslessFormat: null,
+  conversionMode: 'scan_then_convert',
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
   lang: 'zh',
@@ -186,9 +189,35 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   selectDestinationDirectory: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseLosslessFormat: vi.fn().mockResolvedValue(makeDesktopState()),
+  chooseConversionMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseConflictStrategy: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseFilenameRule: vi.fn().mockResolvedValue(makeDesktopState()),
   previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
+  startScan: vi.fn().mockResolvedValue({
+    status: 'completed',
+    phase: 'completed',
+    processed: 2,
+    total: 2,
+    current_file: '',
+    message: '扫描完成',
+  }),
+  loadScanState: vi.fn().mockResolvedValue({
+    status: 'completed',
+    phase: 'completed',
+    processed: 2,
+    total: 2,
+    current_file: '',
+    message: '扫描完成',
+  }),
+  loadScanResult: vi.fn().mockResolvedValue(makePreviewResponse()),
+  cancelScan: vi.fn().mockResolvedValue({
+    status: 'cancelled',
+    phase: 'cancelled',
+    processed: 0,
+    total: 2,
+    current_file: '',
+    message: '扫描已取消',
+  }),
   startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
     slots: [
       makeDesktopSlot({ status: 'running', progress_total: 2 }),
@@ -922,6 +951,26 @@ describe('bindApp', () => {
     });
   });
 
+  it('switches conversion flow with the same sliding control pattern', async () => {
+    const services = makeMockServices({
+      chooseConversionMode: vi.fn().mockResolvedValue(
+        makeDesktopState({ conversion_mode: 'direct' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const initialSwitch = root.querySelector('[data-role="conversion-mode-switch"]');
+    expect(initialSwitch?.getAttribute('data-selected-conversion-mode')).toBe('scan_then_convert');
+    (root.querySelector('[data-conversion-mode="direct"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(services.chooseConversionMode).toHaveBeenCalledWith('direct');
+      expect(root.querySelector('[data-role="conversion-mode-switch"]')
+        ?.getAttribute('data-selected-conversion-mode')).toBe('direct');
+    });
+  });
+
   it('persists conflict and filename selections through backend services', async () => {
     const services = makeMockServices({
       chooseConflictStrategy: vi.fn().mockResolvedValue(
@@ -958,6 +1007,76 @@ describe('bindApp', () => {
       expect(root.querySelector('[data-role="preview-modal"]')?.textContent).toContain('预计输出');
     });
     expect(services.startConfirmedSync).not.toHaveBeenCalled();
+  });
+
+  it('shows scan progress immediately and only confirms after the scan completes', async () => {
+    const deferred = createDeferred<AppScanProgress>();
+    const services = makeMockServices({ startScan: vi.fn().mockReturnValue(deferred.promise) });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    expect(root.querySelector('[data-role="scan-modal"]')).not.toBeNull();
+    expect(root.querySelector('[data-role="scan-modal"]')?.textContent).toContain('0 / 0');
+    expect(root.querySelector('[data-action="cancel-scan"]')).not.toBeNull();
+    expect(services.startConfirmedSync).not.toHaveBeenCalled();
+
+    deferred.resolve({
+      status: 'completed',
+      phase: 'completed',
+      processed: 4,
+      total: 4,
+      current_file: '',
+      message: '扫描完成',
+    });
+    await vi.waitFor(() => expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull());
+  });
+
+  it('direct mode starts conversion automatically after a completed scan', async () => {
+    const services = makeMockServices({
+      loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState({ conversion_mode: 'direct' })),
+      loadScanResult: vi.fn().mockResolvedValue(makePreviewResponse()),
+      startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
+        slots: [
+          makeDesktopSlot({ status: 'running', progress_total: 1 }),
+          makeDesktopSlot({ status: 'idle' }),
+        ],
+      })),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({ conversionMode: 'direct' }), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
+      expect(root.querySelector('[data-role="preview-modal"]')).toBeNull();
+    });
+  });
+
+  it('cancels a running scan without starting conversion', async () => {
+    const deferred = createDeferred<AppScanProgress>();
+    const services = makeMockServices({
+      startScan: vi.fn().mockResolvedValue({
+        status: 'running', phase: 'scanning_source', processed: 1, total: 100,
+        current_file: '/music/one.mp3', message: '正在扫描输入目录',
+      }),
+      loadScanState: vi.fn().mockReturnValue(deferred.promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-action="cancel-scan"]')).not.toBeNull());
+    (root.querySelector('[data-action="cancel-scan"]') as HTMLButtonElement).click();
+    expect(services.cancelScan).toHaveBeenCalledTimes(1);
+    deferred.resolve({
+      status: 'cancelled', phase: 'cancelled', processed: 1, total: 100,
+      current_file: '', message: '扫描已取消',
+    });
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="scan-modal"]')?.textContent).toContain('扫描已取消');
+      expect(services.startConfirmedSync).not.toHaveBeenCalled();
+    });
   });
 
   it('does not invoke the backend or animation for the already selected mode', async () => {
@@ -1143,9 +1262,9 @@ describe('bindApp', () => {
   });
 
   it('ignores repeated global start clicks while the first start is pending', async () => {
-    const deferred = createDeferred<AppPreview[]>();
+    const deferred = createDeferred<AppScanProgress>();
     const services = makeMockServices({
-      previewAllSync: vi.fn().mockReturnValue(deferred.promise),
+      startScan: vi.fn().mockReturnValue(deferred.promise),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
@@ -1155,9 +1274,12 @@ describe('bindApp', () => {
     expect(pendingButton.disabled).toBe(true);
     pendingButton.click();
 
-    expect(services.previewAllSync).toHaveBeenCalledTimes(1);
+    expect(services.startScan).toHaveBeenCalledTimes(1);
 
-    deferred.resolve(makePreviewResponse());
+    deferred.resolve({
+      status: 'completed', phase: 'completed', processed: 2, total: 2,
+      current_file: '', message: '扫描完成',
+    });
 
     await vi.waitFor(() => {
       expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
@@ -1199,7 +1321,7 @@ describe('bindApp', () => {
 
   it('reports an action error on only the affected slot', async () => {
     const services = makeMockServices({
-      previewAllSync: vi.fn().mockRejectedValue(new Error('Sync failed dramatically')),
+      startScan: vi.fn().mockRejectedValue(new Error('Sync failed dramatically')),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
@@ -1207,21 +1329,9 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(
-        (root.querySelector('[data-role="sync-slot"][data-slot="0"]') as HTMLElement).dataset
-          .status,
-      ).toBe('error');
-      expect(
-        (root.querySelector('[data-role="sync-slot"][data-slot="1"]') as HTMLElement).dataset
-          .status,
-      ).toBe('error');
-      expect(root.querySelector('[data-role="log-drawer"][data-slot="1"]')).toBeNull();
-      expect(
-        root.querySelector('[data-role="sync-slot"][data-slot="0"] .progress-copy')?.textContent,
-      ).toContain('Sync failed dramatically');
-      expect(
-        root.querySelector('[data-role="sync-slot"][data-slot="1"] .progress-copy')?.textContent,
-      ).toContain('Sync failed dramatically');
+      expect(root.querySelector('[data-role="scan-modal"]')?.textContent)
+        .toContain('Sync failed dramatically');
+      expect(root.querySelector('[data-action="close-scan"]')).not.toBeNull();
     });
   });
 });

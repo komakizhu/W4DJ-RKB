@@ -7,6 +7,15 @@ pub enum Mode {
     Lossless,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum ConversionMode {
+    #[default]
+    ScanThenConvert,
+    Direct,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LosslessFormat {

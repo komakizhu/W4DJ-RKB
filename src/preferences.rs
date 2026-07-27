@@ -1,4 +1,4 @@
-use crate::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::config::{ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode};
 use crate::gui::GuiShell;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -31,6 +31,8 @@ pub struct AppPreferences {
     pub mode: Mode,
     pub lossless_format: Option<LosslessFormat>,
     #[serde(default)]
+    pub conversion_mode: ConversionMode,
+    #[serde(default)]
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
@@ -53,6 +55,7 @@ impl Default for AppPreferences {
             ],
             mode: Mode::Compat,
             lossless_format: None,
+            conversion_mode: ConversionMode::default(),
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
         }
@@ -71,6 +74,7 @@ impl AppPreferences {
             ],
             mode: shell.mode,
             lossless_format: shell.lossless_format,
+            conversion_mode: ConversionMode::default(),
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
         }
@@ -103,6 +107,7 @@ fn parse_preferences(contents: &str) -> io::Result<AppPreferences> {
         ],
         mode: legacy.mode,
         lossless_format: legacy.lossless_format,
+        conversion_mode: ConversionMode::default(),
         conflict_strategy: ConflictStrategy::default(),
         filename_rule: FilenameRule::default(),
     })

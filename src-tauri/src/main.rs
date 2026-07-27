@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -14,7 +15,7 @@ use w4dj::analysis::{
     TrackAnalysis, TrackMetadata, analysis_file_path, build_rekordbox_xml, load_analysis_file,
     merge_analysis_entries, read_track_metadata, save_analysis_file,
 };
-use w4dj::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use w4dj::config::{ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode};
 use w4dj::desktop::{DesktopController, DesktopState};
 use w4dj::history::{
     FailedFile, HistoryEntry, HistoryStatus, PendingFile, classify_error, clear_history,
@@ -24,11 +25,12 @@ use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
     PreviewCandidate, PreviewIssue, PreviewOperation, SlotPreview, SyncPreview,
     build_retry_preview, build_sync_preview_with_settings,
+    build_sync_preview_with_settings_observed,
 };
 use w4dj::sync::{
-    cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
-    get_music_dict_with_scan_issues, is_supported_source_file, sync_music_library_with_observer,
-    update_existing_metadata,
+    cleanup_temporary_outputs, compare_music_dicts, count_music_files_with_cancel,
+    get_destination_music_dict, get_music_dict_with_scan_issues, is_supported_source_file,
+    sync_music_library_with_observer, update_existing_metadata, ScanPhase,
 };
 
 #[cfg(target_os = "macos")]
@@ -46,6 +48,54 @@ struct AppState {
     history_path: Arc<Mutex<PathBuf>>,
     history_write_lock: Arc<Mutex<()>>,
     destination_coordinator: DestinationCoordinator,
+    scan_progress: Arc<Mutex<ScanProgress>>,
+    scan_cancel: Arc<AtomicBool>,
+    scan_result: Arc<Mutex<Option<Vec<SlotPreview>>>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScanStatus {
+    Idle,
+    Running,
+    Completed,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScanProgressPhase {
+    Preparing,
+    ScanningSource,
+    ScanningDestination,
+    Checking,
+    Completed,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ScanProgress {
+    status: ScanStatus,
+    phase: ScanProgressPhase,
+    processed: usize,
+    total: usize,
+    current_file: String,
+    message: String,
+}
+
+impl Default for ScanProgress {
+    fn default() -> Self {
+        Self {
+            status: ScanStatus::Idle,
+            phase: ScanProgressPhase::Preparing,
+            processed: 0,
+            total: 0,
+            current_file: String::new(),
+            message: String::new(),
+        }
+    }
 }
 
 struct ConfirmedSyncJob {
@@ -60,6 +110,15 @@ struct ConfirmedSyncJob {
     candidates: Vec<PreviewCandidate>,
     preview: SyncPreview,
     retry_of: Option<String>,
+}
+
+struct ScanJob {
+    conversion_mode: ConversionMode,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    tasks: Vec<(usize, String, String)>,
 }
 
 #[derive(serde::Serialize)]
@@ -384,6 +443,20 @@ fn choose_lossless_format(
 }
 
 #[tauri::command]
+fn choose_conversion_mode(
+    mode: ConversionMode,
+    state: tauri::State<'_, AppState>,
+) -> DesktopState {
+    let snapshot = {
+        let mut controller = state.controller.lock().expect("desktop lock poisoned");
+        controller.choose_conversion_mode(mode);
+        controller.state().clone()
+    };
+    persist_preferences(&state);
+    snapshot
+}
+
+#[tauri::command]
 fn choose_conflict_strategy(
     strategy: ConflictStrategy,
     state: tauri::State<'_, AppState>,
@@ -568,6 +641,301 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
         .collect::<Result<Vec<_>, String>>()?;
     deduplicate_cross_slot_candidates(&mut previews);
     Ok(previews)
+}
+
+fn scan_progress_snapshot(progress: &Arc<Mutex<ScanProgress>>) -> ScanProgress {
+    progress
+        .lock()
+        .expect("scan progress lock poisoned")
+        .clone()
+}
+
+fn update_scan_progress(
+    progress: &Arc<Mutex<ScanProgress>>,
+    update: impl FnOnce(&mut ScanProgress),
+) {
+    let mut guard = progress.lock().expect("scan progress lock poisoned");
+    update(&mut guard);
+}
+
+#[tauri::command]
+fn load_scan_state(state: tauri::State<'_, AppState>) -> ScanProgress {
+    scan_progress_snapshot(&state.scan_progress)
+}
+
+#[tauri::command]
+fn load_scan_result(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview>, String> {
+    state
+        .scan_result
+        .lock()
+        .expect("scan result lock poisoned")
+        .clone()
+        .ok_or_else(|| String::from("扫描结果尚未准备好"))
+}
+
+#[tauri::command]
+fn cancel_scan(state: tauri::State<'_, AppState>) -> ScanProgress {
+    state.scan_cancel.store(true, Ordering::SeqCst);
+    scan_progress_snapshot(&state.scan_progress)
+}
+
+#[tauri::command]
+fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String> {
+    {
+        let progress = state
+            .scan_progress
+            .lock()
+            .expect("scan progress lock poisoned");
+        if matches!(progress.status, ScanStatus::Running) {
+            return Ok(progress.clone());
+        }
+    }
+
+    let (
+        conversion_mode,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        tasks,
+    ) = {
+        let controller = state.controller.lock().expect("desktop lock poisoned");
+        let slot_indexes = controller.startable_slot_indexes();
+        if slot_indexes.is_empty() {
+            return Err(String::from("请至少选择一个歌曲文件夹或单曲"));
+        }
+
+        let tasks = slot_indexes
+            .iter()
+            .map(|slot_index| {
+                let slot = &controller.state().slots[*slot_index];
+                let destination = controller
+                    .effective_destination(*slot_index)
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                Ok((*slot_index, slot.source_directory.clone(), destination))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        (
+            controller.state().conversion_mode,
+            controller.state().mode,
+            controller.state().lossless_format,
+            controller.state().conflict_strategy,
+            controller.state().filename_rule,
+            tasks,
+        )
+    };
+
+    state.scan_cancel.store(false, Ordering::SeqCst);
+    {
+        let mut result = state.scan_result.lock().expect("scan result lock poisoned");
+        *result = None;
+    }
+    update_scan_progress(&state.scan_progress, |progress| {
+        *progress = ScanProgress {
+            status: ScanStatus::Running,
+            phase: ScanProgressPhase::Preparing,
+            processed: 0,
+            total: 0,
+            current_file: String::new(),
+            message: "正在准备扫描".to_string(),
+        };
+    });
+
+    let progress = Arc::clone(&state.scan_progress);
+    let scan_cancel = Arc::clone(&state.scan_cancel);
+    let scan_result = Arc::clone(&state.scan_result);
+    let job = ScanJob {
+        conversion_mode,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        tasks,
+    };
+    thread::spawn(move || run_scan_task(progress, scan_cancel, scan_result, job));
+
+    Ok(scan_progress_snapshot(&state.scan_progress))
+}
+
+fn run_scan_task(
+    progress: Arc<Mutex<ScanProgress>>,
+    scan_cancel: Arc<AtomicBool>,
+    scan_result: Arc<Mutex<Option<Vec<SlotPreview>>>>,
+    job: ScanJob,
+) {
+    let ScanJob {
+        conversion_mode,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        tasks,
+    } = job;
+    let mut total = 0;
+    for (_, source, destination) in &tasks {
+        let (source_count, cancelled) = count_music_files_with_cancel(
+            source,
+            w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
+            || scan_cancel.load(Ordering::SeqCst),
+        );
+        total += source_count;
+        if cancelled {
+            finish_scan_cancelled(&progress, &scan_result);
+            return;
+        }
+        let (destination_count, cancelled) = count_music_files_with_cancel(
+            destination,
+            &["mp3", "wav", "aiff"],
+            || scan_cancel.load(Ordering::SeqCst),
+        );
+        total += destination_count;
+        if cancelled {
+            finish_scan_cancelled(&progress, &scan_result);
+            return;
+        }
+    }
+    update_scan_progress(&progress, |state| {
+        state.total = total;
+        state.message = "正在准备扫描".to_string();
+    });
+    let mut previews = Vec::with_capacity(tasks.len());
+    let mut observer = |phase: ScanPhase, path: &Path| {
+        if scan_cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        update_scan_progress(&progress, |state| {
+            state.phase = match phase {
+                ScanPhase::Source => ScanProgressPhase::ScanningSource,
+                ScanPhase::Destination => ScanProgressPhase::ScanningDestination,
+            };
+            state.processed = state.processed.saturating_add(1);
+            state.current_file = path.display().to_string();
+            state.message = match phase {
+                ScanPhase::Source => "正在扫描输入目录".to_string(),
+                ScanPhase::Destination => "正在扫描输出目录".to_string(),
+            };
+        });
+        !scan_cancel.load(Ordering::SeqCst)
+    };
+
+    for (slot_index, source, destination) in tasks {
+        if scan_cancel.load(Ordering::SeqCst) {
+            finish_scan_cancelled(&progress, &scan_result);
+            return;
+        }
+
+        let preview = match build_sync_preview_with_settings_observed(
+            &source,
+            &destination,
+            mode,
+            lossless_format,
+            conflict_strategy,
+            filename_rule,
+            Some(&mut observer),
+        ) {
+            Ok(Some(preview)) => preview,
+            Ok(None) => {
+                finish_scan_cancelled(&progress, &scan_result);
+                return;
+            }
+            Err(error) => {
+                finish_scan_error(&progress, &scan_result, format!("扫描失败：{error}"));
+                return;
+            }
+        };
+        previews.push(SlotPreview {
+            slot_index,
+            mode,
+            lossless_format,
+            conflict_strategy,
+            filename_rule,
+            preview,
+            retry_of: None,
+        });
+    }
+
+    if scan_cancel.load(Ordering::SeqCst) {
+        finish_scan_cancelled(&progress, &scan_result);
+        return;
+    }
+
+    update_scan_progress(&progress, |state| {
+        state.phase = ScanProgressPhase::Checking;
+        state.current_file.clear();
+        state.message = "正在检查转换条件".to_string();
+    });
+    deduplicate_cross_slot_candidates(&mut previews);
+
+    if matches!(conversion_mode, ConversionMode::Direct)
+        && let Err(error) = validate_scan_previews(&previews)
+    {
+        finish_scan_error(&progress, &scan_result, error);
+        return;
+    }
+
+    {
+        let mut result = scan_result.lock().expect("scan result lock poisoned");
+        *result = Some(previews);
+    }
+    update_scan_progress(&progress, |state| {
+        state.status = ScanStatus::Completed;
+        state.phase = ScanProgressPhase::Completed;
+        state.current_file.clear();
+        state.message = "扫描完成".to_string();
+    });
+}
+
+fn validate_scan_previews(previews: &[SlotPreview]) -> Result<(), String> {
+    for preview in previews {
+        validate_source_input(&preview.preview.source_directory)?;
+        let source_path = Path::new(&preview.preview.source_directory);
+        if source_path.is_file() {
+            fs::File::open(source_path)
+                .map_err(|error| format!("无法读取输入文件：{error}"))?;
+        } else {
+            fs::read_dir(source_path)
+                .map_err(|error| format!("无法读取输入目录：{error}"))?;
+        }
+        validate_destination_directory(Path::new(&preview.preview.destination_directory))?;
+        if let Some(issue) = preview.preview.errors.first() {
+            return Err(format!("输入文件检查失败：{}", issue.message));
+        }
+        if matches!(preview.preview.disk_space_sufficient, Some(false)) {
+            return Err(format!("输出目录磁盘空间不足：{}", preview.preview.destination_directory));
+        }
+        if preview.preview.candidates.is_empty() {
+            return Err(format!("任务 {} 没有可转换的歌曲", preview.slot_index + 1));
+        }
+    }
+    validate_unique_planned_outputs(previews)
+}
+
+fn finish_scan_cancelled(
+    progress: &Arc<Mutex<ScanProgress>>,
+    result: &Arc<Mutex<Option<Vec<SlotPreview>>>>,
+) {
+    *result.lock().expect("scan result lock poisoned") = None;
+    update_scan_progress(progress, |state| {
+        state.status = ScanStatus::Cancelled;
+        state.phase = ScanProgressPhase::Cancelled;
+        state.current_file.clear();
+        state.message = "扫描已取消".to_string();
+    });
+}
+
+fn finish_scan_error(
+    progress: &Arc<Mutex<ScanProgress>>,
+    result: &Arc<Mutex<Option<Vec<SlotPreview>>>>,
+    message: String,
+) {
+    *result.lock().expect("scan result lock poisoned") = None;
+    update_scan_progress(progress, |state| {
+        state.status = ScanStatus::Error;
+        state.phase = ScanProgressPhase::Error;
+        state.current_file.clear();
+        state.message = message;
+    });
 }
 
 fn deduplicate_cross_slot_candidates(previews: &mut [SlotPreview]) {
@@ -962,6 +1330,9 @@ fn main() {
             history_path: Arc::new(Mutex::new(PathBuf::new())),
             history_write_lock: Arc::new(Mutex::new(())),
             destination_coordinator: DestinationCoordinator::default(),
+            scan_progress: Arc::new(Mutex::new(ScanProgress::default())),
+            scan_cancel: Arc::new(AtomicBool::new(false)),
+            scan_result: Arc::new(Mutex::new(None)),
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -971,6 +1342,7 @@ fn main() {
             select_destination_directory,
             choose_mode,
             choose_lossless_format,
+            choose_conversion_mode,
             choose_conflict_strategy,
             choose_filename_rule,
             start_sync,
@@ -980,6 +1352,10 @@ fn main() {
             pause_all_sync,
             cancel_all_sync,
             preview_all_sync,
+            load_scan_state,
+            load_scan_result,
+            start_scan,
+            cancel_scan,
             start_confirmed_sync,
             load_history,
             retry_history_failures,

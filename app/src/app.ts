@@ -5,14 +5,17 @@ import { analyzeAudioFile, type TrackAnalysis, type TrackMetadata } from './anal
 
 export type AppMode = 'compat' | 'lossless';
 export type AppLosslessFormat = 'wav' | 'aiff';
+export type AppConversionMode = 'scan_then_convert' | 'direct';
 export type AppConflictStrategy = 'skip' | 'overwrite' | 'rename' | 'update_metadata';
 export type AppFilenameRule = 'title_artist' | 'artist_title' | 'original';
 export type AppStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error' | 'cancelled';
+export type AppScanStatus = 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
+export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destination' | 'checking' | 'completed' | 'cancelled' | 'error';
 export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
-type SelectionMotion = 'mode' | 'format' | 'theme' | 'lang' | null;
-type PendingSelection = 'mode' | 'format' | null;
+type SelectionMotion = 'mode' | 'format' | 'conversion-mode' | 'theme' | 'lang' | null;
+type PendingSelection = 'mode' | 'format' | 'conversion-mode' | null;
 type OnboardingStep = 0 | 1 | 2 | 3;
 type OnboardingTarget = 'mode' | 'source' | 'destination' | 'start';
 
@@ -38,6 +41,7 @@ export type AppViewState = {
   slots: [AppSyncSlotViewState, AppSyncSlotViewState];
   mode: AppMode;
   losslessFormat: AppLosslessFormat | null;
+  conversionMode: AppConversionMode;
   conflictStrategy: AppConflictStrategy;
   filenameRule: AppFilenameRule;
   lang: AppLanguage;
@@ -64,6 +68,7 @@ export type DesktopState = {
   slots: [DesktopSyncSlotState, DesktopSyncSlotState];
   mode: AppMode;
   lossless_format: AppLosslessFormat | null;
+  conversion_mode: AppConversionMode;
   conflict_strategy: AppConflictStrategy;
   filename_rule: AppFilenameRule;
 };
@@ -174,6 +179,15 @@ export type AppPreviewModalState = {
   retryOf: string | null;
 };
 
+export type AppScanProgress = {
+  status: AppScanStatus;
+  phase: AppScanPhase;
+  processed: number;
+  total: number;
+  current_file: string;
+  message: string;
+};
+
 export type AppServices = {
   loadDesktopState: () => Promise<DesktopState>;
   pickDirectory: (
@@ -185,9 +199,14 @@ export type AppServices = {
   selectDestinationDirectory: (slotIndex: SyncSlotIndex, path: string) => Promise<DesktopState>;
   chooseMode: (mode: AppMode) => Promise<DesktopState>;
   chooseLosslessFormat: (format: AppLosslessFormat | null) => Promise<DesktopState>;
+  chooseConversionMode: (mode: AppConversionMode) => Promise<DesktopState>;
   chooseConflictStrategy: (strategy: AppConflictStrategy) => Promise<DesktopState>;
   chooseFilenameRule: (rule: AppFilenameRule) => Promise<DesktopState>;
   previewAllSync: () => Promise<AppPreview[]>;
+  startScan: () => Promise<AppScanProgress>;
+  loadScanState: () => Promise<AppScanProgress>;
+  loadScanResult: () => Promise<AppPreview[]>;
+  cancelScan: () => Promise<AppScanProgress>;
   startConfirmedSync: (previews: AppPreview[], retryOf?: string | null) => Promise<DesktopState>;
   loadHistory: () => Promise<AppHistoryEntry[]>;
   retryHistoryFailures: (id: string) => Promise<AppPreview>;
@@ -274,6 +293,9 @@ const translations = {
     error: '错误',
     controlPanel: '控制面板',
     mode: '输出模式',
+    conversionMode: '转换方式',
+    scanThenConvert: '扫描后转换',
+    directConvert: '直接转换',
     advancedOptions: '高级选项',
     losslessFormat: '无损格式',
     syncSlot: '任务',
@@ -351,6 +373,17 @@ const translations = {
     analysisComplete: '已保存 {count} 首分析结果，可导入 Rekordbox。',
     analysisPartial: '完成 {done}/{total} 首，{failed} 首失败。',
     analysisNoResults: '没有成功的分析结果。',
+    scanTitle: '扫描歌曲',
+    scanPreparing: '正在准备扫描',
+    scanSource: '正在扫描输入目录',
+    scanDestination: '正在扫描输出目录',
+    scanChecking: '正在检查转换条件',
+    scanCompleted: '扫描完成',
+    scanCancelled: '扫描已取消',
+    scanError: '扫描失败',
+    scanCurrentFile: '当前文件',
+    scanCancel: '取消扫描',
+    scanClose: '关闭',
   },
   en: {
     eyebrow: 'W4DJ RKB',
@@ -379,6 +412,9 @@ const translations = {
     error: 'Error',
     controlPanel: 'Control panel',
     mode: 'Output mode',
+    conversionMode: 'Conversion flow',
+    scanThenConvert: 'Scan then convert',
+    directConvert: 'Direct convert',
     advancedOptions: 'Advanced options',
     losslessFormat: 'Lossless format',
     syncSlot: 'Task',
@@ -456,6 +492,17 @@ const translations = {
     analysisComplete: '{count} results saved. Ready for Rekordbox.',
     analysisPartial: 'Completed {done}/{total}; {failed} failed.',
     analysisNoResults: 'No analysis result was completed.',
+    scanTitle: 'Scanning songs',
+    scanPreparing: 'Preparing scan',
+    scanSource: 'Scanning input folders',
+    scanDestination: 'Scanning output folders',
+    scanChecking: 'Checking conversion conditions',
+    scanCompleted: 'Scan complete',
+    scanCancelled: 'Scan cancelled',
+    scanError: 'Scan failed',
+    scanCurrentFile: 'Current file',
+    scanCancel: 'Cancel scan',
+    scanClose: 'Close',
   },
 } as const;
 
@@ -517,6 +564,7 @@ const defaultState: AppViewState = {
   slots: [defaultSlot(initialLanguage), defaultSlot(initialLanguage)],
   mode: 'compat',
   losslessFormat: null,
+  conversionMode: 'scan_then_convert',
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
   lang: initialLanguage,
@@ -580,10 +628,16 @@ const defaultServices: AppServices = {
   chooseMode: (mode) => invoke<DesktopState>('choose_mode', { mode }),
   chooseLosslessFormat: (format) =>
     invoke<DesktopState>('choose_lossless_format', { format }),
+  chooseConversionMode: (mode) =>
+    invoke<DesktopState>('choose_conversion_mode', { mode }),
   chooseConflictStrategy: (strategy) =>
     invoke<DesktopState>('choose_conflict_strategy', { strategy }),
   chooseFilenameRule: (rule) => invoke<DesktopState>('choose_filename_rule', { rule }),
   previewAllSync: () => invoke<AppPreview[]>('preview_all_sync'),
+  startScan: () => invoke<AppScanProgress>('start_scan'),
+  loadScanState: () => invoke<AppScanProgress>('load_scan_state'),
+  loadScanResult: () => invoke<AppPreview[]>('load_scan_result'),
+  cancelScan: () => invoke<AppScanProgress>('cancel_scan'),
   startConfirmedSync: (previews, retryOf = null) =>
     invoke<DesktopState>('start_confirmed_sync', { previews, retryOf }),
   loadHistory: () => invoke<AppHistoryEntry[]>('load_history'),
@@ -621,6 +675,7 @@ export function renderApp(
   onboardingVisible = false,
   onboardingStep: OnboardingStep = 0,
   analysisState: AppAnalysisState = defaultAnalysisState,
+  scanProgress: AppScanProgress | null = null,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -664,6 +719,19 @@ export function renderApp(
     <section class="panel control-panel" data-role="control-panel" aria-label="${t('controlPanel', state.lang)}">
       <aside class="workbench-rail" data-role="workbench-rail">
         <div class="global-controls">
+          <div class="global-control-head">
+            <span>${t('conversionMode', state.lang)}</span>
+          </div>
+          <div class="conversion-mode-row mode-row" data-role="conversion-mode-switch" data-selected-conversion-mode="${state.conversionMode}" aria-label="${t('conversionMode', state.lang)}">
+            <button type="button" class="mode-button ${state.conversionMode === 'scan_then_convert' ? 'selected' : ''}" data-conversion-mode="scan_then_convert" ${pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}>
+              ${icon('list')}
+              ${t('scanThenConvert', state.lang)}
+            </button>
+            <button type="button" class="mode-button ${state.conversionMode === 'direct' ? 'selected' : ''}" data-conversion-mode="direct" ${pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}>
+              ${icon('play')}
+              ${t('directConvert', state.lang)}
+            </button>
+          </div>
           <div class="global-control-head">
             <span>${t('mode', state.lang)}</span>
           </div>
@@ -723,12 +791,66 @@ export function renderApp(
         ${renderHistory(history, state.lang, historyExpanded)}
       </div>
     </section>
+    ${renderScanModal(scanProgress, state.lang)}
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, state.lang)}
     ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
   `;
 
   return root;
+}
+
+function renderScanModal(progress: AppScanProgress | null, lang: AppLanguage): string {
+  if (!progress) {
+    return '';
+  }
+
+  const percent = progress.total > 0
+    ? Math.min(100, Math.round((progress.processed / progress.total) * 100))
+    : progress.status === 'completed' ? 100 : 0;
+  const stageKey: keyof typeof translations.zh = progress.phase === 'scanning_source'
+    ? 'scanSource'
+    : progress.phase === 'scanning_destination'
+      ? 'scanDestination'
+      : progress.phase === 'checking'
+        ? 'scanChecking'
+        : progress.status === 'completed'
+          ? 'scanCompleted'
+          : progress.status === 'cancelled'
+            ? 'scanCancelled'
+            : progress.status === 'error'
+              ? 'scanError'
+              : 'scanPreparing';
+  const isRunning = progress.status === 'running';
+  const message = progress.message || t(stageKey, lang);
+  return `
+    <div class="scan-modal" data-role="scan-modal" role="dialog" aria-modal="true" aria-label="${t('scanTitle', lang)}">
+      <section class="scan-dialog">
+        <div class="scan-dialog-head">
+          <div>
+            <p class="panel-kicker">W4DJ RKB</p>
+            <h2>${t('scanTitle', lang)}</h2>
+          </div>
+          <span class="scan-stage">${t(stageKey, lang)}</span>
+        </div>
+        <p class="scan-message">${message}</p>
+        <div class="scan-progress-summary">
+          <strong>${progress.processed} / ${progress.total}</strong>
+          <span>${percent}%</span>
+        </div>
+        <div class="scan-progress-track" aria-label="${percent}%"><span style="width: ${percent}%"></span></div>
+        <div class="scan-current-file">
+          <span>${t('scanCurrentFile', lang)}</span>
+          <strong title="${progress.current_file}">${progress.current_file || '—'}</strong>
+        </div>
+        <footer class="scan-actions">
+          ${isRunning
+            ? `<button type="button" class="secondary-action" data-action="cancel-scan">${t('scanCancel', lang)}</button>`
+            : `<button type="button" class="global-action" data-action="close-scan">${t('scanClose', lang)}</button>`}
+        </footer>
+      </section>
+    </div>
+  `;
 }
 
 function renderPreviewModal(
@@ -949,6 +1071,8 @@ export function bindApp(
   let aboutInfo: AppInfo | null = null;
   let outputSettingsExpanded = false;
   let historyExpanded = false;
+  let scanProgress: AppScanProgress | null = null;
+  let scanTimer: ReturnType<typeof setTimeout> | null = null;
   let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
   let onboardingStep: OnboardingStep = 0;
   let analysisState: AppAnalysisState = { ...defaultAnalysisState };
@@ -969,6 +1093,7 @@ export function bindApp(
         onboardingVisible,
         onboardingStep,
         analysisState,
+        scanProgress,
       ),
     );
 
@@ -1084,6 +1209,124 @@ export function bindApp(
       reportError(error);
     } finally {
       previewBusy = false;
+      pendingGlobalAction = null;
+      render();
+    }
+  };
+
+  const finishScan = async (progress: AppScanProgress) => {
+    if (progress.status === 'running') {
+      return;
+    }
+    if (scanTimer) {
+      clearTimeout(scanTimer);
+      scanTimer = null;
+    }
+    if (progress.status !== 'completed') {
+      pendingGlobalAction = null;
+      render();
+      return;
+    }
+
+    try {
+      const previews = await services.loadScanResult();
+      scanProgress = null;
+      if (state.conversionMode === 'scan_then_convert') {
+        previewModal = { previews, retryOf: null };
+        pendingGlobalAction = null;
+        render();
+        return;
+      }
+
+      previewBusy = true;
+      render();
+      const nextState = await services.startConfirmedSync(previews, null);
+      applyDesktopState(nextState);
+    } catch (error) {
+      scanProgress = {
+        ...progress,
+        status: 'error',
+        phase: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      previewBusy = false;
+      pendingGlobalAction = null;
+      render();
+    }
+  };
+
+  const pollScan = async () => {
+    if (!scanProgress || scanProgress.status !== 'running') {
+      return;
+    }
+    try {
+      scanProgress = await services.loadScanState();
+      render();
+      if (scanProgress.status === 'running') {
+        scanTimer = setTimeout(() => void pollScan(), 120);
+      } else {
+        await finishScan(scanProgress);
+      }
+    } catch (error) {
+      scanProgress = {
+        ...(scanProgress || {
+          status: 'error', phase: 'error', processed: 0, total: 0, current_file: '', message: '',
+        }),
+        status: 'error',
+        phase: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      };
+      pendingGlobalAction = null;
+      render();
+    }
+  };
+
+  const beginScan = async () => {
+    if (scanProgress?.status === 'running' || pendingGlobalAction !== null) {
+      return;
+    }
+    pendingGlobalAction = 'start-all';
+    scanProgress = {
+      status: 'running',
+      phase: 'preparing',
+      processed: 0,
+      total: 0,
+      current_file: '',
+      message: t('scanPreparing', state.lang),
+    };
+    render();
+    try {
+      scanProgress = await services.startScan();
+      render();
+      if (scanProgress.status === 'running') {
+        scanTimer = setTimeout(() => void pollScan(), 0);
+      } else {
+        await finishScan(scanProgress);
+      }
+    } catch (error) {
+      scanProgress = {
+        status: 'error',
+        phase: 'error',
+        processed: 0,
+        total: 0,
+        current_file: '',
+        message: error instanceof Error ? error.message : String(error),
+      };
+      pendingGlobalAction = null;
+      render();
+    }
+  };
+
+  const cancelScanFlow = async () => {
+    if (!scanProgress || scanProgress.status !== 'running') {
+      return;
+    }
+    try {
+      scanProgress = await services.cancelScan();
+      render();
+    } catch (error) {
+      scanProgress = { ...scanProgress, status: 'error', phase: 'error', message: String(error) };
       pendingGlobalAction = null;
       render();
     }
@@ -1372,6 +1615,7 @@ export function bindApp(
     const action = button.dataset.action;
     const mode = button.dataset.mode as AppMode | undefined;
     const format = button.dataset.format as AppLosslessFormat | undefined;
+    const conversionMode = button.dataset.conversionMode as AppConversionMode | undefined;
     const slotIndex = parseSlotIndex(button.dataset.slot);
     const isOnboardingAction = action === 'onboarding-next'
       || action === 'onboarding-previous'
@@ -1456,6 +1700,20 @@ export function bindApp(
     if (action === 'cancel-preview' || action === 'edit-preview') {
       if (!previewBusy) {
         previewModal = null;
+        render();
+      }
+      return;
+    }
+
+    if (action === 'cancel-scan') {
+      void cancelScanFlow();
+      return;
+    }
+
+    if (action === 'close-scan') {
+      if (scanProgress?.status !== 'running') {
+        scanProgress = null;
+        pendingGlobalAction = null;
         render();
       }
       return;
@@ -1565,8 +1823,17 @@ export function bindApp(
       return;
     }
 
+    if (conversionMode) {
+      void runSelectionAction(
+        'conversion-mode',
+        state.conversionMode !== conversionMode,
+        () => services.chooseConversionMode(conversionMode),
+      );
+      return;
+    }
+
     if (action === 'start-all') {
-      void openPreview();
+      void beginScan();
       return;
     }
 
@@ -1935,6 +2202,7 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
     })) as [AppSyncSlotViewState, AppSyncSlotViewState],
     mode: state.mode,
     losslessFormat: state.lossless_format,
+    conversionMode: state.conversion_mode,
     conflictStrategy: state.conflict_strategy,
     filenameRule: state.filename_rule,
     lang,
