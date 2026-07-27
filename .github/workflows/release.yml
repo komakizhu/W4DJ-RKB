@@ -123,6 +123,16 @@ jobs:
           hdiutil attach "$rw_image" -mountpoint "$mountpoint" -nobrowse -noautoopen
           cp "$helper" "$mountpoint/解决文件已损坏问题（双击）.command"
           chmod +x "$mountpoint/解决文件已损坏问题（双击）.command"
+          osascript <<APPLESCRIPT
+          tell application "Finder"
+            tell folder (POSIX file "$mountpoint" as alias)
+              set position of item "W4DJ RKB.app" to {300, 300}
+              set position of item "解决文件已损坏问题（双击）.command" to {600, 300}
+              set position of item "Applications" to {900, 300}
+              close
+            end tell
+          end tell
+          APPLESCRIPT
           hdiutil detach "$mountpoint"
 
           rebuilt="$workdir/w4dj-final.dmg"
