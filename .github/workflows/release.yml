@@ -123,6 +123,20 @@ jobs:
           hdiutil attach "$rw_image" -mountpoint "$mountpoint" -nobrowse -noautoopen
           cp "$helper" "$mountpoint/解决文件已损坏问题（双击）.command"
           chmod +x "$mountpoint/解决文件已损坏问题（双击）.command"
+          osascript <<APPLESCRIPT
+          tell application "Finder"
+            tell folder (POSIX file "$mountpoint" as alias)
+              set bounds of container window to {100, 100, 900, 600}
+              set current view of container window to icon view
+              set icon size of icon view options of container window to 128
+              set arrangement of icon view options of container window to not arranged
+              set position of item "W4DJ RKB.app" to {150, 240}
+              set position of item "解决文件已损坏问题（双击）.command" to {410, 240}
+              set position of item "Applications" to {670, 240}
+              close
+            end tell
+          end tell
+          APPLESCRIPT
           hdiutil detach "$mountpoint"
 
           rebuilt="$workdir/w4dj-final.dmg"
@@ -133,4 +147,6 @@ jobs:
           asset_name='${{ matrix.asset_name }}'
           asset_name="${asset_name//\[version\]/$version}"
           asset_name="${asset_name//\[ext\]/dmg}"
-          gh release upload "$GITHUB_REF_NAME" "$dmg#$asset_name" --clobber
+          renamed_dmg="$workdir/$asset_name"
+          mv "$dmg" "$renamed_dmg"
+          gh release upload "$GITHUB_REF_NAME" "$renamed_dmg" --clobber
