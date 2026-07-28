@@ -1174,6 +1174,61 @@ export function bindApp(
     });
   };
 
+  const syncSlidingSelectionControl = (
+    kind: 'conversion-mode' | 'enhanced-mode',
+    motion: 'none' | 'start' | 'clear' = 'none',
+  ) => {
+    const isConversionMode = kind === 'conversion-mode';
+    const row = root.querySelector<HTMLElement>(
+      isConversionMode
+        ? '[data-role="conversion-mode-switch"]'
+        : '[data-role="enhanced-mode-switch"]',
+    );
+    if (!row) {
+      render();
+      return;
+    }
+
+    const selectedValue = isConversionMode
+      ? state.conversionMode
+      : state.enhancedMode ? 'on' : 'off';
+    row.setAttribute(
+      isConversionMode ? 'data-selected-conversion-mode' : 'data-selected-enhanced-mode',
+      selectedValue,
+    );
+
+    const otherRow = root.querySelector<HTMLElement>(
+      isConversionMode
+        ? '[data-role="enhanced-mode-switch"]'
+        : '[data-role="conversion-mode-switch"]',
+    );
+    [row, otherRow].forEach((controlRow) => {
+      if (!controlRow) {
+        return;
+      }
+      controlRow.toggleAttribute('data-selection-pending', pendingSelection !== null);
+      controlRow.querySelectorAll<HTMLButtonElement>('.mode-button').forEach((button) => {
+        if (controlRow === row) {
+          const selected = isConversionMode
+            ? button.dataset.conversionMode === state.conversionMode
+            : button.dataset.enhancedMode === selectedValue;
+          button.classList.toggle('selected', selected);
+        }
+        const controlIsEnhanced = controlRow.dataset.role === 'enhanced-mode-switch';
+        button.disabled = pendingSelection !== null
+          || pendingGlobalAction !== null
+          || (controlIsEnhanced && state.slots.some((slot) => slot.status === 'running'));
+      });
+    });
+
+    const shell = root.querySelector<HTMLElement>('.app-shell');
+    if (motion === 'start') {
+      shell?.setAttribute('data-selection-motion', kind);
+    } else if (motion === 'clear' && shell?.dataset.selectionMotion === kind) {
+      delete shell.dataset.selectionMotion;
+    }
+  };
+
   const triggerLocalMotion = (motion: SelectionMotion) => {
     selectionMotion = motion;
     render();
@@ -1246,20 +1301,38 @@ export function bindApp(
       return;
     }
     pendingSelection = kind;
-    render();
+    const patchSlidingControlInPlace = kind === 'conversion-mode' || kind === 'enhanced-mode';
+    if (patchSlidingControlInPlace) {
+      syncSlidingSelectionControl(kind, 'none');
+    } else {
+      render();
+    }
     try {
       const nextState = await action();
       selectionMotion = kind;
-      applyDesktopState(nextState);
+      if (patchSlidingControlInPlace) {
+        state = toViewState(nextState, state.lang, state.theme);
+        syncSlidingSelectionControl(kind, 'start');
+      } else {
+        applyDesktopState(nextState);
+      }
     } catch (error) {
       reportError(error);
     } finally {
       pendingSelection = null;
-      render();
+      if (patchSlidingControlInPlace) {
+        syncSlidingSelectionControl(kind, 'none');
+      } else {
+        render();
+      }
       setTimeout(() => {
         if (selectionMotion === kind) {
           selectionMotion = null;
-          render();
+          if (patchSlidingControlInPlace) {
+            syncSlidingSelectionControl(kind, 'clear');
+          } else {
+            render();
+          }
         }
       }, 520);
     }

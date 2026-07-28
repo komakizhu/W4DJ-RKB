@@ -973,6 +973,51 @@ describe('bindApp', () => {
     });
   });
 
+  it('keeps conversion and enhanced button nodes stable while sliding', async () => {
+    const conversionDeferred = createDeferred<DesktopState>();
+    const enhancedDeferred = createDeferred<DesktopState>();
+    const services = makeMockServices({
+      chooseConversionMode: vi.fn().mockReturnValue(conversionDeferred.promise),
+      chooseEnhancedMode: vi.fn().mockReturnValue(enhancedDeferred.promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const conversionSwitch = root.querySelector('[data-role="conversion-mode-switch"]');
+    const conversionButton = root.querySelector('[data-conversion-mode="direct"]');
+    (conversionButton as HTMLButtonElement).click();
+
+    expect(root.querySelector('[data-role="conversion-mode-switch"]')).toBe(conversionSwitch);
+    expect(root.querySelector('[data-conversion-mode="direct"]')).toBe(conversionButton);
+    expect(conversionSwitch?.hasAttribute('data-selection-pending')).toBe(true);
+    expect(root.querySelector('[data-role="enhanced-mode-switch"]')
+      ?.hasAttribute('data-selection-pending')).toBe(true);
+
+    conversionDeferred.resolve(makeDesktopState({ conversion_mode: 'direct' }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="conversion-mode-switch"]')
+        ?.getAttribute('data-selected-conversion-mode')).toBe('direct');
+      expect((root.querySelector('[data-conversion-mode="direct"]') as HTMLButtonElement).disabled).toBe(false);
+      expect(root.querySelector('[data-role="conversion-mode-switch"]')
+        ?.getAttribute('data-selection-pending')).toBeNull();
+    });
+
+    const enhancedSwitch = root.querySelector('[data-role="enhanced-mode-switch"]');
+    const enhancedButton = root.querySelector('[data-enhanced-mode="on"]');
+    expect((enhancedButton as HTMLButtonElement).disabled).toBe(false);
+    (enhancedButton as HTMLButtonElement).click();
+    expect(services.chooseEnhancedMode).toHaveBeenCalledWith(true);
+
+    expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
+    expect(root.querySelector('[data-enhanced-mode="on"]')).toBe(enhancedButton);
+
+    enhancedDeferred.resolve(makeDesktopState({ enhanced_mode: true }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="enhanced-mode-switch"]')
+        ?.getAttribute('data-selected-enhanced-mode')).toBe('on');
+    });
+  });
+
   it('persists the optional Essentia enhanced mode with the sliding control pattern', async () => {
     const services = makeMockServices({
       chooseEnhancedMode: vi.fn().mockResolvedValue(
