@@ -986,13 +986,25 @@ describe('bindApp', () => {
 
     const conversionSwitch = root.querySelector('[data-role="conversion-mode-switch"]');
     const conversionButton = root.querySelector('[data-conversion-mode="direct"]');
+    const enhancedSwitchBeforeConversion = root.querySelector('[data-role="enhanced-mode-switch"]');
+    const enhancedButtonsBeforeConversion = Array.from(
+      root.querySelectorAll<HTMLButtonElement>('[data-role="enhanced-mode-switch"] .mode-button'),
+    );
     (conversionButton as HTMLButtonElement).click();
 
     expect(root.querySelector('[data-role="conversion-mode-switch"]')).toBe(conversionSwitch);
     expect(root.querySelector('[data-conversion-mode="direct"]')).toBe(conversionButton);
     expect(conversionSwitch?.hasAttribute('data-selection-pending')).toBe(true);
+    expect((conversionButton as HTMLButtonElement).disabled).toBe(false);
+    expect((conversionButton as HTMLButtonElement).getAttribute('aria-disabled')).toBe('true');
     expect(root.querySelector('[data-role="enhanced-mode-switch"]')
-      ?.hasAttribute('data-selection-pending')).toBe(true);
+      ?.hasAttribute('data-selection-pending')).toBe(false);
+    expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(
+      enhancedSwitchBeforeConversion,
+    );
+    enhancedButtonsBeforeConversion.forEach((button) => {
+      expect(button.disabled).toBe(false);
+    });
 
     conversionDeferred.resolve(makeDesktopState({ conversion_mode: 'direct' }));
     await vi.waitFor(() => {
@@ -1005,12 +1017,22 @@ describe('bindApp', () => {
 
     const enhancedSwitch = root.querySelector('[data-role="enhanced-mode-switch"]');
     const enhancedButton = root.querySelector('[data-enhanced-mode="on"]');
+    const conversionButtonsBeforeEnhanced = Array.from(
+      root.querySelectorAll<HTMLButtonElement>('[data-role="conversion-mode-switch"] .mode-button'),
+    );
     expect((enhancedButton as HTMLButtonElement).disabled).toBe(false);
     (enhancedButton as HTMLButtonElement).click();
     expect(services.chooseEnhancedMode).toHaveBeenCalledWith(true);
 
     expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
     expect(root.querySelector('[data-enhanced-mode="on"]')).toBe(enhancedButton);
+    expect((enhancedButton as HTMLButtonElement).disabled).toBe(false);
+    expect((enhancedButton as HTMLButtonElement).getAttribute('aria-disabled')).toBe('true');
+    expect(root.querySelector('[data-role="conversion-mode-switch"]')
+      ?.hasAttribute('data-selection-pending')).toBe(false);
+    conversionButtonsBeforeEnhanced.forEach((button) => {
+      expect(button.disabled).toBe(false);
+    });
 
     enhancedDeferred.resolve(makeDesktopState({ enhanced_mode: true }));
     await vi.waitFor(() => {

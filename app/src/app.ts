@@ -784,11 +784,11 @@ export function renderApp(
             <span>${t('conversionMode', state.lang)}</span>
           </div>
           <div class="conversion-mode-row mode-row" data-role="conversion-mode-switch" data-selected-conversion-mode="${state.conversionMode}" aria-label="${t('conversionMode', state.lang)}">
-            <button type="button" class="mode-button ${state.conversionMode === 'scan_then_convert' ? 'selected' : ''}" data-conversion-mode="scan_then_convert" ${pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}>
+            <button type="button" class="mode-button ${state.conversionMode === 'scan_then_convert' ? 'selected' : ''}" data-conversion-mode="scan_then_convert" ${pendingAction !== null ? 'disabled' : ''}>
               ${icon('list')}
               ${t('scanThenConvert', state.lang)}
             </button>
-            <button type="button" class="mode-button ${state.conversionMode === 'direct' ? 'selected' : ''}" data-conversion-mode="direct" ${pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}>
+            <button type="button" class="mode-button ${state.conversionMode === 'direct' ? 'selected' : ''}" data-conversion-mode="direct" ${pendingAction !== null ? 'disabled' : ''}>
               ${icon('play')}
               ${t('directConvert', state.lang)}
             </button>
@@ -818,7 +818,7 @@ export function renderApp(
               class="mode-button ${state.enhancedMode ? '' : 'selected'}"
               data-enhanced-mode="off"
               title="${t('enhancedModeOffNote', state.lang)}"
-              ${isRunning || pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}
+              ${isRunning || pendingAction !== null ? 'disabled' : ''}
             >
               ${icon('convert')}
               ${t('standardConvert', state.lang)}
@@ -828,7 +828,7 @@ export function renderApp(
               class="mode-button ${state.enhancedMode ? 'selected' : ''}"
               data-enhanced-mode="on"
               title="${t('enhancedModeOnNote', state.lang)}"
-              ${isRunning || pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}
+              ${isRunning || pendingAction !== null ? 'disabled' : ''}
             >
               ${icon('disc')}
               ${t('enhancedMode', state.lang)}
@@ -1211,28 +1211,26 @@ export function bindApp(
       selectedValue,
     );
 
-    const otherRow = root.querySelector<HTMLElement>(
-      isConversionMode
-        ? '[data-role="enhanced-mode-switch"]'
-        : '[data-role="conversion-mode-switch"]',
-    );
-    [row, otherRow].forEach((controlRow) => {
-      if (!controlRow) {
-        return;
-      }
-      controlRow.toggleAttribute('data-selection-pending', pendingSelection !== null);
-      controlRow.querySelectorAll<HTMLButtonElement>('.mode-button').forEach((button) => {
-        if (controlRow === row) {
-          const selected = isConversionMode
-            ? button.dataset.conversionMode === state.conversionMode
-            : button.dataset.enhancedMode === selectedValue;
-          button.classList.toggle('selected', selected);
-        }
-        const controlIsEnhanced = controlRow.dataset.role === 'enhanced-mode-switch';
-        button.disabled = pendingSelection !== null
-          || pendingGlobalAction !== null
-          || (controlIsEnhanced && state.slots.some((slot) => slot.status === 'running'));
-      });
+    const selectionPending = pendingSelection === kind;
+    row.toggleAttribute('data-selection-pending', selectionPending);
+    row.setAttribute('aria-busy', selectionPending ? 'true' : 'false');
+    row.querySelectorAll<HTMLButtonElement>('.mode-button').forEach((button) => {
+      const selected = isConversionMode
+        ? button.dataset.conversionMode === state.conversionMode
+        : button.dataset.enhancedMode === selectedValue;
+      button.classList.toggle('selected', selected);
+
+      // Do not toggle the native disabled state for an in-flight selector
+      // update. WKWebView re-rasterizes disabled button labels, which makes
+      // both Chinese labels visibly flash. The row blocks pointer input while
+      // pending and runSelectionAction serializes keyboard-triggered clicks.
+      const unavailable = pendingGlobalAction !== null
+        || (!isConversionMode && state.slots.some((slot) => slot.status === 'running'));
+      button.disabled = unavailable;
+      button.setAttribute(
+        'aria-disabled',
+        selectionPending || unavailable ? 'true' : 'false',
+      );
     });
 
     const shell = root.querySelector<HTMLElement>('.app-shell');

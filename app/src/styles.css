@@ -1633,9 +1633,14 @@ h1 {
   opacity: 0.58;
 }
 
-.conversion-mode-row[data-selection-pending="true"] .mode-button:disabled,
-.enhanced-mode-row[data-selection-pending="true"] .mode-button:disabled {
-  opacity: 1;
+.conversion-mode-row[data-selection-pending="true"],
+.enhanced-mode-row[data-selection-pending="true"] {
+  pointer-events: none;
+}
+
+.conversion-mode-row[data-selection-pending="true"] .mode-button,
+.enhanced-mode-row[data-selection-pending="true"] .mode-button {
+  cursor: wait;
 }
 
 .history-panel {
