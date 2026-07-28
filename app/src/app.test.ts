@@ -393,8 +393,39 @@ describe('renderApp', () => {
     expect(root.dataset.theme).toBe('dark');
     expect(root.dataset.lightPalette).toBe('c');
     expect(root.querySelector('[data-action="toggle-theme"]')).not.toBeNull();
+    expect(root.querySelector('[data-action="open-help"]')?.textContent).toContain('教程');
+    expect(root.querySelector('[data-action="open-help"] .ui-icon')).not.toBeNull();
     expect(root.querySelector('.topbar-actions')?.lastElementChild?.getAttribute('data-action'))
       .toBe('toggle-lang');
+  });
+
+  it('moves output notes out of the rail and into the tutorial help document', () => {
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      null,
+      false,
+      false,
+      false,
+      0,
+      undefined,
+      null,
+      true,
+    );
+
+    expect(root.querySelector('.rail-note')).toBeNull();
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent)
+      .toContain('兼容模式：最高输出 320kbps MP3');
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent)
+      .toContain('无损模式：最高输出 24-bit / 48kHz');
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('加强转换');
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('扫描后转换');
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('直接转换');
   });
 
   it('renders the global lossless format selector only in lossless mode', () => {
@@ -458,6 +489,7 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.0.0');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
+    expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();
   });
 
   it('keeps Essentia analysis embedded in conversion instead of rendering a separate panel', () => {
@@ -1296,6 +1328,21 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="close-about"]') as HTMLButtonElement).click();
     (root.querySelector('[data-action="cancel-slot"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(services.cancelSync).toHaveBeenCalledWith(0));
+  });
+
+  it('opens the tutorial help and keeps the onboarding guide there', async () => {
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), makeMockServices());
+
+    (root.querySelector('[data-action="open-help"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="help-modal"]')).not.toBeNull());
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('普通转换');
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('加强转换');
+    expect(root.querySelector('[data-role="help-modal"] [data-action="reopen-onboarding"]')).not.toBeNull();
+
+    (root.querySelector('[data-action="reopen-onboarding"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="onboarding-modal"]')).not.toBeNull());
+    expect(root.querySelector('[data-role="help-modal"]')).toBeNull();
   });
 
   it('deletes one history entry and clears all history', async () => {

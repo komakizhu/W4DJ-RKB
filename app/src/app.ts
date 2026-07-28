@@ -361,6 +361,17 @@ const translations = {
     deleteHistory: '删除记录',
     clearHistory: '清空历史',
     about: '关于',
+    tutorial: '教程',
+    helpTitle: '使用帮助',
+    helpIntro: '这里集中说明输出、分析和转换方式，遇到不确定时可以随时回来查看。',
+    helpOutputTitle: '输出与分析',
+    helpCompatibilityTitle: '普通转换',
+    helpCompatibilityBody: '关闭加强模式时，W4DJ 只进行常规格式转换，不运行 Essentia 音乐分析。',
+    helpEnhancedTitle: '加强转换',
+    helpEnhancedBody: '开启加强模式后，W4DJ 会运行 Essentia，分析 BPM、Key、响度和能量，并写入输出音频元数据。',
+    helpConversionTitle: '转换方式',
+    helpScanThenConvertBody: '点击开始后先扫描任务，显示重复文件、错误文件和预计输出；确认后再正式转换。',
+    helpDirectConvertBody: '完成输入目录、输出目录、磁盘空间和文件可读性检查后直接转换，不显示二次确认页。',
     version: '版本',
     developer: '开发者',
     projectHome: '项目主页',
@@ -486,6 +497,17 @@ const translations = {
     deleteHistory: 'Delete entry',
     clearHistory: 'Clear history',
     about: 'About',
+    tutorial: 'Tutorial',
+    helpTitle: 'Help',
+    helpIntro: 'A quick guide to output, analysis, and conversion settings whenever you need it.',
+    helpOutputTitle: 'Output and analysis',
+    helpCompatibilityTitle: 'Standard conversion',
+    helpCompatibilityBody: 'With Enhanced mode off, W4DJ performs a regular format conversion without Essentia analysis.',
+    helpEnhancedTitle: 'Enhanced conversion',
+    helpEnhancedBody: 'With Enhanced mode on, W4DJ runs Essentia to analyze BPM, key, loudness, and energy, then writes them to the output metadata.',
+    helpConversionTitle: 'Conversion flow',
+    helpScanThenConvertBody: 'Click Start to scan first. W4DJ shows duplicates, errors, and estimated output before you confirm the conversion.',
+    helpDirectConvertBody: 'After checking input, output, disk space, and file readability, W4DJ converts immediately without a confirmation page.',
     version: 'Version',
     developer: 'Developer',
     projectHome: 'Project home',
@@ -714,6 +736,7 @@ export function renderApp(
   onboardingStep: OnboardingStep = 0,
   analysisState: AppAnalysisState = defaultAnalysisState,
   scanProgress: AppScanProgress | null = null,
+  helpVisible = false,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -742,6 +765,10 @@ export function renderApp(
         <h1>${t('title', state.lang)}</h1>
       </div>
       <div class="topbar-actions">
+        <button type="button" class="help-button" data-action="open-help" aria-label="${t('tutorial', state.lang)}" title="${t('tutorial', state.lang)}">
+          ${icon('help')}
+          <span>${t('tutorial', state.lang)}</span>
+        </button>
         <button type="button" class="lang-button" data-action="open-about">${t('about', state.lang)}</button>
         <button type="button" class="theme-button" data-action="toggle-theme" aria-label="${
           state.theme === 'light' ? t('darkTheme', state.lang) : t('lightTheme', state.lang)
@@ -813,10 +840,6 @@ export function renderApp(
           </div>
           ${renderOutputSettings(state, outputSettingsExpanded)}
           <div class="rail-lower">
-            <div class="rail-note">
-              <p>${t('compatNote', state.lang)}</p>
-              <p>${t('losslessNote', state.lang)}</p>
-            </div>
             <section class="global-status-card" aria-label="${t('globalStatus', state.lang)}">
               <p class="global-control-head">${t('globalStatus', state.lang)}</p>
               <dl>
@@ -858,6 +881,7 @@ export function renderApp(
     ${renderScanModal(scanProgress, state.lang)}
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, state.lang)}
+    ${renderHelpModal(helpVisible, state.lang)}
     ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
   `;
 
@@ -1135,6 +1159,7 @@ export function bindApp(
   let previewBusy = false;
   let history: AppHistoryEntry[] = [];
   let aboutInfo: AppInfo | null = null;
+  let helpVisible = false;
   let outputSettingsExpanded = false;
   let historyExpanded = false;
   let scanProgress: AppScanProgress | null = null;
@@ -1161,11 +1186,14 @@ export function bindApp(
         onboardingStep,
         analysisState,
         scanProgress,
+        helpVisible,
       ),
     );
 
     if (onboardingVisible) {
       root.querySelector<HTMLButtonElement>('[data-action="onboarding-next"]')?.focus();
+    } else if (helpVisible) {
+      root.querySelector<HTMLButtonElement>('[data-action="close-help"]')?.focus();
     }
 
     const historyDetails = root.querySelector<HTMLDetailsElement>('[data-role="history"]');
@@ -1802,6 +1830,12 @@ export function bindApp(
       return;
     }
 
+    if (action === 'open-help') {
+      helpVisible = true;
+      render();
+      return;
+    }
+
     if (action === 'dismiss-onboarding') {
       onboardingVisible = false;
       onboardingStep = 0;
@@ -1832,6 +1866,7 @@ export function bindApp(
 
     if (action === 'reopen-onboarding') {
       aboutInfo = null;
+      helpVisible = false;
       onboardingVisible = true;
       onboardingStep = 0;
       render();
@@ -1840,6 +1875,12 @@ export function bindApp(
 
     if (action === 'close-about') {
       aboutInfo = null;
+      render();
+      return;
+    }
+
+    if (action === 'close-help') {
+      helpVisible = false;
       render();
       return;
     }
@@ -1998,6 +2039,13 @@ export function bindApp(
   });
 
   root.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && helpVisible) {
+      event.preventDefault();
+      helpVisible = false;
+      render();
+      return;
+    }
+
     if (!onboardingVisible) {
       return;
     }
@@ -2262,9 +2310,67 @@ function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
         </dl>
         <div class="about-links">
           <button type="button" class="about-link" data-action="open-project-home" data-url="${escapeHtml(info.project_url)}">${t('projectHome', lang)}</button>
-          <button type="button" class="about-link" data-action="reopen-onboarding">${t('usageGuide', lang)}</button>
         </div>
         <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>
+      </section>
+    </div>
+  `;
+}
+
+function renderHelpModal(visible: boolean, lang: AppLanguage): string {
+  if (!visible) {
+    return '';
+  }
+
+  return `
+    <div class="about-modal help-modal" data-role="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title" aria-describedby="help-intro">
+      <section class="help-dialog">
+        <header class="help-dialog-head">
+          <div>
+            <p class="panel-kicker">W4DJ RKB</p>
+            <h2 id="help-title">${t('helpTitle', lang)}</h2>
+          </div>
+          <span class="help-dialog-icon" aria-hidden="true">${icon('help')}</span>
+        </header>
+        <p id="help-intro" class="help-dialog-intro">${t('helpIntro', lang)}</p>
+
+        <section class="help-section" aria-labelledby="help-output-title">
+          <h3 id="help-output-title">${t('helpOutputTitle', lang)}</h3>
+          <div class="help-card-grid">
+            <article class="help-card">
+              <h4>${t('helpCompatibilityTitle', lang)}</h4>
+              <p>${t('helpCompatibilityBody', lang)}</p>
+              <p class="help-note">${t('compatNote', lang)}</p>
+            </article>
+            <article class="help-card">
+              <h4>${t('losslessMode', lang)}</h4>
+              <p class="help-note">${t('losslessNote', lang)}</p>
+            </article>
+            <article class="help-card">
+              <h4>${t('helpEnhancedTitle', lang)}</h4>
+              <p>${t('helpEnhancedBody', lang)}</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="help-section" aria-labelledby="help-conversion-title">
+          <h3 id="help-conversion-title">${t('helpConversionTitle', lang)}</h3>
+          <div class="help-card-grid">
+            <article class="help-card">
+              <h4>${t('scanThenConvert', lang)}</h4>
+              <p>${t('helpScanThenConvertBody', lang)}</p>
+            </article>
+            <article class="help-card">
+              <h4>${t('directConvert', lang)}</h4>
+              <p>${t('helpDirectConvertBody', lang)}</p>
+            </article>
+          </div>
+        </section>
+
+        <div class="help-actions">
+          <button type="button" class="about-link" data-action="reopen-onboarding">${t('usageGuide', lang)}</button>
+          <button type="button" class="global-action" data-action="close-help">${t('close', lang)}</button>
+        </div>
       </section>
     </div>
   `;
@@ -2428,7 +2534,7 @@ function parseSlotIndex(value: string | undefined): SyncSlotIndex | null {
   return null;
 }
 
-function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow'): string {
+function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow' | 'help'): string {
   const icons = {
     folder: '<path d="M2.5 5.1h3.4l1.1 1.2h6.5v5.2H2.5z"/><path d="M2.5 4.5h3.2l1.3 1.2"/>',
     music: '<path d="M6.2 11.2V4.6l6-1.2v6.4"/><path d="M6.2 6.5l6-1.2"/><circle cx="4.5" cy="11.5" r="1.7"/><circle cx="10.5" cy="10.1" r="1.7"/>',
@@ -2443,6 +2549,7 @@ function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' |
     sun: '<circle cx="8" cy="8" r="2.8"/><path d="M8 1.8v1.3M8 12.9v1.3M1.8 8h1.3M12.9 8h1.3M3.6 3.6l.9.9M11.5 11.5l.9.9M12.4 3.6l-.9.9M4.5 11.5l-.9.9"/>',
     moon: '<path d="M12.7 10.4A5.3 5.3 0 0 1 5.6 3.3a5.3 5.3 0 1 0 7.1 7.1z"/>',
     arrow: '<path d="M2.5 8h10.2"/><path d="m9.4 4.8 3.3 3.2-3.3 3.2"/>',
+    help: '<circle cx="8" cy="8" r="5.5"/><path d="M6.4 6.3a1.8 1.8 0 1 1 3.1 1.3c-.8.6-1.4 1-1.4 2"/><path d="M8 11.9h.01"/>',
   } as const;
 
   return `<span class="ui-icon ui-icon-${name}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">${icons[name]}</svg></span>`;
