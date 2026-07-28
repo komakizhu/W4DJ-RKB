@@ -376,9 +376,9 @@ fn build_id3_tag_from_flac_carries_cover_and_text() {
 }
 
 #[test]
-fn compat_export_repairs_title_and_artist_swapped_against_the_filename() {
+fn compat_export_uses_tags_to_read_netease_artist_first_filename() {
     let root = tempfile::tempdir().unwrap();
-    let source_dir = root.path().join("source");
+    let source_dir = root.path().join("网易云音乐");
     let output_dir = root.path().join("output");
     fs::create_dir_all(&source_dir).unwrap();
     fs::create_dir_all(&output_dir).unwrap();
@@ -386,8 +386,8 @@ fn compat_export_repairs_title_and_artist_swapped_against_the_filename() {
     let source_path = source_dir.join("KIMERU - Overlap.mp3");
     fs::write(&source_path, b"audio").unwrap();
     let mut source_tag = id3::Tag::new();
-    source_tag.set_title("KIMERU");
-    source_tag.set_artist("Overlap");
+    source_tag.set_title("Overlap");
+    source_tag.set_artist("KIMERU");
     source_tag.add_frame(id3::frame::ExtendedText {
         description: "163 key".into(),
         value: "netease-source".into(),
@@ -411,6 +411,115 @@ fn compat_export_repairs_title_and_artist_swapped_against_the_filename() {
     let output_tag = id3::Tag::read_from_path(output_path).unwrap();
     assert_eq!(output_tag.title(), Some("Overlap"));
     assert_eq!(output_tag.artist(), Some("KIMERU"));
+}
+
+#[test]
+fn compat_export_uses_tags_when_netease_filename_only_contains_the_title() {
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("网易云音乐");
+    let output_dir = root.path().join("output");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&output_dir).unwrap();
+
+    let source_path = source_dir.join("Overlap.mp3");
+    fs::write(&source_path, b"audio").unwrap();
+    let mut source_tag = id3::Tag::new();
+    source_tag.set_title("Overlap");
+    source_tag.set_artist("KIMERU");
+    source_tag
+        .write_to_path(&source_path, Version::Id3v24)
+        .unwrap();
+
+    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_rule(
+        source_dir.to_str().unwrap(),
+        FilenameRule::TitleArtist,
+    );
+    assert!(issues.is_empty());
+    assert!(source_music.contains_key("Overlap - KIMERU"));
+
+    let pending = source_music.iter().collect::<HashMap<_, _>>();
+    sync_music_library_with_policy(&pending, output_dir.to_str().unwrap(), &Mode::Compat, None)
+        .unwrap();
+
+    let output_tag = id3::Tag::read_from_path(output_dir.join("Overlap - KIMERU.mp3")).unwrap();
+    assert_eq!(output_tag.title(), Some("Overlap"));
+    assert_eq!(output_tag.artist(), Some("KIMERU"));
+}
+
+#[test]
+fn compat_export_treats_untagged_netease_filename_as_title_then_artist() {
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("网易云音乐");
+    let output_dir = root.path().join("output");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&output_dir).unwrap();
+
+    let source_path = source_dir.join("Overlap - KIMERU.mp3");
+    fs::write(&source_path, b"audio").unwrap();
+
+    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_rule(
+        source_dir.to_str().unwrap(),
+        FilenameRule::TitleArtist,
+    );
+    assert!(issues.is_empty());
+    assert!(source_music.contains_key("Overlap - KIMERU"));
+
+    let pending = source_music.iter().collect::<HashMap<_, _>>();
+    sync_music_library_with_policy(&pending, output_dir.to_str().unwrap(), &Mode::Compat, None)
+        .unwrap();
+
+    let output_tag = id3::Tag::read_from_path(output_dir.join("Overlap - KIMERU.mp3")).unwrap();
+    assert_eq!(output_tag.title(), Some("Overlap"));
+    assert_eq!(output_tag.artist(), Some("KIMERU"));
+}
+
+#[test]
+fn compat_export_keeps_netease_title_first_filename_and_metadata_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("网易云音乐");
+    let output_dir = root.path().join("output");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&output_dir).unwrap();
+
+    let source_path = source_dir.join("巴适 (Bāshì) - BikaBreezy, Jaytrue.mp3");
+    fs::write(&source_path, b"audio").unwrap();
+    let mut source_tag = id3::Tag::new();
+    source_tag.set_title("巴适 (Bāshì)");
+    source_tag.set_artist("BikaBreezy, Jaytrue");
+    source_tag.add_frame(id3::frame::ExtendedText {
+        description: "163 key".into(),
+        value: "netease-source".into(),
+    });
+    source_tag
+        .write_to_path(&source_path, Version::Id3v24)
+        .unwrap();
+
+    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_rule(
+        source_dir.to_str().unwrap(),
+        FilenameRule::TitleArtist,
+    );
+    assert!(issues.is_empty());
+    assert!(source_music.contains_key("巴适 (Bāshì) - BikaBreezy, Jaytrue"));
+
+    let pending = source_music.iter().collect::<HashMap<_, _>>();
+    sync_music_library_with_policy(&pending, output_dir.to_str().unwrap(), &Mode::Compat, None)
+        .unwrap();
+
+    let output_path = output_dir.join("巴适 (Bāshì) - BikaBreezy, Jaytrue.mp3");
+    let output_tag = id3::Tag::read_from_path(&output_path).unwrap();
+    assert_eq!(output_tag.title(), Some("巴适 (Bāshì)"));
+    assert_eq!(output_tag.artist(), Some("BikaBreezy, Jaytrue"));
+
+    let diagnostic = sync::inspect_metadata_decision(&source_path, &output_path);
+    assert_eq!(diagnostic.detected_filename_layout, "歌名 - 歌手");
+    assert_eq!(diagnostic.decision, "采用完整内嵌元数据");
+    assert_eq!(diagnostic.resolved_title, "巴适 (Bāshì)");
+    assert_eq!(diagnostic.resolved_artist, "BikaBreezy, Jaytrue");
+    assert_eq!(diagnostic.output_title.as_deref(), Some("巴适 (Bāshì)"));
+    assert_eq!(
+        diagnostic.output_artist.as_deref(),
+        Some("BikaBreezy, Jaytrue")
+    );
 }
 
 #[test]

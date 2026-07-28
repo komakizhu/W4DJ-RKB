@@ -5,6 +5,7 @@ use w4dj::history::{
     classify_error, clear_history, delete_history_entry, format_error_report, load_history,
     upsert_history,
 };
+use w4dj::sync::MetadataDiagnostic;
 
 fn test_entry(index: usize) -> HistoryEntry {
     HistoryEntry {
@@ -26,6 +27,7 @@ fn test_entry(index: usize) -> HistoryEntry {
         failed_count: 0,
         failed_files: Vec::new(),
         pending_files: Vec::new(),
+        metadata_diagnostics: Vec::new(),
         logs: Vec::new(),
         status: HistoryStatus::Completed,
         retry_of: None,
@@ -33,6 +35,35 @@ fn test_entry(index: usize) -> HistoryEntry {
         filename_rule: Default::default(),
         report_path: None,
     }
+}
+
+#[test]
+fn complete_error_report_explains_metadata_identity_decisions() {
+    let mut entry = test_entry(1);
+    entry.metadata_diagnostics.push(MetadataDiagnostic {
+        source_path: "/music/in/巴适 - BikaBreezy, Jaytrue.ncm".into(),
+        destination_path: "/music/out/巴适 - BikaBreezy, Jaytrue.mp3".into(),
+        source_filename: "巴适 - BikaBreezy, Jaytrue".into(),
+        detected_filename_layout: "歌名 - 歌手".into(),
+        decision: "采用完整内嵌元数据".into(),
+        source_title: Some("巴适".into()),
+        source_artist: Some("BikaBreezy, Jaytrue".into()),
+        resolved_title: "巴适".into(),
+        resolved_artist: "BikaBreezy, Jaytrue".into(),
+        output_title: Some("巴适".into()),
+        output_artist: Some("BikaBreezy, Jaytrue".into()),
+        source_artwork: true,
+        output_artwork: Some(true),
+    });
+
+    let report = format_error_report(&entry);
+
+    assert!(report.contains("报告格式版本：3"));
+    assert!(report.contains("[逐曲元数据诊断]"));
+    assert!(report.contains("识别格式：歌名 - 歌手"));
+    assert!(report.contains("源标签标题：巴适"));
+    assert!(report.contains("写入歌手：BikaBreezy, Jaytrue"));
+    assert!(report.contains("输出封面：有"));
 }
 
 #[test]
@@ -85,7 +116,7 @@ fn complete_error_report_contains_environment_settings_and_all_counts() {
     let report = format_error_report(&entry);
 
     assert!(report.contains("W4DJ RKB 转换报告"));
-    assert!(report.contains("报告格式版本：2"));
+    assert!(report.contains("报告格式版本：3"));
     assert!(report.contains(&format!("软件版本：{}", env!("CARGO_PKG_VERSION"))));
     assert!(report.contains("操作系统："));
     assert!(report.contains("CPU 架构："));

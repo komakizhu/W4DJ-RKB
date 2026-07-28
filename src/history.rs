@@ -1,4 +1,5 @@
 use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::sync::MetadataDiagnostic;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -124,6 +125,8 @@ pub struct HistoryEntry {
     #[serde(default)]
     pub pending_files: Vec<PendingFile>,
     #[serde(default)]
+    pub metadata_diagnostics: Vec<MetadataDiagnostic>,
+    #[serde(default)]
     pub logs: Vec<String>,
     pub status: HistoryStatus,
     pub retry_of: Option<String>,
@@ -199,7 +202,7 @@ fn write_history(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
 pub fn format_error_report(entry: &HistoryEntry) -> String {
     let mut report = String::new();
     report.push_str("W4DJ RKB 转换报告\n");
-    report.push_str("报告格式版本：2\n\n");
+    report.push_str("报告格式版本：3\n\n");
 
     report.push_str("[软件与系统]\n");
     report.push_str(&format!("软件版本：{}\n", env!("CARGO_PKG_VERSION")));
@@ -313,6 +316,30 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
         ));
     }
 
+    report.push_str("[逐曲元数据诊断]\n");
+    if entry.metadata_diagnostics.is_empty() {
+        report.push_str("未记录（旧版任务或转换尚未进入诊断阶段）\n\n");
+    }
+    for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
+        report.push_str(&format!(
+            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n识别格式：{}\n判断依据：{}\n源标签标题：{}\n源标签歌手：{}\n最终识别标题：{}\n最终识别歌手：{}\n写入标题：{}\n写入歌手：{}\n源封面：{}\n输出封面：{}\n\n",
+            index + 1,
+            diagnostic.source_path,
+            diagnostic.destination_path,
+            diagnostic.source_filename,
+            diagnostic.detected_filename_layout,
+            diagnostic.decision,
+            optional_metadata_label(diagnostic.source_title.as_deref()),
+            optional_metadata_label(diagnostic.source_artist.as_deref()),
+            diagnostic.resolved_title,
+            diagnostic.resolved_artist,
+            optional_metadata_label(diagnostic.output_title.as_deref()),
+            optional_metadata_label(diagnostic.output_artist.as_deref()),
+            if diagnostic.source_artwork { "有" } else { "无" },
+            optional_artwork_label(diagnostic.output_artwork),
+        ));
+    }
+
     report.push_str("[运行日志]\n");
     if entry.logs.is_empty() {
         report.push_str("未记录\n");
@@ -325,6 +352,20 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     }
 
     report
+}
+
+fn optional_metadata_label(value: Option<&str>) -> &str {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("无")
+}
+
+fn optional_artwork_label(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "有",
+        Some(false) => "无",
+        None => "输出文件不存在或无法读取",
+    }
 }
 
 fn history_status_label(status: &HistoryStatus) -> &'static str {

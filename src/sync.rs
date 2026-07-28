@@ -19,6 +19,24 @@ use std::process::Command;
 
 pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "ncm", "wav", "aiff"];
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MetadataDiagnostic {
+    pub source_path: String,
+    pub destination_path: String,
+    pub source_filename: String,
+    pub detected_filename_layout: String,
+    pub decision: String,
+    pub source_title: Option<String>,
+    pub source_artist: Option<String>,
+    pub resolved_title: String,
+    pub resolved_artist: String,
+    pub output_title: Option<String>,
+    pub output_artist: Option<String>,
+    pub source_artwork: bool,
+    pub output_artwork: Option<bool>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputPolicy {
     pub output_extension: &'static str,
@@ -832,14 +850,14 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
-    let prefer_filename_identity =
-        source_prefers_artist_title_filename(source_path, Some(&source_tag));
+    let prefer_title_artist_filename =
+        source_prefers_title_artist_filename(source_path, Some(&source_tag));
 
     if !fill_missing_metadata(
         &mut output_tag,
         &source_tag,
         fallback_name,
-        prefer_filename_identity,
+        prefer_title_artist_filename,
     ) {
         return Ok(());
     }
@@ -875,6 +893,65 @@ fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
     }
 }
 
+#[allow(dead_code)]
+pub fn inspect_metadata_decision(
+    source_path: &Path,
+    destination_path: &Path,
+) -> MetadataDiagnostic {
+    let source_tag = source_metadata_as_id3(source_path);
+    let source_title = normalize_filename_part(source_tag.title());
+    let source_artist =
+        normalize_filename_part(source_tag.artist().or_else(|| source_tag.album_artist()));
+    let fallback_name = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let prefer_title_artist_filename =
+        source_prefers_title_artist_filename(source_path, Some(&source_tag));
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        source_title.as_deref(),
+        source_artist.as_deref(),
+        prefer_title_artist_filename,
+    );
+    let detected_filename_layout = describe_filename_layout(
+        fallback_name,
+        source_title.as_deref(),
+        source_artist.as_deref(),
+        prefer_title_artist_filename,
+    );
+    let decision = match (source_title.is_some(), source_artist.is_some()) {
+        (true, true) => "采用完整内嵌元数据",
+        (true, false) | (false, true) => "采用现有标签，并用文件名补齐缺失字段",
+        (false, false) if prefer_title_artist_filename => "无内嵌元数据，按网易云“歌名 - 歌手”兜底",
+        (false, false) => "无内嵌元数据，按兼容规则“歌手 - 歌名”兜底",
+    }
+    .to_string();
+
+    let output_exists = destination_path.is_file();
+    let output_tag = output_exists.then(|| read_id3_tag_or_empty(destination_path));
+
+    MetadataDiagnostic {
+        source_path: source_path.display().to_string(),
+        destination_path: destination_path.display().to_string(),
+        source_filename: fallback_name.to_string(),
+        detected_filename_layout,
+        decision,
+        source_title,
+        source_artist,
+        resolved_title: identity.title,
+        resolved_artist: identity.artist,
+        output_title: output_tag
+            .as_ref()
+            .and_then(|tag| normalize_filename_part(tag.title())),
+        output_artist: output_tag
+            .as_ref()
+            .and_then(|tag| normalize_filename_part(tag.artist().or_else(|| tag.album_artist()))),
+        source_artwork: source_tag.pictures().next().is_some(),
+        output_artwork: output_tag.map(|tag| tag.pictures().next().is_some()),
+    }
+}
+
 fn read_id3_tag_or_empty(path: &Path) -> id3::Tag {
     id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new())
 }
@@ -883,20 +960,18 @@ fn fill_missing_metadata(
     output_tag: &mut id3::Tag,
     source_tag: &id3::Tag,
     fallback_name: &str,
-    prefer_filename_identity: bool,
+    prefer_title_artist_filename: bool,
 ) -> bool {
     let source_artist = source_tag.artist().or_else(|| source_tag.album_artist());
     let identity = infer_song_identity_with_filename_preference(
         fallback_name,
         source_tag.title(),
         source_artist,
-        prefer_filename_identity,
+        prefer_title_artist_filename,
     );
-    let source_identity_is_reversed = prefer_filename_identity
-        && metadata_identity_is_reversed(fallback_name, source_tag.title(), source_artist);
     let mut changed = false;
 
-    if (is_blank(output_tag.title()) || source_identity_is_reversed)
+    if is_blank(output_tag.title())
         && !identity.title.is_empty()
         && output_tag.title() != Some(identity.title.as_str())
     {
@@ -904,12 +979,9 @@ fn fill_missing_metadata(
         changed = true;
     }
 
-    if is_blank(output_tag.artist()) || source_identity_is_reversed {
-        let artist = if source_identity_is_reversed {
-            identity.artist.clone()
-        } else {
-            normalize_filename_part(source_artist).unwrap_or_else(|| identity.artist.clone())
-        };
+    if is_blank(output_tag.artist()) {
+        let artist =
+            normalize_filename_part(source_artist).unwrap_or_else(|| identity.artist.clone());
         if !artist.is_empty() && output_tag.artist() != Some(artist.as_str()) {
             output_tag.set_artist(&artist);
             changed = true;
@@ -1284,7 +1356,13 @@ fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> Strin
         _ => None,
     };
 
-    candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name, filename_rule))
+    candidate.unwrap_or_else(|| {
+        normalize_fallback_song_name_with_preference(
+            &fallback_name,
+            filename_rule,
+            source_prefers_title_artist_filename(path, None),
+        )
+    })
 }
 
 fn song_name_from_flac(
@@ -1302,7 +1380,7 @@ fn song_name_from_flac(
         fallback_name,
         title,
         artist.as_deref(),
-        source_prefers_artist_title_filename(path, None),
+        source_prefers_title_artist_filename(path, None),
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
@@ -1318,7 +1396,7 @@ fn song_name_from_audio_tag(
         fallback_name,
         tag.title(),
         artist,
-        source_prefers_artist_title_filename(path, Some(&tag)),
+        source_prefers_title_artist_filename(path, Some(&tag)),
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
@@ -1341,7 +1419,7 @@ fn song_name_from_ncm(
         fallback_name,
         Some(&info.name),
         Some(&artist),
-        source_prefers_artist_title_filename(path, None),
+        source_prefers_title_artist_filename(path, None),
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
@@ -1352,6 +1430,7 @@ struct SongIdentity {
     artist: String,
 }
 
+#[cfg(test)]
 fn infer_song_identity(
     fallback_name: &str,
     metadata_title: Option<&str>,
@@ -1369,24 +1448,30 @@ fn infer_song_identity_with_filename_preference(
     fallback_name: &str,
     metadata_title: Option<&str>,
     metadata_artist: Option<&str>,
-    prefer_filename_identity: bool,
+    prefer_title_artist_filename: bool,
 ) -> SongIdentity {
-    let (fallback_title, fallback_artist) = parse_filename_identity(fallback_name);
-    if prefer_filename_identity
-        && metadata_identity_is_reversed(fallback_name, metadata_title, metadata_artist)
-    {
+    let metadata_title = normalize_filename_part(metadata_title);
+    let metadata_artist = normalize_filename_part(metadata_artist);
+    if let (Some(title), Some(artist)) = (&metadata_title, &metadata_artist) {
         return SongIdentity {
-            title: fallback_title,
-            artist: fallback_artist,
+            title: title.clone(),
+            artist: artist.clone(),
         };
     }
-    let title = normalize_filename_part(metadata_title).unwrap_or(fallback_title);
-    let artist = normalize_filename_part(metadata_artist).unwrap_or(fallback_artist);
+
+    let (fallback_title, fallback_artist) = parse_filename_identity_with_hints(
+        fallback_name,
+        metadata_title.as_deref(),
+        metadata_artist.as_deref(),
+        prefer_title_artist_filename,
+    );
+    let title = metadata_title.unwrap_or(fallback_title);
+    let artist = metadata_artist.unwrap_or(fallback_artist);
 
     SongIdentity { title, artist }
 }
 
-fn source_prefers_artist_title_filename(path: &Path, tag: Option<&id3::Tag>) -> bool {
+fn source_prefers_title_artist_filename(path: &Path, tag: Option<&id3::Tag>) -> bool {
     let path_marks_known_source = path.components().any(|component| {
         let component = component.as_os_str().to_string_lossy().to_lowercase();
         component.contains("网易云")
@@ -1406,40 +1491,69 @@ fn has_netease_metadata(tag: &id3::Tag) -> bool {
         .any(|text| text.description.trim().starts_with("163 key"))
 }
 
-fn metadata_identity_is_reversed(
+fn parse_filename_identity_with_hints(
     fallback_name: &str,
     metadata_title: Option<&str>,
     metadata_artist: Option<&str>,
-) -> bool {
-    let (fallback_title, fallback_artist) = parse_filename_identity(fallback_name);
-    if fallback_title.is_empty()
-        || fallback_artist.is_empty()
-        || identity_text_matches(&fallback_title, &fallback_artist)
+    prefer_title_artist_filename: bool,
+) -> (String, String) {
+    let display = normalize_display_text(fallback_name);
+    let Some((left, right)) = display.split_once(" - ") else {
+        return (display, String::new());
+    };
+
+    if metadata_title.is_some_and(|title| identity_text_matches(title, left))
+        || metadata_artist.is_some_and(|artist| identity_text_matches(artist, right))
     {
-        return false;
+        return (left.to_string(), right.to_string());
+    }
+    if metadata_title.is_some_and(|title| identity_text_matches(title, right))
+        || metadata_artist.is_some_and(|artist| identity_text_matches(artist, left))
+    {
+        return (right.to_string(), left.to_string());
     }
 
-    let Some(metadata_title) = normalize_filename_part(metadata_title) else {
-        return false;
-    };
-    let Some(metadata_artist) = normalize_filename_part(metadata_artist) else {
-        return false;
-    };
-
-    identity_text_matches(&metadata_title, &fallback_artist)
-        && identity_text_matches(&metadata_artist, &fallback_title)
+    if prefer_title_artist_filename {
+        (left.to_string(), right.to_string())
+    } else {
+        (right.to_string(), left.to_string())
+    }
 }
 
 fn identity_text_matches(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 
-fn parse_filename_identity(fallback_name: &str) -> (String, String) {
+#[allow(dead_code)]
+fn describe_filename_layout(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+    prefer_title_artist_filename: bool,
+) -> String {
     let display = normalize_display_text(fallback_name);
-    display
-        .split_once(" - ")
-        .map(|(artist, title)| (title.to_string(), artist.to_string()))
-        .unwrap_or((display, String::new()))
+    let Some((left, right)) = display.split_once(" - ") else {
+        return "仅歌名（无分隔符）".to_string();
+    };
+
+    if metadata_title.is_some_and(|title| identity_text_matches(title, left))
+        && metadata_artist.is_some_and(|artist| identity_text_matches(artist, right))
+    {
+        return "歌名 - 歌手".to_string();
+    }
+    if metadata_artist.is_some_and(|artist| identity_text_matches(artist, left))
+        && metadata_title.is_some_and(|title| identity_text_matches(title, right))
+    {
+        return "歌手 - 歌名".to_string();
+    }
+    if metadata_title.is_some() || metadata_artist.is_some() {
+        return "文件名与标签不完全一致（采用标签）".to_string();
+    }
+    if prefer_title_artist_filename {
+        "歌名 - 歌手（网易云兜底）".to_string()
+    } else {
+        "歌手 - 歌名（兼容兜底）".to_string()
+    }
 }
 
 fn normalize_filename_part(value: Option<&str>) -> Option<String> {
@@ -1494,8 +1608,17 @@ fn build_song_name_with_rule(
     }
 }
 
-fn normalize_fallback_song_name(fallback_name: &str, filename_rule: FilenameRule) -> String {
-    let identity = infer_song_identity(fallback_name, None, None);
+fn normalize_fallback_song_name_with_preference(
+    fallback_name: &str,
+    filename_rule: FilenameRule,
+    prefer_title_artist_filename: bool,
+) -> String {
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        None,
+        None,
+        prefer_title_artist_filename,
+    );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
         .unwrap_or_else(|| normalize_display_text(fallback_name))
 }

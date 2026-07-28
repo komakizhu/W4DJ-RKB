@@ -23,8 +23,8 @@ use w4dj::preview::{
 };
 use w4dj::sync::{
     cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
-    get_music_dict_with_scan_issues, is_supported_source_file, sync_music_library_with_observer,
-    update_existing_metadata,
+    get_music_dict_with_scan_issues, inspect_metadata_decision, is_supported_source_file,
+    sync_music_library_with_observer, update_existing_metadata,
 };
 
 #[cfg(target_os = "macos")]
@@ -978,6 +978,7 @@ fn run_confirmed_sync_task(
             .iter()
             .map(pending_file_from_candidate)
             .collect(),
+        metadata_diagnostics: Vec::new(),
         logs: initial_logs,
         status: HistoryStatus::Partial,
         retry_of: job.retry_of.clone(),
@@ -1202,6 +1203,16 @@ fn run_confirmed_sync_task(
     } else {
         Vec::new()
     };
+    let metadata_diagnostics = job
+        .candidates
+        .iter()
+        .map(|candidate| {
+            inspect_metadata_decision(
+                Path::new(&candidate.source_path),
+                Path::new(&candidate.destination_path),
+            )
+        })
+        .collect();
     let mut history_entry = HistoryEntry {
         id: format!("{}-slot{}", job.batch_id, job.slot_index + 1),
         batch_id: job.batch_id,
@@ -1221,6 +1232,7 @@ fn run_confirmed_sync_task(
         failed_count: failed_files.len(),
         failed_files,
         pending_files,
+        metadata_diagnostics,
         logs: slot.logs,
         status,
         retry_of: job.retry_of,
