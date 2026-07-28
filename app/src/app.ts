@@ -820,7 +820,7 @@ export function renderApp(
               title="${t('enhancedModeOffNote', state.lang)}"
               ${isRunning || pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}
             >
-              ${icon('check')}
+              ${icon('convert')}
               ${t('standardConvert', state.lang)}
             </button>
             <button
@@ -1138,7 +1138,9 @@ export function bindApp(
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingGlobalAction: 'start-all' | 'pause-all' | null = null;
   let selectionMotion: SelectionMotion = null;
+  let selectionMotionToken = 0;
   let pendingSelection: PendingSelection = null;
+  let deferredDesktopRender = false;
   let previewModal: AppPreviewModalState | null = null;
   let previewBusy = false;
   let history: AppHistoryEntry[] = [];
@@ -1235,9 +1237,23 @@ export function bindApp(
 
     const shell = root.querySelector<HTMLElement>('.app-shell');
     if (motion === 'start') {
-      shell?.setAttribute('data-selection-motion', kind);
+      if (shell) {
+        // Re-setting the same data attribute does not restart a CSS animation.
+        // Clear it and force one layout read so quick reversals use the same
+        // slide choreography as the WAV/AIFF selector.
+        delete shell.dataset.selectionMotion;
+        void shell.offsetWidth;
+        shell.dataset.selectionMotion = kind;
+      }
     } else if (motion === 'clear' && shell?.dataset.selectionMotion === kind) {
       delete shell.dataset.selectionMotion;
+    }
+  };
+
+  const flushDeferredDesktopRender = () => {
+    if (deferredDesktopRender && selectionMotion === null && pendingSelection === null) {
+      deferredDesktopRender = false;
+      render();
     }
   };
 
@@ -1266,7 +1282,7 @@ export function bindApp(
   const refreshHistory = async (renderAfter = true) => {
     try {
       history = await services.loadHistory();
-      if (renderAfter && selectionMotion === null) {
+      if (renderAfter && selectionMotion === null && pendingSelection === null) {
         render();
       }
     } catch (error) {
@@ -1275,12 +1291,32 @@ export function bindApp(
   };
 
   const applyDesktopState = (desktopState: DesktopState) => {
-    const nextState = toViewState(desktopState, state.lang, state.theme);
+    const slidingControlActive = selectionMotion === 'conversion-mode'
+      || selectionMotion === 'enhanced-mode'
+      || pendingSelection === 'conversion-mode'
+      || pendingSelection === 'enhanced-mode';
+    const hydratedState = toViewState(desktopState, state.lang, state.theme);
+    const nextState = slidingControlActive
+      ? {
+          ...hydratedState,
+          // Keep a just-selected preference when a stale background snapshot
+          // arrives while that preference's animation is still running.
+          conversionMode: state.conversionMode,
+          enhancedMode: state.enhancedMode,
+        }
+      : hydratedState;
     const finishedRunningTask = state.slots.some(
       (slot, index) => slot.status === 'running' && nextState.slots[index].status !== 'running',
     );
     state = nextState;
-    render();
+    if (slidingControlActive) {
+      // Do not replace the sliding controls while an animation is active.
+      // The initial desktop-state hydration can otherwise redraw the labels
+      // during the first user interaction and make them flash once.
+      deferredDesktopRender = true;
+    } else {
+      render();
+    }
     void refreshHistory(finishedRunningTask);
     queueRefresh();
   };
@@ -1319,9 +1355,11 @@ export function bindApp(
     } else {
       render();
     }
+    let motionToken: number | null = null;
     try {
       const nextState = await action();
       selectionMotion = kind;
+      motionToken = ++selectionMotionToken;
       if (patchSlidingControlInPlace) {
         state = toViewState(nextState, state.lang, state.theme);
         syncSlidingSelectionControl(kind, 'start');
@@ -1337,16 +1375,20 @@ export function bindApp(
       } else {
         render();
       }
-      setTimeout(() => {
-        if (selectionMotion === kind) {
-          selectionMotion = null;
-          if (patchSlidingControlInPlace) {
-            syncSlidingSelectionControl(kind, 'clear');
-          } else {
-            render();
+      if (motionToken !== null) {
+        setTimeout(() => {
+          if (selectionMotion === kind && selectionMotionToken === motionToken) {
+            selectionMotion = null;
+            if (patchSlidingControlInPlace) {
+              syncSlidingSelectionControl(kind, 'clear');
+            } else {
+              render();
+            }
+            flushDeferredDesktopRender();
           }
-        }
-      }, 520);
+        }, 520);
+      }
+      flushDeferredDesktopRender();
     }
   };
 
@@ -2521,7 +2563,7 @@ function parseSlotIndex(value: string | undefined): SyncSlotIndex | null {
   return null;
 }
 
-function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow' | 'help'): string {
+function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' | 'convert' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow' | 'help'): string {
   const icons = {
     folder: '<path d="M2.5 5.1h3.4l1.1 1.2h6.5v5.2H2.5z"/><path d="M2.5 4.5h3.2l1.3 1.2"/>',
     music: '<path d="M6.2 11.2V4.6l6-1.2v6.4"/><path d="M6.2 6.5l6-1.2"/><circle cx="4.5" cy="11.5" r="1.7"/><circle cx="10.5" cy="10.1" r="1.7"/>',
@@ -2529,6 +2571,7 @@ function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' |
     open: '<path d="M9.2 3H13v3.8"/><path d="m13 3-6 6"/><path d="M11 8.5v4H3V4.2h4"/>',
     trash: '<path d="M3.8 5.2h8.4"/><path d="M6.2 5.2V3.8h3.6v1.4"/><path d="m5 5.2.5 7.2h5l.5-7.2"/><path d="M6.8 7.1v3.7M9.2 7.1v3.7"/>',
     check: '<path d="M3.3 8.5 6.4 11.4 12.8 4.7"/>',
+    convert: '<path d="M2.5 5.1h8.2"/><path d="m8.2 2.6 2.6 2.5-2.6 2.5"/><path d="M13.5 10.9H5.3"/><path d="m7.8 8.4-2.6 2.5 2.6 2.5"/>',
     disc: '<circle cx="8" cy="8" r="5.1"/><circle cx="8" cy="8" r="1"/>',
     play: '<path d="M5.2 4v8l6.6-4z"/>',
     pause: '<path d="M5.1 4.2v7.6"/><path d="M10.9 4.2v7.6"/>',

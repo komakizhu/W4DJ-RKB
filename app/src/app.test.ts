@@ -1019,6 +1019,58 @@ describe('bindApp', () => {
     });
   });
 
+  it('does not redraw sliding controls when initial state hydration resolves during the first switch', async () => {
+    const initialState = createDeferred<DesktopState>();
+    const enhancedState = createDeferred<DesktopState>();
+    const services = makeMockServices({
+      loadDesktopState: vi.fn().mockReturnValue(initialState.promise),
+      chooseEnhancedMode: vi.fn().mockReturnValue(enhancedState.promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const enhancedSwitch = root.querySelector('[data-role="enhanced-mode-switch"]');
+    (root.querySelector('[data-enhanced-mode="on"]') as HTMLButtonElement).click();
+
+    initialState.resolve(makeDesktopState());
+    await Promise.resolve();
+    expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
+
+    enhancedState.resolve(makeDesktopState({ enhanced_mode: true }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="enhanced-mode-switch"]')
+        ?.getAttribute('data-selected-enhanced-mode')).toBe('on');
+    });
+    expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
+  });
+
+  it('keeps the enhanced selector stable when quickly reversing the slide', async () => {
+    const enhancedOn = createDeferred<DesktopState>();
+    const enhancedOff = createDeferred<DesktopState>();
+    const services = makeMockServices({
+      chooseEnhancedMode: vi.fn((enabled: boolean) =>
+        (enabled ? enhancedOn : enhancedOff).promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const enhancedSwitch = root.querySelector('[data-role="enhanced-mode-switch"]');
+    (root.querySelector('[data-enhanced-mode="on"]') as HTMLButtonElement).click();
+    enhancedOn.resolve(makeDesktopState({ enhanced_mode: true }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="enhanced-mode-switch"]')
+        ?.getAttribute('data-selected-enhanced-mode')).toBe('on');
+    });
+
+    (root.querySelector('[data-enhanced-mode="off"]') as HTMLButtonElement).click();
+    enhancedOff.resolve(makeDesktopState({ enhanced_mode: false }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="enhanced-mode-switch"]')
+        ?.getAttribute('data-selected-enhanced-mode')).toBe('off');
+    });
+    expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
+  });
+
   it('persists the optional Essentia enhanced mode with the sliding control pattern', async () => {
     const services = makeMockServices({
       chooseEnhancedMode: vi.fn().mockResolvedValue(
@@ -1037,6 +1089,13 @@ describe('bindApp', () => {
       expect(root.querySelector('[data-role="enhanced-mode-switch"]')
         ?.getAttribute('data-selected-enhanced-mode')).toBe('on');
     });
+  });
+
+  it('uses a conversion icon for ordinary conversion instead of a completion checkmark', () => {
+    const root = renderApp(makeViewState());
+
+    expect(root.querySelector('[data-enhanced-mode="off"] .ui-icon-convert')).not.toBeNull();
+    expect(root.querySelector('[data-enhanced-mode="off"] .ui-icon-check')).toBeNull();
   });
 
   it('persists conflict and filename selections through backend services', async () => {
