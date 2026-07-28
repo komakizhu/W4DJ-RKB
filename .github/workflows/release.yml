@@ -141,6 +141,24 @@ jobs:
 
           rebuilt="$workdir/w4dj-final.dmg"
           hdiutil convert "$rw_image" -format UDZO -o "$rebuilt"
+
+          verify_mount="$workdir/verify-mount"
+          mkdir -p "$verify_mount"
+          hdiutil attach "$rebuilt" -mountpoint "$verify_mount" -nobrowse -noautoopen
+          if [[ ! -d "$verify_mount/W4DJ RKB.app" ]]; then
+            echo "最终 DMG 缺少 W4DJ RKB.app" >&2
+            exit 1
+          fi
+          if [[ ! -x "$verify_mount/解决文件已损坏问题（双击）.command" ]]; then
+            echo "最终 DMG 缺少可执行的 Gatekeeper 修复工具" >&2
+            exit 1
+          fi
+          if [[ ! -L "$verify_mount/Applications" && ! -d "$verify_mount/Applications" ]]; then
+            echo "最终 DMG 缺少 Applications 链接或目录" >&2
+            exit 1
+          fi
+          hdiutil detach "$verify_mount"
+
           mv "$rebuilt" "$dmg"
 
           version="${GITHUB_REF_NAME#v}"
