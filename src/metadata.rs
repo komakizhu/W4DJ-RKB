@@ -7,18 +7,26 @@ use id3::{TagLike, Version};
 use ncmdump::NcmInfo;
 
 pub(crate) fn get_image_mime_type(bytes: &[u8]) -> &'static str {
-    if bytes.len() < 12 {
-        return "image/*";
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return "image/png";
+    }
+    if bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && bytes.get(8..12) == Some(b"WEBP".as_slice())
+    {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"GIF8") {
+        return "image/gif";
+    }
+    if bytes.starts_with(b"BM") {
+        return "image/bmp";
     }
 
-    match &bytes[..12] {
-        [0x89, 0x50, 0x4e, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, ..] => "image/png",
-        [0xFF, 0xD8, 0xFF, 0xE0 | 0xE1 | 0xE2 | 0xE3 | 0xE8, ..] => "image/jpeg",
-        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x45, 0x42, 0x50] => "image/webp",
-        [0x47, 0x49, 0x46, 0x38, ..] => "image/gif",
-        [0x42, 0x4d, ..] => "image/bmp",
-        _ => "image/*",
-    }
+    "image/*"
 }
 
 pub(crate) trait Metadata {
@@ -114,7 +122,7 @@ impl Metadata for Mp3Metadata {
     fn inject_metadata(&mut self, data: Vec<u8>) -> Result<Vec<u8>> {
         let mut cursor = Cursor::new(data);
         _ = cursor.seek(SeekFrom::Start(0));
-        self.0.write_to_file(&mut cursor, Version::Id3v24)?;
+        self.0.write_to_file(&mut cursor, Version::Id3v23)?;
         Ok(cursor.into_inner())
     }
 }

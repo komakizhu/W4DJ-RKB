@@ -1,9 +1,9 @@
 use crate::config::{FilenameRule, LosslessFormat, Mode};
 use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
+    get_image_mime_type,
 };
 use crate::task::{TaskController, TaskSnapshot};
-use id3::frame::Picture;
 use id3::{TagLike, Version};
 use ncmdump::Ncmdump;
 use std::collections::HashMap;
@@ -573,7 +573,7 @@ pub fn update_existing_metadata(source_path: &Path, destination_path: &Path) -> 
     let result = match destination_extension.as_str() {
         "wav" => source_tag.write_to_wav_path(destination_path, Version::Id3v24),
         "aiff" | "aif" => source_tag.write_to_aiff_path(destination_path, Version::Id3v24),
-        "mp3" => source_tag.write_to_path(destination_path, Version::Id3v24),
+        "mp3" => source_tag.write_to_path(destination_path, Version::Id3v23),
         _ => {
             return Err(Error::new(
                 ErrorKind::Unsupported,
@@ -832,8 +832,15 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
+    let prefer_filename_identity =
+        source_prefers_artist_title_filename(source_path, Some(&source_tag));
 
-    if !fill_missing_metadata(&mut output_tag, &source_tag, fallback_name) {
+    if !fill_missing_metadata(
+        &mut output_tag,
+        &source_tag,
+        fallback_name,
+        prefer_filename_identity,
+    ) {
         return Ok(());
     }
 
@@ -876,19 +883,34 @@ fn fill_missing_metadata(
     output_tag: &mut id3::Tag,
     source_tag: &id3::Tag,
     fallback_name: &str,
+    prefer_filename_identity: bool,
 ) -> bool {
     let source_artist = source_tag.artist().or_else(|| source_tag.album_artist());
-    let identity = infer_song_identity(fallback_name, source_tag.title(), source_artist);
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        source_tag.title(),
+        source_artist,
+        prefer_filename_identity,
+    );
+    let source_identity_is_reversed = prefer_filename_identity
+        && metadata_identity_is_reversed(fallback_name, source_tag.title(), source_artist);
     let mut changed = false;
 
-    if is_blank(output_tag.title()) && !identity.title.is_empty() {
+    if (is_blank(output_tag.title()) || source_identity_is_reversed)
+        && !identity.title.is_empty()
+        && output_tag.title() != Some(identity.title.as_str())
+    {
         output_tag.set_title(&identity.title);
         changed = true;
     }
 
-    if is_blank(output_tag.artist()) {
-        let artist = normalize_filename_part(source_artist).unwrap_or(identity.artist);
-        if !artist.is_empty() {
+    if is_blank(output_tag.artist()) || source_identity_is_reversed {
+        let artist = if source_identity_is_reversed {
+            identity.artist.clone()
+        } else {
+            normalize_filename_part(source_artist).unwrap_or_else(|| identity.artist.clone())
+        };
+        if !artist.is_empty() && output_tag.artist() != Some(artist.as_str()) {
             output_tag.set_artist(&artist);
             changed = true;
         }
@@ -901,19 +923,49 @@ fn fill_missing_metadata(
         changed = true;
     }
 
-    if output_tag.pictures().next().is_none() {
-        for picture in source_tag.pictures() {
-            output_tag.add_frame(Picture {
-                mime_type: picture.mime_type.clone(),
-                picture_type: picture.picture_type,
-                description: picture.description.clone(),
-                data: picture.data.clone(),
-            });
+    if ensure_compatible_artwork(output_tag, source_tag) {
+        changed = true;
+    }
+
+    changed
+}
+
+fn ensure_compatible_artwork(output_tag: &mut id3::Tag, source_tag: &id3::Tag) -> bool {
+    let output_had_artwork = output_tag.pictures().next().is_some();
+    let mut pictures = output_tag.pictures().cloned().collect::<Vec<_>>();
+    if pictures.is_empty() {
+        pictures = source_tag.pictures().cloned().collect::<Vec<_>>();
+    }
+    if pictures.is_empty() {
+        return false;
+    }
+
+    let mut changed = !output_had_artwork;
+    for picture in &mut pictures {
+        let detected_mime = get_image_mime_type(&picture.data);
+        if detected_mime != "image/*" && picture.mime_type != detected_mime {
+            picture.mime_type = detected_mime.to_string();
             changed = true;
         }
     }
 
-    changed
+    if !pictures
+        .iter()
+        .any(|picture| picture.picture_type == id3::frame::PictureType::CoverFront)
+    {
+        pictures[0].picture_type = id3::frame::PictureType::CoverFront;
+        changed = true;
+    }
+
+    if !changed {
+        return false;
+    }
+
+    output_tag.remove("APIC");
+    for picture in pictures {
+        output_tag.add_frame(picture);
+    }
+    true
 }
 
 fn write_id3_tag_for_output(tag: &id3::Tag, output_path: &Path) -> io::Result<()> {
@@ -925,7 +977,7 @@ fn write_id3_tag_for_output(tag: &id3::Tag, output_path: &Path) -> io::Result<()
 
     #[allow(deprecated)]
     let result = match extension.as_str() {
-        "mp3" => tag.write_to_path(output_path, Version::Id3v24),
+        "mp3" => tag.write_to_path(output_path, Version::Id3v23),
         "wav" => tag.write_to_wav_path(output_path, Version::Id3v24),
         "aiff" | "aif" => tag.write_to_aiff_path(output_path, Version::Id3v24),
         _ => return Ok(()),
@@ -1199,7 +1251,7 @@ fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
     for description in extended_texts_to_remove {
         tag.remove_extended_text(Some(&description), None);
     }
-    tag.write_to_path(path, Version::Id3v24)
+    tag.write_to_path(path, Version::Id3v23)
         .map_err(io::Error::other)
 }
 
@@ -1246,7 +1298,12 @@ fn song_name_from_flac(
     let artist = comments.and_then(|comments| {
         join_non_empty(comments.artist()).or_else(|| join_non_empty(comments.album_artist()))
     });
-    let identity = infer_song_identity(fallback_name, title, artist.as_deref());
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        title,
+        artist.as_deref(),
+        source_prefers_artist_title_filename(path, None),
+    );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
@@ -1257,7 +1314,12 @@ fn song_name_from_audio_tag(
 ) -> Option<String> {
     let tag = id3::Tag::read_from_path(path).ok()?;
     let artist = tag.artist().or_else(|| tag.album_artist());
-    let identity = infer_song_identity(fallback_name, tag.title(), artist);
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        tag.title(),
+        artist,
+        source_prefers_artist_title_filename(path, Some(&tag)),
+    );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
@@ -1275,7 +1337,12 @@ fn song_name_from_ncm(
         .map(|item| item.0.as_str())
         .collect::<Vec<&str>>()
         .join(", ");
-    let identity = infer_song_identity(fallback_name, Some(&info.name), Some(&artist));
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        Some(&info.name),
+        Some(&artist),
+        source_prefers_artist_title_filename(path, None),
+    );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
@@ -1290,11 +1357,81 @@ fn infer_song_identity(
     metadata_title: Option<&str>,
     metadata_artist: Option<&str>,
 ) -> SongIdentity {
+    infer_song_identity_with_filename_preference(
+        fallback_name,
+        metadata_title,
+        metadata_artist,
+        false,
+    )
+}
+
+fn infer_song_identity_with_filename_preference(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+    prefer_filename_identity: bool,
+) -> SongIdentity {
     let (fallback_title, fallback_artist) = parse_filename_identity(fallback_name);
+    if prefer_filename_identity
+        && metadata_identity_is_reversed(fallback_name, metadata_title, metadata_artist)
+    {
+        return SongIdentity {
+            title: fallback_title,
+            artist: fallback_artist,
+        };
+    }
     let title = normalize_filename_part(metadata_title).unwrap_or(fallback_title);
     let artist = normalize_filename_part(metadata_artist).unwrap_or(fallback_artist);
 
     SongIdentity { title, artist }
+}
+
+fn source_prefers_artist_title_filename(path: &Path, tag: Option<&id3::Tag>) -> bool {
+    let path_marks_known_source = path.components().any(|component| {
+        let component = component.as_os_str().to_string_lossy().to_lowercase();
+        component.contains("网易云")
+            || component.contains("netease")
+            || component.contains("cloudmusic")
+    });
+
+    path_marks_known_source || tag.is_some_and(has_netease_metadata)
+}
+
+fn has_netease_metadata(tag: &id3::Tag) -> bool {
+    tag.comments().any(|comment| {
+        comment.description.trim().starts_with("163 key")
+            || comment.text.trim().starts_with("163 key")
+    }) || tag
+        .extended_texts()
+        .any(|text| text.description.trim().starts_with("163 key"))
+}
+
+fn metadata_identity_is_reversed(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+) -> bool {
+    let (fallback_title, fallback_artist) = parse_filename_identity(fallback_name);
+    if fallback_title.is_empty()
+        || fallback_artist.is_empty()
+        || identity_text_matches(&fallback_title, &fallback_artist)
+    {
+        return false;
+    }
+
+    let Some(metadata_title) = normalize_filename_part(metadata_title) else {
+        return false;
+    };
+    let Some(metadata_artist) = normalize_filename_part(metadata_artist) else {
+        return false;
+    };
+
+    identity_text_matches(&metadata_title, &fallback_artist)
+        && identity_text_matches(&metadata_artist, &fallback_title)
+}
+
+fn identity_text_matches(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
 }
 
 fn parse_filename_identity(fallback_name: &str) -> (String, String) {
@@ -2101,7 +2238,8 @@ mod tests {
         assert!(fill_missing_metadata(
             &mut output,
             &source,
-            "Mr Wankerman - Mystic State, Third Degree"
+            "Mr Wankerman - Mystic State, Third Degree",
+            false,
         ));
 
         assert_eq!(output.title(), Some("Mystic State, Third Degree"));
@@ -2144,7 +2282,8 @@ mod tests {
         assert!(fill_missing_metadata(
             &mut output,
             &source,
-            "Artist - Fallback Title"
+            "Artist - Fallback Title",
+            false,
         ));
 
         assert_eq!(output.title(), Some("Existing Title"));

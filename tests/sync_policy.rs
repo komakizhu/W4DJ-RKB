@@ -8,15 +8,15 @@ mod sync;
 #[path = "../src/task.rs"]
 mod task;
 
-use config::{LosslessFormat, Mode};
-use id3::TagLike;
+use config::{FilenameRule, LosslessFormat, Mode};
+use id3::{TagLike, Version};
 use ncmdump::NcmInfo;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use sync::{
     TargetProfile, cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
-    resolve_output_policy,
+    resolve_output_policy, sync_music_library_with_policy,
 };
 
 #[test]
@@ -373,4 +373,120 @@ fn build_id3_tag_from_flac_carries_cover_and_text() {
     assert_eq!(tag.album(), Some("Album"));
     assert_eq!(tag.artist(), Some("Artist"));
     assert_eq!(tag.pictures().count(), 1);
+}
+
+#[test]
+fn compat_export_repairs_title_and_artist_swapped_against_the_filename() {
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("source");
+    let output_dir = root.path().join("output");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&output_dir).unwrap();
+
+    let source_path = source_dir.join("KIMERU - Overlap.mp3");
+    fs::write(&source_path, b"audio").unwrap();
+    let mut source_tag = id3::Tag::new();
+    source_tag.set_title("KIMERU");
+    source_tag.set_artist("Overlap");
+    source_tag.add_frame(id3::frame::ExtendedText {
+        description: "163 key".into(),
+        value: "netease-source".into(),
+    });
+    source_tag
+        .write_to_path(&source_path, Version::Id3v24)
+        .unwrap();
+
+    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_rule(
+        source_dir.to_str().unwrap(),
+        FilenameRule::TitleArtist,
+    );
+    assert!(issues.is_empty());
+    assert!(source_music.contains_key("Overlap - KIMERU"));
+
+    let pending = source_music.iter().collect::<HashMap<_, _>>();
+    sync_music_library_with_policy(&pending, output_dir.to_str().unwrap(), &Mode::Compat, None)
+        .unwrap();
+
+    let output_path = output_dir.join("Overlap - KIMERU.mp3");
+    let output_tag = id3::Tag::read_from_path(output_path).unwrap();
+    assert_eq!(output_tag.title(), Some("Overlap"));
+    assert_eq!(output_tag.artist(), Some("KIMERU"));
+}
+
+#[test]
+fn compat_export_does_not_reverse_trustworthy_title_first_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("source");
+    let output_dir = root.path().join("output");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&output_dir).unwrap();
+
+    let source_path = source_dir.join("Song - Artist.mp3");
+    fs::write(&source_path, b"audio").unwrap();
+    let mut source_tag = id3::Tag::new();
+    source_tag.set_title("Song");
+    source_tag.set_artist("Artist");
+    source_tag
+        .write_to_path(&source_path, Version::Id3v24)
+        .unwrap();
+
+    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_rule(
+        source_dir.to_str().unwrap(),
+        FilenameRule::TitleArtist,
+    );
+    assert!(issues.is_empty());
+    assert!(source_music.contains_key("Song - Artist"));
+
+    let pending = source_music.iter().collect::<HashMap<_, _>>();
+    sync_music_library_with_policy(&pending, output_dir.to_str().unwrap(), &Mode::Compat, None)
+        .unwrap();
+
+    let output_tag = id3::Tag::read_from_path(output_dir.join("Song - Artist.mp3")).unwrap();
+    assert_eq!(output_tag.title(), Some("Song"));
+    assert_eq!(output_tag.artist(), Some("Artist"));
+}
+
+#[test]
+fn compat_export_normalizes_a_generic_embedded_cover_for_dj_software() {
+    let root = tempfile::tempdir().unwrap();
+    let source_dir = root.path().join("source");
+    let output_dir = root.path().join("output");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&output_dir).unwrap();
+
+    let source_path = source_dir.join("Artist - Song.mp3");
+    fs::write(&source_path, b"audio").unwrap();
+    let jpeg_cover = vec![0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x01, 0x02];
+    let mut source_tag = id3::Tag::new();
+    source_tag.set_title("Song");
+    source_tag.set_artist("Artist");
+    source_tag.add_frame(id3::frame::Picture {
+        mime_type: "image/*".into(),
+        picture_type: id3::frame::PictureType::CoverFront,
+        description: String::new(),
+        data: jpeg_cover.clone(),
+    });
+    source_tag
+        .write_to_path(&source_path, Version::Id3v24)
+        .unwrap();
+
+    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_rule(
+        source_dir.to_str().unwrap(),
+        FilenameRule::TitleArtist,
+    );
+    assert!(issues.is_empty());
+    let pending = source_music.iter().collect::<HashMap<_, _>>();
+    sync_music_library_with_policy(&pending, output_dir.to_str().unwrap(), &Mode::Compat, None)
+        .unwrap();
+
+    let output_path = output_dir.join("Song - Artist.mp3");
+    let output_tag = id3::Tag::read_from_path(&output_path).unwrap();
+    let output_cover = output_tag.pictures().next().expect("missing output cover");
+    assert_eq!(output_cover.mime_type, "image/jpeg");
+    assert_eq!(
+        output_cover.picture_type,
+        id3::frame::PictureType::CoverFront
+    );
+    assert_eq!(output_cover.data, jpeg_cover);
+    assert_eq!(fs::read(output_path).unwrap()[3], 3);
 }
