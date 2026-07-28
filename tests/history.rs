@@ -44,6 +44,12 @@ fn complete_error_report_explains_metadata_identity_decisions() {
         source_path: "/music/in/巴适 - BikaBreezy, Jaytrue.ncm".into(),
         destination_path: "/music/out/巴适 - BikaBreezy, Jaytrue.mp3".into(),
         source_filename: "巴适 - BikaBreezy, Jaytrue".into(),
+        source_extension: "ncm".into(),
+        source_size_bytes: Some(1024),
+        source_metadata_status: "NCM 元数据与封面已读取".into(),
+        source_metadata_summary: "标题=巴适；歌手=BikaBreezy, Jaytrue；专辑=无；帧数=4；封面帧数=1"
+            .into(),
+        source_cover_details: "1 张：image/jpeg，CoverFront，128 bytes，图像签名可识别".into(),
         detected_filename_layout: "歌名 - 歌手".into(),
         decision: "采用完整内嵌元数据".into(),
         source_title: Some("巴适".into()),
@@ -52,18 +58,25 @@ fn complete_error_report_explains_metadata_identity_decisions() {
         resolved_artist: "BikaBreezy, Jaytrue".into(),
         output_title: Some("巴适".into()),
         output_artist: Some("BikaBreezy, Jaytrue".into()),
+        output_size_bytes: Some(2048),
+        output_metadata_status: "已读取 ID3 标签".into(),
+        output_metadata_summary: "标题=巴适；歌手=BikaBreezy, Jaytrue；专辑=无；帧数=4；封面帧数=1"
+            .into(),
+        output_cover_details: "1 张：image/jpeg，CoverFront，128 bytes，图像签名可识别".into(),
         source_artwork: true,
         output_artwork: Some(true),
     });
 
     let report = format_error_report(&entry);
 
-    assert!(report.contains("报告格式版本：3"));
+    assert!(report.contains("报告格式版本：4"));
     assert!(report.contains("[逐曲元数据诊断]"));
     assert!(report.contains("识别格式：歌名 - 歌手"));
     assert!(report.contains("源标签标题：巴适"));
     assert!(report.contains("写入歌手：BikaBreezy, Jaytrue"));
     assert!(report.contains("输出封面：有"));
+    assert!(report.contains("源元数据读取：NCM 元数据与封面已读取"));
+    assert!(report.contains("目标文件大小：2048 bytes"));
 }
 
 #[test]
@@ -116,7 +129,7 @@ fn complete_error_report_contains_environment_settings_and_all_counts() {
     let report = format_error_report(&entry);
 
     assert!(report.contains("W4DJ RKB 转换报告"));
-    assert!(report.contains("报告格式版本：3"));
+    assert!(report.contains("报告格式版本：4"));
     assert!(report.contains(&format!("软件版本：{}", env!("CARGO_PKG_VERSION"))));
     assert!(report.contains("操作系统："));
     assert!(report.contains("CPU 架构："));

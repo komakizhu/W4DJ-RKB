@@ -25,6 +25,16 @@ pub struct MetadataDiagnostic {
     pub source_path: String,
     pub destination_path: String,
     pub source_filename: String,
+    #[serde(default)]
+    pub source_extension: String,
+    #[serde(default)]
+    pub source_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub source_metadata_status: String,
+    #[serde(default)]
+    pub source_metadata_summary: String,
+    #[serde(default)]
+    pub source_cover_details: String,
     pub detected_filename_layout: String,
     pub decision: String,
     pub source_title: Option<String>,
@@ -33,6 +43,14 @@ pub struct MetadataDiagnostic {
     pub resolved_artist: String,
     pub output_title: Option<String>,
     pub output_artist: Option<String>,
+    #[serde(default)]
+    pub output_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub output_metadata_status: String,
+    #[serde(default)]
+    pub output_metadata_summary: String,
+    #[serde(default)]
+    pub output_cover_details: String,
     pub source_artwork: bool,
     pub output_artwork: Option<bool>,
 }
@@ -783,7 +801,7 @@ fn convert_audio_to_target_format(
         .arg("-i")
         .arg(src_path)
         .arg("-loglevel")
-        .arg("quiet")
+        .arg("error")
         .arg("-map_metadata")
         .arg("0");
 
@@ -799,17 +817,32 @@ fn convert_audio_to_target_format(
         }
     }
 
-    let status = command.arg(output_path).status().map_err(|error| {
+    command.arg(output_path);
+    let command_debug = format!("{command:?}");
+    let output = command.output().map_err(|error| {
         Error::new(
             error.kind(),
             format!("Failed to start FFmpeg at {}: {}", ffmpeg_path, error),
         )
     })?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if stderr.is_empty() && stdout.is_empty() {
+            "FFmpeg 没有返回错误输出".to_string()
+        } else if stdout.is_empty() {
+            format!("stderr：{stderr}")
+        } else if stderr.is_empty() {
+            format!("stdout：{stdout}")
+        } else {
+            format!("stderr：{stderr}\nstdout：{stdout}")
+        };
         return Err(Error::other(format!(
-            "FFmpeg conversion failed for {}",
-            name_stem
+            "FFmpeg 转换失败：{name_stem}\n退出状态：{}\n命令：{command_debug}\n输入：{}\n输出：{}\n{details}",
+            output.status,
+            src_path.display(),
+            output_path.display(),
         )));
     }
 
@@ -844,28 +877,45 @@ fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()
 }
 
 fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<()> {
-    let source_tag = source_metadata_as_id3(source_path);
+    let source_metadata = read_metadata_details(source_path);
+    let source_tag = &source_metadata.tag;
     let mut output_tag = read_id3_tag_or_empty(output_path);
     let fallback_name = source_path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
     let prefer_title_artist_filename =
-        source_prefers_title_artist_filename(source_path, Some(&source_tag));
+        source_prefers_title_artist_filename(source_path, Some(source_tag));
 
     if !fill_missing_metadata(
         &mut output_tag,
-        &source_tag,
+        source_tag,
         fallback_name,
         prefer_title_artist_filename,
     ) {
-        return Ok(());
+        return verify_output_metadata(
+            source_path,
+            output_path,
+            source_tag,
+            &source_metadata.status,
+        );
     }
 
-    write_id3_tag_for_output(&output_tag, output_path)
+    write_id3_tag_for_output(&output_tag, output_path)?;
+    verify_output_metadata(
+        source_path,
+        output_path,
+        source_tag,
+        &source_metadata.status,
+    )
 }
 
-fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
+struct MetadataReadResult {
+    tag: id3::Tag,
+    status: String,
+}
+
+fn read_metadata_details(source_path: &Path) -> MetadataReadResult {
     let extension = source_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -873,23 +923,73 @@ fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
         .to_ascii_lowercase();
 
     match extension.as_str() {
-        "flac" => metaflac::Tag::read_from_path(source_path)
-            .map(|tag| build_id3_tag_from_flac(&tag))
-            .unwrap_or_else(|_| id3::Tag::new()),
+        "flac" => match metaflac::Tag::read_from_path(source_path) {
+            Ok(tag) => MetadataReadResult {
+                tag: build_id3_tag_from_flac(&tag),
+                status: "已读取 FLAC Vorbis 标签".to_string(),
+            },
+            Err(error) => MetadataReadResult {
+                tag: id3::Tag::new(),
+                status: format!("读取 FLAC 元数据失败：{error}"),
+            },
+        },
         "ncm" => {
-            let Ok(file) = File::open(source_path) else {
-                return id3::Tag::new();
+            let file = match File::open(source_path) {
+                Ok(file) => file,
+                Err(error) => {
+                    return MetadataReadResult {
+                        tag: id3::Tag::new(),
+                        status: format!("打开 NCM 文件失败：{error}"),
+                    };
+                }
             };
-            let Ok(mut ncm) = Ncmdump::from_reader(file) else {
-                return id3::Tag::new();
+            let mut ncm = match Ncmdump::from_reader(file) {
+                Ok(ncm) => ncm,
+                Err(error) => {
+                    return MetadataReadResult {
+                        tag: id3::Tag::new(),
+                        status: format!("解析 NCM 文件失败：{error}"),
+                    };
+                }
             };
-            let Ok(info) = ncm.get_info() else {
-                return id3::Tag::new();
+            let info = match ncm.get_info() {
+                Ok(info) => info,
+                Err(error) => {
+                    return MetadataReadResult {
+                        tag: id3::Tag::new(),
+                        status: format!("读取 NCM 元数据失败：{error}"),
+                    };
+                }
             };
-            let image = ncm.get_image().unwrap_or_default();
-            build_id3_tag(&info, &image)
+            let (image, image_status) = match ncm.get_image() {
+                Ok(image) if image.is_empty() => {
+                    (image, "NCM 元数据已读取，但封面数据为空".to_string())
+                }
+                Ok(image) => (image, "NCM 元数据与封面已读取".to_string()),
+                Err(error) => (
+                    Vec::new(),
+                    format!("NCM 元数据已读取，但封面读取失败：{error}"),
+                ),
+            };
+            MetadataReadResult {
+                tag: build_id3_tag(&info, &image),
+                status: image_status,
+            }
         }
-        _ => read_id3_tag_or_empty(source_path),
+        _ => match id3::Tag::read_from_path(source_path) {
+            Ok(tag) => MetadataReadResult {
+                tag,
+                status: "已读取 ID3 标签".to_string(),
+            },
+            Err(error) if error.to_string().contains("NoTag") => MetadataReadResult {
+                tag: id3::Tag::new(),
+                status: "未发现 ID3 标签（这是允许的，后续按文件名补齐）".to_string(),
+            },
+            Err(error) => MetadataReadResult {
+                tag: id3::Tag::new(),
+                status: format!("读取 ID3 标签失败：{error}"),
+            },
+        },
     }
 }
 
@@ -898,7 +998,8 @@ pub fn inspect_metadata_decision(
     source_path: &Path,
     destination_path: &Path,
 ) -> MetadataDiagnostic {
-    let source_tag = source_metadata_as_id3(source_path);
+    let source_metadata = read_metadata_details(source_path);
+    let source_tag = &source_metadata.tag;
     let source_title = normalize_filename_part(source_tag.title());
     let source_artist =
         normalize_filename_part(source_tag.artist().or_else(|| source_tag.album_artist()));
@@ -907,7 +1008,7 @@ pub fn inspect_metadata_decision(
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
     let prefer_title_artist_filename =
-        source_prefers_title_artist_filename(source_path, Some(&source_tag));
+        source_prefers_title_artist_filename(source_path, Some(source_tag));
     let identity = infer_song_identity_with_filename_preference(
         fallback_name,
         source_title.as_deref(),
@@ -928,13 +1029,26 @@ pub fn inspect_metadata_decision(
     }
     .to_string();
 
-    let output_exists = destination_path.is_file();
-    let output_tag = output_exists.then(|| read_id3_tag_or_empty(destination_path));
+    let output_metadata = destination_path
+        .is_file()
+        .then(|| read_metadata_details(destination_path));
+    let output_tag = output_metadata.as_ref().map(|metadata| &metadata.tag);
 
     MetadataDiagnostic {
         source_path: source_path.display().to_string(),
         destination_path: destination_path.display().to_string(),
         source_filename: fallback_name.to_string(),
+        source_extension: source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        source_size_bytes: fs::metadata(source_path)
+            .ok()
+            .map(|metadata| metadata.len()),
+        source_metadata_status: source_metadata.status,
+        source_metadata_summary: metadata_tag_summary(source_tag),
+        source_cover_details: metadata_cover_details(source_tag),
         detected_filename_layout,
         decision,
         source_title,
@@ -945,15 +1059,136 @@ pub fn inspect_metadata_decision(
             .as_ref()
             .and_then(|tag| normalize_filename_part(tag.title())),
         output_artist: output_tag
-            .as_ref()
             .and_then(|tag| normalize_filename_part(tag.artist().or_else(|| tag.album_artist()))),
-        source_artwork: source_tag.pictures().next().is_some(),
-        output_artwork: output_tag.map(|tag| tag.pictures().next().is_some()),
+        output_size_bytes: fs::metadata(destination_path)
+            .ok()
+            .map(|metadata| metadata.len()),
+        output_metadata_status: output_metadata
+            .as_ref()
+            .map(|metadata| metadata.status.clone())
+            .unwrap_or_else(|| "输出文件不存在".to_string()),
+        output_metadata_summary: output_tag
+            .map(metadata_tag_summary)
+            .unwrap_or_else(|| "无法读取输出标签".to_string()),
+        output_cover_details: output_tag
+            .map(metadata_cover_details)
+            .unwrap_or_else(|| "输出文件不存在或无法读取".to_string()),
+        source_artwork: source_tag
+            .pictures()
+            .any(|picture| !picture.data.is_empty()),
+        output_artwork: output_tag
+            .map(|tag| tag.pictures().any(|picture| !picture.data.is_empty())),
     }
 }
 
 fn read_id3_tag_or_empty(path: &Path) -> id3::Tag {
-    id3::Tag::read_from_path(path).unwrap_or_else(|_| id3::Tag::new())
+    read_metadata_details(path).tag
+}
+
+fn metadata_tag_summary(tag: &id3::Tag) -> String {
+    let title = normalize_filename_part(tag.title()).unwrap_or_else(|| "无".to_string());
+    let artist = normalize_filename_part(tag.artist().or_else(|| tag.album_artist()))
+        .unwrap_or_else(|| "无".to_string());
+    let album = normalize_filename_part(tag.album()).unwrap_or_else(|| "无".to_string());
+    format!(
+        "标题={title}；歌手={artist}；专辑={album}；帧数={}；封面帧数={}",
+        tag.frames().count(),
+        tag.pictures().count()
+    )
+}
+
+fn metadata_cover_details(tag: &id3::Tag) -> String {
+    let pictures = tag
+        .pictures()
+        .map(|picture| {
+            let recognized = get_image_mime_type(&picture.data) != "image/*";
+            format!(
+                "{}，{}，{} bytes，{}",
+                picture.mime_type,
+                picture.picture_type,
+                picture.data.len(),
+                if recognized {
+                    "图像签名可识别"
+                } else {
+                    "图像签名不可识别"
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    if pictures.is_empty() {
+        "无（未找到 APIC/Picture）".to_string()
+    } else {
+        format!("{} 张：{}", pictures.len(), pictures.join("；"))
+    }
+}
+
+fn verify_output_metadata(
+    source_path: &Path,
+    output_path: &Path,
+    source_tag: &id3::Tag,
+    source_metadata_status: &str,
+) -> io::Result<()> {
+    let output_metadata = read_metadata_details(output_path);
+    let output_tag = &output_metadata.tag;
+    let fallback_name = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let prefer_title_artist_filename =
+        source_prefers_title_artist_filename(source_path, Some(source_tag));
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        source_tag.title(),
+        source_tag.artist().or_else(|| source_tag.album_artist()),
+        prefer_title_artist_filename,
+    );
+    let mut problems = Vec::new();
+
+    if !identity.title.is_empty() && output_tag.title() != Some(identity.title.as_str()) {
+        problems.push(format!(
+            "标题应为“{}”，实际为“{}”",
+            identity.title,
+            output_tag.title().unwrap_or("无")
+        ));
+    }
+    if !identity.artist.is_empty() && output_tag.artist() != Some(identity.artist.as_str()) {
+        problems.push(format!(
+            "歌手应为“{}”，实际为“{}”",
+            identity.artist,
+            output_tag.artist().unwrap_or("无")
+        ));
+    }
+
+    let source_has_cover = source_tag
+        .pictures()
+        .any(|picture| !picture.data.is_empty());
+    let output_has_cover = output_tag
+        .pictures()
+        .any(|picture| !picture.data.is_empty());
+    if source_has_cover && !output_has_cover {
+        problems.push(format!(
+            "源文件有封面，但输出文件没有有效封面；源封面详情：{}",
+            metadata_cover_details(source_tag)
+        ));
+    }
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::new(
+        ErrorKind::InvalidData,
+        format!(
+            "输出元数据校验失败：{}\n源文件：{}\n源标签读取：{}\n输出文件：{}\n输出标签读取：{}\n输出标签：{}\n输出封面：{}",
+            problems.join("；"),
+            source_path.display(),
+            source_metadata_status,
+            output_path.display(),
+            output_metadata.status,
+            metadata_tag_summary(output_tag),
+            metadata_cover_details(output_tag),
+        ),
+    ))
 }
 
 fn fill_missing_metadata(
@@ -971,17 +1206,26 @@ fn fill_missing_metadata(
     );
     let mut changed = false;
 
-    if is_blank(output_tag.title())
-        && !identity.title.is_empty()
-        && output_tag.title() != Some(identity.title.as_str())
+    let source_title = normalize_filename_part(source_tag.title());
+    if !identity.title.is_empty()
+        && ((is_blank(output_tag.title()) && output_tag.title() != Some(identity.title.as_str()))
+            || source_title
+                .as_deref()
+                .is_some_and(|title| output_tag.title() != Some(title)))
     {
         output_tag.set_title(&identity.title);
         changed = true;
     }
 
-    if is_blank(output_tag.artist()) {
-        let artist =
-            normalize_filename_part(source_artist).unwrap_or_else(|| identity.artist.clone());
+    let source_artist = normalize_filename_part(source_artist);
+    if !identity.artist.is_empty()
+        && ((is_blank(output_tag.artist())
+            && output_tag.artist() != Some(identity.artist.as_str()))
+            || source_artist
+                .as_deref()
+                .is_some_and(|artist| output_tag.artist() != Some(artist)))
+    {
+        let artist = source_artist.unwrap_or_else(|| identity.artist.clone());
         if !artist.is_empty() && output_tag.artist() != Some(artist.as_str()) {
             output_tag.set_artist(&artist);
             changed = true;
@@ -1003,16 +1247,26 @@ fn fill_missing_metadata(
 }
 
 fn ensure_compatible_artwork(output_tag: &mut id3::Tag, source_tag: &id3::Tag) -> bool {
-    let output_had_artwork = output_tag.pictures().next().is_some();
-    let mut pictures = output_tag.pictures().cloned().collect::<Vec<_>>();
-    if pictures.is_empty() {
-        pictures = source_tag.pictures().cloned().collect::<Vec<_>>();
-    }
-    if pictures.is_empty() {
+    let output_pictures = output_tag.pictures().cloned().collect::<Vec<_>>();
+    let source_pictures = source_tag.pictures().cloned().collect::<Vec<_>>();
+    let output_has_usable_picture = output_pictures.iter().any(is_usable_picture);
+    let mut pictures = if output_has_usable_picture {
+        output_pictures.clone()
+    } else if !source_pictures.is_empty() {
+        source_pictures
+    } else {
+        Vec::new()
+    };
+
+    if pictures.is_empty() && output_pictures.is_empty() {
         return false;
     }
+    if pictures.is_empty() {
+        output_tag.remove("APIC");
+        return true;
+    }
 
-    let mut changed = !output_had_artwork;
+    let mut changed = pictures != output_pictures;
     for picture in &mut pictures {
         let detected_mime = get_image_mime_type(&picture.data);
         if detected_mime != "image/*" && picture.mime_type != detected_mime {
@@ -1038,6 +1292,10 @@ fn ensure_compatible_artwork(output_tag: &mut id3::Tag, source_tag: &id3::Tag) -
         output_tag.add_frame(picture);
     }
     true
+}
+
+fn is_usable_picture(picture: &id3::frame::Picture) -> bool {
+    !picture.data.is_empty() && get_image_mime_type(&picture.data) != "image/*"
 }
 
 fn write_id3_tag_for_output(tag: &id3::Tag, output_path: &Path) -> io::Result<()> {
@@ -2022,10 +2280,10 @@ fn write_container_tags(
 mod tests {
     use super::{
         SongIdentity, build_song_name, build_song_name_with_rule, compare_music_dicts,
-        derive_song_name, derive_song_name_with_rule, ensure_generated_output,
-        ensure_output_metadata, fill_missing_metadata, find_ffmpeg_next_to_exe,
-        infer_song_identity, remove_conflicting_outputs, sanitize_filename_component,
-        strip_163_key_from_mp3,
+        derive_song_name, derive_song_name_with_rule, ensure_compatible_artwork,
+        ensure_generated_output, ensure_output_metadata, fill_missing_metadata,
+        find_ffmpeg_next_to_exe, infer_song_identity, inspect_metadata_decision,
+        remove_conflicting_outputs, sanitize_filename_component, strip_163_key_from_mp3,
     };
     use crate::config::{FilenameRule, LosslessFormat, Mode};
     use id3::{Tag, TagLike, Version};
@@ -2389,6 +2647,47 @@ mod tests {
     }
 
     #[test]
+    fn repairs_reversed_output_identity_when_source_has_complete_tags() {
+        let source_dir = tempdir().unwrap();
+        let output_dir = tempdir().unwrap();
+        let source_path = source_dir.path().join("巴适 - BikaBreezy, Jaytrue.mp3");
+        let output_path = output_dir.path().join("巴适 - BikaBreezy, Jaytrue.mp3");
+
+        let mut source = Tag::new();
+        source.set_title("巴适");
+        source.set_artist("BikaBreezy, Jaytrue");
+        fs::write(&source_path, b"audio").unwrap();
+        source.write_to_path(&source_path, Version::Id3v23).unwrap();
+
+        let mut output = Tag::new();
+        output.set_title("BikaBreezy, Jaytrue");
+        output.set_artist("巴适");
+        fs::write(&output_path, b"audio").unwrap();
+        output.write_to_path(&output_path, Version::Id3v23).unwrap();
+
+        ensure_output_metadata(&source_path, &output_path).unwrap();
+
+        let tag = Tag::read_from_path(&output_path).unwrap();
+        assert_eq!(tag.title(), Some("巴适"));
+        assert_eq!(tag.artist(), Some("BikaBreezy, Jaytrue"));
+    }
+
+    #[test]
+    fn metadata_diagnostic_distinguishes_missing_tags_from_missing_output() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("Title - Artist.mp3");
+        let output_path = dir.path().join("out").join("Title - Artist.mp3");
+        fs::write(&source_path, b"audio-without-id3").unwrap();
+
+        let diagnostic = inspect_metadata_decision(&source_path, &output_path);
+
+        assert!(diagnostic.source_metadata_status.contains("ID3"));
+        assert!(diagnostic.source_metadata_summary.contains("标题=无"));
+        assert_eq!(diagnostic.output_metadata_status, "输出文件不存在");
+        assert_eq!(diagnostic.output_artwork, None);
+    }
+
+    #[test]
     fn backfills_only_missing_fields_and_preserves_source_cover() {
         let mut source = Tag::new();
         source.set_album("Existing Album");
@@ -2413,6 +2712,32 @@ mod tests {
         assert_eq!(output.artist(), Some("Artist"));
         assert_eq!(output.album(), Some("Existing Album"));
         assert_eq!(output.pictures().count(), 1);
+    }
+
+    #[test]
+    fn replaces_an_unusable_output_cover_with_the_source_cover() {
+        let mut source = Tag::new();
+        source.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".into(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02],
+        });
+
+        let mut output = Tag::new();
+        output.add_frame(id3::frame::Picture {
+            mime_type: "image/*".into(),
+            picture_type: id3::frame::PictureType::Other,
+            description: String::new(),
+            data: b"ffmpeg-placeholder".to_vec(),
+        });
+
+        assert!(ensure_compatible_artwork(&mut output, &source));
+
+        let picture = output.pictures().next().unwrap();
+        assert_eq!(picture.mime_type, "image/jpeg");
+        assert_eq!(picture.data, vec![0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02]);
+        assert_eq!(picture.picture_type, id3::frame::PictureType::CoverFront);
     }
 
     #[test]

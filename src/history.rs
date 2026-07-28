@@ -202,7 +202,7 @@ fn write_history(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
 pub fn format_error_report(entry: &HistoryEntry) -> String {
     let mut report = String::new();
     report.push_str("W4DJ RKB 转换报告\n");
-    report.push_str("报告格式版本：3\n\n");
+    report.push_str("报告格式版本：4\n\n");
 
     report.push_str("[软件与系统]\n");
     report.push_str(&format!("软件版本：{}\n", env!("CARGO_PKG_VERSION")));
@@ -322,19 +322,34 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     }
     for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
         report.push_str(&format!(
-            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n识别格式：{}\n判断依据：{}\n源标签标题：{}\n源标签歌手：{}\n最终识别标题：{}\n最终识别歌手：{}\n写入标题：{}\n写入歌手：{}\n源封面：{}\n输出封面：{}\n\n",
+            "{}. 源文件：{}\n源文件扩展名：{}\n源文件大小：{}\n目标文件：{}\n目标文件大小：{}\n源文件名：{}\n识别格式：{}\n判断依据：{}\n源元数据读取：{}\n源标签摘要：{}\n源标签标题：{}\n源标签歌手：{}\n最终识别标题：{}\n最终识别歌手：{}\n写入标题：{}\n写入歌手：{}\n输出元数据读取：{}\n输出标签摘要：{}\n源封面详情：{}\n输出封面详情：{}\n源封面：{}\n输出封面：{}\n\n",
             index + 1,
             diagnostic.source_path,
+            diagnostic.source_extension,
+            diagnostic
+                .source_size_bytes
+                .map(|value| format!("{value} bytes"))
+                .unwrap_or_else(|| "无法读取".to_string()),
             diagnostic.destination_path,
+            diagnostic
+                .output_size_bytes
+                .map(|value| format!("{value} bytes"))
+                .unwrap_or_else(|| "不存在或无法读取".to_string()),
             diagnostic.source_filename,
             diagnostic.detected_filename_layout,
             diagnostic.decision,
+            diagnostic.source_metadata_status,
+            diagnostic.source_metadata_summary,
             optional_metadata_label(diagnostic.source_title.as_deref()),
             optional_metadata_label(diagnostic.source_artist.as_deref()),
             diagnostic.resolved_title,
             diagnostic.resolved_artist,
             optional_metadata_label(diagnostic.output_title.as_deref()),
             optional_metadata_label(diagnostic.output_artist.as_deref()),
+            diagnostic.output_metadata_status,
+            diagnostic.output_metadata_summary,
+            diagnostic.source_cover_details,
+            diagnostic.output_cover_details,
             if diagnostic.source_artwork { "有" } else { "无" },
             optional_artwork_label(diagnostic.output_artwork),
         ));
