@@ -47,6 +47,7 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   mode: 'compat',
   lossless_format: null,
   conversion_mode: 'scan_then_convert',
+  enhanced_mode: false,
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
   report_path: null,
@@ -90,6 +91,7 @@ const makeViewState = (overrides: Partial<AppViewState> = {}): AppViewState => (
   mode: 'compat',
   losslessFormat: null,
   conversionMode: 'scan_then_convert',
+  enhancedMode: false,
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
   lang: 'zh',
@@ -190,6 +192,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   chooseMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseLosslessFormat: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseConversionMode: vi.fn().mockResolvedValue(makeDesktopState()),
+  chooseEnhancedMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseConflictStrategy: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseFilenameRule: vi.fn().mockResolvedValue(makeDesktopState()),
   previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
@@ -970,6 +973,26 @@ describe('bindApp', () => {
     });
   });
 
+  it('persists the optional Essentia enhanced mode with the sliding control pattern', async () => {
+    const services = makeMockServices({
+      chooseEnhancedMode: vi.fn().mockResolvedValue(
+        makeDesktopState({ enhanced_mode: true }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const initialSwitch = root.querySelector('[data-role="enhanced-mode-switch"]');
+    expect(initialSwitch?.getAttribute('data-selected-enhanced-mode')).toBe('off');
+    (root.querySelector('[data-enhanced-mode="on"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(services.chooseEnhancedMode).toHaveBeenCalledWith(true);
+      expect(root.querySelector('[data-role="enhanced-mode-switch"]')
+        ?.getAttribute('data-selected-enhanced-mode')).toBe('on');
+    });
+  });
+
   it('persists conflict and filename selections through backend services', async () => {
     const services = makeMockServices({
       chooseConflictStrategy: vi.fn().mockResolvedValue(
@@ -1050,6 +1073,40 @@ describe('bindApp', () => {
       expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
       expect(root.querySelector('[data-role="preview-modal"]')).toBeNull();
     });
+    expect(services.readAudioFile).not.toHaveBeenCalled();
+    expect(services.saveTrackAnalyses).not.toHaveBeenCalled();
+  });
+
+  it('runs Essentia only when enhanced mode is enabled', async () => {
+    const services = makeMockServices({
+      loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState({
+        conversion_mode: 'direct',
+        enhanced_mode: true,
+      })),
+      loadScanResult: vi.fn().mockResolvedValue([makePreview(0)]),
+      readAudioFile: vi.fn().mockRejectedValue(new Error('test decode failure')),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({
+      conversionMode: 'direct',
+      enhancedMode: true,
+    }), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(services.readAudioFile).toHaveBeenCalledWith('/music/in-1/Song.mp3');
+      expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
+    });
+    expect(services.startConfirmedSync).toHaveBeenCalledWith(
+      expect.any(Array),
+      null,
+      [],
+      [{
+        path: '/music/in-1/Song.mp3',
+        message: 'test decode failure',
+      }],
+    );
   });
 
   it('cancels a running scan without starting conversion', async () => {

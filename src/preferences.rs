@@ -33,6 +33,8 @@ pub struct AppPreferences {
     #[serde(default)]
     pub conversion_mode: ConversionMode,
     #[serde(default)]
+    pub enhanced_mode: bool,
+    #[serde(default)]
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
@@ -56,6 +58,7 @@ impl Default for AppPreferences {
             mode: Mode::Compat,
             lossless_format: None,
             conversion_mode: ConversionMode::default(),
+            enhanced_mode: false,
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
         }
@@ -75,6 +78,7 @@ impl AppPreferences {
             mode: shell.mode,
             lossless_format: shell.lossless_format,
             conversion_mode: ConversionMode::default(),
+            enhanced_mode: false,
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
         }
@@ -108,6 +112,7 @@ fn parse_preferences(contents: &str) -> io::Result<AppPreferences> {
         mode: legacy.mode,
         lossless_format: legacy.lossless_format,
         conversion_mode: ConversionMode::default(),
+        enhanced_mode: false,
         conflict_strategy: ConflictStrategy::default(),
         filename_rule: FilenameRule::default(),
     })

@@ -112,8 +112,15 @@ struct ConfirmedSyncJob {
     filename_rule: FilenameRule,
     candidates: Vec<PreviewCandidate>,
     analyses: Vec<EmbeddedAnalysis>,
+    analysis_failures: Vec<AnalysisFailure>,
     preview: SyncPreview,
     retry_of: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AnalysisFailure {
+    path: String,
+    message: String,
 }
 
 struct ScanJob {
@@ -465,6 +472,17 @@ fn choose_conversion_mode(
     let snapshot = {
         let mut controller = state.controller.lock().expect("desktop lock poisoned");
         controller.choose_conversion_mode(mode);
+        controller.state().clone()
+    };
+    persist_preferences(&state);
+    snapshot
+}
+
+#[tauri::command]
+fn choose_enhanced_mode(enabled: bool, state: tauri::State<'_, AppState>) -> DesktopState {
+    let snapshot = {
+        let mut controller = state.controller.lock().expect("desktop lock poisoned");
+        controller.choose_enhanced_mode(enabled);
         controller.state().clone()
     };
     persist_preferences(&state);
@@ -1048,6 +1066,7 @@ fn start_confirmed_sync(
     previews: Vec<SlotPreview>,
     retry_of: Option<String>,
     analyses: Option<Vec<TrackAnalysis>>,
+    analysis_failures: Option<Vec<AnalysisFailure>>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
     if previews.is_empty() {
@@ -1062,7 +1081,8 @@ fn start_confirmed_sync(
         .clone();
     let history_write_lock = Arc::clone(&state.history_write_lock);
     let destination_coordinator = state.destination_coordinator.clone();
-    let analyses = analyses.unwrap_or_default();
+    let requested_analyses = analyses.unwrap_or_default();
+    let requested_analysis_failures = analysis_failures.unwrap_or_default();
     let mut jobs = Vec::with_capacity(previews.len());
     let mut seen_slots = Vec::with_capacity(previews.len());
 
@@ -1070,6 +1090,7 @@ fn start_confirmed_sync(
         let mut controller = state.controller.lock().expect("desktop lock poisoned");
         let state_mode = controller.state().mode;
         let state_lossless_format = controller.state().lossless_format;
+        let enhanced_mode = controller.state().enhanced_mode;
         let state_conflict_strategy = controller.state().conflict_strategy;
         let state_filename_rule = controller.state().filename_rule;
         let mut validated_previews = Vec::with_capacity(previews.len());
@@ -1120,6 +1141,12 @@ fn start_confirmed_sync(
 
         for slot_preview in processable_previews {
             let slot_index = slot_preview.slot_index;
+            let candidate_paths = slot_preview
+                .preview
+                .candidates
+                .iter()
+                .map(|candidate| candidate.source_path.as_str())
+                .collect::<HashSet<_>>();
             jobs.push(ConfirmedSyncJob {
                 batch_id: batch_id.clone(),
                 slot_index,
@@ -1130,10 +1157,24 @@ fn start_confirmed_sync(
                 conflict_strategy: slot_preview.conflict_strategy,
                 filename_rule: slot_preview.filename_rule,
                 candidates: slot_preview.preview.candidates.clone(),
-                analyses: analyses
-                    .iter()
-                    .map(embedded_analysis_from_track)
-                    .collect(),
+                analyses: if enhanced_mode {
+                    requested_analyses
+                        .iter()
+                        .filter(|analysis| candidate_paths.contains(analysis.path.as_str()))
+                        .map(embedded_analysis_from_track)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                analysis_failures: if enhanced_mode {
+                    requested_analysis_failures
+                        .iter()
+                        .filter(|failure| candidate_paths.contains(failure.path.as_str()))
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 preview: slot_preview.preview,
                 retry_of: retry_of.clone().or(slot_preview.retry_of),
             });
@@ -1157,6 +1198,15 @@ fn start_confirmed_sync(
             controller.start_confirmed_sync(job.slot_index, job.candidates.len())?;
             apply_preflight_summary(&mut controller, job.slot_index, &job.preview)?;
             controller.push_log(job.slot_index, "Confirmed preflight; conversion started")?;
+            for failure in &job.analysis_failures {
+                controller.push_log(
+                    job.slot_index,
+                    format!(
+                        "Essentia analysis failed for {}: {}",
+                        failure.path, failure.message
+                    ),
+                )?;
+            }
         }
     }
 
@@ -1364,6 +1414,7 @@ fn main() {
             choose_mode,
             choose_lossless_format,
             choose_conversion_mode,
+            choose_enhanced_mode,
             choose_conflict_strategy,
             choose_filename_rule,
             start_sync,

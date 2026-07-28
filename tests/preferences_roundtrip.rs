@@ -16,6 +16,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         mode: Mode::Compat,
         lossless_format: Some(LosslessFormat::Aiff),
         conversion_mode: ConversionMode::Direct,
+        enhanced_mode: true,
         conflict_strategy: ConflictStrategy::Rename,
         filename_rule: FilenameRule::ArtistTitle,
     };
@@ -30,6 +31,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
     assert!(matches!(loaded.mode, Mode::Compat));
     assert!(matches!(loaded.lossless_format, Some(LosslessFormat::Aiff)));
     assert!(matches!(loaded.conversion_mode, ConversionMode::Direct));
+    assert!(loaded.enhanced_mode);
     assert_eq!(loaded.conflict_strategy, ConflictStrategy::Rename);
     assert_eq!(loaded.filename_rule, FilenameRule::ArtistTitle);
 }
@@ -54,6 +56,7 @@ fn legacy_preferences_migrate_into_slot_one() {
     assert_eq!(loaded.slots[0].source_directory, "/legacy/in");
     assert_eq!(loaded.slots[0].destination_directory, "/legacy/out");
     assert_eq!(loaded.slots[1], SyncSlotPreferences::default());
+    assert!(!loaded.enhanced_mode);
 }
 
 #[test]
@@ -72,4 +75,30 @@ fn missing_preferences_file_uses_defaults() {
     );
     assert!(matches!(loaded.mode, Mode::Compat));
     assert_eq!(loaded.lossless_format, None);
+    assert!(!loaded.enhanced_mode);
+}
+
+#[test]
+fn preferences_without_enhanced_mode_default_to_disabled() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("preferences.json");
+    fs::write(
+        &path,
+        r#"{
+            "slots": [
+                {"source_directory": "/music/in", "destination_directory": "/music/out"},
+                {"source_directory": "", "destination_directory": ""}
+            ],
+            "mode": "compat",
+            "lossless_format": null,
+            "conversion_mode": "scan_then_convert",
+            "conflict_strategy": "skip",
+            "filename_rule": "title_artist"
+        }"#,
+    )
+    .unwrap();
+
+    let loaded = load_preferences(&path).unwrap();
+
+    assert!(!loaded.enhanced_mode);
 }

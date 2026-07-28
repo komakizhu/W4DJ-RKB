@@ -39,3 +39,20 @@ fn desktop_controller_starts_in_idle_state_with_saved_values() {
     assert_eq!(controller.state().slots[1].progress_completed, 0);
     assert_eq!(controller.state().slots[1].current_file, "");
 }
+
+#[test]
+fn desktop_controller_persists_enhanced_mode_selection() {
+    let mut controller =
+        DesktopController::new(DesktopState::from_preferences(AppPreferences::default()));
+
+    assert!(!controller.state().enhanced_mode);
+    controller.choose_enhanced_mode(true);
+
+    assert!(controller.state().enhanced_mode);
+    assert!(controller.state().preferences().enhanced_mode);
+    assert!(controller.state().slots.iter().all(|slot| {
+        slot.logs
+            .last()
+            .is_some_and(|line| line == "Enhanced analysis enabled")
+    }));
+}

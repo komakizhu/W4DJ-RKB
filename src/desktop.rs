@@ -38,6 +38,7 @@ pub struct DesktopState {
     pub mode: Mode,
     pub lossless_format: Option<LosslessFormat>,
     pub conversion_mode: ConversionMode,
+    pub enhanced_mode: bool,
     pub conflict_strategy: ConflictStrategy,
     pub filename_rule: FilenameRule,
 }
@@ -75,6 +76,7 @@ impl DesktopState {
             mode,
             lossless_format,
             conversion_mode,
+            enhanced_mode,
             conflict_strategy,
             filename_rule,
         } = preferences;
@@ -84,6 +86,7 @@ impl DesktopState {
             mode,
             lossless_format,
             conversion_mode,
+            enhanced_mode,
             conflict_strategy,
             filename_rule,
         }
@@ -98,6 +101,7 @@ impl DesktopState {
             mode: self.mode,
             lossless_format: self.lossless_format,
             conversion_mode: self.conversion_mode,
+            enhanced_mode: self.enhanced_mode,
             conflict_strategy: self.conflict_strategy,
             filename_rule: self.filename_rule,
         }
@@ -118,6 +122,7 @@ impl DesktopController {
             mode,
             lossless_format,
             conversion_mode,
+            enhanced_mode,
             conflict_strategy,
             filename_rule,
         } = preferences;
@@ -129,6 +134,7 @@ impl DesktopController {
         self.state.mode = mode;
         self.state.lossless_format = lossless_format;
         self.state.conversion_mode = conversion_mode;
+        self.state.enhanced_mode = enhanced_mode;
         self.state.conflict_strategy = conflict_strategy;
         self.state.filename_rule = filename_rule;
     }
@@ -173,6 +179,15 @@ impl DesktopController {
     pub fn choose_conversion_mode(&mut self, mode: ConversionMode) {
         self.state.conversion_mode = mode;
         self.push_log_to_all("Conversion mode updated");
+    }
+
+    pub fn choose_enhanced_mode(&mut self, enabled: bool) {
+        self.state.enhanced_mode = enabled;
+        self.push_log_to_all(if enabled {
+            "Enhanced analysis enabled"
+        } else {
+            "Enhanced analysis disabled"
+        });
     }
 
     pub fn choose_conflict_strategy(&mut self, strategy: ConflictStrategy) {

@@ -14,8 +14,8 @@ export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destinati
 export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
-type SelectionMotion = 'mode' | 'format' | 'conversion-mode' | 'theme' | 'lang' | null;
-type PendingSelection = 'mode' | 'format' | 'conversion-mode' | null;
+type SelectionMotion = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | 'theme' | 'lang' | null;
+type PendingSelection = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | null;
 type OnboardingStep = 0 | 1 | 2 | 3;
 type OnboardingTarget = 'mode' | 'source' | 'destination' | 'start';
 
@@ -42,6 +42,7 @@ export type AppViewState = {
   mode: AppMode;
   losslessFormat: AppLosslessFormat | null;
   conversionMode: AppConversionMode;
+  enhancedMode: boolean;
   conflictStrategy: AppConflictStrategy;
   filenameRule: AppFilenameRule;
   lang: AppLanguage;
@@ -69,6 +70,7 @@ export type DesktopState = {
   mode: AppMode;
   lossless_format: AppLosslessFormat | null;
   conversion_mode: AppConversionMode;
+  enhanced_mode: boolean;
   conflict_strategy: AppConflictStrategy;
   filename_rule: AppFilenameRule;
 };
@@ -145,6 +147,11 @@ export type AppAnalysisState = {
   message: string;
 };
 
+export type AppAnalysisFailure = {
+  path: string;
+  message: string;
+};
+
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
 
 export type AppHistoryEntry = {
@@ -200,6 +207,7 @@ export type AppServices = {
   chooseMode: (mode: AppMode) => Promise<DesktopState>;
   chooseLosslessFormat: (format: AppLosslessFormat | null) => Promise<DesktopState>;
   chooseConversionMode: (mode: AppConversionMode) => Promise<DesktopState>;
+  chooseEnhancedMode: (enabled: boolean) => Promise<DesktopState>;
   chooseConflictStrategy: (strategy: AppConflictStrategy) => Promise<DesktopState>;
   chooseFilenameRule: (rule: AppFilenameRule) => Promise<DesktopState>;
   previewAllSync: () => Promise<AppPreview[]>;
@@ -211,6 +219,7 @@ export type AppServices = {
     previews: AppPreview[],
     retryOf?: string | null,
     analyses?: TrackAnalysis[],
+    analysisFailures?: AppAnalysisFailure[],
   ) => Promise<DesktopState>;
   loadHistory: () => Promise<AppHistoryEntry[]>;
   retryHistoryFailures: (id: string) => Promise<AppPreview>;
@@ -300,6 +309,11 @@ const translations = {
     conversionMode: '转换方式',
     scanThenConvert: '扫描后转换',
     directConvert: '直接转换',
+    enhancedAnalysis: '分析增强',
+    standardConvert: '普通转换',
+    enhancedMode: '加强模式',
+    enhancedModeOffNote: '只转换，不运行 Essentia 分析',
+    enhancedModeOnNote: '自动分析 BPM、Key、响度和能量并写入元数据',
     advancedOptions: '高级选项',
     losslessFormat: '无损格式',
     syncSlot: '任务',
@@ -420,6 +434,11 @@ const translations = {
     conversionMode: 'Conversion flow',
     scanThenConvert: 'Scan then convert',
     directConvert: 'Direct convert',
+    enhancedAnalysis: 'Analysis enhancement',
+    standardConvert: 'Standard',
+    enhancedMode: 'Enhanced',
+    enhancedModeOffNote: 'Convert only; Essentia analysis stays off',
+    enhancedModeOnNote: 'Analyze BPM, key, loudness, and energy and write metadata',
     advancedOptions: 'Advanced options',
     losslessFormat: 'Lossless format',
     syncSlot: 'Task',
@@ -571,6 +590,7 @@ const defaultState: AppViewState = {
   mode: 'compat',
   losslessFormat: null,
   conversionMode: 'scan_then_convert',
+  enhancedMode: false,
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
   lang: initialLanguage,
@@ -636,6 +656,8 @@ const defaultServices: AppServices = {
     invoke<DesktopState>('choose_lossless_format', { format }),
   chooseConversionMode: (mode) =>
     invoke<DesktopState>('choose_conversion_mode', { mode }),
+  chooseEnhancedMode: (enabled) =>
+    invoke<DesktopState>('choose_enhanced_mode', { enabled }),
   chooseConflictStrategy: (strategy) =>
     invoke<DesktopState>('choose_conflict_strategy', { strategy }),
   chooseFilenameRule: (rule) => invoke<DesktopState>('choose_filename_rule', { rule }),
@@ -644,8 +666,18 @@ const defaultServices: AppServices = {
   loadScanState: () => invoke<AppScanProgress>('load_scan_state'),
   loadScanResult: () => invoke<AppPreview[]>('load_scan_result'),
   cancelScan: () => invoke<AppScanProgress>('cancel_scan'),
-  startConfirmedSync: (previews, retryOf = null, analyses = []) =>
-    invoke<DesktopState>('start_confirmed_sync', { previews, retryOf, analyses }),
+  startConfirmedSync: (
+    previews,
+    retryOf = null,
+    analyses = [],
+    analysisFailures = [],
+  ) =>
+    invoke<DesktopState>('start_confirmed_sync', {
+      previews,
+      retryOf,
+      analyses,
+      analysisFailures,
+    }),
   loadHistory: () => invoke<AppHistoryEntry[]>('load_history'),
   retryHistoryFailures: (id) => invoke<AppPreview>('retry_history_failures', { id }),
   exportHistoryErrorReport: (id, path) =>
@@ -752,6 +784,33 @@ export function renderApp(
             </button>
           </div>
           ${renderLosslessFormats(state, pendingSelection)}
+          <div
+            class="enhanced-mode-row mode-row"
+            data-role="enhanced-mode-switch"
+            data-selected-enhanced-mode="${state.enhancedMode ? 'on' : 'off'}"
+            aria-label="${t('enhancedAnalysis', state.lang)}"
+          >
+            <button
+              type="button"
+              class="mode-button ${state.enhancedMode ? '' : 'selected'}"
+              data-enhanced-mode="off"
+              title="${t('enhancedModeOffNote', state.lang)}"
+              ${isRunning || pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}
+            >
+              ${icon('check')}
+              ${t('standardConvert', state.lang)}
+            </button>
+            <button
+              type="button"
+              class="mode-button ${state.enhancedMode ? 'selected' : ''}"
+              data-enhanced-mode="on"
+              title="${t('enhancedModeOnNote', state.lang)}"
+              ${isRunning || pendingSelection !== null || pendingAction !== null ? 'disabled' : ''}
+            >
+              ${icon('disc')}
+              ${t('enhancedMode', state.lang)}
+            </button>
+          </div>
           ${renderOutputSettings(state, outputSettingsExpanded)}
           <div class="rail-lower">
             <div class="rail-note">
@@ -1248,11 +1307,18 @@ export function bindApp(
 
       previewBusy = true;
       render();
-      const analyses = await analyzePreviewCandidates(previews);
-      if (analysisCancelRequested) {
+      const analysis = state.enhancedMode
+        ? await analyzePreviewCandidates(previews)
+        : { analyses: [], failures: [] };
+      if (state.enhancedMode && analysisCancelRequested) {
         return;
       }
-      const nextState = await services.startConfirmedSync(previews, null, analyses);
+      const nextState = await services.startConfirmedSync(
+        previews,
+        null,
+        analysis.analyses,
+        analysis.failures,
+      );
       applyDesktopState(nextState);
     } catch (error) {
       scanProgress = {
@@ -1374,14 +1440,17 @@ export function bindApp(
     pendingGlobalAction = 'start-all';
     render();
     try {
-      const analyses = await analyzePreviewCandidates(previewModal.previews);
-      if (analysisCancelRequested) {
+      const analysis = state.enhancedMode
+        ? await analyzePreviewCandidates(previewModal.previews)
+        : { analyses: [], failures: [] };
+      if (state.enhancedMode && analysisCancelRequested) {
         return;
       }
       const nextState = await services.startConfirmedSync(
         previewModal.previews,
         previewModal.retryOf,
-        analyses,
+        analysis.analyses,
+        analysis.failures,
       );
       previewModal = null;
       applyDesktopState(nextState);
@@ -1462,17 +1531,17 @@ export function bindApp(
 
   const analyzePreviewCandidates = async (
     previews: AppPreview[],
-  ): Promise<TrackAnalysis[]> => {
+  ): Promise<{ analyses: TrackAnalysis[]; failures: AppAnalysisFailure[] }> => {
+    analysisCancelRequested = false;
     const candidates = Array.from(new Map(
       previews
         .flatMap((item) => item.preview.candidates)
         .map((candidate) => [candidate.source_path, candidate]),
     ).values());
     if (candidates.length === 0) {
-      return [];
+      return { analyses: [], failures: [] };
     }
 
-    analysisCancelRequested = false;
     analysisState = {
       status: 'running',
       completed: 0,
@@ -1492,6 +1561,7 @@ export function bindApp(
     render();
 
     const results: TrackAnalysis[] = [];
+    const failures: AppAnalysisFailure[] = [];
     let failedCount = 0;
     for (const candidate of candidates) {
       if (analysisCancelRequested) {
@@ -1507,7 +1577,7 @@ export function bindApp(
           message: t('scanCancelled', state.lang),
         };
         render();
-        return [];
+        return { analyses: [], failures: [] };
       }
       try {
         const bytes = await services.readAudioFile(candidate.source_path);
@@ -1522,6 +1592,10 @@ export function bindApp(
         );
       } catch (error) {
         failedCount += 1;
+        failures.push({
+          path: candidate.source_path,
+          message: error instanceof Error ? error.message : String(error),
+        });
         console.warn(`Essentia analysis failed for ${candidate.source_path}`, error);
       }
       analysisState = {
@@ -1560,7 +1634,7 @@ export function bindApp(
     }
     scanProgress = null;
     render();
-    return results;
+    return { analyses: results, failures };
   };
 
   const openAbout = async () => {
@@ -1623,6 +1697,7 @@ export function bindApp(
     const mode = button.dataset.mode as AppMode | undefined;
     const format = button.dataset.format as AppLosslessFormat | undefined;
     const conversionMode = button.dataset.conversionMode as AppConversionMode | undefined;
+    const enhancedMode = button.dataset.enhancedMode;
     const slotIndex = parseSlotIndex(button.dataset.slot);
     const isOnboardingAction = action === 'onboarding-next'
       || action === 'onboarding-previous'
@@ -1825,6 +1900,16 @@ export function bindApp(
         'conversion-mode',
         state.conversionMode !== conversionMode,
         () => services.chooseConversionMode(conversionMode),
+      );
+      return;
+    }
+
+    if (enhancedMode === 'on' || enhancedMode === 'off') {
+      const enabled = enhancedMode === 'on';
+      void runSelectionAction(
+        'enhanced-mode',
+        state.enhancedMode !== enabled,
+        () => services.chooseEnhancedMode(enabled),
       );
       return;
     }
@@ -2168,6 +2253,7 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
     mode: state.mode,
     losslessFormat: state.lossless_format,
     conversionMode: state.conversion_mode,
+    enhancedMode: state.enhanced_mode,
     conflictStrategy: state.conflict_strategy,
     filenameRule: state.filename_rule,
     lang,

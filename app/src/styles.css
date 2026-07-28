@@ -317,6 +317,7 @@ h1 {
 
 .mode-row,
 .conversion-mode-row,
+.enhanced-mode-row,
 .format-row {
   position: relative;
   display: grid;
@@ -330,6 +331,7 @@ h1 {
 
 .mode-row::before,
 .conversion-mode-row::before,
+.enhanced-mode-row::before,
 .format-row::before {
   position: absolute;
   z-index: 0;
@@ -354,8 +356,19 @@ h1 {
   transform: translateY(0);
 }
 
+.enhanced-mode-row::before {
+  inset: 8px auto auto 8px;
+  width: calc(50% - 11.5px);
+  height: 37px;
+  transform: translateX(0);
+}
+
 .conversion-mode-row[data-selected-conversion-mode="direct"]::before {
   transform: translateY(44px);
+}
+
+.enhanced-mode-row[data-selected-enhanced-mode="on"]::before {
+  transform: translateX(calc(100% + 7px));
 }
 
 .mode-row[data-selected-mode="lossless"]::before {
@@ -391,6 +404,16 @@ h1 {
 @keyframes conversion-slide-up {
   from { transform: translateY(44px); }
   to { transform: translateY(0); }
+}
+
+@keyframes enhanced-slide-down {
+  from { transform: translateX(0); }
+  to { transform: translateX(calc(100% + 7px)); }
+}
+
+@keyframes enhanced-slide-up {
+  from { transform: translateX(calc(100% + 7px)); }
+  to { transform: translateX(0); }
 }
 
 @keyframes format-slide-right {
@@ -442,6 +465,16 @@ h1 {
 
 .app-shell[data-selection-motion="conversion-mode"] .conversion-mode-row[data-selected-conversion-mode="scan_then_convert"]::before {
   animation: conversion-slide-up 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
+}
+
+.app-shell[data-selection-motion="enhanced-mode"] .enhanced-mode-row[data-selected-enhanced-mode="on"]::before {
+  animation: enhanced-slide-down 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  animation-fill-mode: both;
+}
+
+.app-shell[data-selection-motion="enhanced-mode"] .enhanced-mode-row[data-selected-enhanced-mode="off"]::before {
+  animation: enhanced-slide-up 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
   animation-fill-mode: both;
 }
 
@@ -569,6 +602,7 @@ h1 {
 
 .app-shell[data-theme="light"][data-light-palette="c"] .mode-row,
 .app-shell[data-theme="light"][data-light-palette="c"] .conversion-mode-row,
+.app-shell[data-theme="light"][data-light-palette="c"] .enhanced-mode-row,
 .app-shell[data-theme="light"][data-light-palette="c"] .format-row {
   background: rgba(12, 10, 9, 0.3);
 }
@@ -592,10 +626,16 @@ h1 {
 
 .app-shell[data-theme="dark"] .mode-row::before,
 .app-shell[data-theme="dark"] .conversion-mode-row::before,
+.app-shell[data-theme="dark"] .enhanced-mode-row::before,
 .app-shell[data-theme="dark"] .format-row::before {
   border-color: rgba(195, 75, 80, 0.34);
   background: #2d171a;
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
+}
+
+.enhanced-mode-row {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  height: var(--format-slot-height);
 }
 
 .rail-note {
