@@ -1236,11 +1236,9 @@ export function bindApp(
     const shell = root.querySelector<HTMLElement>('.app-shell');
     if (motion === 'start') {
       if (shell) {
-        // Re-setting the same data attribute does not restart a CSS animation.
-        // Clear it and force one layout read so quick reversals use the same
-        // slide choreography as the WAV/AIFF selector.
-        delete shell.dataset.selectionMotion;
-        void shell.offsetWidth;
+        // These selectors move through their persistent CSS transition.
+        // Keeping the attribute in place lets a quick reversal continue from
+        // the current interpolated position instead of flashing at an endpoint.
         shell.dataset.selectionMotion = kind;
       }
     } else if (motion === 'clear' && shell?.dataset.selectionMotion === kind) {

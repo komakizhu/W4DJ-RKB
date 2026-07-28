@@ -1076,6 +1076,15 @@ describe('bindApp', () => {
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
+    const shell = root.querySelector<HTMLElement>('.app-shell');
+    let forcedLayoutReads = 0;
+    Object.defineProperty(shell as HTMLElement, 'offsetWidth', {
+      configurable: true,
+      get: () => {
+        forcedLayoutReads += 1;
+        return 1440;
+      },
+    });
     const enhancedSwitch = root.querySelector('[data-role="enhanced-mode-switch"]');
     (root.querySelector('[data-enhanced-mode="on"]') as HTMLButtonElement).click();
     enhancedOn.resolve(makeDesktopState({ enhanced_mode: true }));
@@ -1091,6 +1100,44 @@ describe('bindApp', () => {
         ?.getAttribute('data-selected-enhanced-mode')).toBe('off');
     });
     expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
+    expect(forcedLayoutReads).toBe(0);
+  });
+
+  it('keeps the conversion selector stable when quickly reversing the slide', async () => {
+    const conversionDirect = createDeferred<DesktopState>();
+    const conversionScan = createDeferred<DesktopState>();
+    const services = makeMockServices({
+      chooseConversionMode: vi.fn((mode: 'scan_then_convert' | 'direct') =>
+        (mode === 'direct' ? conversionDirect : conversionScan).promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const shell = root.querySelector<HTMLElement>('.app-shell');
+    let forcedLayoutReads = 0;
+    Object.defineProperty(shell as HTMLElement, 'offsetWidth', {
+      configurable: true,
+      get: () => {
+        forcedLayoutReads += 1;
+        return 1440;
+      },
+    });
+    const conversionSwitch = root.querySelector('[data-role="conversion-mode-switch"]');
+    (root.querySelector('[data-conversion-mode="direct"]') as HTMLButtonElement).click();
+    conversionDirect.resolve(makeDesktopState({ conversion_mode: 'direct' }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="conversion-mode-switch"]')
+        ?.getAttribute('data-selected-conversion-mode')).toBe('direct');
+    });
+
+    (root.querySelector('[data-conversion-mode="scan_then_convert"]') as HTMLButtonElement).click();
+    conversionScan.resolve(makeDesktopState({ conversion_mode: 'scan_then_convert' }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="conversion-mode-switch"]')
+        ?.getAttribute('data-selected-conversion-mode')).toBe('scan_then_convert');
+    });
+    expect(root.querySelector('[data-role="conversion-mode-switch"]')).toBe(conversionSwitch);
+    expect(forcedLayoutReads).toBe(0);
   });
 
   it('persists the optional Essentia enhanced mode with the sliding control pattern', async () => {
