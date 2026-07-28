@@ -50,7 +50,6 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   enhanced_mode: false,
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
-  report_path: null,
   ...overrides,
 });
 
@@ -180,6 +179,7 @@ const makeHistoryEntry = (overrides: Partial<AppHistoryEntry> = {}): AppHistoryE
   retry_of: null,
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
+  report_path: null,
   ...overrides,
 });
 
@@ -233,7 +233,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '2.2.1',
+    version: '3.0.0',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -449,13 +449,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '2.2.1',
+        version: '3.0.0',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.1');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.0.0');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
   });
@@ -1144,7 +1144,7 @@ describe('bindApp', () => {
     await Promise.resolve();
 
     expect(services.chooseMode).not.toHaveBeenCalled();
-    expect(root.querySelector('.app-shell')?.dataset.selectionMotion).not.toBe('mode');
+    expect((root.querySelector('.app-shell') as HTMLElement | null)?.dataset.selectionMotion).not.toBe('mode');
   });
 
   it('serializes rapid WAV and AIFF selection clicks', async () => {

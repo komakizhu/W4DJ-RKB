@@ -1,5 +1,29 @@
 # W4DJ RKB 更新日志
 
+## v3.0.0
+
+### Added
+
+- 新增可选“加强模式”：开启后使用 Essentia.js 自动分析 BPM、Key、响度、能量、Danceability 和节拍位置。
+- 分析结果会写入转换后的音频元数据，并保存在本地分析库中，便于 Rekordbox 读取和后续 XML 导出。
+- 加强模式默认关闭；关闭时保持原有的普通转换流程，不读取音频分析数据。
+- 单曲分析失败不会中断整批转换，失败路径和原因会写入转换历史及自动错误报告。
+- macOS DMG 内新增 Gatekeeper 修复工具；清除隔离属性后会自动打开已安装的 W4DJ RKB.app。
+
+### Improved
+
+- 加强模式开关采用紧凑横向滑动样式，默认窗口仍可完整看到主要操作和转换历史。
+- 加强模式状态会保存到本地偏好设置，重新打开软件后继续使用上次选择。
+
+### Fixed
+
+- Release Actions 会校验最终 DMG 同时包含 App、Gatekeeper 修复工具和 Applications 入口。
+
+### Notes
+
+- Rekordbox XML 只引用音频文件路径，不会复制音频文件；导入后请确保原输出目录保持不变。
+- Essentia.js 使用 AGPL-3.0 授权，分发包含该模块的安装包时需要遵守对应许可证。
+
 ## v2.2.4
 
 ### Added
@@ -10,19 +34,6 @@
 ### Fixed
 
 - 修复未签名 macOS 应用首次打开时可能出现“文件已损坏”提示的问题。
-
-## Unreleased
-
-### Added
-
-- 接入 Essentia.js 音频分析，可扫描输出目录并保存 BPM、Key、节拍位置、LUFS、Energy、Danceability 等结果。
-- 新增 Rekordbox XML 导出：BPM、Key 和节拍网格写入标准字段，响度、能量、舞动性和 Key 置信度写入 Comments。
-- 新增本地音乐分析库，分析结果独立于转换历史保存，重复分析同一首歌会更新而不会产生重复记录。
-
-### Notes
-
-- Rekordbox XML 只引用音频文件路径，不会复制音频文件；导入后请确保原输出目录保持不变。
-- Essentia.js 使用 AGPL-3.0 授权，分发包含该模块的安装包时需要遵守对应许可证。
 
 ## v2.2.3
 

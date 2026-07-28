@@ -67,7 +67,7 @@ pub struct Config {
 #[derive(clap::Parser)]
 #[command(
     name = "w4dj",
-    version = "2.2.1",
+    version = "3.0.0",
     author = "slipstream",
     about = "网易云音乐曲库同步器"
 )]

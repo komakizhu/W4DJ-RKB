@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn rekordbox_xml_contains_native_and_visible_analysis_fields() {
-        let xml = build_rekordbox_xml(&[sample()], "2.2.3");
+        let xml = build_rekordbox_xml(&[sample()], "3.0.0");
 
         assert!(xml.contains("AverageBpm=\"140.25\""));
         assert!(xml.contains("Tonality=\"F#m\""));

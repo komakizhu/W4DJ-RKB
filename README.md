@@ -75,7 +75,7 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 
 ### Essentia 自动分析与 Rekordbox 元数据
 
-Essentia.js 已内置在转换流程中。点击确认并开始转换后，W4DJ 会在后台逐首分析待处理歌曲，并把结果直接写入输出音频，不需要另外点击“分析音乐库”：
+Essentia.js 已内置在“加强模式”中。打开“加强模式”后，点击确认并开始转换，W4DJ 会在后台逐首分析待处理歌曲，并把结果直接写入输出音频；关闭时不会运行分析，也不改变普通转换流程：
 
 - BPM 和节拍位置；
 - Key、大小调和 Key 置信度；
@@ -84,7 +84,7 @@ Essentia.js 已内置在转换流程中。点击确认并开始转换后，W4DJ 
 
 其中 BPM 和 Key 使用标准音频标签，Rekordbox 导入音频后可以直接读取；节拍位置、响度、Energy、Danceability 和 Key 置信度同时写入 W4DJ 自定义标签与 Comment。不同版本的 Rekordbox 对自定义标签的显示方式可能不同，但不会影响标准 BPM/Key。
 
-分析进度会显示在转换进度窗口中；某一首分析失败不会阻断整批转换，失败会进入本次转换记录。旧版 Rekordbox XML 导出接口仍保留用于兼容，但当前桌面界面不再提供独立的分析按钮。
+加强模式的分析进度会显示在转换进度窗口中；某一首分析失败不会阻断整批转换，失败会进入本次转换记录。旧版 Rekordbox XML 导出接口仍保留用于兼容，但当前桌面界面不再提供独立的分析按钮。
 
 ### 冲突与文件名策略
 
@@ -116,7 +116,7 @@ Essentia.js 已内置在转换流程中。点击确认并开始转换后，W4DJ 
 7. 点击“同时开始”。
 8. 在汇总确认窗口检查文件数量、预计大小和磁盘可用空间，点击“确认并开始转换”。
 9. 将输出目录导入 Rekordbox，或复制到 DJ 设备使用的存储介质。
-10. 转换过程中 W4DJ 会自动分析歌曲并写入元数据；完成后将输出目录导入 Rekordbox 即可。
+10. 如果打开“加强模式”，转换过程中 W4DJ 会自动分析歌曲并写入元数据；关闭时只进行普通转换。
 
 ## 支持的平台
 
@@ -129,9 +129,9 @@ Essentia.js 已内置在转换流程中。点击确认并开始转换后，W4DJ 
 
 从 Releases 下载对应架构的安装包：
 
-- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v2.2.3.dmg`
-- Intel：`W4DJ-RKB-macOS-Intel-v2.2.3.dmg`
-- Windows：`W4DJ-RKB-Windows-Installer-v2.2.3-setup.exe`
+- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v3.0.0.dmg`
+- Intel：`W4DJ-RKB-macOS-Intel-v3.0.0.dmg`
+- Windows：`W4DJ-RKB-Windows-Installer-v3.0.0-setup.exe`
 
 首次打开时，如果 macOS 提示应用无法验证：
 
