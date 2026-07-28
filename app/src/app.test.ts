@@ -339,52 +339,14 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-role="sync-slot"][data-slot="1"] .progress-copy')).toBeNull();
   });
 
-  it('renders new and skipped track counts in the global status card', () => {
-    const root = renderApp(
-      makeViewState({
-        slots: [
-          makeViewSlot({ newTracks: 3, skippedTracks: 1 }),
-          makeViewSlot({ newTracks: 2, skippedTracks: 4 }),
-        ],
-      }),
-    );
+  it('removes the global status card and moves the start action directly below settings', () => {
+    const root = renderApp(makeViewState());
 
-    const status = root.querySelector('.global-status-card') as HTMLElement;
-    expect(status.textContent).toContain('新增歌曲');
-    expect(status.textContent).toContain('5');
-    expect(status.textContent).toContain('跳过歌曲');
-    expect(status.textContent).toContain('5');
-  });
-
-  it('keeps planned, completed, skipped, and error counts independent', () => {
-    const root = renderApp(
-      makeViewState({
-        slots: [
-          makeViewSlot({
-            newTracks: 5,
-            progressCompleted: 2,
-            skippedTracks: 3,
-            errorTracks: 1,
-          }),
-          makeViewSlot({
-            newTracks: 4,
-            progressCompleted: 1,
-            skippedTracks: 2,
-            errorTracks: 2,
-          }),
-        ],
-      }),
-    );
-
-    const status = root.querySelector('.global-status-card') as HTMLElement;
-    expect(Array.from(status.querySelectorAll('dd')).map((item) => item.textContent)).toEqual([
-      '2/2',
-      '3',
-      '9',
-      '5',
-      '3',
-    ]);
-    expect(status.textContent).toContain('错误文件');
+    expect(root.querySelector('.global-status-card')).toBeNull();
+    const actionGroup = root.querySelector('.global-action-group');
+    expect(actionGroup).not.toBeNull();
+    expect(actionGroup?.previousElementSibling?.matches('[data-role="advanced-output-settings"]'))
+      .toBe(true);
   });
 
   it('renders the selected color theme and a top-right theme toggle', () => {
@@ -423,7 +385,14 @@ describe('renderApp', () => {
       .toContain('兼容模式：最高输出 320kbps MP3');
     expect(root.querySelector('[data-role="help-modal"]')?.textContent)
       .toContain('无损模式：最高输出 24-bit / 48kHz');
-    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('加强转换');
+    const helpText = root.querySelector('[data-role="help-modal"]')?.textContent || '';
+    expect(helpText).toContain('兼容模式');
+    expect(helpText).toContain('无损模式');
+    expect(helpText).toContain('普通转换');
+    expect(helpText).toContain('增强转换');
+    expect(helpText).not.toContain('Essentia');
+    expect(root.querySelector('[data-role="help-modal"] .help-section')?.querySelectorAll('.help-card'))
+      .toHaveLength(4);
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('扫描后转换');
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('直接转换');
   });
@@ -1337,7 +1306,8 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="open-help"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(root.querySelector('[data-role="help-modal"]')).not.toBeNull());
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('普通转换');
-    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('加强转换');
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('增强转换');
+    expect(root.querySelector('[data-role="help-modal"]')?.textContent).not.toContain('Essentia');
     expect(root.querySelector('[data-role="help-modal"] [data-action="reopen-onboarding"]')).not.toBeNull();
 
     (root.querySelector('[data-action="reopen-onboarding"]') as HTMLButtonElement).click();

@@ -622,10 +622,6 @@ h1 {
   background: rgba(12, 10, 9, 0.3);
 }
 
-.app-shell[data-theme="light"][data-light-palette="c"] .global-status-card {
-  background: rgba(12, 10, 9, 0.3);
-}
-
 .app-shell[data-theme="light"][data-light-palette="c"] .progress-track {
   border-color: rgba(72, 61, 56, 0.16);
   background: rgba(86, 76, 70, 0.2);
@@ -651,64 +647,6 @@ h1 {
 .enhanced-mode-row {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   height: var(--format-slot-height);
-}
-
-.rail-lower {
-  display: grid;
-  gap: 12px;
-  margin-top: 0;
-}
-
-.global-status-card {
-  display: grid;
-  gap: 11px;
-  margin-top: 0;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 17px;
-  padding: 15px;
-  background: rgba(4, 24, 29, 0.28);
-}
-
-.global-status-card dl {
-  display: grid;
-  gap: 9px;
-  margin: 0;
-}
-
-.global-status-card dl > div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.global-status-card dt {
-  color: var(--rail-muted);
-  font-size: 10px;
-}
-
-.global-status-card dd {
-  margin: 0;
-  color: var(--rail-text);
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.global-status-card dd.stat-new {
-  color: #69d5b0;
-}
-
-.global-status-card dd.stat-skipped {
-  color: #f3a06b;
-}
-
-.global-status-card dd.stat-error {
-  color: #ee786d;
-}
-
-.app-shell[data-theme="dark"] .global-status-card {
-  background: rgba(4, 5, 6, 0.46);
 }
 
 .global-action {
@@ -1130,10 +1068,6 @@ h1 {
     min-height: auto;
   }
 
-  .global-status-card {
-    margin-top: 0;
-  }
-
   .sync-slots {
     grid-template-rows: auto;
   }
@@ -1483,13 +1417,17 @@ h1 {
   gap: 16px;
 }
 
+.help-dialog-head > div {
+  display: grid;
+  gap: 4px;
+}
+
 .help-dialog h2,
 .help-dialog p {
   margin: 0;
 }
 
 .help-dialog h2 {
-  margin-top: -10px;
   color: var(--text);
 }
 
@@ -1648,11 +1586,6 @@ h1 {
 
   .global-controls {
     gap: 8px;
-  }
-
-  .global-status-card {
-    gap: 7px;
-    padding: 10px 12px;
   }
 
   .global-action {

@@ -311,8 +311,8 @@ const translations = {
     directConvert: '直接转换',
     enhancedAnalysis: '分析增强',
     standardConvert: '普通转换',
-    enhancedMode: '加强模式',
-    enhancedModeOffNote: '只转换，不运行 Essentia 分析',
+    enhancedMode: '增强模式',
+    enhancedModeOffNote: '只转换，不执行音乐分析',
     enhancedModeOnNote: '自动分析 BPM、Key、响度和能量并写入元数据',
     advancedOptions: '高级选项',
     losslessFormat: '无损格式',
@@ -366,9 +366,9 @@ const translations = {
     helpIntro: '这里集中说明输出、分析和转换方式，遇到不确定时可以随时回来查看。',
     helpOutputTitle: '输出与分析',
     helpCompatibilityTitle: '普通转换',
-    helpCompatibilityBody: '关闭加强模式时，W4DJ 只进行常规格式转换，不运行 Essentia 音乐分析。',
-    helpEnhancedTitle: '加强转换',
-    helpEnhancedBody: '开启加强模式后，W4DJ 会运行 Essentia，分析 BPM、Key、响度和能量，并写入输出音频元数据。',
+    helpCompatibilityBody: '关闭增强模式时，W4DJ 只进行常规格式转换。',
+    helpEnhancedTitle: '增强转换',
+    helpEnhancedBody: '开启增强模式后，W4DJ 会自动分析 BPM、Key、响度和能量，并写入输出音频元数据。',
     helpConversionTitle: '转换方式',
     helpScanThenConvertBody: '点击开始后先扫描任务，显示重复文件、错误文件和预计输出；确认后再正式转换。',
     helpDirectConvertBody: '完成输入目录、输出目录、磁盘空间和文件可读性检查后直接转换，不显示二次确认页。',
@@ -394,7 +394,7 @@ const translations = {
     onboardingFinish: '完成',
     usageGuide: '重新查看使用引导',
     analysisTitle: '音乐分析',
-    analysisBody: '用 Essentia 扫描输出目录，写入 BPM、Key、响度和能量。',
+    analysisBody: '扫描输出目录，写入 BPM、Key、响度和能量。',
     analyzeLibrary: '分析音乐库',
     exportRekordbox: '导出 Rekordbox XML',
     analysisIdle: '先设置输出目录，再开始分析。',
@@ -448,7 +448,7 @@ const translations = {
     enhancedAnalysis: 'Analysis enhancement',
     standardConvert: 'Standard',
     enhancedMode: 'Enhanced',
-    enhancedModeOffNote: 'Convert only; Essentia analysis stays off',
+    enhancedModeOffNote: 'Convert only; music analysis stays off',
     enhancedModeOnNote: 'Analyze BPM, key, loudness, and energy and write metadata',
     advancedOptions: 'Advanced options',
     losslessFormat: 'Lossless format',
@@ -502,9 +502,9 @@ const translations = {
     helpIntro: 'A quick guide to output, analysis, and conversion settings whenever you need it.',
     helpOutputTitle: 'Output and analysis',
     helpCompatibilityTitle: 'Standard conversion',
-    helpCompatibilityBody: 'With Enhanced mode off, W4DJ performs a regular format conversion without Essentia analysis.',
+    helpCompatibilityBody: 'With Enhanced mode off, W4DJ performs a regular format conversion.',
     helpEnhancedTitle: 'Enhanced conversion',
-    helpEnhancedBody: 'With Enhanced mode on, W4DJ runs Essentia to analyze BPM, key, loudness, and energy, then writes them to the output metadata.',
+    helpEnhancedBody: 'With Enhanced mode on, W4DJ automatically analyzes BPM, key, loudness, and energy, then writes them to the output metadata.',
     helpConversionTitle: 'Conversion flow',
     helpScanThenConvertBody: 'Click Start to scan first. W4DJ shows duplicates, errors, and estimated output before you confirm the conversion.',
     helpDirectConvertBody: 'After checking input, output, disk space, and file readability, W4DJ converts immediately without a confirmation page.',
@@ -530,7 +530,7 @@ const translations = {
     onboardingFinish: 'Done',
     usageGuide: 'View usage guide again',
     analysisTitle: 'Music analysis',
-    analysisBody: 'Scan output folders with Essentia and write BPM, key, loudness, and energy.',
+    analysisBody: 'Scan output folders and write BPM, key, loudness, and energy.',
     analyzeLibrary: 'Analyze library',
     exportRekordbox: 'Export Rekordbox XML',
     analysisIdle: 'Choose an output folder before analyzing.',
@@ -754,10 +754,6 @@ export function renderApp(
   const onboardingTarget: OnboardingTarget | null = onboardingVisible
     ? (['mode', 'source', 'destination', 'start'] as const)[onboardingStep]
     : null;
-  const completedTracks = state.slots.reduce((total, slot) => total + slot.progressCompleted, 0);
-  const newTracks = state.slots.reduce((total, slot) => total + slot.newTracks, 0);
-  const skippedTracks = state.slots.reduce((total, slot) => total + slot.skippedTracks, 0);
-  const errorTracks = state.slots.reduce((total, slot) => total + slot.errorTracks, 0);
   root.innerHTML = `
     <header class="topbar">
       <div class="brand-block">
@@ -839,18 +835,6 @@ export function renderApp(
             </button>
           </div>
           ${renderOutputSettings(state, outputSettingsExpanded)}
-          <div class="rail-lower">
-            <section class="global-status-card" aria-label="${t('globalStatus', state.lang)}">
-              <p class="global-control-head">${t('globalStatus', state.lang)}</p>
-              <dl>
-                <div><dt>${t('configuredTasks', state.lang)}</dt><dd>${configuredTasks}/2</dd></div>
-                <div><dt>${t('completedTracks', state.lang)}</dt><dd>${completedTracks}</dd></div>
-                <div><dt>${t('newTracks', state.lang)}</dt><dd class="stat-new">${newTracks}</dd></div>
-                <div><dt>${t('skippedTracks', state.lang)}</dt><dd class="stat-skipped">${skippedTracks}</dd></div>
-                <div><dt>${t('errorTracks', state.lang)}</dt><dd class="stat-error">${errorTracks}</dd></div>
-              </dl>
-            </section>
-          </div>
           <div class="global-action-group">
             <button type="button" class="global-action"${onboardingTarget === 'start' ? ' data-onboarding-target="start"' : ''} data-action="${isRunning ? 'pause-all' : 'start-all'}" ${
               configuredTasks === 0 || pendingAction !== null ? 'disabled' : ''
@@ -2338,13 +2322,16 @@ function renderHelpModal(visible: boolean, lang: AppLanguage): string {
           <h3 id="help-output-title">${t('helpOutputTitle', lang)}</h3>
           <div class="help-card-grid">
             <article class="help-card">
-              <h4>${t('helpCompatibilityTitle', lang)}</h4>
-              <p>${t('helpCompatibilityBody', lang)}</p>
+              <h4>${t('compatMode', lang)}</h4>
               <p class="help-note">${t('compatNote', lang)}</p>
             </article>
             <article class="help-card">
               <h4>${t('losslessMode', lang)}</h4>
               <p class="help-note">${t('losslessNote', lang)}</p>
+            </article>
+            <article class="help-card">
+              <h4>${t('helpCompatibilityTitle', lang)}</h4>
+              <p>${t('helpCompatibilityBody', lang)}</p>
             </article>
             <article class="help-card">
               <h4>${t('helpEnhancedTitle', lang)}</h4>
