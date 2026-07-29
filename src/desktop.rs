@@ -1,4 +1,4 @@
-use crate::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use crate::history::FailedFile;
 use crate::preferences::{AppPreferences, SYNC_SLOT_COUNT, SyncSlotPreferences};
 use crate::task::{TaskController, TaskSnapshot};
@@ -39,6 +39,7 @@ pub struct DesktopState {
     pub lossless_format: Option<LosslessFormat>,
     pub conflict_strategy: ConflictStrategy,
     pub filename_rule: FilenameRule,
+    pub netease_filename_format: NeteaseFilenameFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,7 @@ impl DesktopState {
             lossless_format,
             conflict_strategy,
             filename_rule,
+            netease_filename_format,
         } = preferences;
 
         Self {
@@ -83,6 +85,7 @@ impl DesktopState {
             lossless_format,
             conflict_strategy,
             filename_rule,
+            netease_filename_format,
         }
     }
 
@@ -96,6 +99,7 @@ impl DesktopState {
             lossless_format: self.lossless_format,
             conflict_strategy: self.conflict_strategy,
             filename_rule: self.filename_rule,
+            netease_filename_format: self.netease_filename_format,
         }
     }
 }
@@ -115,6 +119,7 @@ impl DesktopController {
             lossless_format,
             conflict_strategy,
             filename_rule,
+            netease_filename_format,
         } = preferences;
 
         for (state_slot, preferences_slot) in self.state.slots.iter_mut().zip(slots) {
@@ -125,6 +130,7 @@ impl DesktopController {
         self.state.lossless_format = lossless_format;
         self.state.conflict_strategy = conflict_strategy;
         self.state.filename_rule = filename_rule;
+        self.state.netease_filename_format = netease_filename_format;
     }
 
     pub fn state(&self) -> &DesktopState {
@@ -172,6 +178,11 @@ impl DesktopController {
     pub fn choose_filename_rule(&mut self, rule: FilenameRule) {
         self.state.filename_rule = rule;
         self.push_log_to_all("Filename rule updated");
+    }
+
+    pub fn choose_netease_filename_format(&mut self, format: NeteaseFilenameFormat) {
+        self.state.netease_filename_format = format;
+        self.push_log_to_all("NetEase input filename format updated");
     }
 
     pub fn start_sync(&mut self, slot_index: usize, total_files: usize) -> Result<(), String> {

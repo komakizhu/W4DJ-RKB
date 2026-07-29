@@ -8,7 +8,7 @@ mod sync;
 #[path = "../src/task.rs"]
 mod task;
 
-use config::{FilenameRule, LosslessFormat, Mode};
+use config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use id3::{TagLike, Version};
 use ncmdump::NcmInfo;
 use std::collections::HashMap;
@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use sync::{
     TargetProfile, cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
     resolve_output_policy, sync_music_library_with_policy,
+    sync_music_library_with_policy_with_settings,
 };
 
 #[test]
@@ -396,16 +397,23 @@ fn compat_export_uses_tags_to_read_netease_artist_first_filename() {
         .write_to_path(&source_path, Version::Id3v24)
         .unwrap();
 
-    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_rule(
+    let (source_music, issues) = sync::get_music_dict_with_scan_issues_with_settings(
         source_dir.to_str().unwrap(),
         FilenameRule::TitleArtist,
+        NeteaseFilenameFormat::ArtistTitle,
     );
     assert!(issues.is_empty());
     assert!(source_music.contains_key("Overlap - KIMERU"));
 
     let pending = source_music.iter().collect::<HashMap<_, _>>();
-    sync_music_library_with_policy(&pending, output_dir.to_str().unwrap(), &Mode::Compat, None)
-        .unwrap();
+    sync_music_library_with_policy_with_settings(
+        &pending,
+        output_dir.to_str().unwrap(),
+        &Mode::Compat,
+        None,
+        NeteaseFilenameFormat::ArtistTitle,
+    )
+    .unwrap();
 
     let output_path = output_dir.join("Overlap - KIMERU.mp3");
     let output_tag = id3::Tag::read_from_path(output_path).unwrap();
@@ -510,9 +518,13 @@ fn compat_export_keeps_netease_title_first_filename_and_metadata_identity() {
     assert_eq!(output_tag.title(), Some("巴适 (Bāshì)"));
     assert_eq!(output_tag.artist(), Some("BikaBreezy, Jaytrue"));
 
-    let diagnostic = sync::inspect_metadata_decision(&source_path, &output_path);
+    let diagnostic = sync::inspect_metadata_decision_with_settings(
+        &source_path,
+        &output_path,
+        NeteaseFilenameFormat::TitleArtist,
+    );
     assert_eq!(diagnostic.detected_filename_layout, "歌名 - 歌手");
-    assert_eq!(diagnostic.decision, "采用完整内嵌元数据");
+    assert_eq!(diagnostic.decision, "网易云源文件格式：歌名 - 歌手");
     assert_eq!(diagnostic.resolved_title, "巴适 (Bāshì)");
     assert_eq!(diagnostic.resolved_artist, "BikaBreezy, Jaytrue");
     assert_eq!(diagnostic.output_title.as_deref(), Some("巴适 (Bāshì)"));

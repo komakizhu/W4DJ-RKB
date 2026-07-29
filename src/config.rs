@@ -35,6 +35,15 @@ pub enum FilenameRule {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum NeteaseFilenameFormat {
+    TitleOnly,
+    ArtistTitle,
+    #[default]
+    TitleArtist,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum CandidateOperation {
     #[default]
@@ -53,6 +62,8 @@ pub struct Config {
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
+    #[serde(default)]
+    pub netease_filename_format: NeteaseFilenameFormat,
 }
 
 #[derive(clap::Parser)]
@@ -71,7 +82,7 @@ pub struct Cmd {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, Config, LosslessFormat, Mode};
+    use super::{Cmd, Config, LosslessFormat, Mode, NeteaseFilenameFormat};
     use clap::CommandFactory;
 
     #[test]
@@ -91,5 +102,20 @@ lossless_format = "aiff"
     #[test]
     fn command_line_version_matches_v2_2_5() {
         assert_eq!(Cmd::command().get_version(), Some("2.2.5"));
+    }
+
+    #[test]
+    fn netease_filename_format_defaults_to_title_artist() {
+        let toml = r#"
+source = "/music/in"
+destination = "/music/out"
+mode = "compat"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.netease_filename_format,
+            NeteaseFilenameFormat::TitleArtist
+        );
     }
 }

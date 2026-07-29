@@ -6,6 +6,7 @@ export type AppMode = 'compat' | 'lossless';
 export type AppLosslessFormat = 'wav' | 'aiff';
 export type AppConflictStrategy = 'skip' | 'overwrite' | 'rename' | 'update_metadata';
 export type AppFilenameRule = 'title_artist' | 'artist_title' | 'original';
+export type AppNeteaseFilenameFormat = 'title_only' | 'artist_title' | 'title_artist';
 export type AppStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error' | 'cancelled';
 export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
@@ -39,6 +40,7 @@ export type AppViewState = {
   losslessFormat: AppLosslessFormat | null;
   conflictStrategy: AppConflictStrategy;
   filenameRule: AppFilenameRule;
+  neteaseFilenameFormat: AppNeteaseFilenameFormat;
   lang: AppLanguage;
   theme: AppTheme;
 };
@@ -65,6 +67,7 @@ export type DesktopState = {
   lossless_format: AppLosslessFormat | null;
   conflict_strategy: AppConflictStrategy;
   filename_rule: AppFilenameRule;
+  netease_filename_format: AppNeteaseFilenameFormat;
 };
 
 export type AppErrorCategory =
@@ -120,6 +123,7 @@ export type AppPreview = {
   lossless_format: AppLosslessFormat | null;
   conflict_strategy: AppConflictStrategy;
   filename_rule: AppFilenameRule;
+  netease_filename_format: AppNeteaseFilenameFormat;
   preview: AppSyncPreview;
   retry_of: string | null;
 };
@@ -177,6 +181,7 @@ export type AppServices = {
   chooseLosslessFormat: (format: AppLosslessFormat | null) => Promise<DesktopState>;
   chooseConflictStrategy: (strategy: AppConflictStrategy) => Promise<DesktopState>;
   chooseFilenameRule: (rule: AppFilenameRule) => Promise<DesktopState>;
+  chooseNeteaseFilenameFormat: (format: AppNeteaseFilenameFormat) => Promise<DesktopState>;
   previewAllSync: () => Promise<AppPreview[]>;
   startConfirmedSync: (previews: AppPreview[], retryOf?: string | null) => Promise<DesktopState>;
   loadHistory: () => Promise<AppHistoryEntry[]>;
@@ -295,6 +300,11 @@ const translations = {
     conflictOverwrite: '已存在文件：覆盖',
     conflictMetadata: '高级选项：仅更新元数据',
     filenameRule: '文件名规则',
+    neteaseFilenameFormat: '网易云源文件格式',
+    neteaseFilenameFormatHint: '仅网易云来源生效',
+    neteaseTitleOnly: '歌名',
+    neteaseArtistTitle: '歌手 - 歌名',
+    neteaseTitleArtist: '歌名 - 歌手',
     titleArtist: '标题 - 艺术家（默认）',
     artistTitle: '艺术家 - 标题',
     originalName: '保留原文件名',
@@ -391,6 +401,11 @@ const translations = {
     conflictOverwrite: 'Existing file: overwrite',
     conflictMetadata: 'Advanced: update metadata only',
     filenameRule: 'Filename rule',
+    neteaseFilenameFormat: 'NetEase source filename format',
+    neteaseFilenameFormatHint: 'Applies to NetEase sources only',
+    neteaseTitleOnly: 'Title only',
+    neteaseArtistTitle: 'Artist - Title',
+    neteaseTitleArtist: 'Title - Artist',
     titleArtist: 'Title - Artist (default)',
     artistTitle: 'Artist - Title',
     originalName: 'Keep original filename',
@@ -485,6 +500,7 @@ const defaultState: AppViewState = {
   losslessFormat: null,
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
+  neteaseFilenameFormat: 'title_artist',
   lang: initialLanguage,
   theme: initialTheme,
 };
@@ -540,6 +556,8 @@ const defaultServices: AppServices = {
   chooseConflictStrategy: (strategy) =>
     invoke<DesktopState>('choose_conflict_strategy', { strategy }),
   chooseFilenameRule: (rule) => invoke<DesktopState>('choose_filename_rule', { rule }),
+  chooseNeteaseFilenameFormat: (format) =>
+    invoke<DesktopState>('choose_netease_filename_format', { format }),
   previewAllSync: () => invoke<AppPreview[]>('preview_all_sync'),
   startConfirmedSync: (previews, retryOf = null) =>
     invoke<DesktopState>('start_confirmed_sync', { previews, retryOf }),
@@ -1440,6 +1458,14 @@ export function bindApp(
       if (rule !== state.filenameRule) {
         void runAction(() => services.chooseFilenameRule(rule), 'all');
       }
+      return;
+    }
+
+    if (select.dataset.action === 'choose-netease-filename-format') {
+      const format = select.value as AppNeteaseFilenameFormat;
+      if (format !== state.neteaseFilenameFormat) {
+        void runAction(() => services.chooseNeteaseFilenameFormat(format), 'all');
+      }
     }
   });
 
@@ -1621,6 +1647,15 @@ function renderOutputSettings(state: AppViewState, expanded = false): string {
             <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
           </select>
         </label>
+        <label>
+          <span>${t('neteaseFilenameFormat', state.lang)}</span>
+          <select data-action="choose-netease-filename-format" aria-label="${t('neteaseFilenameFormat', state.lang)}">
+            <option value="title_only" ${state.neteaseFilenameFormat === 'title_only' ? 'selected' : ''}>${t('neteaseTitleOnly', state.lang)}</option>
+            <option value="artist_title" ${state.neteaseFilenameFormat === 'artist_title' ? 'selected' : ''}>${t('neteaseArtistTitle', state.lang)}</option>
+            <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('neteaseTitleArtist', state.lang)}</option>
+          </select>
+          <small>${t('neteaseFilenameFormatHint', state.lang)}</small>
+        </label>
       </div>
     </details>
   `;
@@ -1707,6 +1742,7 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
     losslessFormat: state.lossless_format,
     conflictStrategy: state.conflict_strategy,
     filenameRule: state.filename_rule,
+    neteaseFilenameFormat: state.netease_filename_format,
     lang,
     theme,
   };

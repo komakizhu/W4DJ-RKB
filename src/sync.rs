@@ -1,4 +1,4 @@
-use crate::config::{FilenameRule, LosslessFormat, Mode};
+use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
     get_image_mime_type,
@@ -259,22 +259,41 @@ pub struct MusicScanIssue {
     pub message: String,
 }
 
+#[allow(dead_code)]
 pub fn get_music_dict_with_scan_issues(
     folder: &str,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     get_music_dict_with_scan_issues_with_rule(folder, FilenameRule::default())
 }
 
+#[allow(dead_code)]
 pub fn get_music_dict_with_scan_issues_with_rule(
     folder: &str,
     filename_rule: FilenameRule,
+) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
+    get_music_dict_with_scan_issues_with_settings(
+        folder,
+        filename_rule,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+pub fn get_music_dict_with_scan_issues_with_settings(
+    folder: &str,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let source_path = Path::new(folder);
     if source_path.is_file() && !is_supported_source_file(source_path) {
         return (HashMap::new(), Vec::new());
     }
 
-    collect_music_dict_with_scan_issues(folder, SUPPORTED_SOURCE_EXTENSIONS, filename_rule)
+    collect_music_dict_with_scan_issues_with_settings(
+        folder,
+        SUPPORTED_SOURCE_EXTENSIONS,
+        filename_rule,
+        netease_filename_format,
+    )
 }
 
 pub fn is_supported_source_file(path: &Path) -> bool {
@@ -283,10 +302,12 @@ pub fn is_supported_source_file(path: &Path) -> bool {
         && has_allowed_extension(path, SUPPORTED_SOURCE_EXTENSIONS)
 }
 
+#[allow(dead_code)]
 pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
     get_music_dict_with_scan_issues(folder).0
 }
 
+#[allow(dead_code)]
 pub fn get_destination_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
     get_destination_music_dict_with_rule(folder, FilenameRule::default())
 }
@@ -309,6 +330,20 @@ fn collect_music_dict_with_scan_issues(
     folder: &str,
     allowed_extensions: &[&str],
     filename_rule: FilenameRule,
+) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
+    collect_music_dict_with_scan_issues_with_settings(
+        folder,
+        allowed_extensions,
+        filename_rule,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+fn collect_music_dict_with_scan_issues_with_settings(
+    folder: &str,
+    allowed_extensions: &[&str],
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let mut music_dict = HashMap::new();
     let mut scan_issues = Vec::new();
@@ -337,7 +372,8 @@ fn collect_music_dict_with_scan_issues(
         }
 
         let path = entry.path().to_path_buf();
-        let song_name = derive_song_name_with_rule(entry.path(), filename_rule);
+        let song_name =
+            derive_song_name_with_settings(entry.path(), filename_rule, netease_filename_format);
         let size = entry
             .metadata()
             .map(|m| m.len().to_string())
@@ -478,22 +514,42 @@ fn needs_regeneration(
     }
 }
 
+#[allow(dead_code)]
 pub fn sync_music_library_with_policy(
     new_songs: &HashMap<&String, &(String, PathBuf)>,
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
 ) -> io::Result<TaskSnapshot> {
-    let task_controller = TaskController::running(new_songs.len());
-    sync_music_library_with_task(
+    sync_music_library_with_policy_with_settings(
         new_songs,
         dest_folder,
         mode,
         lossless_format,
-        &task_controller,
+        NeteaseFilenameFormat::default(),
     )
 }
 
+pub fn sync_music_library_with_policy_with_settings(
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> io::Result<TaskSnapshot> {
+    let task_controller = TaskController::running(new_songs.len());
+    sync_music_library_with_observer_with_settings(
+        new_songs,
+        dest_folder,
+        mode,
+        lossless_format,
+        netease_filename_format,
+        &task_controller,
+        |_, _, _| {},
+    )
+}
+
+#[allow(dead_code)]
 pub fn sync_music_library_with_task(
     new_songs: &HashMap<&String, &(String, PathBuf)>,
     dest_folder: &str,
@@ -511,11 +567,32 @@ pub fn sync_music_library_with_task(
     )
 }
 
+#[allow(dead_code)]
 pub fn sync_music_library_with_observer(
     new_songs: &HashMap<&String, &(String, PathBuf)>,
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
+    task_controller: &TaskController,
+    after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
+) -> io::Result<TaskSnapshot> {
+    sync_music_library_with_observer_with_settings(
+        new_songs,
+        dest_folder,
+        mode,
+        lossless_format,
+        NeteaseFilenameFormat::default(),
+        task_controller,
+        after_file,
+    )
+}
+
+pub fn sync_music_library_with_observer_with_settings(
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    netease_filename_format: NeteaseFilenameFormat,
     task_controller: &TaskController,
     mut after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
 ) -> io::Result<TaskSnapshot> {
@@ -547,7 +624,15 @@ pub fn sync_music_library_with_observer(
             return Ok(task_controller.snapshot());
         }
 
-        let task_result = process_music_file(name, info, dest_folder, mode, lossless_format, &bar);
+        let task_result = process_music_file_with_settings(
+            name,
+            info,
+            dest_folder,
+            mode,
+            lossless_format,
+            netease_filename_format,
+            &bar,
+        );
         match task_result {
             Ok(()) => {
                 task_controller.complete_current_file();
@@ -644,12 +729,33 @@ pub fn update_existing_metadata(source_path: &Path, destination_path: &Path) -> 
     })
 }
 
+#[allow(dead_code)]
 fn process_music_file(
     name: &str,
     info: &(String, PathBuf),
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
+    bar: &indicatif::ProgressBar,
+) -> io::Result<()> {
+    process_music_file_with_settings(
+        name,
+        info,
+        dest_folder,
+        mode,
+        lossless_format,
+        NeteaseFilenameFormat::default(),
+        bar,
+    )
+}
+
+fn process_music_file_with_settings(
+    name: &str,
+    info: &(String, PathBuf),
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    netease_filename_format: NeteaseFilenameFormat,
     bar: &indicatif::ProgressBar,
 ) -> io::Result<()> {
     let src_path = info.1.as_path();
@@ -681,10 +787,18 @@ fn process_music_file(
             };
 
             if result.is_ok() {
-                ensure_output_metadata(src_path, &output_path)?;
+                ensure_output_metadata_with_settings(
+                    src_path,
+                    &output_path,
+                    netease_filename_format,
+                )?;
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
                     strip_163_key_from_mp3(&output_path)?;
-                    ensure_output_metadata(src_path, &output_path)?;
+                    ensure_output_metadata_with_settings(
+                        src_path,
+                        &output_path,
+                        netease_filename_format,
+                    )?;
                 }
                 remove_conflicting_outputs(
                     dest_folder,
@@ -712,7 +826,11 @@ fn process_music_file(
             };
 
             if result.is_ok() {
-                ensure_output_metadata(src_path, &output_path)?;
+                ensure_output_metadata_with_settings(
+                    src_path,
+                    &output_path,
+                    netease_filename_format,
+                )?;
                 remove_conflicting_outputs(
                     dest_folder,
                     name,
@@ -738,7 +856,11 @@ fn process_music_file(
             };
 
             if result.is_ok() {
-                ensure_output_metadata(src_path, &output_path)?;
+                ensure_output_metadata_with_settings(
+                    src_path,
+                    &output_path,
+                    netease_filename_format,
+                )?;
                 remove_conflicting_outputs(
                     dest_folder,
                     name,
@@ -758,10 +880,18 @@ fn process_music_file(
                 let output_policy = resolve_output_policy(*mode, lossless_format, &file_format);
                 let output_path =
                     target_output_path(dest_folder, name, output_policy.output_extension);
-                ensure_output_metadata(src_path, &output_path)?;
+                ensure_output_metadata_with_settings(
+                    src_path,
+                    &output_path,
+                    netease_filename_format,
+                )?;
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
                     strip_163_key_from_mp3(&output_path)?;
-                    ensure_output_metadata(src_path, &output_path)?;
+                    ensure_output_metadata_with_settings(
+                        src_path,
+                        &output_path,
+                        netease_filename_format,
+                    )?;
                 }
                 remove_conflicting_outputs(
                     dest_folder,
@@ -896,7 +1026,16 @@ fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()
     Ok(())
 }
 
+#[allow(dead_code)]
 fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<()> {
+    ensure_output_metadata_with_settings(source_path, output_path, NeteaseFilenameFormat::default())
+}
+
+fn ensure_output_metadata_with_settings(
+    source_path: &Path,
+    output_path: &Path,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> io::Result<()> {
     let source_metadata = read_metadata_details(source_path);
     let source_tag = &source_metadata.tag;
     let mut output_tag = read_id3_tag_or_empty(output_path);
@@ -907,17 +1046,19 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
     let prefer_title_artist_filename =
         source_prefers_title_artist_filename(source_path, Some(source_tag));
 
-    if !fill_missing_metadata(
+    if !fill_missing_metadata_with_settings(
         &mut output_tag,
         source_tag,
         fallback_name,
         prefer_title_artist_filename,
+        netease_filename_format,
     ) {
         return verify_output_metadata(
             source_path,
             output_path,
             source_tag,
             &source_metadata.status,
+            netease_filename_format,
         );
     }
 
@@ -927,6 +1068,7 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
         output_path,
         source_tag,
         &source_metadata.status,
+        netease_filename_format,
     )
 }
 
@@ -1018,6 +1160,18 @@ pub fn inspect_metadata_decision(
     source_path: &Path,
     destination_path: &Path,
 ) -> MetadataDiagnostic {
+    inspect_metadata_decision_with_settings(
+        source_path,
+        destination_path,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+pub fn inspect_metadata_decision_with_settings(
+    source_path: &Path,
+    destination_path: &Path,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> MetadataDiagnostic {
     let source_metadata = read_metadata_details(source_path);
     let source_tag = &source_metadata.tag;
     let source_title = normalize_filename_part(source_tag.title());
@@ -1029,11 +1183,12 @@ pub fn inspect_metadata_decision(
         .unwrap_or_default();
     let prefer_title_artist_filename =
         source_prefers_title_artist_filename(source_path, Some(source_tag));
-    let resolution = resolve_song_identity(
+    let resolution = resolve_song_identity_with_format(
         fallback_name,
         source_title.as_deref(),
         source_artist.as_deref(),
         prefer_title_artist_filename,
+        netease_filename_format,
     );
 
     let output_metadata = destination_path
@@ -1052,6 +1207,7 @@ pub fn inspect_metadata_decision(
             output_tag,
             source_tag,
             &source_metadata.status,
+            netease_filename_format,
         );
         if problems.is_empty() {
             if resolution.ambiguous {
@@ -1319,11 +1475,17 @@ fn verify_output_metadata(
     output_path: &Path,
     source_tag: &id3::Tag,
     source_metadata_status: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> io::Result<()> {
     let output_metadata = read_metadata_details(output_path);
     let output_tag = &output_metadata.tag;
-    let problems =
-        metadata_validation_problems(source_path, output_tag, source_tag, source_metadata_status);
+    let problems = metadata_validation_problems(
+        source_path,
+        output_tag,
+        source_tag,
+        source_metadata_status,
+        netease_filename_format,
+    );
 
     if problems.is_empty() {
         return Ok(());
@@ -1349,6 +1511,7 @@ fn metadata_validation_problems(
     output_tag: &id3::Tag,
     source_tag: &id3::Tag,
     source_metadata_status: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> Vec<String> {
     let fallback_name = source_path
         .file_stem()
@@ -1356,11 +1519,12 @@ fn metadata_validation_problems(
         .unwrap_or_default();
     let prefer_title_artist_filename =
         source_prefers_title_artist_filename(source_path, Some(source_tag));
-    let resolution = resolve_song_identity(
+    let resolution = resolve_song_identity_with_format(
         fallback_name,
         source_tag.title(),
         source_tag.artist().or_else(|| source_tag.album_artist()),
         prefer_title_artist_filename,
+        netease_filename_format,
     );
     let mut problems = Vec::new();
 
@@ -1421,18 +1585,36 @@ fn metadata_validation_problems(
     problems
 }
 
+#[allow(dead_code)]
 fn fill_missing_metadata(
     output_tag: &mut id3::Tag,
     source_tag: &id3::Tag,
     fallback_name: &str,
     prefer_title_artist_filename: bool,
 ) -> bool {
+    fill_missing_metadata_with_settings(
+        output_tag,
+        source_tag,
+        fallback_name,
+        prefer_title_artist_filename,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+fn fill_missing_metadata_with_settings(
+    output_tag: &mut id3::Tag,
+    source_tag: &id3::Tag,
+    fallback_name: &str,
+    prefer_title_artist_filename: bool,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> bool {
     let source_artist = source_tag.artist().or_else(|| source_tag.album_artist());
-    let resolution = resolve_song_identity(
+    let resolution = resolve_song_identity_with_format(
         fallback_name,
         source_tag.title(),
         source_artist,
         prefer_title_artist_filename,
+        netease_filename_format,
     );
     let mut changed = false;
 
@@ -1816,6 +1998,14 @@ fn derive_song_name(path: &Path) -> String {
 }
 
 fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> String {
+    derive_song_name_with_settings(path, filename_rule, NeteaseFilenameFormat::default())
+}
+
+fn derive_song_name_with_settings(
+    path: &Path,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> String {
     let fallback_name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -1833,9 +2023,11 @@ fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> Strin
         .to_lowercase();
 
     let candidate = match extension.as_str() {
-        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path, filename_rule, &fallback_name),
-        "flac" => song_name_from_flac(path, filename_rule, &fallback_name),
-        "ncm" => song_name_from_ncm(path, filename_rule, &fallback_name),
+        "mp3" | "wav" | "aiff" => {
+            song_name_from_audio_tag(path, filename_rule, &fallback_name, netease_filename_format)
+        }
+        "flac" => song_name_from_flac(path, filename_rule, &fallback_name, netease_filename_format),
+        "ncm" => song_name_from_ncm(path, filename_rule, &fallback_name, netease_filename_format),
         _ => None,
     };
 
@@ -1844,6 +2036,7 @@ fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> Strin
             &fallback_name,
             filename_rule,
             source_prefers_title_artist_filename(path, None),
+            netease_filename_format,
         )
     })
 }
@@ -1852,6 +2045,7 @@ fn song_name_from_flac(
     path: &Path,
     filename_rule: FilenameRule,
     fallback_name: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> Option<String> {
     let tag = metaflac::Tag::read_from_path(path).ok()?;
     let comments = tag.vorbis_comments();
@@ -1859,11 +2053,12 @@ fn song_name_from_flac(
     let artist = comments.and_then(|comments| {
         join_non_empty(comments.artist()).or_else(|| join_non_empty(comments.album_artist()))
     });
-    let identity = infer_song_identity_with_filename_preference(
+    let identity = infer_song_identity_with_filename_preference_and_format(
         fallback_name,
         title,
         artist.as_deref(),
         source_prefers_title_artist_filename(path, None),
+        netease_filename_format,
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
@@ -1872,14 +2067,16 @@ fn song_name_from_audio_tag(
     path: &Path,
     filename_rule: FilenameRule,
     fallback_name: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> Option<String> {
     let tag = id3::Tag::read_from_path(path).ok()?;
     let artist = tag.artist().or_else(|| tag.album_artist());
-    let identity = infer_song_identity_with_filename_preference(
+    let identity = infer_song_identity_with_filename_preference_and_format(
         fallback_name,
         tag.title(),
         artist,
         source_prefers_title_artist_filename(path, Some(&tag)),
+        netease_filename_format,
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
@@ -1888,6 +2085,7 @@ fn song_name_from_ncm(
     path: &Path,
     filename_rule: FilenameRule,
     fallback_name: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut ncm = Ncmdump::from_reader(file).ok()?;
@@ -1898,11 +2096,12 @@ fn song_name_from_ncm(
         .map(|item| item.0.as_str())
         .collect::<Vec<&str>>()
         .join(", ");
-    let identity = infer_song_identity_with_filename_preference(
+    let identity = infer_song_identity_with_filename_preference_and_format(
         fallback_name,
         Some(&info.name),
         Some(&artist),
         source_prefers_title_artist_filename(path, None),
+        netease_filename_format,
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
@@ -1944,26 +2143,61 @@ fn infer_song_identity(
     )
 }
 
+#[allow(dead_code)]
 fn infer_song_identity_with_filename_preference(
     fallback_name: &str,
     metadata_title: Option<&str>,
     metadata_artist: Option<&str>,
     prefer_title_artist_filename: bool,
 ) -> SongIdentity {
-    resolve_song_identity(
+    infer_song_identity_with_filename_preference_and_format(
         fallback_name,
         metadata_title,
         metadata_artist,
         prefer_title_artist_filename,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+fn infer_song_identity_with_filename_preference_and_format(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+    prefer_title_artist_filename: bool,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> SongIdentity {
+    resolve_song_identity_with_format(
+        fallback_name,
+        metadata_title,
+        metadata_artist,
+        prefer_title_artist_filename,
+        netease_filename_format,
     )
     .identity
 }
 
+#[allow(dead_code)]
 fn resolve_song_identity(
     fallback_name: &str,
     metadata_title: Option<&str>,
     metadata_artist: Option<&str>,
     prefer_title_artist_filename: bool,
+) -> IdentityResolution {
+    resolve_song_identity_with_format(
+        fallback_name,
+        metadata_title,
+        metadata_artist,
+        prefer_title_artist_filename,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+fn resolve_song_identity_with_format(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+    prefer_title_artist_filename: bool,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> IdentityResolution {
     let metadata_title = normalize_filename_part(metadata_title);
     let metadata_artist = normalize_filename_part(metadata_artist);
@@ -1974,6 +2208,40 @@ fn resolve_song_identity(
         Some((left, right))
     });
     let mut candidates = Vec::new();
+
+    if prefer_title_artist_filename {
+        if let Some((left, right)) = &filename_parts {
+            let (title, artist) = match netease_filename_format {
+                NeteaseFilenameFormat::TitleOnly => {
+                    (display.clone(), metadata_artist.clone().unwrap_or_default())
+                }
+                NeteaseFilenameFormat::ArtistTitle => (right.clone(), left.clone()),
+                NeteaseFilenameFormat::TitleArtist => (left.clone(), right.clone()),
+            };
+            push_identity_candidate(
+                &mut candidates,
+                SongIdentity { title, artist },
+                format!(
+                    "网易云源文件格式：{}",
+                    netease_filename_format_label(netease_filename_format)
+                ),
+                170,
+            );
+        } else if !display.is_empty() {
+            push_identity_candidate(
+                &mut candidates,
+                SongIdentity {
+                    title: display.clone(),
+                    artist: metadata_artist.clone().unwrap_or_default(),
+                },
+                format!(
+                    "网易云源文件格式：{}",
+                    netease_filename_format_label(netease_filename_format)
+                ),
+                170,
+            );
+        }
+    }
 
     if let (Some(title), Some(artist)) = (&metadata_title, &metadata_artist) {
         push_identity_candidate(
@@ -2274,6 +2542,14 @@ fn source_prefers_title_artist_filename(path: &Path, tag: Option<&id3::Tag>) -> 
     path_marks_known_source || tag.is_some_and(has_netease_metadata)
 }
 
+fn netease_filename_format_label(format: NeteaseFilenameFormat) -> &'static str {
+    match format {
+        NeteaseFilenameFormat::TitleOnly => "歌名",
+        NeteaseFilenameFormat::ArtistTitle => "歌手 - 歌名",
+        NeteaseFilenameFormat::TitleArtist => "歌名 - 歌手",
+    }
+}
+
 fn has_netease_metadata(tag: &id3::Tag) -> bool {
     tag.comments().any(|comment| {
         comment.description.trim().starts_with("163 key")
@@ -2343,12 +2619,14 @@ fn normalize_fallback_song_name_with_preference(
     fallback_name: &str,
     filename_rule: FilenameRule,
     prefer_title_artist_filename: bool,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> String {
-    let identity = infer_song_identity_with_filename_preference(
+    let identity = infer_song_identity_with_filename_preference_and_format(
         fallback_name,
         None,
         None,
         prefer_title_artist_filename,
+        netease_filename_format,
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
         .unwrap_or_else(|| normalize_display_text(fallback_name))
@@ -2753,12 +3031,13 @@ fn write_container_tags(
 mod tests {
     use super::{
         SongIdentity, build_song_name, build_song_name_with_rule, compare_music_dicts,
-        derive_song_name, derive_song_name_with_rule, ensure_compatible_artwork,
-        ensure_generated_output, ensure_output_metadata, fill_missing_metadata,
-        find_ffmpeg_next_to_exe, infer_song_identity, inspect_metadata_decision,
+        derive_song_name, derive_song_name_with_rule, derive_song_name_with_settings,
+        ensure_compatible_artwork, ensure_generated_output, ensure_output_metadata,
+        ensure_output_metadata_with_settings, fill_missing_metadata, find_ffmpeg_next_to_exe,
+        infer_song_identity, inspect_metadata_decision, inspect_metadata_decision_with_settings,
         remove_conflicting_outputs, sanitize_filename_component, strip_163_key_from_mp3,
     };
-    use crate::config::{FilenameRule, LosslessFormat, Mode};
+    use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
     use id3::{Tag, TagLike, Version};
     use std::collections::HashMap;
     use std::fs;
@@ -3118,7 +3397,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_reversed_netease_tags_from_title_first_filename() {
+    fn respects_explicit_netease_artist_title_format_for_title_first_sources() {
         let dir = tempdir().unwrap();
         let source_path = dir.path().join("网易云音乐/BikaBreezy, Jaytrue - 巴适.mp3");
         let output_path = dir.path().join("output.mp3");
@@ -3134,13 +3413,22 @@ mod tests {
         source.write_to_path(&source_path, Version::Id3v23).unwrap();
         fs::copy(&source_path, &output_path).unwrap();
 
-        ensure_output_metadata(&source_path, &output_path).unwrap();
+        ensure_output_metadata_with_settings(
+            &source_path,
+            &output_path,
+            NeteaseFilenameFormat::ArtistTitle,
+        )
+        .unwrap();
 
         let tag = Tag::read_from_path(&output_path).unwrap();
         assert_eq!(tag.title(), Some("巴适"));
         assert_eq!(tag.artist(), Some("BikaBreezy, Jaytrue"));
 
-        let diagnostic = inspect_metadata_decision(&source_path, &output_path);
+        let diagnostic = inspect_metadata_decision_with_settings(
+            &source_path,
+            &output_path,
+            NeteaseFilenameFormat::ArtistTitle,
+        );
         assert_eq!(diagnostic.resolved_title, "巴适");
         assert_eq!(diagnostic.resolved_artist, "BikaBreezy, Jaytrue");
         assert!(diagnostic.identity_candidates.contains("评分="));
@@ -3182,7 +3470,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_artist_first_title_markers_even_when_source_is_marked_as_netease() {
+    fn respects_explicit_netease_artist_title_format_for_artist_first_sources() {
         let dir = tempdir().unwrap();
         let source_path = dir
             .path()
@@ -3199,8 +3487,37 @@ mod tests {
         source.write_to_path(&source_path, Version::Id3v23).unwrap();
 
         assert_eq!(
-            derive_song_name_with_rule(&source_path, FilenameRule::TitleArtist),
+            derive_song_name_with_settings(
+                &source_path,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::ArtistTitle,
+            ),
             "My Head & My Heart (Claptone Remix) - Ava Max"
+        );
+    }
+
+    #[test]
+    fn respects_explicit_netease_title_only_format() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("网易云音乐/100 & Lonely.mp3");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, b"audio").unwrap();
+        let mut source = Tag::new();
+        source.set_title("100 & Lonely");
+        source.set_artist("ARAI");
+        source.add_frame(id3::frame::ExtendedText {
+            description: "163 key".into(),
+            value: "netease-source".into(),
+        });
+        source.write_to_path(&source_path, Version::Id3v23).unwrap();
+
+        assert_eq!(
+            derive_song_name_with_settings(
+                &source_path,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::TitleOnly,
+            ),
+            "100 & Lonely - ARAI"
         );
     }
 

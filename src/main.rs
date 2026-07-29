@@ -5,8 +5,8 @@ mod sync;
 pub mod task;
 use crate::config::{Cmd, Config};
 use crate::sync::{
-    cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict, get_music_dict,
-    sync_music_library_with_policy,
+    cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict_with_rule,
+    get_music_dict_with_scan_issues_with_settings, sync_music_library_with_policy_with_settings,
 };
 use clap::Parser;
 use std::fs;
@@ -43,7 +43,9 @@ fn main() -> Result<(), Error> {
         destination,
         mode,
         lossless_format,
-        ..
+        netease_filename_format,
+        conflict_strategy,
+        filename_rule,
     } = config;
 
     println!(
@@ -57,8 +59,9 @@ fn main() -> Result<(), Error> {
             destination: destination.clone(),
             mode,
             lossless_format,
-            conflict_strategy: Default::default(),
-            filename_rule: Default::default(),
+            conflict_strategy,
+            filename_rule,
+            netease_filename_format,
         });
         println!("GUI shell launched: {}", shell.status_summary());
         return Ok(());
@@ -83,18 +86,25 @@ fn main() -> Result<(), Error> {
     cleanup_temporary_outputs(sf)?;
 
     println!("Scanning source folder: {}", wf);
-    let wf_dict = get_music_dict(wf);
+    let wf_dict =
+        get_music_dict_with_scan_issues_with_settings(wf, filename_rule, netease_filename_format).0;
     println!("Found {} music files in source.", wf_dict.len());
 
     println!("Scanning destination folder: {}", sf);
-    let sf_dict = get_destination_music_dict(sf);
+    let sf_dict = get_destination_music_dict_with_rule(sf, filename_rule);
     println!("Found {} music files in destination.", sf_dict.len());
 
     let new_songs = compare_music_dicts(&wf_dict, &sf_dict, &mode, lossless_format);
     println!("Found {} new songs to sync.", new_songs.len());
 
     if !new_songs.is_empty() {
-        let snapshot = sync_music_library_with_policy(&new_songs, sf, &mode, lossless_format)?;
+        let snapshot = sync_music_library_with_policy_with_settings(
+            &new_songs,
+            sf,
+            &mode,
+            lossless_format,
+            netease_filename_format,
+        )?;
         println!(
             "Sync status: {}/{} files processed, {} remaining.",
             snapshot.completed, snapshot.total, snapshot.remaining

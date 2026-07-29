@@ -1,8 +1,10 @@
-use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::config::{
+    CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
+};
 use crate::history::HistoryEntry;
 use crate::sync::{
     effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
-    get_music_dict_with_scan_issues_with_rule, is_ignored_music_file, is_supported_source_file,
+    get_music_dict_with_scan_issues_with_settings, is_ignored_music_file, is_supported_source_file,
     resolve_output_policy, target_output_path,
 };
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,8 @@ pub struct SlotPreview {
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
+    #[serde(default)]
+    pub netease_filename_format: NeteaseFilenameFormat,
     pub preview: SyncPreview,
     pub retry_of: Option<String>,
 }
@@ -86,6 +90,26 @@ pub fn build_sync_preview_with_settings(
     lossless_format: Option<LosslessFormat>,
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
+) -> io::Result<SyncPreview> {
+    build_sync_preview_with_source_settings(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+pub fn build_sync_preview_with_source_settings(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> io::Result<SyncPreview> {
     let mut preview = SyncPreview {
         source_directory: source_directory.to_string(),
@@ -151,8 +175,11 @@ pub fn build_sync_preview_with_settings(
         }
     }
 
-    let (source_files, scan_issues) =
-        get_music_dict_with_scan_issues_with_rule(source_directory, filename_rule);
+    let (source_files, scan_issues) = get_music_dict_with_scan_issues_with_settings(
+        source_directory,
+        filename_rule,
+        netease_filename_format,
+    );
     for issue in scan_issues {
         preview.errors.push(PreviewIssue {
             path: issue.path.display().to_string(),

@@ -47,7 +47,7 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   lossless_format: null,
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
-  report_path: null,
+  netease_filename_format: 'title_artist',
   ...overrides,
 });
 
@@ -89,6 +89,7 @@ const makeViewState = (overrides: Partial<AppViewState> = {}): AppViewState => (
   losslessFormat: null,
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
+  neteaseFilenameFormat: 'title_artist',
   lang: 'zh',
   theme: 'light',
   ...overrides,
@@ -114,6 +115,7 @@ const makePreview = (slotIndex: 0 | 1 = 0): AppPreview => ({
   lossless_format: null,
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
+  netease_filename_format: 'title_artist',
   retry_of: null,
   preview: {
     source_directory: `/music/in-${slotIndex + 1}`,
@@ -188,6 +190,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   chooseLosslessFormat: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseConflictStrategy: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseFilenameRule: vi.fn().mockResolvedValue(makeDesktopState()),
+  chooseNeteaseFilenameFormat: vi.fn().mockResolvedValue(makeDesktopState()),
   previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
   startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
     slots: [
@@ -907,6 +910,26 @@ describe('bindApp', () => {
     filename.value = 'artist_title';
     filename.dispatchEvent(new Event('change', { bubbles: true }));
     await vi.waitFor(() => expect(services.chooseFilenameRule).toHaveBeenCalledWith('artist_title'));
+  });
+
+  it('persists the NetEase source filename format selection', async () => {
+    const services = makeMockServices({
+      chooseNeteaseFilenameFormat: vi.fn().mockResolvedValue(
+        makeDesktopState({ netease_filename_format: 'artist_title' }),
+      ),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    const format = root.querySelector(
+      '[data-action="choose-netease-filename-format"]',
+    ) as HTMLSelectElement;
+    format.value = 'artist_title';
+    format.dispatchEvent(new Event('change', { bubbles: true }));
+
+    await vi.waitFor(() =>
+      expect(services.chooseNeteaseFilenameFormat).toHaveBeenCalledWith('artist_title'),
+    );
   });
 
   it('shows one combined preview modal before starting both slots', async () => {

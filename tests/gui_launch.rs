@@ -15,6 +15,7 @@ fn gui_shell_tracks_basic_user_choices() {
         lossless_format: Some(LosslessFormat::Aiff),
         conflict_strategy: Default::default(),
         filename_rule: Default::default(),
+        netease_filename_format: Default::default(),
     };
     let mut shell = launch_shell(&config);
 

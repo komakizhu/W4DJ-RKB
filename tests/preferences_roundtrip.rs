@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::tempdir;
-use w4dj::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use w4dj::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use w4dj::preferences::{AppPreferences, SyncSlotPreferences, load_preferences, save_preferences};
 
 #[test]
@@ -17,6 +17,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         lossless_format: Some(LosslessFormat::Aiff),
         conflict_strategy: ConflictStrategy::Rename,
         filename_rule: FilenameRule::ArtistTitle,
+        netease_filename_format: NeteaseFilenameFormat::ArtistTitle,
     };
 
     save_preferences(&path, &preferences).unwrap();

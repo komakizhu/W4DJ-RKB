@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
-use w4dj::config::{ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use w4dj::config::{
+    ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
+};
 use w4dj::desktop::{DesktopController, DesktopState};
 use w4dj::history::{
     FailedFile, HistoryEntry, HistoryStatus, PendingFile, classify_error, clear_history,
@@ -19,12 +21,13 @@ use w4dj::history::{
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
     PreviewCandidate, PreviewIssue, PreviewOperation, SlotPreview, SyncPreview,
-    build_retry_preview, build_sync_preview_with_settings,
+    build_retry_preview, build_sync_preview_with_source_settings,
 };
 use w4dj::sync::{
     cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
-    get_music_dict_with_scan_issues, inspect_metadata_decision, is_supported_source_file,
-    sync_music_library_with_observer, update_existing_metadata,
+    inspect_metadata_decision_with_settings,
+    is_supported_source_file, sync_music_library_with_observer_with_settings,
+    update_existing_metadata,
 };
 
 #[cfg(target_os = "macos")]
@@ -53,6 +56,7 @@ struct ConfirmedSyncJob {
     lossless_format: Option<LosslessFormat>,
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
     candidates: Vec<PreviewCandidate>,
     preview: SyncPreview,
     retry_of: Option<String>,
@@ -259,6 +263,20 @@ fn choose_filename_rule(rule: FilenameRule, state: tauri::State<'_, AppState>) -
 }
 
 #[tauri::command]
+fn choose_netease_filename_format(
+    format: NeteaseFilenameFormat,
+    state: tauri::State<'_, AppState>,
+) -> DesktopState {
+    let snapshot = {
+        let mut controller = state.controller.lock().expect("desktop lock poisoned");
+        controller.choose_netease_filename_format(format);
+        controller.state().clone()
+    };
+    persist_preferences(&state);
+    snapshot
+}
+
+#[tauri::command]
 fn start_sync(
     slot_index: usize,
     state: tauri::State<'_, AppState>,
@@ -361,13 +379,22 @@ fn cancel_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, St
 
 #[tauri::command]
 fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview>, String> {
-    let (slot_indexes, mode, lossless_format, conflict_strategy, filename_rule, slots) = {
+    let (
+        slot_indexes,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        slots,
+    ) = {
         let controller = state.controller.lock().expect("desktop lock poisoned");
         let slot_indexes = controller.startable_slot_indexes();
         let mode = controller.state().mode;
         let lossless_format = controller.state().lossless_format;
         let conflict_strategy = controller.state().conflict_strategy;
         let filename_rule = controller.state().filename_rule;
+        let netease_filename_format = controller.state().netease_filename_format;
         let slots = slot_indexes
             .iter()
             .map(|slot_index| {
@@ -385,6 +412,7 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
             lossless_format,
             conflict_strategy,
             filename_rule,
+            netease_filename_format,
             slots,
         )
     };
@@ -396,13 +424,14 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
     let mut previews = slots
         .into_iter()
         .map(|(slot_index, source, destination)| {
-            let preview = build_sync_preview_with_settings(
+            let preview = build_sync_preview_with_source_settings(
                 &source,
                 &destination,
                 mode,
                 lossless_format,
                 conflict_strategy,
                 filename_rule,
+                netease_filename_format,
             )
             .map_err(|error| format!("预检失败：{error}"))?;
             Ok(SlotPreview {
@@ -411,6 +440,7 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
                 lossless_format,
                 conflict_strategy,
                 filename_rule,
+                netease_filename_format,
                 preview,
                 retry_of: None,
             })
@@ -537,6 +567,7 @@ fn start_confirmed_sync(
         let state_lossless_format = controller.state().lossless_format;
         let state_conflict_strategy = controller.state().conflict_strategy;
         let state_filename_rule = controller.state().filename_rule;
+        let state_netease_filename_format = controller.state().netease_filename_format;
         let mut validated_previews = Vec::with_capacity(previews.len());
 
         for slot_preview in previews {
@@ -560,6 +591,7 @@ fn start_confirmed_sync(
                     || slot_preview.lossless_format != state_lossless_format
                     || slot_preview.conflict_strategy != state_conflict_strategy
                     || slot_preview.filename_rule != state_filename_rule
+                    || slot_preview.netease_filename_format != state_netease_filename_format
                     || slot_preview.preview.source_directory != slot.source_directory
                     || slot_preview.preview.destination_directory
                         != controller
@@ -594,6 +626,7 @@ fn start_confirmed_sync(
                 lossless_format: slot_preview.lossless_format,
                 conflict_strategy: slot_preview.conflict_strategy,
                 filename_rule: slot_preview.filename_rule,
+                netease_filename_format: slot_preview.netease_filename_format,
                 candidates: slot_preview.preview.candidates.clone(),
                 preview: slot_preview.preview,
                 retry_of: retry_of.clone().or(slot_preview.retry_of),
@@ -683,12 +716,19 @@ fn retry_history_failures(
         .ok_or_else(|| String::from("找不到对应的转换历史"))?;
 
     let preview = build_retry_preview(&entry);
+    let netease_filename_format = state
+        .controller
+        .lock()
+        .expect("desktop lock poisoned")
+        .state()
+        .netease_filename_format;
     Ok(SlotPreview {
         slot_index: entry.slot_index,
         mode: entry.mode,
         lossless_format: entry.lossless_format,
         conflict_strategy: entry.conflict_strategy,
         filename_rule: entry.filename_rule,
+        netease_filename_format,
         preview,
         retry_of: Some(entry.id),
     })
@@ -823,6 +863,7 @@ fn main() {
             choose_lossless_format,
             choose_conflict_strategy,
             choose_filename_rule,
+            choose_netease_filename_format,
             start_sync,
             pause_sync,
             cancel_sync,
@@ -1108,11 +1149,12 @@ fn run_confirmed_sync_task(
             let sync_result = if queued_files.is_empty() {
                 Ok(task_controller.snapshot())
             } else {
-                sync_music_library_with_observer(
+                sync_music_library_with_observer_with_settings(
                     &queued_files,
                     &job.destination,
                     &job.mode,
                     job.lossless_format,
+                    job.netease_filename_format,
                     &task_controller,
                     |name, task, error| {
                         let failed_file = if let Some(error) = error {
@@ -1207,9 +1249,10 @@ fn run_confirmed_sync_task(
         .candidates
         .iter()
         .map(|candidate| {
-            inspect_metadata_decision(
+            inspect_metadata_decision_with_settings(
                 Path::new(&candidate.source_path),
                 Path::new(&candidate.destination_path),
+                job.netease_filename_format,
             )
         })
         .collect();
@@ -1488,7 +1531,15 @@ fn run_sync_task(
     destination_coordinator: DestinationCoordinator,
     slot_index: usize,
 ) {
-    let (source, destination, using_fallback, mode, lossless_format, task_controller) = {
+    let (
+        source,
+        destination,
+        using_fallback,
+        mode,
+        lossless_format,
+        netease_filename_format,
+        task_controller,
+    ) = {
         let controller = controller.lock().expect("desktop lock poisoned");
         let state = controller.state();
         let slot = &state.slots[slot_index];
@@ -1504,6 +1555,7 @@ fn run_sync_task(
                 && !destination.trim().is_empty(),
             state.mode,
             state.lossless_format,
+            state.netease_filename_format,
             controller
                 .task_controller(slot_index)
                 .expect("sync slot index validated before worker start"),
@@ -1557,7 +1609,12 @@ fn run_sync_task(
             .push_log(slot_index, format!("Scanning source: {}", source))
             .expect("sync slot index validated before worker start");
     }
-    let (mut source_files, scan_issues) = get_music_dict_with_scan_issues(&source);
+    let (mut source_files, scan_issues) =
+        w4dj::sync::get_music_dict_with_scan_issues_with_settings(
+            &source,
+            FilenameRule::default(),
+            netease_filename_format,
+        );
     let missing_sources = source_files
         .iter()
         .filter(|(_, (_, path))| !path.exists())
@@ -1632,11 +1689,12 @@ fn run_sync_task(
     }
 
     let mut failed_files = 0usize;
-    let result = sync_music_library_with_observer(
+    let result = sync_music_library_with_observer_with_settings(
         &queued_files,
         &destination,
         &mode,
         lossless_format,
+        netease_filename_format,
         &task_controller,
         |name, task, error| {
             if error.is_some() {
@@ -1794,6 +1852,7 @@ mod tests {
             lossless_format: None,
             conflict_strategy: Default::default(),
             filename_rule: Default::default(),
+            netease_filename_format: Default::default(),
             retry_of: None,
             preview: SyncPreview {
                 source_directory: format!("/music/in-{slot_index}"),
