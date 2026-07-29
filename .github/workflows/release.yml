@@ -143,6 +143,14 @@ jobs:
           hdiutil convert "$rw_image" -format UDZO -o "$rebuilt"
           mv "$rebuilt" "$dmg"
 
+          final_mountpoint="$workdir/final-mount"
+          mkdir -p "$final_mountpoint"
+          hdiutil attach "$dmg" -mountpoint "$final_mountpoint" -nobrowse -noautoopen -readonly
+          test -d "$final_mountpoint/W4DJ RKB.app"
+          test -x "$final_mountpoint/解决文件已损坏问题（双击）.command"
+          test -e "$final_mountpoint/Applications"
+          hdiutil detach "$final_mountpoint"
+
           version="${GITHUB_REF_NAME#v}"
           asset_name='${{ matrix.asset_name }}'
           asset_name="${asset_name//\[version\]/$version}"

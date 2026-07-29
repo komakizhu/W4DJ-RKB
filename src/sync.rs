@@ -1479,10 +1479,10 @@ fn ensure_compatible_artwork(output_tag: &mut id3::Tag, source_tag: &id3::Tag) -
         .filter(|picture| is_usable_picture(picture))
         .cloned()
         .collect::<Vec<_>>();
-    let mut pictures = if !usable_output_pictures.is_empty() {
-        usable_output_pictures
-    } else if !usable_source_pictures.is_empty() {
+    let mut pictures = if !usable_source_pictures.is_empty() {
         usable_source_pictures
+    } else if !usable_output_pictures.is_empty() {
+        usable_output_pictures
     } else {
         Vec::new()
     };
@@ -2080,9 +2080,14 @@ fn resolve_song_identity(
         }
     }
 
-    let filename_title_hint = filename_parts
-        .as_ref()
-        .map(|(left, right)| song_title_likeness(right).cmp(&song_title_likeness(left)));
+    let filename_title_hint = filename_parts.as_ref().map(|(left, right)| {
+        let left_score = song_title_likeness(left);
+        let right_score = song_title_likeness(right);
+        (
+            right_score.cmp(&left_score),
+            right_score.abs_diff(left_score) >= 25,
+        )
+    });
 
     for candidate in &mut candidates {
         if prefer_title_artist_filename {
@@ -2118,7 +2123,7 @@ fn resolve_song_identity(
                 candidate.identity.title == *right && candidate.identity.artist == *left;
             let is_left_title =
                 candidate.identity.title == *left && candidate.identity.artist == *right;
-            let title_hint_score = match filename_title_hint {
+            let title_hint_score = match filename_title_hint.map(|(ordering, _)| ordering) {
                 Some(std::cmp::Ordering::Greater) if is_right_title => 55,
                 Some(std::cmp::Ordering::Less) if is_left_title => 55,
                 Some(std::cmp::Ordering::Greater) if is_left_title => -55,
@@ -2145,11 +2150,13 @@ fn resolve_song_identity(
     let second_has_different_identity = candidates
         .get(1)
         .is_some_and(|candidate| candidate.identity != best.identity);
+    let strong_filename_title_hint = filename_title_hint.is_some_and(|(_, strong)| strong);
     let ambiguous = second_has_different_identity && candidates[1].score >= best.score - 3
         || metadata_title.is_none()
             && metadata_artist.is_none()
             && filename_parts.is_some()
-            && !prefer_title_artist_filename;
+            && !prefer_title_artist_filename
+            && !strong_filename_title_hint;
     let confidence = best.score.clamp(0, 100) as u8;
     let reason = if ambiguous {
         format!(
@@ -3198,6 +3205,21 @@ mod tests {
     }
 
     #[test]
+    fn resolves_a_strong_title_marker_from_a_filename_without_tags() {
+        let mut output = Tag::new();
+
+        assert!(fill_missing_metadata(
+            &mut output,
+            &Tag::new(),
+            "ARAI - 100 & Lonely",
+            false,
+        ));
+
+        assert_eq!(output.title(), Some("100 & Lonely"));
+        assert_eq!(output.artist(), Some("ARAI"));
+    }
+
+    #[test]
     fn repairs_reversed_output_identity_when_source_has_complete_tags() {
         let source_dir = tempdir().unwrap();
         let output_dir = tempdir().unwrap();
@@ -3292,7 +3314,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_invalid_output_cover_frames_when_a_valid_cover_exists() {
+    fn prefers_the_source_cover_over_a_stale_output_cover() {
         let mut source = Tag::new();
         source.add_frame(id3::frame::Picture {
             mime_type: "image/jpeg".into(),
@@ -3320,7 +3342,7 @@ mod tests {
         let pictures = output.pictures().collect::<Vec<_>>();
         assert_eq!(pictures.len(), 1);
         assert_eq!(pictures[0].mime_type, "image/jpeg");
-        assert_eq!(pictures[0].data, vec![0xff, 0xd8, 0xff, 0xe0, 0x03, 0x04]);
+        assert_eq!(pictures[0].data, vec![0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02]);
     }
 
     #[test]
