@@ -2080,6 +2080,10 @@ fn resolve_song_identity(
         }
     }
 
+    let filename_title_hint = filename_parts
+        .as_ref()
+        .map(|(left, right)| song_title_likeness(right).cmp(&song_title_likeness(left)));
+
     for candidate in &mut candidates {
         if prefer_title_artist_filename {
             let title_looks_like_artist = looks_like_multiple_artists(&candidate.identity.title);
@@ -2104,6 +2108,24 @@ fn resolve_song_identity(
             } else if candidate.identity.title == *right && candidate.identity.artist == *left {
                 candidate.score += if prefer_title_artist_filename { 5 } else { 40 };
             }
+
+            // A complete tag is not automatically trustworthy: downloaders and
+            // taggers sometimes write the two fields in the opposite order.
+            // Strong title markers in one filename half are useful evidence for
+            // both the preview key and the metadata repair decision, even when
+            // the path is not recognizably from NetEase.
+            let is_right_title =
+                candidate.identity.title == *right && candidate.identity.artist == *left;
+            let is_left_title =
+                candidate.identity.title == *left && candidate.identity.artist == *right;
+            let title_hint_score = match filename_title_hint {
+                Some(std::cmp::Ordering::Greater) if is_right_title => 55,
+                Some(std::cmp::Ordering::Less) if is_left_title => 55,
+                Some(std::cmp::Ordering::Greater) if is_left_title => -55,
+                Some(std::cmp::Ordering::Less) if is_right_title => -55,
+                _ => 0,
+            };
+            candidate.score += title_hint_score;
         }
     }
 
@@ -2180,12 +2202,45 @@ fn looks_like_multiple_artists(value: &str) -> bool {
     let lowered = value.to_lowercase();
     value.contains(',')
         || value.contains('，')
-        || value.contains('&')
         || lowered.contains(" feat")
         || lowered.contains(" ft")
         || lowered.contains(" with ")
         || lowered.contains(" x ")
         || value.contains("/")
+}
+
+fn song_title_likeness(value: &str) -> u8 {
+    let lowered = value.to_lowercase();
+    let mut score = 0;
+
+    if value.contains('&') || value.contains('＆') {
+        score += 30;
+    }
+    if value.contains('(') || value.contains('（') {
+        score += 15;
+    }
+    if [
+        "remix",
+        "edit",
+        "mix",
+        "version",
+        "radio",
+        "live",
+        "acoustic",
+        "extended",
+        "instrumental",
+        "bootleg",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+    {
+        score += 35;
+    }
+    if value.split_whitespace().count() >= 3 {
+        score += 10;
+    }
+
+    score
 }
 
 fn push_identity_candidate(
@@ -3083,6 +3138,63 @@ mod tests {
         assert_eq!(diagnostic.resolved_artist, "BikaBreezy, Jaytrue");
         assert!(diagnostic.identity_candidates.contains("评分="));
         assert!(!diagnostic.identity_ambiguous);
+    }
+
+    #[test]
+    fn recognizes_reversed_tags_when_artist_first_filename_contains_title_markers() {
+        let cases = [
+            (
+                "Ava Max - My Head & My Heart (Claptone Remix).mp3",
+                "Ava Max",
+                "My Head & My Heart (Claptone Remix)",
+                "My Head & My Heart (Claptone Remix) - Ava Max",
+            ),
+            (
+                "ARAI - 100 & Lonely.mp3",
+                "ARAI",
+                "100 & Lonely",
+                "100 & Lonely - ARAI",
+            ),
+        ];
+
+        for (filename, source_title, source_artist, expected_name) in cases {
+            let dir = tempdir().unwrap();
+            let source_path = dir.path().join(filename);
+            fs::write(&source_path, b"audio").unwrap();
+            let mut source = Tag::new();
+            source.set_title(source_title);
+            source.set_artist(source_artist);
+            source.write_to_path(&source_path, Version::Id3v23).unwrap();
+
+            assert_eq!(
+                derive_song_name_with_rule(&source_path, FilenameRule::TitleArtist),
+                expected_name,
+                "failed for {filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn recognizes_artist_first_title_markers_even_when_source_is_marked_as_netease() {
+        let dir = tempdir().unwrap();
+        let source_path = dir
+            .path()
+            .join("网易云音乐/Ava Max - My Head & My Heart (Claptone Remix).mp3");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, b"audio").unwrap();
+        let mut source = Tag::new();
+        source.set_title("Ava Max");
+        source.set_artist("My Head & My Heart (Claptone Remix)");
+        source.add_frame(id3::frame::ExtendedText {
+            description: "163 key".into(),
+            value: "netease-source".into(),
+        });
+        source.write_to_path(&source_path, Version::Id3v23).unwrap();
+
+        assert_eq!(
+            derive_song_name_with_rule(&source_path, FilenameRule::TitleArtist),
+            "My Head & My Heart (Claptone Remix) - Ava Max"
+        );
     }
 
     #[test]

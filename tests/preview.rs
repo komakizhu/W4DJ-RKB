@@ -1,5 +1,6 @@
 use std::fs;
 
+use id3::{Tag, TagLike, Version};
 use tempfile::tempdir;
 use w4dj::config::{ConflictStrategy, FilenameRule, Mode};
 use w4dj::history::{ErrorCategory, FailedFile, HistoryEntry, HistoryStatus, PendingFile};
@@ -34,6 +35,46 @@ fn preview_separates_new_existing_and_estimated_bytes() {
     assert!(preview.skipped.is_empty());
     assert_eq!(preview.candidates[0].source_size_bytes, 120);
     assert_eq!(preview.estimated_output_bytes, Some(120));
+}
+
+#[test]
+fn preview_counts_reversed_artist_first_tags_as_existing_output() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_file = source
+        .path()
+        .join("Ava Max - My Head & My Heart (Claptone Remix).mp3");
+    let destination_file = destination
+        .path()
+        .join("My Head & My Heart (Claptone Remix) - Ava Max.mp3");
+
+    write_file(&source_file, 120);
+    let mut reversed_source_tag = Tag::new();
+    reversed_source_tag.set_title("Ava Max");
+    reversed_source_tag.set_artist("My Head & My Heart (Claptone Remix)");
+    reversed_source_tag
+        .write_to_path(&source_file, Version::Id3v23)
+        .unwrap();
+
+    write_file(&destination_file, 80);
+    let mut destination_tag = Tag::new();
+    destination_tag.set_title("My Head & My Heart (Claptone Remix)");
+    destination_tag.set_artist("Ava Max");
+    destination_tag
+        .write_to_path(&destination_file, Version::Id3v23)
+        .unwrap();
+
+    let preview = build_sync_preview(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.new_count, 0);
+    assert_eq!(preview.existing_count, 1);
+    assert_eq!(preview.skipped_count, 1);
 }
 
 #[test]
