@@ -1811,6 +1811,18 @@ export function bindApp(
 
   root.addEventListener('click', (event) => {
     const target = event.target as HTMLElement | null;
+    const modal = target?.closest('.about-modal');
+    const dialog = target?.closest('.about-dialog, .help-dialog');
+    if (modal && !dialog) {
+      if (modal.classList.contains('help-modal')) {
+        helpVisible = false;
+      } else {
+        aboutInfo = null;
+      }
+      render();
+      return;
+    }
+
     const button = target?.closest<HTMLButtonElement>('button');
     if (!button) {
       return;
@@ -2352,9 +2364,22 @@ function renderHelpModal(visible: boolean, lang: AppLanguage): string {
             <p class="panel-kicker">W4DJ RKB</p>
             <h2 id="help-title">${t('helpTitle', lang)}</h2>
           </div>
-          <span class="help-dialog-icon" aria-hidden="true">${icon('help')}</span>
         </header>
         <p id="help-intro" class="help-dialog-intro">${t('helpIntro', lang)}</p>
+
+        <section class="help-section" aria-labelledby="help-conversion-title">
+          <h3 id="help-conversion-title">${t('helpConversionTitle', lang)}</h3>
+          <div class="help-card-grid">
+            <article class="help-card">
+              <h4>${t('scanThenConvert', lang)}</h4>
+              <p>${t('helpScanThenConvertBody', lang)}</p>
+            </article>
+            <article class="help-card">
+              <h4>${t('directConvert', lang)}</h4>
+              <p>${t('helpDirectConvertBody', lang)}</p>
+            </article>
+          </div>
+        </section>
 
         <section class="help-section" aria-labelledby="help-output-title">
           <h3 id="help-output-title">${t('helpOutputTitle', lang)}</h3>
@@ -2374,20 +2399,6 @@ function renderHelpModal(visible: boolean, lang: AppLanguage): string {
             <article class="help-card">
               <h4>${t('helpEnhancedTitle', lang)}</h4>
               <p>${t('helpEnhancedBody', lang)}</p>
-            </article>
-          </div>
-        </section>
-
-        <section class="help-section" aria-labelledby="help-conversion-title">
-          <h3 id="help-conversion-title">${t('helpConversionTitle', lang)}</h3>
-          <div class="help-card-grid">
-            <article class="help-card">
-              <h4>${t('scanThenConvert', lang)}</h4>
-              <p>${t('helpScanThenConvertBody', lang)}</p>
-            </article>
-            <article class="help-card">
-              <h4>${t('directConvert', lang)}</h4>
-              <p>${t('helpDirectConvertBody', lang)}</p>
             </article>
           </div>
         </section>

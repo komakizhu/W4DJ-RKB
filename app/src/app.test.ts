@@ -391,10 +391,14 @@ describe('renderApp', () => {
     expect(helpText).toContain('普通转换');
     expect(helpText).toContain('增强转换');
     expect(helpText).not.toContain('Essentia');
-    expect(root.querySelector('[data-role="help-modal"] .help-section')?.querySelectorAll('.help-card'))
+    expect(root.querySelector('[data-role="help-modal"] [aria-labelledby="help-output-title"]')?.querySelectorAll('.help-card'))
       .toHaveLength(4);
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('扫描后转换');
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('直接转换');
+
+    const helpSections = Array.from(root.querySelectorAll('[data-role="help-modal"] .help-section'));
+    expect(helpSections[0]?.getAttribute('aria-labelledby')).toBe('help-conversion-title');
+    expect(helpSections[1]?.getAttribute('aria-labelledby')).toBe('help-output-title');
   });
 
   it('renders the global lossless format selector only in lossless mode', () => {
@@ -1433,6 +1437,7 @@ describe('bindApp', () => {
 
     (root.querySelector('[data-action="open-help"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(root.querySelector('[data-role="help-modal"]')).not.toBeNull());
+    expect(root.querySelector('[data-role="help-modal"] .help-dialog-icon')).toBeNull();
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('普通转换');
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).toContain('增强转换');
     expect(root.querySelector('[data-role="help-modal"]')?.textContent).not.toContain('Essentia');
@@ -1441,6 +1446,25 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="reopen-onboarding"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(root.querySelector('[data-role="onboarding-modal"]')).not.toBeNull());
     expect(root.querySelector('[data-role="help-modal"]')).toBeNull();
+  });
+
+  it('closes help and about dialogs when clicking their blurred backdrop', async () => {
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), makeMockServices());
+
+    (root.querySelector('[data-action="open-help"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="help-modal"]')).not.toBeNull());
+    root.querySelector<HTMLElement>('[data-role="help-modal"]')?.dispatchEvent(
+      new MouseEvent('click', { bubbles: true }),
+    );
+    await vi.waitFor(() => expect(root.querySelector('[data-role="help-modal"]')).toBeNull());
+
+    (root.querySelector('[data-action="open-about"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="about-modal"]')).not.toBeNull());
+    root.querySelector<HTMLElement>('[data-role="about-modal"]')?.dispatchEvent(
+      new MouseEvent('click', { bubbles: true }),
+    );
+    await vi.waitFor(() => expect(root.querySelector('[data-role="about-modal"]')).toBeNull());
   });
 
   it('deletes one history entry and clears all history', async () => {

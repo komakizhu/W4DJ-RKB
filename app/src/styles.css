@@ -325,7 +325,7 @@ h1 {
   color: var(--rail-muted);
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 9px;
-  font-weight: 800;
+  font-weight: 500;
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
@@ -541,7 +541,7 @@ h1 {
   color: var(--rail-muted);
   cursor: pointer;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 500;
   white-space: nowrap;
   transition: background 260ms cubic-bezier(0.22, 1, 0.36, 1), color 260ms cubic-bezier(0.22, 1, 0.36, 1), border-color 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms cubic-bezier(0.22, 1, 0.36, 1);
 }
@@ -635,7 +635,7 @@ h1 {
   box-shadow: 0 12px 28px rgba(214, 94, 37, 0.3);
   cursor: pointer;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 600;
   letter-spacing: 0.08em;
   transition: none;
 }
@@ -1403,23 +1403,6 @@ h1 {
 
 .help-dialog h2 {
   color: var(--text);
-}
-
-.help-dialog-icon {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  flex: 0 0 auto;
-  border-radius: 12px;
-  background: var(--cyan-soft);
-  color: var(--cyan);
-}
-
-.help-dialog-icon .ui-icon {
-  width: 19px;
-  height: 19px;
-  margin: 0;
 }
 
 .help-dialog-intro {
