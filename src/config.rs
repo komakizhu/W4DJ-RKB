@@ -58,7 +58,7 @@ pub struct Config {
 #[derive(clap::Parser)]
 #[command(
     name = "w4dj",
-    version = "2.2.4",
+    version = "2.2.5",
     author = "slipstream",
     about = "网易云音乐曲库同步器"
 )]
@@ -89,7 +89,7 @@ lossless_format = "aiff"
     }
 
     #[test]
-    fn command_line_version_matches_v2_2_4() {
-        assert_eq!(Cmd::command().get_version(), Some("2.2.4"));
+    fn command_line_version_matches_v2_2_5() {
+        assert_eq!(Cmd::command().get_version(), Some("2.2.5"));
     }
 }
