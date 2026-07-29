@@ -322,7 +322,7 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     }
     for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
         report.push_str(&format!(
-            "{}. 源文件：{}\n源文件扩展名：{}\n源文件大小：{}\n目标文件：{}\n目标文件大小：{}\n源文件名：{}\n识别格式：{}\n判断依据：{}\n源元数据读取：{}\n源标签摘要：{}\n源标签标题：{}\n源标签歌手：{}\n最终识别标题：{}\n最终识别歌手：{}\n写入标题：{}\n写入歌手：{}\n输出元数据读取：{}\n输出标签摘要：{}\n源封面详情：{}\n输出封面详情：{}\n源封面：{}\n输出封面：{}\n\n",
+            "{}. 源文件：{}\n源文件扩展名：{}\n源文件大小：{}\n目标文件：{}\n目标文件大小：{}\n源文件名：{}\n识别格式：{}\n判断依据：{}\n识别置信度：{}\n顺序是否不确定：{}\n候选结果：{}\n源元数据读取：{}\n源格式详情：{}\n源标签摘要：{}\n源标签标题：{}\n源标签歌手：{}\n源标签专辑：{}\n最终识别标题：{}\n最终识别歌手：{}\n写入标题：{}\n写入歌手：{}\n输出专辑：{}\n输出元数据读取：{}\n输出标签摘要：{}\n源封面详情：{}\n输出封面详情：{}\n源封面：{}\n输出封面：{}\nFFmpeg 命令：{}\n元数据写入计划：{}\n最终校验：{}\n\n",
             index + 1,
             diagnostic.source_path,
             diagnostic.source_extension,
@@ -338,20 +338,29 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
             diagnostic.source_filename,
             diagnostic.detected_filename_layout,
             diagnostic.decision,
+            diagnostic.identity_confidence,
+            if diagnostic.identity_ambiguous { "是" } else { "否" },
+            diagnostic.identity_candidates,
             diagnostic.source_metadata_status,
+            diagnostic.source_format_details,
             diagnostic.source_metadata_summary,
             optional_metadata_label(diagnostic.source_title.as_deref()),
             optional_metadata_label(diagnostic.source_artist.as_deref()),
+            optional_metadata_label(diagnostic.source_album.as_deref()),
             diagnostic.resolved_title,
             diagnostic.resolved_artist,
             optional_metadata_label(diagnostic.output_title.as_deref()),
             optional_metadata_label(diagnostic.output_artist.as_deref()),
+            optional_metadata_label(diagnostic.output_album.as_deref()),
             diagnostic.output_metadata_status,
             diagnostic.output_metadata_summary,
             diagnostic.source_cover_details,
             diagnostic.output_cover_details,
             if diagnostic.source_artwork { "有" } else { "无" },
             optional_artwork_label(diagnostic.output_artwork),
+            diagnostic.ffmpeg_command,
+            diagnostic.metadata_write_plan,
+            diagnostic.metadata_validation,
         ));
     }
 

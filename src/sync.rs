@@ -35,14 +35,26 @@ pub struct MetadataDiagnostic {
     pub source_metadata_summary: String,
     #[serde(default)]
     pub source_cover_details: String,
+    #[serde(default)]
+    pub source_format_details: String,
     pub detected_filename_layout: String,
     pub decision: String,
+    #[serde(default)]
+    pub identity_confidence: u8,
+    #[serde(default)]
+    pub identity_ambiguous: bool,
+    #[serde(default)]
+    pub identity_candidates: String,
     pub source_title: Option<String>,
     pub source_artist: Option<String>,
+    #[serde(default)]
+    pub source_album: Option<String>,
     pub resolved_title: String,
     pub resolved_artist: String,
     pub output_title: Option<String>,
     pub output_artist: Option<String>,
+    #[serde(default)]
+    pub output_album: Option<String>,
     #[serde(default)]
     pub output_size_bytes: Option<u64>,
     #[serde(default)]
@@ -51,6 +63,12 @@ pub struct MetadataDiagnostic {
     pub output_metadata_summary: String,
     #[serde(default)]
     pub output_cover_details: String,
+    #[serde(default)]
+    pub ffmpeg_command: String,
+    #[serde(default)]
+    pub metadata_write_plan: String,
+    #[serde(default)]
+    pub metadata_validation: String,
     pub source_artwork: bool,
     pub output_artwork: Option<bool>,
 }
@@ -666,6 +684,7 @@ fn process_music_file(
                 ensure_output_metadata(src_path, &output_path)?;
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
                     strip_163_key_from_mp3(&output_path)?;
+                    ensure_output_metadata(src_path, &output_path)?;
                 }
                 remove_conflicting_outputs(
                     dest_folder,
@@ -742,6 +761,7 @@ fn process_music_file(
                 ensure_output_metadata(src_path, &output_path)?;
                 if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
                     strip_163_key_from_mp3(&output_path)?;
+                    ensure_output_metadata(src_path, &output_path)?;
                 }
                 remove_conflicting_outputs(
                     dest_folder,
@@ -1009,30 +1029,43 @@ pub fn inspect_metadata_decision(
         .unwrap_or_default();
     let prefer_title_artist_filename =
         source_prefers_title_artist_filename(source_path, Some(source_tag));
-    let identity = infer_song_identity_with_filename_preference(
+    let resolution = resolve_song_identity(
         fallback_name,
         source_title.as_deref(),
         source_artist.as_deref(),
         prefer_title_artist_filename,
     );
-    let detected_filename_layout = describe_filename_layout(
-        fallback_name,
-        source_title.as_deref(),
-        source_artist.as_deref(),
-        prefer_title_artist_filename,
-    );
-    let decision = match (source_title.is_some(), source_artist.is_some()) {
-        (true, true) => "采用完整内嵌元数据",
-        (true, false) | (false, true) => "采用现有标签，并用文件名补齐缺失字段",
-        (false, false) if prefer_title_artist_filename => "无内嵌元数据，按网易云“歌名 - 歌手”兜底",
-        (false, false) => "无内嵌元数据，按兼容规则“歌手 - 歌名”兜底",
-    }
-    .to_string();
 
     let output_metadata = destination_path
         .is_file()
         .then(|| read_metadata_details(destination_path));
     let output_tag = output_metadata.as_ref().map(|metadata| &metadata.tag);
+    let output_title = output_tag
+        .as_ref()
+        .and_then(|tag| normalize_filename_part(tag.title()));
+    let output_artist = output_tag
+        .and_then(|tag| normalize_filename_part(tag.artist().or_else(|| tag.album_artist())));
+    let output_album = output_tag.and_then(|tag| normalize_filename_part(tag.album()));
+    let metadata_validation = if let Some(output_tag) = output_tag {
+        let problems = metadata_validation_problems(
+            source_path,
+            output_tag,
+            source_tag,
+            &source_metadata.status,
+        );
+        if problems.is_empty() {
+            if resolution.ambiguous {
+                "无法确认文件名顺序；未据此强制改写标题/歌手".to_string()
+            } else {
+                "通过".to_string()
+            }
+        } else {
+            format!("失败：{}", problems.join("；"))
+        }
+    } else {
+        "输出文件不存在或无法读取".to_string()
+    };
+    let write_plan = metadata_write_plan(output_tag, &resolution, source_tag);
 
     MetadataDiagnostic {
         source_path: source_path.display().to_string(),
@@ -1046,20 +1079,23 @@ pub fn inspect_metadata_decision(
         source_size_bytes: fs::metadata(source_path)
             .ok()
             .map(|metadata| metadata.len()),
-        source_metadata_status: source_metadata.status,
+        source_metadata_status: source_metadata.status.clone(),
         source_metadata_summary: metadata_tag_summary(source_tag),
         source_cover_details: metadata_cover_details(source_tag),
-        detected_filename_layout,
-        decision,
+        source_format_details: source_format_details(source_path, &source_metadata),
+        detected_filename_layout: resolution.layout,
+        decision: resolution.reason,
+        identity_confidence: resolution.confidence,
+        identity_ambiguous: resolution.ambiguous,
+        identity_candidates: resolution.candidates,
         source_title,
         source_artist,
-        resolved_title: identity.title,
-        resolved_artist: identity.artist,
-        output_title: output_tag
-            .as_ref()
-            .and_then(|tag| normalize_filename_part(tag.title())),
-        output_artist: output_tag
-            .and_then(|tag| normalize_filename_part(tag.artist().or_else(|| tag.album_artist()))),
+        source_album: normalize_filename_part(source_tag.album()),
+        resolved_title: resolution.identity.title,
+        resolved_artist: resolution.identity.artist,
+        output_title,
+        output_artist,
+        output_album,
         output_size_bytes: fs::metadata(destination_path)
             .ok()
             .map(|metadata| metadata.len()),
@@ -1073,11 +1109,11 @@ pub fn inspect_metadata_decision(
         output_cover_details: output_tag
             .map(metadata_cover_details)
             .unwrap_or_else(|| "输出文件不存在或无法读取".to_string()),
-        source_artwork: source_tag
-            .pictures()
-            .any(|picture| !picture.data.is_empty()),
-        output_artwork: output_tag
-            .map(|tag| tag.pictures().any(|picture| !picture.data.is_empty())),
+        ffmpeg_command: ffmpeg_command_for_report(source_path, destination_path),
+        metadata_write_plan: write_plan,
+        metadata_validation,
+        source_artwork: source_tag.pictures().any(is_usable_picture),
+        output_artwork: output_tag.map(|tag| tag.pictures().any(is_usable_picture)),
     }
 }
 
@@ -1122,6 +1158,162 @@ fn metadata_cover_details(tag: &id3::Tag) -> String {
     }
 }
 
+fn source_format_details(source_path: &Path, source_metadata: &MetadataReadResult) -> String {
+    let extension = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if extension != "ncm" {
+        return format!(
+            "源格式：{}；{}",
+            if extension.is_empty() {
+                "未知".to_string()
+            } else {
+                extension.to_uppercase()
+            },
+            source_metadata.status
+        );
+    }
+
+    let file = match File::open(source_path) {
+        Ok(file) => file,
+        Err(error) => return format!("NCM 原始信息读取失败：打开文件失败：{error}"),
+    };
+    let mut ncm = match Ncmdump::from_reader(file) {
+        Ok(ncm) => ncm,
+        Err(error) => return format!("NCM 原始信息读取失败：解析失败：{error}"),
+    };
+    let info = match ncm.get_info() {
+        Ok(info) => info,
+        Err(error) => return format!("NCM 原始信息读取失败：读取标签失败：{error}"),
+    };
+    let artists = info
+        .artist
+        .iter()
+        .map(|artist| artist.0.as_str())
+        .filter(|artist| !artist.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cover = match ncm.get_image() {
+        Ok(image) if image.is_empty() => "空数据".to_string(),
+        Ok(image) => format!(
+            "{} bytes，{}（按图片签名识别）",
+            image.len(),
+            get_image_mime_type(&image)
+        ),
+        Err(error) => format!("提取失败：{error}"),
+    };
+
+    format!(
+        "NCM 原始信息：标题={}；歌手={}；专辑={}；解密音频格式={}；封面提取={}",
+        normalize_display_text(&info.name),
+        if artists.is_empty() {
+            "无"
+        } else {
+            artists.as_str()
+        },
+        normalize_display_text(&info.album),
+        if info.format.trim().is_empty() {
+            "未知"
+        } else {
+            info.format.as_str()
+        },
+        cover
+    )
+}
+
+fn ffmpeg_command_for_report(source_path: &Path, output_path: &Path) -> String {
+    let ffmpeg = find_ffmpeg().unwrap_or_else(|| "ffmpeg".to_string());
+    let output_extension = output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let profile_args = match output_extension.as_str() {
+        "mp3" => "-q:a 0 -id3v2_version 3",
+        "wav" => "-c:a pcm_s24le",
+        "aiff" | "aif" => "-c:a pcm_s24be",
+        _ => return "未使用 FFmpeg（该目标格式不在转换流程中）".to_string(),
+    };
+    let input = if source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
+    {
+        quote_report_argument("<NCM 解密后的临时音频>")
+    } else {
+        quote_report_argument(&source_path.display().to_string())
+    };
+    let command = format!(
+        "{} -y -i {} -loglevel error -map_metadata 0 {} {}",
+        quote_report_argument(&ffmpeg),
+        input,
+        profile_args,
+        quote_report_argument(&output_path.display().to_string()),
+    );
+
+    if source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
+    {
+        format!("NCM 解密后实际命令模板：{command}")
+    } else {
+        command
+    }
+}
+
+fn quote_report_argument(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+fn metadata_write_plan(
+    output_tag: Option<&id3::Tag>,
+    resolution: &IdentityResolution,
+    source_tag: &id3::Tag,
+) -> String {
+    let Some(output_tag) = output_tag else {
+        return "输出文件不存在：待写入标题、歌手、专辑和封面".to_string();
+    };
+
+    let mut actions = Vec::new();
+    if resolution.ambiguous {
+        actions.push("标题/歌手顺序不确定，暂不自动改写".to_string());
+    } else {
+        if !resolution.identity.title.is_empty()
+            && output_tag.title() != Some(resolution.identity.title.as_str())
+        {
+            actions.push(format!("修正标题为“{}”", resolution.identity.title));
+        }
+        if !resolution.identity.artist.is_empty()
+            && output_tag.artist() != Some(resolution.identity.artist.as_str())
+        {
+            actions.push(format!("修正歌手为“{}”", resolution.identity.artist));
+        }
+    }
+    if let Some(album) = non_empty(source_tag.album())
+        && output_tag.album() != Some(album)
+    {
+        actions.push(format!("修正专辑为“{}”", album));
+    }
+    if source_tag.pictures().any(is_usable_picture) && !output_tag.pictures().any(is_usable_picture)
+    {
+        actions.push("复制源封面并修正图片 MIME/封面类型".to_string());
+    } else if output_tag
+        .pictures()
+        .any(|picture| !is_usable_picture(picture))
+    {
+        actions.push("替换输出中的无效封面帧".to_string());
+    }
+    if actions.is_empty() {
+        "无需写入或修正".to_string()
+    } else {
+        actions.join("；")
+    }
+}
+
 fn verify_output_metadata(
     source_path: &Path,
     output_path: &Path,
@@ -1130,47 +1322,8 @@ fn verify_output_metadata(
 ) -> io::Result<()> {
     let output_metadata = read_metadata_details(output_path);
     let output_tag = &output_metadata.tag;
-    let fallback_name = source_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
-    let prefer_title_artist_filename =
-        source_prefers_title_artist_filename(source_path, Some(source_tag));
-    let identity = infer_song_identity_with_filename_preference(
-        fallback_name,
-        source_tag.title(),
-        source_tag.artist().or_else(|| source_tag.album_artist()),
-        prefer_title_artist_filename,
-    );
-    let mut problems = Vec::new();
-
-    if !identity.title.is_empty() && output_tag.title() != Some(identity.title.as_str()) {
-        problems.push(format!(
-            "标题应为“{}”，实际为“{}”",
-            identity.title,
-            output_tag.title().unwrap_or("无")
-        ));
-    }
-    if !identity.artist.is_empty() && output_tag.artist() != Some(identity.artist.as_str()) {
-        problems.push(format!(
-            "歌手应为“{}”，实际为“{}”",
-            identity.artist,
-            output_tag.artist().unwrap_or("无")
-        ));
-    }
-
-    let source_has_cover = source_tag
-        .pictures()
-        .any(|picture| !picture.data.is_empty());
-    let output_has_cover = output_tag
-        .pictures()
-        .any(|picture| !picture.data.is_empty());
-    if source_has_cover && !output_has_cover {
-        problems.push(format!(
-            "源文件有封面，但输出文件没有有效封面；源封面详情：{}",
-            metadata_cover_details(source_tag)
-        ));
-    }
+    let problems =
+        metadata_validation_problems(source_path, output_tag, source_tag, source_metadata_status);
 
     if problems.is_empty() {
         return Ok(());
@@ -1191,6 +1344,83 @@ fn verify_output_metadata(
     ))
 }
 
+fn metadata_validation_problems(
+    source_path: &Path,
+    output_tag: &id3::Tag,
+    source_tag: &id3::Tag,
+    source_metadata_status: &str,
+) -> Vec<String> {
+    let fallback_name = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let prefer_title_artist_filename =
+        source_prefers_title_artist_filename(source_path, Some(source_tag));
+    let resolution = resolve_song_identity(
+        fallback_name,
+        source_tag.title(),
+        source_tag.artist().or_else(|| source_tag.album_artist()),
+        prefer_title_artist_filename,
+    );
+    let mut problems = Vec::new();
+
+    if !resolution.ambiguous {
+        if !resolution.identity.title.is_empty()
+            && output_tag.title() != Some(resolution.identity.title.as_str())
+        {
+            problems.push(format!(
+                "标题应为“{}”，实际为“{}”",
+                resolution.identity.title,
+                output_tag.title().unwrap_or("无")
+            ));
+        }
+        if !resolution.identity.artist.is_empty()
+            && output_tag.artist() != Some(resolution.identity.artist.as_str())
+        {
+            problems.push(format!(
+                "歌手应为“{}”，实际为“{}”",
+                resolution.identity.artist,
+                output_tag.artist().unwrap_or("无")
+            ));
+        }
+    }
+
+    if let Some(album) = non_empty(source_tag.album())
+        && output_tag.album() != Some(album)
+    {
+        problems.push(format!(
+            "专辑应为“{}”，实际为“{}”",
+            album,
+            output_tag.album().unwrap_or("无")
+        ));
+    }
+
+    let source_has_cover = source_tag.pictures().any(is_usable_picture);
+    let output_has_cover = output_tag.pictures().any(is_usable_picture);
+    if source_has_cover && !output_has_cover {
+        problems.push(format!(
+            "源文件有封面，但输出文件没有有效封面；源封面详情：{}",
+            metadata_cover_details(source_tag)
+        ));
+    }
+
+    if output_tag
+        .pictures()
+        .any(|picture| !is_usable_picture(picture))
+    {
+        problems.push(format!(
+            "输出文件包含不可用封面帧：{}",
+            metadata_cover_details(output_tag)
+        ));
+    }
+
+    if source_metadata_status.contains("失败") && source_tag.frames().count() == 0 {
+        problems.push(format!("源元数据读取异常：{source_metadata_status}"));
+    }
+
+    problems
+}
+
 fn fill_missing_metadata(
     output_tag: &mut id3::Tag,
     source_tag: &id3::Tag,
@@ -1198,7 +1428,7 @@ fn fill_missing_metadata(
     prefer_title_artist_filename: bool,
 ) -> bool {
     let source_artist = source_tag.artist().or_else(|| source_tag.album_artist());
-    let identity = infer_song_identity_with_filename_preference(
+    let resolution = resolve_song_identity(
         fallback_name,
         source_tag.title(),
         source_artist,
@@ -1206,34 +1436,24 @@ fn fill_missing_metadata(
     );
     let mut changed = false;
 
-    let source_title = normalize_filename_part(source_tag.title());
-    if !identity.title.is_empty()
-        && ((is_blank(output_tag.title()) && output_tag.title() != Some(identity.title.as_str()))
-            || source_title
-                .as_deref()
-                .is_some_and(|title| output_tag.title() != Some(title)))
-    {
-        output_tag.set_title(&identity.title);
-        changed = true;
-    }
+    if !resolution.ambiguous {
+        if !resolution.identity.title.is_empty()
+            && output_tag.title() != Some(resolution.identity.title.as_str())
+        {
+            output_tag.set_title(&resolution.identity.title);
+            changed = true;
+        }
 
-    let source_artist = normalize_filename_part(source_artist);
-    if !identity.artist.is_empty()
-        && ((is_blank(output_tag.artist())
-            && output_tag.artist() != Some(identity.artist.as_str()))
-            || source_artist
-                .as_deref()
-                .is_some_and(|artist| output_tag.artist() != Some(artist)))
-    {
-        let artist = source_artist.unwrap_or_else(|| identity.artist.clone());
-        if !artist.is_empty() && output_tag.artist() != Some(artist.as_str()) {
-            output_tag.set_artist(&artist);
+        if !resolution.identity.artist.is_empty()
+            && output_tag.artist() != Some(resolution.identity.artist.as_str())
+        {
+            output_tag.set_artist(&resolution.identity.artist);
             changed = true;
         }
     }
 
-    if is_blank(output_tag.album())
-        && let Some(album) = non_empty(source_tag.album())
+    if let Some(album) = non_empty(source_tag.album())
+        && output_tag.album() != Some(album)
     {
         output_tag.set_album(album);
         changed = true;
@@ -1249,11 +1469,20 @@ fn fill_missing_metadata(
 fn ensure_compatible_artwork(output_tag: &mut id3::Tag, source_tag: &id3::Tag) -> bool {
     let output_pictures = output_tag.pictures().cloned().collect::<Vec<_>>();
     let source_pictures = source_tag.pictures().cloned().collect::<Vec<_>>();
-    let output_has_usable_picture = output_pictures.iter().any(is_usable_picture);
-    let mut pictures = if output_has_usable_picture {
-        output_pictures.clone()
-    } else if !source_pictures.is_empty() {
-        source_pictures
+    let usable_output_pictures = output_pictures
+        .iter()
+        .filter(|picture| is_usable_picture(picture))
+        .cloned()
+        .collect::<Vec<_>>();
+    let usable_source_pictures = source_pictures
+        .iter()
+        .filter(|picture| is_usable_picture(picture))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut pictures = if !usable_output_pictures.is_empty() {
+        usable_output_pictures
+    } else if !usable_source_pictures.is_empty() {
+        usable_source_pictures
     } else {
         Vec::new()
     };
@@ -1314,10 +1543,6 @@ fn write_id3_tag_for_output(tag: &id3::Tag, output_path: &Path) -> io::Result<()
     };
 
     result.map_err(io::Error::other)
-}
-
-fn is_blank(value: Option<&str>) -> bool {
-    value.is_none_or(|value| value.trim().is_empty())
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -1688,6 +1913,23 @@ struct SongIdentity {
     artist: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdentityResolution {
+    identity: SongIdentity,
+    layout: String,
+    reason: String,
+    confidence: u8,
+    ambiguous: bool,
+    candidates: String,
+}
+
+#[derive(Debug, Clone)]
+struct IdentityCandidate {
+    identity: SongIdentity,
+    label: String,
+    score: i32,
+}
+
 #[cfg(test)]
 fn infer_song_identity(
     fallback_name: &str,
@@ -1708,25 +1950,255 @@ fn infer_song_identity_with_filename_preference(
     metadata_artist: Option<&str>,
     prefer_title_artist_filename: bool,
 ) -> SongIdentity {
+    resolve_song_identity(
+        fallback_name,
+        metadata_title,
+        metadata_artist,
+        prefer_title_artist_filename,
+    )
+    .identity
+}
+
+fn resolve_song_identity(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+    prefer_title_artist_filename: bool,
+) -> IdentityResolution {
     let metadata_title = normalize_filename_part(metadata_title);
     let metadata_artist = normalize_filename_part(metadata_artist);
+    let display = normalize_display_text(fallback_name);
+    let filename_parts = display.split_once(" - ").and_then(|(left, right)| {
+        let left = normalize_filename_part(Some(left))?;
+        let right = normalize_filename_part(Some(right))?;
+        Some((left, right))
+    });
+    let mut candidates = Vec::new();
+
     if let (Some(title), Some(artist)) = (&metadata_title, &metadata_artist) {
-        return SongIdentity {
-            title: title.clone(),
-            artist: artist.clone(),
-        };
+        push_identity_candidate(
+            &mut candidates,
+            SongIdentity {
+                title: title.clone(),
+                artist: artist.clone(),
+            },
+            "采用完整内嵌元数据".to_string(),
+            115,
+        );
+        push_identity_candidate(
+            &mut candidates,
+            SongIdentity {
+                title: artist.clone(),
+                artist: title.clone(),
+            },
+            "内嵌标签反向候选".to_string(),
+            20,
+        );
     }
 
-    let (fallback_title, fallback_artist) = parse_filename_identity_with_hints(
-        fallback_name,
-        metadata_title.as_deref(),
-        metadata_artist.as_deref(),
-        prefer_title_artist_filename,
-    );
-    let title = metadata_title.unwrap_or(fallback_title);
-    let artist = metadata_artist.unwrap_or(fallback_artist);
+    if let Some((left, right)) = &filename_parts {
+        let title_first_score = if prefer_title_artist_filename { 70 } else { 45 };
+        let artist_first_score = if prefer_title_artist_filename { 45 } else { 70 };
+        push_identity_candidate(
+            &mut candidates,
+            SongIdentity {
+                title: left.clone(),
+                artist: right.clone(),
+            },
+            "文件名：歌名 - 歌手".to_string(),
+            title_first_score,
+        );
+        push_identity_candidate(
+            &mut candidates,
+            SongIdentity {
+                title: right.clone(),
+                artist: left.clone(),
+            },
+            "文件名：歌手 - 歌名".to_string(),
+            artist_first_score,
+        );
+    } else if !display.is_empty() {
+        push_identity_candidate(
+            &mut candidates,
+            SongIdentity {
+                title: display.clone(),
+                artist: String::new(),
+            },
+            "文件名：仅歌名".to_string(),
+            50,
+        );
+    }
 
-    SongIdentity { title, artist }
+    if let Some(title) = &metadata_title
+        && let Some((left, right)) = &filename_parts
+    {
+        if identity_text_matches(title, left) {
+            push_identity_candidate(
+                &mut candidates,
+                SongIdentity {
+                    title: title.clone(),
+                    artist: right.clone(),
+                },
+                "标签标题匹配文件名左侧".to_string(),
+                85,
+            );
+        } else if identity_text_matches(title, right) {
+            push_identity_candidate(
+                &mut candidates,
+                SongIdentity {
+                    title: title.clone(),
+                    artist: left.clone(),
+                },
+                "标签标题匹配文件名右侧".to_string(),
+                85,
+            );
+        }
+    }
+    if let Some(artist) = &metadata_artist
+        && let Some((left, right)) = &filename_parts
+    {
+        if identity_text_matches(artist, left) {
+            push_identity_candidate(
+                &mut candidates,
+                SongIdentity {
+                    title: right.clone(),
+                    artist: artist.clone(),
+                },
+                "标签歌手匹配文件名左侧".to_string(),
+                85,
+            );
+        } else if identity_text_matches(artist, right) {
+            push_identity_candidate(
+                &mut candidates,
+                SongIdentity {
+                    title: left.clone(),
+                    artist: artist.clone(),
+                },
+                "标签歌手匹配文件名右侧".to_string(),
+                85,
+            );
+        }
+    }
+
+    for candidate in &mut candidates {
+        if prefer_title_artist_filename {
+            let title_looks_like_artist = looks_like_multiple_artists(&candidate.identity.title);
+            let artist_looks_like_artist = looks_like_multiple_artists(&candidate.identity.artist);
+            if artist_looks_like_artist && !title_looks_like_artist {
+                candidate.score += 35;
+            } else if title_looks_like_artist && !artist_looks_like_artist {
+                candidate.score -= 35;
+            }
+            if candidate.label == "采用完整内嵌元数据" || candidate.label == "内嵌标签反向候选"
+            {
+                if artist_looks_like_artist && !title_looks_like_artist {
+                    candidate.score += 35;
+                } else if title_looks_like_artist && !artist_looks_like_artist {
+                    candidate.score -= 35;
+                }
+            }
+        }
+        if let Some((left, right)) = &filename_parts {
+            if candidate.identity.title == *left && candidate.identity.artist == *right {
+                candidate.score += if prefer_title_artist_filename { 40 } else { 25 };
+            } else if candidate.identity.title == *right && candidate.identity.artist == *left {
+                candidate.score += if prefer_title_artist_filename { 5 } else { 40 };
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        candidates.push(IdentityCandidate {
+            identity: SongIdentity {
+                title: metadata_title.clone().unwrap_or_default(),
+                artist: metadata_artist.clone().unwrap_or_default(),
+            },
+            label: "没有可用的标题或歌手".to_string(),
+            score: 0,
+        });
+    }
+
+    candidates.sort_by(|left, right| right.score.cmp(&left.score));
+    let best = candidates[0].clone();
+    let second_has_different_identity = candidates
+        .get(1)
+        .is_some_and(|candidate| candidate.identity != best.identity);
+    let ambiguous = second_has_different_identity && candidates[1].score >= best.score - 3
+        || metadata_title.is_none()
+            && metadata_artist.is_none()
+            && filename_parts.is_some()
+            && !prefer_title_artist_filename;
+    let confidence = best.score.clamp(0, 100) as u8;
+    let reason = if ambiguous {
+        format!(
+            "{}；未发现足够来源线索，文件名左右顺序存在不确定性",
+            best.label
+        )
+    } else {
+        best.label.clone()
+    };
+    let layout = if let Some((left, right)) = &filename_parts {
+        if best.identity.title == *left && best.identity.artist == *right {
+            "歌名 - 歌手".to_string()
+        } else if best.identity.title == *right && best.identity.artist == *left {
+            "歌手 - 歌名".to_string()
+        } else {
+            best.label.clone()
+        }
+    } else if metadata_title.is_some() && metadata_artist.is_some() {
+        "完整内嵌元数据".to_string()
+    } else {
+        "仅歌名或标签不完整".to_string()
+    };
+
+    let candidates = candidates
+        .iter()
+        .take(6)
+        .map(|candidate| {
+            format!(
+                "{}：标题={}；歌手={}；评分={}",
+                candidate.label,
+                candidate.identity.title,
+                candidate.identity.artist,
+                candidate.score
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+
+    IdentityResolution {
+        identity: best.identity,
+        layout,
+        reason,
+        confidence,
+        ambiguous,
+        candidates,
+    }
+}
+
+fn looks_like_multiple_artists(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    value.contains(',')
+        || value.contains('，')
+        || value.contains('&')
+        || lowered.contains(" feat")
+        || lowered.contains(" ft")
+        || lowered.contains(" with ")
+        || lowered.contains(" x ")
+        || value.contains("/")
+}
+
+fn push_identity_candidate(
+    candidates: &mut Vec<IdentityCandidate>,
+    identity: SongIdentity,
+    label: String,
+    score: i32,
+) {
+    candidates.push(IdentityCandidate {
+        identity,
+        label,
+        score,
+    });
 }
 
 fn source_prefers_title_artist_filename(path: &Path, tag: Option<&id3::Tag>) -> bool {
@@ -1749,69 +2221,8 @@ fn has_netease_metadata(tag: &id3::Tag) -> bool {
         .any(|text| text.description.trim().starts_with("163 key"))
 }
 
-fn parse_filename_identity_with_hints(
-    fallback_name: &str,
-    metadata_title: Option<&str>,
-    metadata_artist: Option<&str>,
-    prefer_title_artist_filename: bool,
-) -> (String, String) {
-    let display = normalize_display_text(fallback_name);
-    let Some((left, right)) = display.split_once(" - ") else {
-        return (display, String::new());
-    };
-
-    if metadata_title.is_some_and(|title| identity_text_matches(title, left))
-        || metadata_artist.is_some_and(|artist| identity_text_matches(artist, right))
-    {
-        return (left.to_string(), right.to_string());
-    }
-    if metadata_title.is_some_and(|title| identity_text_matches(title, right))
-        || metadata_artist.is_some_and(|artist| identity_text_matches(artist, left))
-    {
-        return (right.to_string(), left.to_string());
-    }
-
-    if prefer_title_artist_filename {
-        (left.to_string(), right.to_string())
-    } else {
-        (right.to_string(), left.to_string())
-    }
-}
-
 fn identity_text_matches(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
-}
-
-#[allow(dead_code)]
-fn describe_filename_layout(
-    fallback_name: &str,
-    metadata_title: Option<&str>,
-    metadata_artist: Option<&str>,
-    prefer_title_artist_filename: bool,
-) -> String {
-    let display = normalize_display_text(fallback_name);
-    let Some((left, right)) = display.split_once(" - ") else {
-        return "仅歌名（无分隔符）".to_string();
-    };
-
-    if metadata_title.is_some_and(|title| identity_text_matches(title, left))
-        && metadata_artist.is_some_and(|artist| identity_text_matches(artist, right))
-    {
-        return "歌名 - 歌手".to_string();
-    }
-    if metadata_artist.is_some_and(|artist| identity_text_matches(artist, left))
-        && metadata_title.is_some_and(|title| identity_text_matches(title, right))
-    {
-        return "歌手 - 歌名".to_string();
-    }
-    if metadata_title.is_some() || metadata_artist.is_some() {
-        return "文件名与标签不完全一致（采用标签）".to_string();
-    }
-    if prefer_title_artist_filename {
-        "歌名 - 歌手（网易云兜底）".to_string()
-    } else {
-        "歌手 - 歌名（兼容兜底）".to_string()
-    }
 }
 
 fn normalize_filename_part(value: Option<&str>) -> Option<String> {
@@ -2616,15 +3027,15 @@ mod tests {
         let mut output = Tag::new();
         let source = Tag::new();
 
-        assert!(fill_missing_metadata(
+        assert!(!fill_missing_metadata(
             &mut output,
             &source,
             "Mr Wankerman - Mystic State, Third Degree",
             false,
         ));
 
-        assert_eq!(output.title(), Some("Mystic State, Third Degree"));
-        assert_eq!(output.artist(), Some("Mr Wankerman"));
+        assert_eq!(output.title(), None);
+        assert_eq!(output.artist(), None);
     }
 
     #[test]
@@ -2641,9 +3052,37 @@ mod tests {
 
         ensure_output_metadata(&source_path, &output_path).unwrap();
 
+        assert!(Tag::read_from_path(&output_path).is_err());
+    }
+
+    #[test]
+    fn recognizes_reversed_netease_tags_from_title_first_filename() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("网易云音乐/BikaBreezy, Jaytrue - 巴适.mp3");
+        let output_path = dir.path().join("output.mp3");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, b"audio").unwrap();
+        let mut source = Tag::new();
+        source.set_title("BikaBreezy, Jaytrue");
+        source.set_artist("巴适");
+        source.add_frame(id3::frame::ExtendedText {
+            description: "163 key".into(),
+            value: "netease-source".into(),
+        });
+        source.write_to_path(&source_path, Version::Id3v23).unwrap();
+        fs::copy(&source_path, &output_path).unwrap();
+
+        ensure_output_metadata(&source_path, &output_path).unwrap();
+
         let tag = Tag::read_from_path(&output_path).unwrap();
-        assert_eq!(tag.title(), Some("Mystic State, Third Degree"));
-        assert_eq!(tag.artist(), Some("Mr Wankerman"));
+        assert_eq!(tag.title(), Some("巴适"));
+        assert_eq!(tag.artist(), Some("BikaBreezy, Jaytrue"));
+
+        let diagnostic = inspect_metadata_decision(&source_path, &output_path);
+        assert_eq!(diagnostic.resolved_title, "巴适");
+        assert_eq!(diagnostic.resolved_artist, "BikaBreezy, Jaytrue");
+        assert!(diagnostic.identity_candidates.contains("评分="));
+        assert!(!diagnostic.identity_ambiguous);
     }
 
     #[test]
@@ -2709,7 +3148,7 @@ mod tests {
         ));
 
         assert_eq!(output.title(), Some("Existing Title"));
-        assert_eq!(output.artist(), Some("Artist"));
+        assert_eq!(output.artist(), None);
         assert_eq!(output.album(), Some("Existing Album"));
         assert_eq!(output.pictures().count(), 1);
     }
@@ -2738,6 +3177,38 @@ mod tests {
         assert_eq!(picture.mime_type, "image/jpeg");
         assert_eq!(picture.data, vec![0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02]);
         assert_eq!(picture.picture_type, id3::frame::PictureType::CoverFront);
+    }
+
+    #[test]
+    fn removes_invalid_output_cover_frames_when_a_valid_cover_exists() {
+        let mut source = Tag::new();
+        source.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".into(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02],
+        });
+
+        let mut output = Tag::new();
+        output.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".into(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x03, 0x04],
+        });
+        output.add_frame(id3::frame::Picture {
+            mime_type: "image/*".into(),
+            picture_type: id3::frame::PictureType::Other,
+            description: String::new(),
+            data: b"invalid-cover".to_vec(),
+        });
+
+        assert!(ensure_compatible_artwork(&mut output, &source));
+
+        let pictures = output.pictures().collect::<Vec<_>>();
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].mime_type, "image/jpeg");
+        assert_eq!(pictures[0].data, vec![0xff, 0xd8, 0xff, 0xe0, 0x03, 0x04]);
     }
 
     #[test]

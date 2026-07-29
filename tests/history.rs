@@ -50,19 +50,28 @@ fn complete_error_report_explains_metadata_identity_decisions() {
         source_metadata_summary: "标题=巴适；歌手=BikaBreezy, Jaytrue；专辑=无；帧数=4；封面帧数=1"
             .into(),
         source_cover_details: "1 张：image/jpeg，CoverFront，128 bytes，图像签名可识别".into(),
+        source_format_details: "源格式：MP3；已读取 ID3 标签".into(),
         detected_filename_layout: "歌名 - 歌手".into(),
         decision: "采用完整内嵌元数据".into(),
+        identity_confidence: 100,
+        identity_ambiguous: false,
+        identity_candidates: "完整内嵌标签：标题=巴适；歌手=BikaBreezy, Jaytrue；评分=100".into(),
         source_title: Some("巴适".into()),
         source_artist: Some("BikaBreezy, Jaytrue".into()),
+        source_album: None,
         resolved_title: "巴适".into(),
         resolved_artist: "BikaBreezy, Jaytrue".into(),
         output_title: Some("巴适".into()),
         output_artist: Some("BikaBreezy, Jaytrue".into()),
+        output_album: None,
         output_size_bytes: Some(2048),
         output_metadata_status: "已读取 ID3 标签".into(),
         output_metadata_summary: "标题=巴适；歌手=BikaBreezy, Jaytrue；专辑=无；帧数=4；封面帧数=1"
             .into(),
         output_cover_details: "1 张：image/jpeg，CoverFront，128 bytes，图像签名可识别".into(),
+        ffmpeg_command: "ffmpeg -y ...".into(),
+        metadata_write_plan: "无需写入或修正".into(),
+        metadata_validation: "通过".into(),
         source_artwork: true,
         output_artwork: Some(true),
     });
@@ -77,6 +86,9 @@ fn complete_error_report_explains_metadata_identity_decisions() {
     assert!(report.contains("输出封面：有"));
     assert!(report.contains("源元数据读取：NCM 元数据与封面已读取"));
     assert!(report.contains("目标文件大小：2048 bytes"));
+    assert!(report.contains("识别置信度：100"));
+    assert!(report.contains("FFmpeg 命令：ffmpeg -y ..."));
+    assert!(report.contains("源格式详情：源格式：MP3；已读取 ID3 标签"));
 }
 
 #[test]

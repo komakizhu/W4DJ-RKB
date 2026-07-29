@@ -58,7 +58,7 @@ pub struct Config {
 #[derive(clap::Parser)]
 #[command(
     name = "w4dj",
-    version = "2.2.1",
+    version = "2.2.4",
     author = "slipstream",
     about = "网易云音乐曲库同步器"
 )]
@@ -71,7 +71,8 @@ pub struct Cmd {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, LosslessFormat, Mode};
+    use super::{Cmd, Config, LosslessFormat, Mode};
+    use clap::CommandFactory;
 
     #[test]
     fn parses_mode_and_lossless_output_format() {
@@ -85,5 +86,10 @@ lossless_format = "aiff"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(matches!(config.mode, Mode::Compat));
         assert!(matches!(config.lossless_format, Some(LosslessFormat::Aiff)));
+    }
+
+    #[test]
+    fn command_line_version_matches_v2_2_4() {
+        assert_eq!(Cmd::command().get_version(), Some("2.2.4"));
     }
 }
