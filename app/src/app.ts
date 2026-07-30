@@ -304,18 +304,18 @@ const translations = {
     failedCount: '失败',
     sourcePath: '输入来源',
     destinationPath: '输出目录',
-    conflictStrategy: '已存在文件',
-    conflictSkip: '已存在文件：跳过',
-    conflictOverwrite: '已存在文件：覆盖',
-    conflictMetadata: '高级选项：仅更新元数据',
-    filenameRule: '文件名规则',
-    neteaseFilenameFormat: '网易云源文件格式',
-    neteaseFilenameFormatHint: '仅网易云来源生效',
+    conflictStrategy: '已存在文件处理规则',
+    conflictSkip: '跳过',
+    conflictOverwrite: '覆盖',
+    conflictMetadata: '仅更新元数据',
+    filenameRule: '输出歌曲模式',
+    neteaseFilenameFormat: '网易云歌曲格式（仅对 NCM 生效）',
+    neteaseFilenameFormatHint: '仅对 NCM 文件生效',
     neteaseTitleOnly: '歌名',
     neteaseArtistTitle: '歌手 - 歌名',
     neteaseTitleArtist: '歌名 - 歌手',
-    titleArtist: '标题 - 艺术家（默认）',
-    artistTitle: '艺术家 - 标题',
+    titleArtist: '歌名 - 歌手',
+    artistTitle: '歌手 - 歌名',
     originalName: '保留原文件名',
     availableSpace: '可用空间',
     insufficientSpace: '磁盘空间不足，无法开始转换',
@@ -411,17 +411,17 @@ const translations = {
     failedCount: 'Failed',
     sourcePath: 'Input source',
     destinationPath: 'Output',
-    conflictStrategy: 'Existing files',
-    conflictSkip: 'Existing file: skip',
-    conflictOverwrite: 'Existing file: overwrite',
-    conflictMetadata: 'Advanced: update metadata only',
-    filenameRule: 'Filename rule',
-    neteaseFilenameFormat: 'NetEase source filename format',
-    neteaseFilenameFormatHint: 'Applies to NetEase sources only',
+    conflictStrategy: 'Existing file handling',
+    conflictSkip: 'Skip',
+    conflictOverwrite: 'Overwrite',
+    conflictMetadata: 'Update metadata only',
+    filenameRule: 'Output filename mode',
+    neteaseFilenameFormat: 'NetEase song format (NCM only)',
+    neteaseFilenameFormatHint: 'Applies to NCM files only',
     neteaseTitleOnly: 'Title only',
     neteaseArtistTitle: 'Artist - Title',
     neteaseTitleArtist: 'Title - Artist',
-    titleArtist: 'Title - Artist (default)',
+    titleArtist: 'Title - Artist',
     artistTitle: 'Artist - Title',
     originalName: 'Keep original filename',
     availableSpace: 'Available space',
@@ -1703,17 +1703,9 @@ function renderOutputSettings(state: AppViewState, expanded = false): string {
         <label>
           <span>${t('conflictStrategy', state.lang)}</span>
           <select data-action="choose-conflict" aria-label="${t('conflictStrategy', state.lang)}">
-            <option value="skip" ${state.conflictStrategy === 'skip' ? 'selected' : ''}>${t('conflictSkip', state.lang)}</option>
             <option value="overwrite" ${state.conflictStrategy === 'overwrite' ? 'selected' : ''}>${t('conflictOverwrite', state.lang)}</option>
+            <option value="skip" ${state.conflictStrategy === 'skip' ? 'selected' : ''}>${t('conflictSkip', state.lang)}</option>
             <option value="update_metadata" ${state.conflictStrategy === 'update_metadata' ? 'selected' : ''}>${t('conflictMetadata', state.lang)}</option>
-          </select>
-        </label>
-        <label>
-          <span>${t('filenameRule', state.lang)}</span>
-          <select data-action="choose-filename-rule" aria-label="${t('filenameRule', state.lang)}">
-            <option value="title_artist" ${state.filenameRule === 'title_artist' ? 'selected' : ''}>${t('titleArtist', state.lang)}</option>
-            <option value="artist_title" ${state.filenameRule === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
-            <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
           </select>
         </label>
         <label>
@@ -1723,7 +1715,14 @@ function renderOutputSettings(state: AppViewState, expanded = false): string {
             <option value="artist_title" ${state.neteaseFilenameFormat === 'artist_title' ? 'selected' : ''}>${t('neteaseArtistTitle', state.lang)}</option>
             <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('neteaseTitleArtist', state.lang)}</option>
           </select>
-          <small>${t('neteaseFilenameFormatHint', state.lang)}</small>
+        </label>
+        <label>
+          <span>${t('filenameRule', state.lang)}</span>
+          <select data-action="choose-filename-rule" aria-label="${t('filenameRule', state.lang)}">
+            <option value="title_artist" ${state.filenameRule === 'title_artist' ? 'selected' : ''}>${t('titleArtist', state.lang)}</option>
+            <option value="artist_title" ${state.filenameRule === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
+            <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
+          </select>
         </label>
       </div>
     </details>

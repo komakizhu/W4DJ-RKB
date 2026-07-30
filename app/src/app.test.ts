@@ -394,6 +394,25 @@ describe('renderApp', () => {
       .toBe('title_artist');
   });
 
+  it('orders and labels advanced settings for direct user understanding', () => {
+    const root = renderApp(makeViewState());
+    const settings = root.querySelector('[data-role="advanced-output-settings"]') as HTMLElement;
+    const labels = [...settings.querySelectorAll('.output-settings-content > label > span')]
+      .map((label) => label.textContent?.trim());
+
+    expect(labels).toEqual([
+      '已存在文件处理规则',
+      '网易云歌曲格式（仅对 NCM 生效）',
+      '输出歌曲模式',
+    ]);
+    expect([...settings.querySelector('[data-action="choose-conflict"]')!.querySelectorAll('option')]
+      .map((option) => option.textContent?.trim()))
+      .toEqual(['覆盖', '跳过', '仅更新元数据']);
+    expect([...settings.querySelector('[data-action="choose-filename-rule"]')!.querySelectorAll('option')]
+      .map((option) => option.textContent?.trim()))
+      .toEqual(['歌名 - 歌手', '歌手 - 歌名', '保留原文件名']);
+  });
+
   it('blocks confirmation when the destination disk is too full', () => {
     const preview = makePreview(0);
     preview.preview.disk_space_sufficient = false;
