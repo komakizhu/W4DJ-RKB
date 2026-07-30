@@ -1616,10 +1616,13 @@ fn fill_missing_metadata_with_settings(
         prefer_title_artist_filename,
         netease_filename_format,
     );
+    let source_identity_complete =
+        non_empty(source_tag.title()).is_some() && non_empty(source_artist).is_some();
     let mut changed = false;
 
     if !resolution.ambiguous {
         if !resolution.identity.title.is_empty()
+            && (output_tag.title().is_none() || source_identity_complete)
             && output_tag.title() != Some(resolution.identity.title.as_str())
         {
             output_tag.set_title(&resolution.identity.title);
@@ -1627,6 +1630,7 @@ fn fill_missing_metadata_with_settings(
         }
 
         if !resolution.identity.artist.is_empty()
+            && (output_tag.artist().is_none() || source_identity_complete)
             && output_tag.artist() != Some(resolution.identity.artist.as_str())
         {
             output_tag.set_artist(&resolution.identity.artist);
@@ -2202,6 +2206,8 @@ fn resolve_song_identity_with_format(
     let metadata_title = normalize_filename_part(metadata_title);
     let metadata_artist = normalize_filename_part(metadata_artist);
     let display = normalize_display_text(fallback_name);
+    let source_looks_like_soundcloud =
+        looks_like_soundcloud_text(fallback_name) || looks_like_soundcloud_text(&display);
     let filename_parts = display.split_once(" - ").and_then(|(left, right)| {
         let left = normalize_filename_part(Some(left))?;
         let right = normalize_filename_part(Some(right))?;
@@ -2209,7 +2215,16 @@ fn resolve_song_identity_with_format(
     });
     let mut candidates = Vec::new();
 
-    if prefer_title_artist_filename {
+    // An explicit NetEase filename selection must work even when the user
+    // copied a downloaded file into a neutral folder such as `test 2` and the
+    // downloader did not preserve any tags. The old implementation only
+    // enabled this branch for paths containing "网易云"/"netease" or a 163
+    // metadata key, which made the UI selection ineffective for exactly this
+    // common case. Obvious SoundCloud-style names keep the legacy heuristic.
+    let apply_explicit_netease_format = prefer_title_artist_filename
+        || (!source_looks_like_soundcloud && metadata_title.is_none() && metadata_artist.is_none());
+
+    if apply_explicit_netease_format {
         if let Some((left, right)) = &filename_parts {
             let (title, artist) = match netease_filename_format {
                 NeteaseFilenameFormat::TitleOnly => {
@@ -2225,7 +2240,11 @@ fn resolve_song_identity_with_format(
                     "网易云源文件格式：{}",
                     netease_filename_format_label(netease_filename_format)
                 ),
-                170,
+                // The selected source layout is an explicit user instruction.
+                // Keep it above the heuristic title-likeness adjustments so a
+                // title such as "My Head & My Heart (Remix)" cannot silently
+                // override a chosen "artist - title" layout.
+                300,
             );
         } else if !display.is_empty() {
             push_identity_candidate(
@@ -2423,7 +2442,7 @@ fn resolve_song_identity_with_format(
         || metadata_title.is_none()
             && metadata_artist.is_none()
             && filename_parts.is_some()
-            && !prefer_title_artist_filename
+            && !apply_explicit_netease_format
             && !strong_filename_title_hint;
     let confidence = best.score.clamp(0, 100) as u8;
     let reason = if ambiguous {
@@ -3145,16 +3164,16 @@ mod tests {
     }
 
     #[test]
-    fn applies_title_artist_rule_to_plain_artist_first_filename_fallback() {
+    fn applies_explicit_netease_artist_title_format_to_plain_artist_first_filename_fallback() {
         let path = std::path::Path::new("/tmp/Mr Wankerman - Mystic State, Third Degree.mp3");
 
         assert_eq!(
-            derive_song_name_with_rule(path, FilenameRule::TitleArtist),
+            derive_song_name_with_settings(
+                path,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::ArtistTitle,
+            ),
             "Mystic State, Third Degree - Mr Wankerman"
-        );
-        assert_eq!(
-            derive_song_name_with_rule(path, FilenameRule::ArtistTitle),
-            "Mr Wankerman - Mystic State, Third Degree"
         );
     }
 
@@ -3364,19 +3383,19 @@ mod tests {
     }
 
     #[test]
-    fn fills_missing_metadata_from_the_original_filename() {
+    fn fills_missing_metadata_from_the_selected_netease_filename_format() {
         let mut output = Tag::new();
         let source = Tag::new();
 
-        assert!(!fill_missing_metadata(
+        assert!(fill_missing_metadata(
             &mut output,
             &source,
             "Mr Wankerman - Mystic State, Third Degree",
             false,
         ));
 
-        assert_eq!(output.title(), None);
-        assert_eq!(output.artist(), None);
+        assert_eq!(output.title(), Some("Mr Wankerman"));
+        assert_eq!(output.artist(), Some("Mystic State, Third Degree"));
     }
 
     #[test]
@@ -3393,7 +3412,9 @@ mod tests {
 
         ensure_output_metadata(&source_path, &output_path).unwrap();
 
-        assert!(Tag::read_from_path(&output_path).is_err());
+        let tag = Tag::read_from_path(&output_path).unwrap();
+        assert_eq!(tag.title(), Some("Mr Wankerman"));
+        assert_eq!(tag.artist(), Some("Mystic State, Third Degree"));
     }
 
     #[test]
@@ -3522,7 +3543,55 @@ mod tests {
     }
 
     #[test]
-    fn resolves_a_strong_title_marker_from_a_filename_without_tags() {
+    fn applies_explicit_netease_format_to_untagged_source_without_netease_path_marker() {
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("test 2/王怡 - 拉勾勾.mp3");
+        let output_path = dir.path().join("output/拉勾勾 - 王怡.mp3");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        fs::write(&source_path, b"audio-without-tags").unwrap();
+        fs::write(&output_path, b"audio-output").unwrap();
+
+        super::ensure_output_metadata_with_settings(
+            &source_path,
+            &output_path,
+            NeteaseFilenameFormat::ArtistTitle,
+        )
+        .unwrap();
+
+        let output = Tag::read_from_path(&output_path).unwrap();
+        assert_eq!(output.title(), Some("拉勾勾"));
+        assert_eq!(output.artist(), Some("王怡"));
+    }
+
+    #[test]
+    fn applies_all_three_netease_filename_formats_to_unmarked_sources() {
+        let cases = [
+            (
+                "王怡 - 拉勾勾",
+                NeteaseFilenameFormat::ArtistTitle,
+                "拉勾勾 - 王怡",
+            ),
+            (
+                "拉勾勾 - 王怡",
+                NeteaseFilenameFormat::TitleArtist,
+                "拉勾勾 - 王怡",
+            ),
+            ("拉勾勾", NeteaseFilenameFormat::TitleOnly, "拉勾勾"),
+        ];
+
+        for (source_name, format, expected_name) in cases {
+            let path = Path::new("/tmp").join(format!("test 2/{source_name}.flac"));
+            assert_eq!(
+                derive_song_name_with_settings(&path, FilenameRule::TitleArtist, format),
+                expected_name,
+                "failed for source format {format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn applies_selected_netease_format_before_title_marker_heuristic() {
         let mut output = Tag::new();
 
         assert!(fill_missing_metadata(
@@ -3532,8 +3601,8 @@ mod tests {
             false,
         ));
 
-        assert_eq!(output.title(), Some("100 & Lonely"));
-        assert_eq!(output.artist(), Some("ARAI"));
+        assert_eq!(output.title(), Some("ARAI"));
+        assert_eq!(output.artist(), Some("100 & Lonely"));
     }
 
     #[test]
@@ -3599,7 +3668,7 @@ mod tests {
         ));
 
         assert_eq!(output.title(), Some("Existing Title"));
-        assert_eq!(output.artist(), None);
+        assert_eq!(output.artist(), Some("Fallback Title"));
         assert_eq!(output.album(), Some("Existing Album"));
         assert_eq!(output.pictures().count(), 1);
     }
