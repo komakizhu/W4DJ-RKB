@@ -134,6 +134,14 @@ export type AppInfo = {
   project_url: string;
 };
 
+export type AppUpdateCheck = {
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+  release_url: string;
+  release_name: string;
+};
+
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
 
 export type AppHistoryEntry = {
@@ -190,6 +198,7 @@ export type AppServices = {
   deleteHistoryEntry: (id: string) => Promise<void>;
   clearHistory: () => Promise<void>;
   loadAppInfo: () => Promise<AppInfo>;
+  checkForUpdates: () => Promise<AppUpdateCheck>;
   openExternalUrl: (url: string) => Promise<void>;
   openDestination: (path: string) => Promise<void>;
   startAllSync: () => Promise<DesktopState>;
@@ -318,6 +327,12 @@ const translations = {
     version: '版本',
     developer: '开发者',
     projectHome: '项目主页',
+    checkUpdates: '检测更新',
+    checkingUpdates: '正在检查…',
+    latestVersion: '已是最新版 {version}',
+    updateAvailable: '发现新版本 {version}',
+    viewRelease: '查看 Release',
+    updateCheckFailed: '检查更新失败：{error}',
     close: '关闭',
     pendingCount: '待继续',
     errorCategory: '错误类型',
@@ -419,6 +434,12 @@ const translations = {
     version: 'Version',
     developer: 'Developer',
     projectHome: 'Project home',
+    checkUpdates: 'Check for updates',
+    checkingUpdates: 'Checking…',
+    latestVersion: 'You’re up to date: {version}',
+    updateAvailable: 'New version available: {version}',
+    viewRelease: 'View Release',
+    updateCheckFailed: 'Update check failed: {error}',
     close: 'Close',
     pendingCount: 'Pending',
     errorCategory: 'Error type',
@@ -442,6 +463,10 @@ const translations = {
 
 function t(key: keyof typeof translations.zh, lang: AppLanguage): string {
   return translations[lang][key];
+}
+
+function displayVersion(version: string): string {
+  return /^v/i.test(version) ? version : `v${version}`;
 }
 
 export function humanizeError(
@@ -568,6 +593,7 @@ const defaultServices: AppServices = {
   deleteHistoryEntry: (id) => invoke<void>('delete_history_entry_command', { id }),
   clearHistory: () => invoke<void>('clear_history_command'),
   loadAppInfo: () => invoke<AppInfo>('app_info'),
+  checkForUpdates: () => invoke<AppUpdateCheck>('check_for_updates'),
   openExternalUrl: (url) => invoke<void>('open_external_url', { url }),
   openDestination: (path) => invoke<void>('open_destination', { path }),
   startAllSync: () => invoke<DesktopState>('start_all_sync'),
@@ -589,6 +615,9 @@ export function renderApp(
   historyExpanded = false,
   onboardingVisible = false,
   onboardingStep: OnboardingStep = 0,
+  updateCheck: AppUpdateCheck | null = null,
+  updateChecking = false,
+  updateCheckError: string | null = null,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -691,7 +720,7 @@ export function renderApp(
       </div>
     </section>
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
-    ${renderAboutModal(aboutInfo, state.lang)}
+    ${renderAboutModal(aboutInfo, state.lang, updateCheck, updateChecking, updateCheckError)}
     ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
   `;
 
@@ -914,6 +943,9 @@ export function bindApp(
   let previewBusy = false;
   let history: AppHistoryEntry[] = [];
   let aboutInfo: AppInfo | null = null;
+  let updateCheck: AppUpdateCheck | null = null;
+  let updateChecking = false;
+  let updateCheckError: string | null = null;
   let outputSettingsExpanded = false;
   let historyExpanded = false;
   let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
@@ -934,6 +966,9 @@ export function bindApp(
         historyExpanded,
         onboardingVisible,
         onboardingStep,
+        updateCheck,
+        updateChecking,
+        updateCheckError,
       ),
     );
 
@@ -1146,9 +1181,30 @@ export function bindApp(
   const openAbout = async () => {
     try {
       aboutInfo = await services.loadAppInfo();
+      updateCheck = null;
+      updateChecking = false;
+      updateCheckError = null;
       render();
     } catch (error) {
       reportError(error);
+    }
+  };
+
+  const checkForUpdates = async () => {
+    if (updateChecking) {
+      return;
+    }
+    updateChecking = true;
+    updateCheck = null;
+    updateCheckError = null;
+    render();
+    try {
+      updateCheck = await services.checkForUpdates();
+    } catch (error) {
+      updateCheckError = error instanceof Error ? error.message : String(error);
+    } finally {
+      updateChecking = false;
+      render();
     }
   };
 
@@ -1280,6 +1336,19 @@ export function bindApp(
       if (url) {
         void services.openExternalUrl(url);
       }
+      return;
+    }
+
+    if (action === 'open-release') {
+      const url = button.dataset.url;
+      if (url) {
+        void services.openExternalUrl(url);
+      }
+      return;
+    }
+
+    if (action === 'check-updates') {
+      void checkForUpdates();
       return;
     }
 
@@ -1661,7 +1730,13 @@ function renderOutputSettings(state: AppViewState, expanded = false): string {
   `;
 }
 
-function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
+function renderAboutModal(
+  info: AppInfo | null,
+  lang: AppLanguage,
+  updateCheck: AppUpdateCheck | null = null,
+  updateChecking = false,
+  updateCheckError: string | null = null,
+): string {
   if (!info) {
     return '';
   }
@@ -1676,8 +1751,15 @@ function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
           <div><dt>${t('developer', lang)}</dt><dd>${escapeHtml(info.developer)}</dd></div>
         </dl>
         <div class="about-links">
-          <button type="button" class="about-link" data-action="open-project-home" data-url="${escapeHtml(info.project_url)}">${t('projectHome', lang)}</button>
+          <div class="about-link-row">
+            <button type="button" class="about-link" data-action="open-project-home" data-url="${escapeHtml(info.project_url)}">${t('projectHome', lang)}</button>
+            <button type="button" class="about-link" data-action="check-updates" ${updateChecking ? 'disabled aria-busy="true"' : ''}>${updateChecking ? t('checkingUpdates', lang) : t('checkUpdates', lang)}</button>
+          </div>
           <button type="button" class="about-link" data-action="reopen-onboarding">${t('usageGuide', lang)}</button>
+          ${updateChecking ? `<p class="about-update-status" data-role="update-status" aria-live="polite">${t('checkingUpdates', lang)}</p>` : ''}
+          ${updateCheckError ? `<p class="about-update-status about-update-status--error" data-role="update-status" aria-live="polite">${escapeHtml(t('updateCheckFailed', lang).replace('{error}', updateCheckError))}</p>` : ''}
+          ${updateCheck ? `<p class="about-update-status" data-role="update-status" aria-live="polite">${escapeHtml((updateCheck.update_available ? t('updateAvailable', lang) : t('latestVersion', lang)).replace('{version}', displayVersion(updateCheck.latest_version)))}</p>` : ''}
+          ${updateCheck?.update_available ? `<button type="button" class="about-link" data-action="open-release" data-url="${escapeHtml(updateCheck.release_url)}">${t('viewRelease', lang)}</button>` : ''}
         </div>
         <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>
       </section>

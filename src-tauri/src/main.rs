@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 use w4dj::config::{
     ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
@@ -67,6 +67,22 @@ struct AppInfo {
     version: &'static str,
     developer: &'static str,
     project_url: &'static str,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: String,
+    name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateCheckResult {
+    current_version: &'static str,
+    latest_version: String,
+    update_available: bool,
+    release_url: String,
+    release_name: String,
 }
 
 #[derive(Clone, Default)]
@@ -779,10 +795,54 @@ fn app_info() -> AppInfo {
     }
 }
 
+fn parse_release_version(value: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = value.trim();
+    let trimmed = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let core = trimmed.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+#[tauri::command]
+fn check_for_updates() -> Result<UpdateCheckResult, String> {
+    const LATEST_RELEASE_URL: &str =
+        "https://api.github.com/repos/komakizhu/W4DJ-RKB/releases/latest";
+
+    let response = ureq::get(LATEST_RELEASE_URL)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "W4DJ-RKB")
+        .timeout(Duration::from_secs(8))
+        .call()
+        .map_err(|error| format!("无法连接 GitHub：{error}"))?;
+    let release: GitHubRelease = response
+        .into_json()
+        .map_err(|error| format!("GitHub 更新信息格式错误：{error}"))?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    let current = parse_release_version(current_version)
+        .ok_or_else(|| format!("当前版本号无法识别：{current_version}"))?;
+    let latest = parse_release_version(&release.tag_name)
+        .ok_or_else(|| format!("GitHub Release 版本号无法识别：{}", release.tag_name))?;
+
+    Ok(UpdateCheckResult {
+        current_version,
+        latest_version: release.tag_name,
+        update_available: latest > current,
+        release_url: release.html_url,
+        release_name: release.name.unwrap_or_default(),
+    })
+}
+
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     const PROJECT_URL: &str = "https://github.com/komakizhu/W4DJ-RKB";
-    if url != PROJECT_URL {
+    const RELEASES_URL_PREFIX: &str = "https://github.com/komakizhu/W4DJ-RKB/releases/";
+    if url != PROJECT_URL && !url.starts_with(RELEASES_URL_PREFIX) {
         return Err("不允许打开此外部地址".to_string());
     }
 
@@ -878,6 +938,7 @@ fn main() {
             delete_history_entry_command,
             clear_history_command,
             app_info,
+            check_for_updates,
             open_external_url,
             open_destination
         ])
@@ -1832,6 +1893,7 @@ mod tests {
     use super::collect_processable_previews;
     use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
+    use super::parse_release_version;
     use super::validate_destination_directory;
     use super::validate_source_input;
     use super::validate_unique_planned_outputs;
@@ -1920,6 +1982,20 @@ mod tests {
             super::format_unix_timestamp(1_784_210_712),
             "2026-07-16 14:05:12 UTC"
         );
+    }
+
+    #[test]
+    fn release_version_parser_handles_tags_and_prerelease_suffixes() {
+        assert_eq!(parse_release_version("v2.2.5"), Some((2, 2, 5)));
+        assert_eq!(parse_release_version("2.2.6-beta.1"), Some((2, 2, 6)));
+        assert_eq!(parse_release_version("release"), None);
+    }
+
+    #[test]
+    fn release_version_comparison_detects_only_newer_releases() {
+        assert!((2, 2, 6) > (2, 2, 5));
+        assert!((2, 2, 5) <= (2, 2, 5));
+        assert!((2, 2, 4) <= (2, 2, 5));
     }
 
     #[cfg(target_os = "macos")]

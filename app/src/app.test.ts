@@ -208,6 +208,13 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
+  checkForUpdates: vi.fn().mockResolvedValue({
+    current_version: '2.2.1',
+    latest_version: '2.2.1',
+    update_available: false,
+    release_url: 'https://github.com/komakizhu/W4DJ-RKB/releases/tag/v2.2.1',
+    release_name: 'W4DJ RKB 2.2.1',
+  }),
   openExternalUrl: vi.fn().mockResolvedValue(undefined),
   openDestination: vi.fn().mockResolvedValue(undefined),
   startAllSync: vi
@@ -423,6 +430,40 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v2.2.1');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
+    expect(root.querySelector('[data-role="about-modal"] [data-action="check-updates"]')).not.toBeNull();
+  });
+
+  it('renders an available update result with a Release link', () => {
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      {
+        version: '2.2.5',
+        developer: 'komakizhu',
+        project_url: 'https://github.com/komakizhu/W4DJ-RKB',
+      },
+      false,
+      false,
+      false,
+      0,
+      {
+        current_version: '2.2.5',
+        latest_version: 'v2.2.6',
+        update_available: true,
+        release_url: 'https://github.com/komakizhu/W4DJ-RKB/releases/tag/v2.2.6',
+        release_name: 'W4DJ RKB 2.2.6',
+      },
+    );
+
+    expect(root.querySelector('[data-role="update-status"]')?.textContent).toContain('发现新版本 v2.2.6');
+    expect(root.querySelector('[data-action="open-release"]')?.getAttribute('data-url')).toBe(
+      'https://github.com/komakizhu/W4DJ-RKB/releases/tag/v2.2.6',
+    );
   });
 
   it('shows slot two running state without changing slot one', () => {
@@ -1063,6 +1104,28 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="close-about"]') as HTMLButtonElement).click();
     (root.querySelector('[data-action="cancel-slot"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(services.cancelSync).toHaveBeenCalledWith(0));
+  });
+
+  it('checks GitHub Releases from the About window', async () => {
+    const checkForUpdates = vi.fn().mockResolvedValue({
+      current_version: '2.2.5',
+      latest_version: 'v2.2.6',
+      update_available: true,
+      release_url: 'https://github.com/komakizhu/W4DJ-RKB/releases/tag/v2.2.6',
+      release_name: 'W4DJ RKB 2.2.6',
+    });
+    const services = makeMockServices({ checkForUpdates });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => expect(root.querySelector('[data-action="open-about"]')).not.toBeNull());
+    (root.querySelector('[data-action="open-about"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-action="check-updates"]')).not.toBeNull());
+    (root.querySelector('[data-action="check-updates"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => expect(checkForUpdates).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(root.querySelector('[data-role="update-status"]')?.textContent).toContain('发现新版本 v2.2.6'));
+    expect(root.querySelector('[data-action="open-release"]')).not.toBeNull();
   });
 
   it('deletes one history entry and clears all history', async () => {
