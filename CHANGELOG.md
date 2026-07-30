@@ -1,5 +1,12 @@
 # W4DJ RKB 更新日志
 
+## v3.0.2
+
+### Fixed
+
+- 以当前合并版作为 3.0.2 发布基线，保留增强模式、后台扫描、教程和 macOS Gatekeeper 修复工具。
+- 统一 App、Tauri、Rust CLI 和前端显示的版本号。
+
 ## v3.0.0
 
 ### Added
