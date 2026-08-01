@@ -1,4 +1,6 @@
-use crate::config::{ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode};
+use crate::config::{
+    ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
+};
 use crate::gui::GuiShell;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -38,6 +40,8 @@ pub struct AppPreferences {
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
+    #[serde(default)]
+    pub netease_filename_format: NeteaseFilenameFormat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +65,7 @@ impl Default for AppPreferences {
             enhanced_mode: false,
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
+            netease_filename_format: NeteaseFilenameFormat::default(),
         }
     }
 }
@@ -81,6 +86,7 @@ impl AppPreferences {
             enhanced_mode: false,
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
+            netease_filename_format: NeteaseFilenameFormat::default(),
         }
     }
 }
@@ -115,6 +121,7 @@ fn parse_preferences(contents: &str) -> io::Result<AppPreferences> {
         enhanced_mode: false,
         conflict_strategy: ConflictStrategy::default(),
         filename_rule: FilenameRule::default(),
+        netease_filename_format: NeteaseFilenameFormat::default(),
     })
 }
 

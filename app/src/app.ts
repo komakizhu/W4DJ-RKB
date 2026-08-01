@@ -8,6 +8,7 @@ export type AppLosslessFormat = 'wav' | 'aiff';
 export type AppConversionMode = 'scan_then_convert' | 'direct';
 export type AppConflictStrategy = 'skip' | 'overwrite' | 'rename' | 'update_metadata';
 export type AppFilenameRule = 'title_artist' | 'artist_title' | 'original';
+export type AppNeteaseFilenameFormat = 'title_only' | 'artist_title' | 'title_artist';
 export type AppStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error' | 'cancelled';
 export type AppScanStatus = 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
 export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destination' | 'checking' | 'analyzing' | 'completed' | 'cancelled' | 'error';
@@ -45,6 +46,7 @@ export type AppViewState = {
   enhancedMode: boolean;
   conflictStrategy: AppConflictStrategy;
   filenameRule: AppFilenameRule;
+  neteaseFilenameFormat: AppNeteaseFilenameFormat;
   lang: AppLanguage;
   theme: AppTheme;
 };
@@ -73,6 +75,7 @@ export type DesktopState = {
   enhanced_mode: boolean;
   conflict_strategy: AppConflictStrategy;
   filename_rule: AppFilenameRule;
+  netease_filename_format: AppNeteaseFilenameFormat;
 };
 
 export type AppErrorCategory =
@@ -136,6 +139,14 @@ export type AppInfo = {
   version: string;
   developer: string;
   project_url: string;
+};
+
+export type AppUpdateCheck = {
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+  release_url: string;
+  release_name: string;
 };
 
 export type AppAnalysisState = {
@@ -210,6 +221,7 @@ export type AppServices = {
   chooseEnhancedMode: (enabled: boolean) => Promise<DesktopState>;
   chooseConflictStrategy: (strategy: AppConflictStrategy) => Promise<DesktopState>;
   chooseFilenameRule: (rule: AppFilenameRule) => Promise<DesktopState>;
+  chooseNeteaseFilenameFormat: (format: AppNeteaseFilenameFormat) => Promise<DesktopState>;
   previewAllSync: () => Promise<AppPreview[]>;
   startScan: () => Promise<AppScanProgress>;
   loadScanState: () => Promise<AppScanProgress>;
@@ -227,6 +239,7 @@ export type AppServices = {
   deleteHistoryEntry: (id: string) => Promise<void>;
   clearHistory: () => Promise<void>;
   loadAppInfo: () => Promise<AppInfo>;
+  checkForUpdates: () => Promise<AppUpdateCheck>;
   openExternalUrl: (url: string) => Promise<void>;
   openDestination: (path: string) => Promise<void>;
   startAllSync: () => Promise<DesktopState>;
@@ -351,6 +364,10 @@ const translations = {
     conflictOverwrite: '已存在文件：覆盖',
     conflictMetadata: '高级选项：仅更新元数据',
     filenameRule: '文件名规则',
+    neteaseFilenameFormat: '网易云源文件名格式',
+    neteaseTitleOnly: '仅歌名',
+    neteaseArtistTitle: '歌手 - 歌名',
+    neteaseTitleArtist: '歌名 - 歌手',
     titleArtist: '标题 - 艺术家（默认）',
     artistTitle: '艺术家 - 标题',
     originalName: '保留原文件名',
@@ -375,6 +392,10 @@ const translations = {
     version: '版本',
     developer: '开发者',
     projectHome: '项目主页',
+    checkUpdates: '检查更新',
+    updateAvailable: '发现新版本 {version}',
+    alreadyLatest: '已是最新版本',
+    viewRelease: '查看发布页',
     close: '关闭',
     pendingCount: '待继续',
     errorCategory: '错误类型',
@@ -487,6 +508,10 @@ const translations = {
     conflictOverwrite: 'Existing file: overwrite',
     conflictMetadata: 'Advanced: update metadata only',
     filenameRule: 'Filename rule',
+    neteaseFilenameFormat: 'NetEase source filename format',
+    neteaseTitleOnly: 'Title only',
+    neteaseArtistTitle: 'Artist - Title',
+    neteaseTitleArtist: 'Title - Artist',
     titleArtist: 'Title - Artist (default)',
     artistTitle: 'Artist - Title',
     originalName: 'Keep original filename',
@@ -511,6 +536,10 @@ const translations = {
     version: 'Version',
     developer: 'Developer',
     projectHome: 'Project home',
+    checkUpdates: 'Check for updates',
+    updateAvailable: 'Version {version} is available',
+    alreadyLatest: 'You are up to date',
+    viewRelease: 'View release',
     close: 'Close',
     pendingCount: 'Pending',
     errorCategory: 'Error type',
@@ -615,6 +644,7 @@ const defaultState: AppViewState = {
   enhancedMode: false,
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
+  neteaseFilenameFormat: 'title_artist',
   lang: initialLanguage,
   theme: initialTheme,
 };
@@ -683,6 +713,8 @@ const defaultServices: AppServices = {
   chooseConflictStrategy: (strategy) =>
     invoke<DesktopState>('choose_conflict_strategy', { strategy }),
   chooseFilenameRule: (rule) => invoke<DesktopState>('choose_filename_rule', { rule }),
+  chooseNeteaseFilenameFormat: (format) =>
+    invoke<DesktopState>('choose_netease_filename_format', { format }),
   previewAllSync: () => invoke<AppPreview[]>('preview_all_sync'),
   startScan: () => invoke<AppScanProgress>('start_scan'),
   loadScanState: () => invoke<AppScanProgress>('load_scan_state'),
@@ -707,6 +739,7 @@ const defaultServices: AppServices = {
   deleteHistoryEntry: (id) => invoke<void>('delete_history_entry_command', { id }),
   clearHistory: () => invoke<void>('clear_history_command'),
   loadAppInfo: () => invoke<AppInfo>('app_info'),
+  checkForUpdates: () => invoke<AppUpdateCheck>('check_for_updates'),
   openExternalUrl: (url) => invoke<void>('open_external_url', { url }),
   openDestination: (path) => invoke<void>('open_destination', { path }),
   startAllSync: () => invoke<DesktopState>('start_all_sync'),
@@ -737,6 +770,7 @@ export function renderApp(
   analysisState: AppAnalysisState = defaultAnalysisState,
   scanProgress: AppScanProgress | null = null,
   helpVisible = false,
+  updateInfo: AppUpdateCheck | null = null,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -864,7 +898,7 @@ export function renderApp(
     </section>
     ${renderScanModal(scanProgress, state.lang)}
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
-    ${renderAboutModal(aboutInfo, state.lang)}
+    ${renderAboutModal(aboutInfo, updateInfo, state.lang)}
     ${renderHelpModal(helpVisible, state.lang)}
     ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
   `;
@@ -1145,6 +1179,7 @@ export function bindApp(
   let previewBusy = false;
   let history: AppHistoryEntry[] = [];
   let aboutInfo: AppInfo | null = null;
+  let updateInfo: AppUpdateCheck | null = null;
   let helpVisible = false;
   let outputSettingsExpanded = false;
   let historyExpanded = false;
@@ -1173,6 +1208,7 @@ export function bindApp(
         analysisState,
         scanProgress,
         helpVisible,
+        updateInfo,
       ),
     );
 
@@ -1909,6 +1945,7 @@ export function bindApp(
 
     if (action === 'close-about') {
       aboutInfo = null;
+      updateInfo = null;
       render();
       return;
     }
@@ -1920,6 +1957,24 @@ export function bindApp(
     }
 
     if (action === 'open-project-home') {
+      const url = button.dataset.url;
+      if (url) {
+        void services.openExternalUrl(url);
+      }
+      return;
+    }
+
+    if (action === 'check-updates') {
+      void services.checkForUpdates()
+        .then((result) => {
+          updateInfo = result;
+          render();
+        })
+        .catch(reportError);
+      return;
+    }
+
+    if (action === 'open-release-page') {
       const url = button.dataset.url;
       if (url) {
         void services.openExternalUrl(url);
@@ -2142,6 +2197,14 @@ export function bindApp(
       if (rule !== state.filenameRule) {
         void runAction(() => services.chooseFilenameRule(rule), 'all');
       }
+      return;
+    }
+
+    if (select.dataset.action === 'choose-netease-filename-format') {
+      const format = select.value as AppNeteaseFilenameFormat;
+      if (format !== state.neteaseFilenameFormat) {
+        void runAction(() => services.chooseNeteaseFilenameFormat(format), 'all');
+      }
     }
   });
 
@@ -2323,12 +2386,20 @@ function renderOutputSettings(state: AppViewState, expanded = false): string {
             <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
           </select>
         </label>
+        <label>
+          <span>${t('neteaseFilenameFormat', state.lang)}</span>
+          <select data-action="choose-netease-filename-format" aria-label="${t('neteaseFilenameFormat', state.lang)}">
+            <option value="title_only" ${state.neteaseFilenameFormat === 'title_only' ? 'selected' : ''}>${t('neteaseTitleOnly', state.lang)}</option>
+            <option value="artist_title" ${state.neteaseFilenameFormat === 'artist_title' ? 'selected' : ''}>${t('neteaseArtistTitle', state.lang)}</option>
+            <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('neteaseTitleArtist', state.lang)}</option>
+          </select>
+        </label>
       </div>
     </details>
   `;
 }
 
-function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
+function renderAboutModal(info: AppInfo | null, update: AppUpdateCheck | null, lang: AppLanguage): string {
   if (!info) {
     return '';
   }
@@ -2344,7 +2415,9 @@ function renderAboutModal(info: AppInfo | null, lang: AppLanguage): string {
         </dl>
         <div class="about-links">
           <button type="button" class="about-link" data-action="open-project-home" data-url="${escapeHtml(info.project_url)}">${t('projectHome', lang)}</button>
+          <button type="button" class="about-link" data-action="check-updates">${t('checkUpdates', lang)}</button>
         </div>
+        ${update ? `<p class="about-update">${update.update_available ? t('updateAvailable', lang).replace('{version}', escapeHtml(update.latest_version)) : t('alreadyLatest', lang)}${update.update_available ? ` <button type="button" class="about-link" data-action="open-release-page" data-url="${escapeHtml(update.release_url)}">${t('viewRelease', lang)}</button>` : ''}</p>` : ''}
         <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>
       </section>
     </div>
@@ -2471,6 +2544,7 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
     enhancedMode: state.enhanced_mode,
     conflictStrategy: state.conflict_strategy,
     filenameRule: state.filename_rule,
+    neteaseFilenameFormat: state.netease_filename_format,
     lang,
     theme,
   };

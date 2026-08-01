@@ -44,6 +44,15 @@ pub enum FilenameRule {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum NeteaseFilenameFormat {
+    TitleOnly,
+    ArtistTitle,
+    #[default]
+    TitleArtist,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum CandidateOperation {
     #[default]
@@ -62,6 +71,8 @@ pub struct Config {
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
+    #[serde(default)]
+    pub netease_filename_format: NeteaseFilenameFormat,
 }
 
 #[derive(clap::Parser)]

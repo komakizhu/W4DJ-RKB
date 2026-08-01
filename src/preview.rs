@@ -1,9 +1,12 @@
-use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::config::{
+    CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
+};
 use crate::history::HistoryEntry;
 use crate::sync::{
     ScanObserver, effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
-    get_destination_music_dict_with_rule_and_observer, get_music_dict_with_scan_issues_with_rule,
-    get_music_dict_with_scan_issues_with_rule_and_observer, is_ignored_music_file,
+    get_destination_music_dict_with_rule_and_observer,
+    get_music_dict_with_scan_issues_with_settings,
+    get_music_dict_with_scan_issues_with_settings_and_observer, is_ignored_music_file,
     is_supported_source_file, resolve_output_policy, target_output_path,
 };
 use serde::{Deserialize, Serialize};
@@ -60,6 +63,8 @@ pub struct SlotPreview {
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
+    #[serde(default)]
+    pub netease_filename_format: NeteaseFilenameFormat,
     pub preview: SyncPreview,
     pub retry_of: Option<String>,
 }
@@ -88,13 +93,34 @@ pub fn build_sync_preview_with_settings(
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
 ) -> io::Result<SyncPreview> {
-    build_sync_preview_with_settings_observed(
+    build_sync_preview_with_settings_and_netease(
         source_directory,
         destination_directory,
         mode,
         lossless_format,
         conflict_strategy,
         filename_rule,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+pub fn build_sync_preview_with_settings_and_netease(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> io::Result<SyncPreview> {
+    build_sync_preview_with_settings_and_netease_observed(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
         None,
     )?
     .ok_or_else(|| io::Error::other("扫描被取消"))
@@ -107,6 +133,29 @@ pub fn build_sync_preview_with_settings_observed(
     lossless_format: Option<LosslessFormat>,
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
+    observer: Option<&mut ScanObserver<'_>>,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        NeteaseFilenameFormat::default(),
+        observer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
     mut observer: Option<&mut ScanObserver<'_>>,
 ) -> io::Result<Option<SyncPreview>> {
     let mut preview = SyncPreview {
@@ -174,14 +223,18 @@ pub fn build_sync_preview_with_settings_observed(
     }
 
     let (source_files, scan_issues, cancelled) = if let Some(observer) = observer.as_deref_mut() {
-        get_music_dict_with_scan_issues_with_rule_and_observer(
+        get_music_dict_with_scan_issues_with_settings_and_observer(
             source_directory,
             filename_rule,
+            netease_filename_format,
             observer,
         )
     } else {
-        let (files, issues) =
-            get_music_dict_with_scan_issues_with_rule(source_directory, filename_rule);
+        let (files, issues) = get_music_dict_with_scan_issues_with_settings(
+            source_directory,
+            filename_rule,
+            netease_filename_format,
+        );
         (files, issues, false)
     };
     if cancelled {

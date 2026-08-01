@@ -1,4 +1,4 @@
-use crate::config::{FilenameRule, LosslessFormat, Mode};
+use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
@@ -18,6 +18,31 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "ncm", "wav", "aiff"];
+
+/// Per-track metadata evidence saved in the conversion report.  It is kept
+/// deliberately textual so that users can attach it to a bug report without
+/// needing the original music files.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MetadataDiagnostic {
+    pub source_path: String,
+    pub destination_path: String,
+    pub source_filename: String,
+    pub source_extension: String,
+    pub source_size_bytes: Option<u64>,
+    pub output_size_bytes: Option<u64>,
+    pub source_title: Option<String>,
+    pub source_artist: Option<String>,
+    pub source_album: Option<String>,
+    pub output_title: Option<String>,
+    pub output_artist: Option<String>,
+    pub output_album: Option<String>,
+    pub source_artwork: bool,
+    pub output_artwork: Option<bool>,
+    pub detected_filename_layout: String,
+    pub decision: String,
+    pub metadata_validation: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -244,18 +269,53 @@ pub fn get_music_dict_with_scan_issues_with_rule(
     folder: &str,
     filename_rule: FilenameRule,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
+    get_music_dict_with_scan_issues_with_settings(
+        folder,
+        filename_rule,
+        NeteaseFilenameFormat::default(),
+    )
+}
+
+pub fn get_music_dict_with_scan_issues_with_settings(
+    folder: &str,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let source_path = Path::new(folder);
     if source_path.is_file() && !is_supported_source_file(source_path) {
         return (HashMap::new(), Vec::new());
     }
 
-    collect_music_dict_with_scan_issues(folder, SUPPORTED_SOURCE_EXTENSIONS, filename_rule)
+    collect_music_dict_with_scan_issues(
+        folder,
+        SUPPORTED_SOURCE_EXTENSIONS,
+        filename_rule,
+        netease_filename_format,
+    )
 }
 
 #[allow(dead_code)]
 pub fn get_music_dict_with_scan_issues_with_rule_and_observer(
     folder: &str,
     filename_rule: FilenameRule,
+    observer: &mut ScanObserver<'_>,
+) -> (
+    HashMap<String, (String, PathBuf)>,
+    Vec<MusicScanIssue>,
+    bool,
+) {
+    get_music_dict_with_scan_issues_with_settings_and_observer(
+        folder,
+        filename_rule,
+        NeteaseFilenameFormat::default(),
+        observer,
+    )
+}
+
+pub fn get_music_dict_with_scan_issues_with_settings_and_observer(
+    folder: &str,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
     observer: &mut ScanObserver<'_>,
 ) -> (
     HashMap<String, (String, PathBuf)>,
@@ -271,6 +331,7 @@ pub fn get_music_dict_with_scan_issues_with_rule_and_observer(
         folder,
         SUPPORTED_SOURCE_EXTENSIONS,
         filename_rule,
+        netease_filename_format,
         Some(observer),
         ScanPhase::Source,
     )
@@ -294,7 +355,13 @@ pub fn get_destination_music_dict_with_rule(
     folder: &str,
     filename_rule: FilenameRule,
 ) -> HashMap<String, (String, PathBuf)> {
-    collect_music_dict_with_scan_issues(folder, &["mp3", "wav", "aiff"], filename_rule).0
+    collect_music_dict_with_scan_issues(
+        folder,
+        &["mp3", "wav", "aiff"],
+        filename_rule,
+        NeteaseFilenameFormat::default(),
+    )
+    .0
 }
 
 #[allow(dead_code)]
@@ -307,6 +374,7 @@ pub fn get_destination_music_dict_with_rule_and_observer(
         folder,
         &["mp3", "wav", "aiff"],
         filename_rule,
+        NeteaseFilenameFormat::default(),
         Some(observer),
         ScanPhase::Destination,
     );
@@ -356,11 +424,13 @@ fn collect_music_dict_with_scan_issues(
     folder: &str,
     allowed_extensions: &[&str],
     filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let (music_dict, scan_issues, _cancelled) = collect_music_dict_with_scan_issues_observed(
         folder,
         allowed_extensions,
         filename_rule,
+        netease_filename_format,
         None,
         ScanPhase::Source,
     );
@@ -371,6 +441,7 @@ fn collect_music_dict_with_scan_issues_observed(
     folder: &str,
     allowed_extensions: &[&str],
     filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
     mut observer: Option<&mut ScanObserver<'_>>,
     phase: ScanPhase,
 ) -> (
@@ -409,7 +480,8 @@ fn collect_music_dict_with_scan_issues_observed(
         }
 
         let path = entry.path().to_path_buf();
-        let song_name = derive_song_name_with_rule(entry.path(), filename_rule);
+        let song_name =
+            derive_song_name_with_settings(entry.path(), filename_rule, netease_filename_format);
         let size = entry
             .metadata()
             .map(|m| m.len().to_string())
@@ -959,11 +1031,22 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
 
-    if !fill_missing_metadata(&mut output_tag, &source_tag, fallback_name) {
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        source_tag.title(),
+        source_tag.artist().or_else(|| source_tag.album_artist()),
+        source_prefers_title_artist_filename(source_path),
+    );
+    let source_has_valid_cover = source_tag
+        .pictures()
+        .any(|picture| crate::metadata::get_image_mime_type(&picture.data) != "image/*");
+
+    if !fill_missing_metadata(&mut output_tag, &source_tag, &identity) {
         return Ok(());
     }
 
-    write_id3_tag_for_output(&output_tag, output_path)
+    write_id3_tag_for_output(&output_tag, output_path)?;
+    validate_written_metadata(output_path, &identity, source_has_valid_cover)
 }
 
 /// Writes Essentia's analysis into the native metadata of a converted file.
@@ -1164,23 +1247,18 @@ fn read_id3_tag_or_empty(path: &Path) -> id3::Tag {
 fn fill_missing_metadata(
     output_tag: &mut id3::Tag,
     source_tag: &id3::Tag,
-    fallback_name: &str,
+    identity: &SongIdentity,
 ) -> bool {
-    let source_artist = source_tag.artist().or_else(|| source_tag.album_artist());
-    let identity = infer_song_identity(fallback_name, source_tag.title(), source_artist);
     let mut changed = false;
 
-    if is_blank(output_tag.title()) && !identity.title.is_empty() {
+    if !identity.title.is_empty() && output_tag.title() != Some(identity.title.as_str()) {
         output_tag.set_title(&identity.title);
         changed = true;
     }
 
-    if is_blank(output_tag.artist()) {
-        let artist = normalize_filename_part(source_artist).unwrap_or(identity.artist);
-        if !artist.is_empty() {
-            output_tag.set_artist(&artist);
-            changed = true;
-        }
+    if !identity.artist.is_empty() && output_tag.artist() != Some(identity.artist.as_str()) {
+        output_tag.set_artist(&identity.artist);
+        changed = true;
     }
 
     if is_blank(output_tag.album())
@@ -1190,8 +1268,13 @@ fn fill_missing_metadata(
         changed = true;
     }
 
-    if output_tag.pictures().next().is_none() {
-        for picture in source_tag.pictures() {
+    let source_pictures = source_tag
+        .pictures()
+        .filter(|picture| crate::metadata::get_image_mime_type(&picture.data) != "image/*")
+        .collect::<Vec<_>>();
+    if !source_pictures.is_empty() {
+        output_tag.remove("APIC");
+        for picture in source_pictures {
             output_tag.add_frame(Picture {
                 mime_type: picture.mime_type.clone(),
                 picture_type: picture.picture_type,
@@ -1203,6 +1286,117 @@ fn fill_missing_metadata(
     }
 
     changed
+}
+
+fn validate_written_metadata(
+    output_path: &Path,
+    identity: &SongIdentity,
+    expect_cover: bool,
+) -> io::Result<()> {
+    let written = read_id3_tag_or_empty(output_path);
+    if !identity.title.is_empty() && written.title() != Some(identity.title.as_str()) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("输出标题写入校验失败：{}", output_path.display()),
+        ));
+    }
+    if !identity.artist.is_empty() && written.artist() != Some(identity.artist.as_str()) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("输出歌手写入校验失败：{}", output_path.display()),
+        ));
+    }
+    if expect_cover
+        && !written
+            .pictures()
+            .any(|picture| crate::metadata::get_image_mime_type(&picture.data) != "image/*")
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("输出封面写入校验失败：{}", output_path.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn inspect_metadata_diagnostic(source_path: &Path, output_path: &Path) -> MetadataDiagnostic {
+    let source_tag = source_metadata_as_id3(source_path);
+    let output_exists = output_path.is_file();
+    let output_tag = output_exists.then(|| read_id3_tag_or_empty(output_path));
+    let fallback_name = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let prefer_title_artist = source_prefers_title_artist_filename(source_path);
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        source_tag.title(),
+        source_tag.artist().or_else(|| source_tag.album_artist()),
+        prefer_title_artist,
+    );
+    let valid_cover = |tag: &id3::Tag| {
+        tag.pictures()
+            .any(|picture| crate::metadata::get_image_mime_type(&picture.data) != "image/*")
+    };
+    let output_matches = output_tag.as_ref().is_some_and(|tag| {
+        (identity.title.is_empty() || tag.title() == Some(identity.title.as_str()))
+            && (identity.artist.is_empty() || tag.artist() == Some(identity.artist.as_str()))
+            && (!valid_cover(&source_tag) || valid_cover(tag))
+    });
+
+    MetadataDiagnostic {
+        source_path: source_path.display().to_string(),
+        destination_path: output_path.display().to_string(),
+        source_filename: fallback_name.to_string(),
+        source_extension: source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        source_size_bytes: fs::metadata(source_path)
+            .ok()
+            .map(|metadata| metadata.len()),
+        output_size_bytes: fs::metadata(output_path)
+            .ok()
+            .map(|metadata| metadata.len()),
+        source_title: non_empty(source_tag.title()).map(str::to_string),
+        source_artist: non_empty(source_tag.artist().or_else(|| source_tag.album_artist()))
+            .map(str::to_string),
+        source_album: non_empty(source_tag.album()).map(str::to_string),
+        output_title: output_tag
+            .as_ref()
+            .and_then(|tag| non_empty(tag.title()).map(str::to_string)),
+        output_artist: output_tag.as_ref().and_then(|tag| {
+            non_empty(tag.artist().or_else(|| tag.album_artist())).map(str::to_string)
+        }),
+        output_album: output_tag
+            .as_ref()
+            .and_then(|tag| non_empty(tag.album()).map(str::to_string)),
+        source_artwork: valid_cover(&source_tag),
+        output_artwork: output_tag.as_ref().map(valid_cover),
+        detected_filename_layout: if split_filename_identity(fallback_name).is_some() {
+            if prefer_title_artist {
+                "标题 - 歌手"
+            } else {
+                "歌手 - 标题"
+            }
+            .to_string()
+        } else {
+            "未检测到分隔符".to_string()
+        },
+        decision: format!(
+            "最终标题：{}；最终歌手：{}",
+            identity.title, identity.artist
+        ),
+        metadata_validation: if !output_exists {
+            "输出文件不存在或转换失败".to_string()
+        } else if output_matches {
+            "通过：标题、歌手和可用封面已校验".to_string()
+        } else {
+            "未通过：输出标签或封面与识别结果不一致".to_string()
+        },
+    }
 }
 
 fn write_id3_tag_for_output(tag: &id3::Tag, output_path: &Path) -> io::Result<()> {
@@ -1498,6 +1692,14 @@ fn derive_song_name(path: &Path) -> String {
 }
 
 fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> String {
+    derive_song_name_with_settings(path, filename_rule, NeteaseFilenameFormat::default())
+}
+
+fn derive_song_name_with_settings(
+    path: &Path,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> String {
     let fallback_name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -1517,7 +1719,7 @@ fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> Strin
     let candidate = match extension.as_str() {
         "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path, filename_rule, &fallback_name),
         "flac" => song_name_from_flac(path, filename_rule, &fallback_name),
-        "ncm" => song_name_from_ncm(path, filename_rule, &fallback_name),
+        "ncm" => song_name_from_ncm(path, filename_rule, &fallback_name, netease_filename_format),
         _ => None,
     };
 
@@ -1554,6 +1756,7 @@ fn song_name_from_ncm(
     path: &Path,
     filename_rule: FilenameRule,
     fallback_name: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut ncm = Ncmdump::from_reader(file).ok()?;
@@ -1564,7 +1767,16 @@ fn song_name_from_ncm(
         .map(|item| item.0.as_str())
         .collect::<Vec<&str>>()
         .join(", ");
-    let identity = infer_song_identity(fallback_name, Some(&info.name), Some(&artist));
+    let metadata_identity = infer_song_identity(fallback_name, Some(&info.name), Some(&artist));
+    let identity = match netease_filename_format {
+        NeteaseFilenameFormat::TitleOnly => metadata_identity,
+        NeteaseFilenameFormat::ArtistTitle => split_filename_identity(fallback_name)
+            .map(|(artist, title)| SongIdentity { title, artist })
+            .unwrap_or(metadata_identity),
+        NeteaseFilenameFormat::TitleArtist => split_filename_identity(fallback_name)
+            .map(|(title, artist)| SongIdentity { title, artist })
+            .unwrap_or(metadata_identity),
+    };
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
@@ -1579,19 +1791,94 @@ fn infer_song_identity(
     metadata_title: Option<&str>,
     metadata_artist: Option<&str>,
 ) -> SongIdentity {
-    let (fallback_title, fallback_artist) = parse_filename_identity(fallback_name);
-    let title = normalize_filename_part(metadata_title).unwrap_or(fallback_title);
-    let artist = normalize_filename_part(metadata_artist).unwrap_or(fallback_artist);
+    infer_song_identity_with_filename_preference(
+        fallback_name,
+        metadata_title,
+        metadata_artist,
+        false,
+    )
+}
+
+fn infer_song_identity_with_filename_preference(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+    prefer_title_artist_filename: bool,
+) -> SongIdentity {
+    let (fallback_title, fallback_artist) =
+        parse_filename_identity(fallback_name, prefer_title_artist_filename);
+    let title = normalize_filename_part(metadata_title);
+    let artist = normalize_filename_part(metadata_artist);
+
+    if let (Some(title), Some(artist)) = (&title, &artist) {
+        if let Some((left, right)) = split_filename_identity(fallback_name) {
+            let filename_identity = if prefer_title_artist_filename {
+                SongIdentity {
+                    title: left,
+                    artist: right,
+                }
+            } else {
+                SongIdentity {
+                    title: right,
+                    artist: left,
+                }
+            };
+            if *title == filename_identity.artist && *artist == filename_identity.title {
+                return filename_identity;
+            }
+        }
+        return SongIdentity {
+            title: title.clone(),
+            artist: artist.clone(),
+        };
+    }
+
+    let title = title.unwrap_or(fallback_title);
+    let artist = artist.unwrap_or(fallback_artist);
 
     SongIdentity { title, artist }
 }
 
-fn parse_filename_identity(fallback_name: &str) -> (String, String) {
+fn source_prefers_title_artist_filename(path: &Path) -> bool {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
+    {
+        return true;
+    }
+
+    path.ancestors().any(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.contains("netease") || name.contains("网易云")
+            })
+    })
+}
+
+fn parse_filename_identity(
+    fallback_name: &str,
+    prefer_title_artist_filename: bool,
+) -> (String, String) {
+    let display = normalize_display_text(fallback_name);
+    if let Some((left, right)) = split_filename_identity(&display) {
+        return if prefer_title_artist_filename {
+            (left, right)
+        } else {
+            (right, left)
+        };
+    }
+    (display, String::new())
+}
+
+fn split_filename_identity(fallback_name: &str) -> Option<(String, String)> {
     let display = normalize_display_text(fallback_name);
     display
         .split_once(" - ")
-        .map(|(artist, title)| (title.to_string(), artist.to_string()))
-        .unwrap_or((display, String::new()))
+        .map(|(left, right)| (left.to_string(), right.to_string()))
 }
 
 fn normalize_filename_part(value: Option<&str>) -> Option<String> {
@@ -2386,12 +2673,9 @@ mod tests {
     fn fills_missing_metadata_from_the_original_filename() {
         let mut output = Tag::new();
         let source = Tag::new();
+        let identity = infer_song_identity("Mr Wankerman - Mystic State, Third Degree", None, None);
 
-        assert!(fill_missing_metadata(
-            &mut output,
-            &source,
-            "Mr Wankerman - Mystic State, Third Degree"
-        ));
+        assert!(fill_missing_metadata(&mut output, &source, &identity));
 
         assert_eq!(output.title(), Some("Mystic State, Third Degree"));
         assert_eq!(output.artist(), Some("Mr Wankerman"));
@@ -2459,7 +2743,7 @@ mod tests {
     }
 
     #[test]
-    fn backfills_only_missing_fields_and_preserves_source_cover() {
+    fn corrects_conflicting_fields_and_preserves_source_cover() {
         let mut source = Tag::new();
         source.set_album("Existing Album");
         source.add_frame(id3::frame::Picture {
@@ -2471,14 +2755,11 @@ mod tests {
 
         let mut output = Tag::new();
         output.set_title("Existing Title");
+        let identity = infer_song_identity("Artist - Fallback Title", None, None);
 
-        assert!(fill_missing_metadata(
-            &mut output,
-            &source,
-            "Artist - Fallback Title"
-        ));
+        assert!(fill_missing_metadata(&mut output, &source, &identity));
 
-        assert_eq!(output.title(), Some("Existing Title"));
+        assert_eq!(output.title(), Some("Fallback Title"));
         assert_eq!(output.artist(), Some("Artist"));
         assert_eq!(output.album(), Some("Existing Album"));
         assert_eq!(output.pictures().count(), 1);

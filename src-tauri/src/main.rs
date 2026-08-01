@@ -9,14 +9,16 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ncmdump::Ncmdump;
 use tauri::Manager;
 use w4dj::analysis::{
     TrackAnalysis, TrackMetadata, analysis_file_path, build_rekordbox_xml, load_analysis_file,
     merge_analysis_entries, read_track_metadata, save_analysis_file,
 };
-use w4dj::config::{ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode};
+use w4dj::config::{
+    ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
+};
 use w4dj::desktop::{DesktopController, DesktopState};
 use w4dj::history::{
     FailedFile, HistoryEntry, HistoryStatus, PendingFile, classify_error, clear_history,
@@ -25,13 +27,13 @@ use w4dj::history::{
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
     PreviewCandidate, PreviewIssue, PreviewOperation, SlotPreview, SyncPreview,
-    build_retry_preview, build_sync_preview_with_settings,
-    build_sync_preview_with_settings_observed,
+    build_retry_preview, build_sync_preview_with_settings_and_netease,
+    build_sync_preview_with_settings_and_netease_observed,
 };
 use w4dj::sync::{
     apply_track_analysis_metadata, cleanup_temporary_outputs, compare_music_dicts,
     count_music_files_with_cancel,
-    EmbeddedAnalysis,
+    EmbeddedAnalysis, inspect_metadata_diagnostic,
     get_destination_music_dict, get_music_dict_with_scan_issues, is_supported_source_file,
     sync_music_library_with_observer, update_existing_metadata, ScanPhase,
 };
@@ -129,6 +131,7 @@ struct ScanJob {
     lossless_format: Option<LosslessFormat>,
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
     tasks: Vec<(usize, String, String)>,
 }
 
@@ -137,6 +140,22 @@ struct AppInfo {
     version: &'static str,
     developer: &'static str,
     project_url: &'static str,
+}
+
+#[derive(serde::Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: String,
+    name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateCheckResult {
+    current_version: &'static str,
+    latest_version: String,
+    update_available: bool,
+    release_url: String,
+    release_name: String,
 }
 
 #[derive(Clone, Default)]
@@ -515,6 +534,20 @@ fn choose_filename_rule(rule: FilenameRule, state: tauri::State<'_, AppState>) -
 }
 
 #[tauri::command]
+fn choose_netease_filename_format(
+    format: NeteaseFilenameFormat,
+    state: tauri::State<'_, AppState>,
+) -> DesktopState {
+    let snapshot = {
+        let mut controller = state.controller.lock().expect("desktop lock poisoned");
+        controller.choose_netease_filename_format(format);
+        controller.state().clone()
+    };
+    persist_preferences(&state);
+    snapshot
+}
+
+#[tauri::command]
 fn start_sync(
     slot_index: usize,
     state: tauri::State<'_, AppState>,
@@ -617,13 +650,14 @@ fn cancel_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, St
 
 #[tauri::command]
 fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview>, String> {
-    let (slot_indexes, mode, lossless_format, conflict_strategy, filename_rule, slots) = {
+    let (slot_indexes, mode, lossless_format, conflict_strategy, filename_rule, netease_filename_format, slots) = {
         let controller = state.controller.lock().expect("desktop lock poisoned");
         let slot_indexes = controller.startable_slot_indexes();
         let mode = controller.state().mode;
         let lossless_format = controller.state().lossless_format;
         let conflict_strategy = controller.state().conflict_strategy;
         let filename_rule = controller.state().filename_rule;
+        let netease_filename_format = controller.state().netease_filename_format;
         let slots = slot_indexes
             .iter()
             .map(|slot_index| {
@@ -641,6 +675,7 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
             lossless_format,
             conflict_strategy,
             filename_rule,
+            netease_filename_format,
             slots,
         )
     };
@@ -652,13 +687,14 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
     let mut previews = slots
         .into_iter()
         .map(|(slot_index, source, destination)| {
-            let preview = build_sync_preview_with_settings(
+            let preview = build_sync_preview_with_settings_and_netease(
                 &source,
                 &destination,
                 mode,
                 lossless_format,
                 conflict_strategy,
                 filename_rule,
+                netease_filename_format,
             )
             .map_err(|error| format!("预检失败：{error}"))?;
             Ok(SlotPreview {
@@ -667,6 +703,7 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
                 lossless_format,
                 conflict_strategy,
                 filename_rule,
+                netease_filename_format,
                 preview,
                 retry_of: None,
             })
@@ -730,6 +767,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         lossless_format,
         conflict_strategy,
         filename_rule,
+        netease_filename_format,
         tasks,
     ) = {
         let controller = state.controller.lock().expect("desktop lock poisoned");
@@ -755,6 +793,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
             controller.state().lossless_format,
             controller.state().conflict_strategy,
             controller.state().filename_rule,
+            controller.state().netease_filename_format,
             tasks,
         )
     };
@@ -784,6 +823,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         lossless_format,
         conflict_strategy,
         filename_rule,
+        netease_filename_format,
         tasks,
     };
     thread::spawn(move || run_scan_task(progress, scan_cancel, scan_result, job));
@@ -803,6 +843,7 @@ fn run_scan_task(
         lossless_format,
         conflict_strategy,
         filename_rule,
+        netease_filename_format,
         tasks,
     } = job;
     let mut total = 0;
@@ -858,13 +899,14 @@ fn run_scan_task(
             return;
         }
 
-        let preview = match build_sync_preview_with_settings_observed(
+        let preview = match build_sync_preview_with_settings_and_netease_observed(
             &source,
             &destination,
             mode,
             lossless_format,
             conflict_strategy,
             filename_rule,
+            netease_filename_format,
             Some(&mut observer),
         ) {
             Ok(Some(preview)) => preview,
@@ -883,6 +925,7 @@ fn run_scan_task(
             lossless_format,
             conflict_strategy,
             filename_rule,
+            netease_filename_format,
             preview,
             retry_of: None,
         });
@@ -1093,6 +1136,7 @@ fn start_confirmed_sync(
         let enhanced_mode = controller.state().enhanced_mode;
         let state_conflict_strategy = controller.state().conflict_strategy;
         let state_filename_rule = controller.state().filename_rule;
+        let state_netease_filename_format = controller.state().netease_filename_format;
         let mut validated_previews = Vec::with_capacity(previews.len());
 
         for slot_preview in previews {
@@ -1116,6 +1160,7 @@ fn start_confirmed_sync(
                     || slot_preview.lossless_format != state_lossless_format
                     || slot_preview.conflict_strategy != state_conflict_strategy
                     || slot_preview.filename_rule != state_filename_rule
+                    || slot_preview.netease_filename_format != state_netease_filename_format
                     || slot_preview.preview.source_directory != slot.source_directory
                     || slot_preview.preview.destination_directory
                         != controller
@@ -1278,6 +1323,7 @@ fn retry_history_failures(
         lossless_format: entry.lossless_format,
         conflict_strategy: entry.conflict_strategy,
         filename_rule: entry.filename_rule,
+        netease_filename_format: NeteaseFilenameFormat::default(),
         preview,
         retry_of: Some(entry.id),
     })
@@ -1328,10 +1374,41 @@ fn app_info() -> AppInfo {
     }
 }
 
+fn parse_release_version(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.trim().trim_start_matches(['v', 'V']);
+    let mut parts = value.split(['-', '+']).next()?.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+#[tauri::command]
+fn check_for_updates() -> Result<UpdateCheckResult, String> {
+    let response = ureq::get("https://api.github.com/repos/komakizhu/W4DJ-RKB/releases/latest")
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "W4DJ-RKB")
+        .timeout(Duration::from_secs(8))
+        .call()
+        .map_err(|error| format!("无法连接 GitHub：{error}"))?;
+    let release: GitHubRelease = response
+        .into_json()
+        .map_err(|error| format!("GitHub 更新信息格式错误：{error}"))?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    let current = parse_release_version(current_version)
+        .ok_or_else(|| format!("当前版本号无法识别：{current_version}"))?;
+    let latest = parse_release_version(&release.tag_name)
+        .ok_or_else(|| format!("GitHub Release 版本号无法识别：{}", release.tag_name))?;
+    Ok(UpdateCheckResult {
+        current_version,
+        latest_version: release.tag_name,
+        update_available: latest > current,
+        release_url: release.html_url,
+        release_name: release.name.unwrap_or_default(),
+    })
+}
+
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     const PROJECT_URL: &str = "https://github.com/komakizhu/W4DJ-RKB";
-    if url != PROJECT_URL {
+    if url != PROJECT_URL && !url.starts_with("https://github.com/komakizhu/W4DJ-RKB/releases/") {
         return Err("不允许打开此外部地址".to_string());
     }
 
@@ -1345,12 +1422,12 @@ fn open_external_url(url: String) -> Result<(), String> {
     let status = Command::new("xdg-open").arg(url).status();
 
     status
-        .map_err(|error| format!("无法打开项目主页：{error}"))
+        .map_err(|error| format!("无法打开链接：{error}"))
         .and_then(|status| {
             if status.success() {
                 Ok(())
             } else {
-                Err(format!("无法打开项目主页（退出码 {:?}）", status.code()))
+                Err(format!("无法打开链接（退出码 {:?}）", status.code()))
             }
         })
 }
@@ -1417,6 +1494,7 @@ fn main() {
             choose_enhanced_mode,
             choose_conflict_strategy,
             choose_filename_rule,
+            choose_netease_filename_format,
             start_sync,
             pause_sync,
             cancel_sync,
@@ -1435,6 +1513,7 @@ fn main() {
             delete_history_entry_command,
             clear_history_command,
             app_info,
+            check_for_updates,
             open_external_url,
             open_destination,
             list_audio_files,
@@ -1612,6 +1691,7 @@ fn run_confirmed_sync_task(
             .iter()
             .map(pending_file_from_candidate)
             .collect(),
+        metadata_diagnostics: Vec::new(),
         logs: initial_logs,
         status: HistoryStatus::Partial,
         retry_of: job.retry_of.clone(),
@@ -1733,6 +1813,7 @@ fn run_confirmed_sync_task(
                     }
                 };
                 drop(controller_guard);
+                record_metadata_diagnostic(&recovery_entry, candidate);
                 mark_recovery_processed(
                     &history_path,
                     &history_write_lock,
@@ -1792,6 +1873,9 @@ fn run_confirmed_sync_task(
                                 .expect("confirmed slot index should be valid");
                             None
                         };
+                        if let Some(candidate) = candidate {
+                            record_metadata_diagnostic(&recovery_entry, candidate);
+                        }
                         mark_recovery_processed(
                             &history_path,
                             &history_write_lock,
@@ -1868,6 +1952,11 @@ fn run_confirmed_sync_task(
         failed_count: failed_files.len(),
         failed_files,
         pending_files,
+        metadata_diagnostics: recovery_entry
+            .lock()
+            .expect("recovery history lock poisoned")
+            .metadata_diagnostics
+            .clone(),
         logs: slot.logs,
         status,
         retry_of: job.retry_of,
@@ -1895,6 +1984,24 @@ fn run_confirmed_sync_task(
         .expect("history write lock poisoned");
     if let Err(error) = upsert_history(history_path, history_entry) {
         eprintln!("Failed to save conversion history: {}", error);
+    }
+}
+
+fn record_metadata_diagnostic(
+    recovery_entry: &Arc<Mutex<HistoryEntry>>,
+    candidate: &PreviewCandidate,
+) {
+    let diagnostic = inspect_metadata_diagnostic(
+        Path::new(&candidate.source_path),
+        Path::new(&candidate.destination_path),
+    );
+    let mut entry = recovery_entry.lock().expect("recovery history lock poisoned");
+    if entry
+        .metadata_diagnostics
+        .iter()
+        .all(|existing| existing.source_path != diagnostic.source_path)
+    {
+        entry.metadata_diagnostics.push(diagnostic);
     }
 }
 
@@ -2429,6 +2536,7 @@ mod tests {
             lossless_format: None,
             conflict_strategy: Default::default(),
             filename_rule: Default::default(),
+            netease_filename_format: Default::default(),
             retry_of: None,
             preview: SyncPreview {
                 source_directory: format!("/music/in-{slot_index}"),

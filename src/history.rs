@@ -1,4 +1,5 @@
 use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::sync::MetadataDiagnostic;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -123,6 +124,8 @@ pub struct HistoryEntry {
     pub failed_files: Vec<FailedFile>,
     #[serde(default)]
     pub pending_files: Vec<PendingFile>,
+    #[serde(default)]
+    pub metadata_diagnostics: Vec<MetadataDiagnostic>,
     #[serde(default)]
     pub logs: Vec<String>,
     pub status: HistoryStatus,
@@ -310,6 +313,34 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
                 .map(|value| format!("{value} bytes"))
                 .unwrap_or_else(|| "未知".to_string()),
             candidate_operation_label(pending_file.operation),
+        ));
+    }
+
+    report.push_str("[逐曲元数据诊断]\n");
+    if entry.metadata_diagnostics.is_empty() {
+        report.push_str("未记录（旧版任务或尚未处理歌曲）\n\n");
+    }
+    for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
+        report.push_str(&format!(
+            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n源封面：{}\n输出封面：{}\n最终校验：{}\n\n",
+            index + 1,
+            diagnostic.source_path,
+            diagnostic.destination_path,
+            diagnostic.source_filename,
+            diagnostic.source_extension,
+            diagnostic.source_size_bytes.map(|value| format!("{value} bytes")).unwrap_or_else(|| "无法读取".to_string()),
+            diagnostic.output_size_bytes.map(|value| format!("{value} bytes")).unwrap_or_else(|| "不存在或无法读取".to_string()),
+            diagnostic.source_title.as_deref().unwrap_or("无"),
+            diagnostic.source_artist.as_deref().unwrap_or("无"),
+            diagnostic.source_album.as_deref().unwrap_or("无"),
+            diagnostic.output_title.as_deref().unwrap_or("无"),
+            diagnostic.output_artist.as_deref().unwrap_or("无"),
+            diagnostic.output_album.as_deref().unwrap_or("无"),
+            diagnostic.detected_filename_layout,
+            diagnostic.decision,
+            if diagnostic.source_artwork { "有（有效图片）" } else { "无或无效" },
+            match diagnostic.output_artwork { Some(true) => "有（有效图片）", Some(false) => "无或无效", None => "无法读取" },
+            diagnostic.metadata_validation,
         ));
     }
 

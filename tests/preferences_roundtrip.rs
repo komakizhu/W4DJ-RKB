@@ -19,6 +19,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         enhanced_mode: true,
         conflict_strategy: ConflictStrategy::Rename,
         filename_rule: FilenameRule::ArtistTitle,
+        netease_filename_format: Default::default(),
     };
 
     save_preferences(&path, &preferences).unwrap();

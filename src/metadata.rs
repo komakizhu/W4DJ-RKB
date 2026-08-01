@@ -7,18 +7,26 @@ use id3::{TagLike, Version};
 use ncmdump::NcmInfo;
 
 pub(crate) fn get_image_mime_type(bytes: &[u8]) -> &'static str {
-    if bytes.len() < 12 {
-        return "image/*";
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return "image/png";
+    }
+    if bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && bytes.get(8..12) == Some(b"WEBP".as_slice())
+    {
+        return "image/webp";
+    }
+    if bytes.starts_with(b"GIF8") {
+        return "image/gif";
+    }
+    if bytes.starts_with(b"BM") {
+        return "image/bmp";
     }
 
-    match &bytes[..12] {
-        [0x89, 0x50, 0x4e, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, ..] => "image/png",
-        [0xFF, 0xD8, 0xFF, 0xE0 | 0xE1 | 0xE2 | 0xE3 | 0xE8, ..] => "image/jpeg",
-        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x45, 0x42, 0x50] => "image/webp",
-        [0x47, 0x49, 0x46, 0x38, ..] => "image/gif",
-        [0x42, 0x4d, ..] => "image/bmp",
-        _ => "image/*",
-    }
+    "image/*"
 }
 
 pub(crate) trait Metadata {
@@ -49,7 +57,7 @@ pub(crate) fn build_id3_tag_from_parts(
     tag.set_album(album);
     tag.set_artist(artist);
 
-    if !image.is_empty() {
+    if get_image_mime_type(image) != "image/*" {
         tag.add_frame(Picture {
             mime_type: get_image_mime_type(image).to_owned(),
             picture_type: id3::frame::PictureType::CoverFront,
@@ -79,8 +87,12 @@ pub(crate) fn build_id3_tag_from_flac(tag: &metaflac::Tag) -> id3::Tag {
         .unwrap_or_default();
     let image = tag
         .pictures()
+        .filter(|picture| get_image_mime_type(&picture.data) != "image/*")
         .find(|picture| picture.picture_type == metaflac::block::PictureType::CoverFront)
-        .or_else(|| tag.pictures().next())
+        .or_else(|| {
+            tag.pictures()
+                .find(|picture| get_image_mime_type(&picture.data) != "image/*")
+        })
         .map(|picture| picture.data.as_slice())
         .unwrap_or_default();
 
@@ -98,13 +110,16 @@ impl Mp3Metadata {
         tag.set_title(base_tag.title().unwrap_or_default());
         tag.set_album(base_tag.album().unwrap_or_default());
         tag.set_artist(base_tag.artist().unwrap_or_default());
-        for picture in base_tag.pictures() {
-            tag.add_frame(Picture {
-                mime_type: picture.mime_type.clone(),
-                picture_type: picture.picture_type,
-                description: picture.description.clone(),
-                data: picture.data.clone(),
-            });
+        if base_tag.pictures().next().is_some() {
+            tag.remove("APIC");
+            for picture in base_tag.pictures() {
+                tag.add_frame(Picture {
+                    mime_type: picture.mime_type.clone(),
+                    picture_type: picture.picture_type,
+                    description: picture.description.clone(),
+                    data: picture.data.clone(),
+                });
+            }
         }
         Self(tag)
     }
@@ -114,7 +129,7 @@ impl Metadata for Mp3Metadata {
     fn inject_metadata(&mut self, data: Vec<u8>) -> Result<Vec<u8>> {
         let mut cursor = Cursor::new(data);
         _ = cursor.seek(SeekFrom::Start(0));
-        self.0.write_to_file(&mut cursor, Version::Id3v24)?;
+        self.0.write_to_file(&mut cursor, Version::Id3v23)?;
         Ok(cursor.into_inner())
     }
 }
@@ -135,7 +150,8 @@ impl FlacMetadata {
         mc.set_title(vec![info.name.to_string()]);
         mc.set_album(vec![info.album.to_string()]);
         mc.set_artist(artist);
-        if !image.is_empty() {
+        if get_image_mime_type(image) != "image/*" {
+            tag.remove_blocks(metaflac::BlockType::Picture);
             tag.add_picture(
                 get_image_mime_type(image),
                 metaflac::block::PictureType::CoverFront,
@@ -154,5 +170,66 @@ impl Metadata for FlacMetadata {
         self.0.write_to(&mut buffer)?;
         buffer.write_all(&data)?;
         Ok(buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Metadata, Mp3Metadata, build_id3_tag_from_parts};
+    use id3::{Tag, TagLike, Version};
+    use ncmdump::NcmInfo;
+    use std::io::Cursor;
+
+    fn sample_info() -> NcmInfo {
+        NcmInfo {
+            name: "Track title".to_string(),
+            id: 1,
+            album: "Album".to_string(),
+            artist: vec![("Artist".to_string(), 2)],
+            bitrate: 320_000,
+            duration: 180_000,
+            format: "mp3".to_string(),
+            mv_id: None,
+            alias: None,
+        }
+    }
+
+    #[test]
+    fn ignores_invalid_cover_bytes_when_building_id3_metadata() {
+        let tag = build_id3_tag_from_parts(
+            "Track title",
+            "Album",
+            &["Artist".to_string()],
+            b"not-an-image",
+        );
+
+        assert_eq!(tag.pictures().count(), 0);
+    }
+
+    #[test]
+    fn replaces_stale_mp3_cover_with_the_extracted_cover() {
+        let mut original = Tag::new();
+        original.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".to_string(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x01],
+        });
+        let mut original_bytes = Vec::new();
+        original
+            .write_to(&mut original_bytes, Version::Id3v23)
+            .unwrap();
+        original_bytes.extend_from_slice(b"audio");
+
+        let extracted_cover = vec![0xff, 0xd8, 0xff, 0xe0, 0x02];
+        let mut metadata = Mp3Metadata::new(&sample_info(), &extracted_cover, &original_bytes);
+        let output = metadata.inject_metadata(b"audio".to_vec()).unwrap();
+        let tag = Tag::read_from2(Cursor::new(output)).unwrap();
+        let pictures = tag.pictures().collect::<Vec<_>>();
+
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].data, extracted_cover);
+        assert_eq!(tag.title(), Some("Track title"));
+        assert_eq!(tag.artist(), Some("Artist"));
     }
 }

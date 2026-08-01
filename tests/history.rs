@@ -5,6 +5,7 @@ use w4dj::history::{
     classify_error, clear_history, delete_history_entry, format_error_report, load_history,
     upsert_history,
 };
+use w4dj::sync::MetadataDiagnostic;
 
 fn test_entry(index: usize) -> HistoryEntry {
     HistoryEntry {
@@ -26,6 +27,7 @@ fn test_entry(index: usize) -> HistoryEntry {
         failed_count: 0,
         failed_files: Vec::new(),
         pending_files: Vec::new(),
+        metadata_diagnostics: Vec::new(),
         logs: Vec::new(),
         status: HistoryStatus::Completed,
         retry_of: None,
@@ -67,6 +69,35 @@ fn error_report_contains_failed_path_and_reason() {
 
     assert!(report.contains("/music/in/song.flac"));
     assert!(report.contains("FFmpeg failed"));
+}
+
+#[test]
+fn conversion_report_includes_per_track_metadata_diagnostics() {
+    let mut entry = test_entry(2);
+    entry.metadata_diagnostics.push(MetadataDiagnostic {
+        source_path: "/music/in/Artist - Song.mp3".into(),
+        destination_path: "/music/out/Song - Artist.mp3".into(),
+        source_filename: "Artist - Song".into(),
+        source_extension: "mp3".into(),
+        source_size_bytes: Some(100),
+        output_size_bytes: Some(90),
+        source_title: Some("Song".into()),
+        source_artist: Some("Artist".into()),
+        source_album: None,
+        output_title: Some("Song".into()),
+        output_artist: Some("Artist".into()),
+        output_album: None,
+        source_artwork: true,
+        output_artwork: Some(true),
+        detected_filename_layout: "歌手 - 标题".into(),
+        decision: "最终标题：Song；最终歌手：Artist".into(),
+        metadata_validation: "通过：标题、歌手和可用封面已校验".into(),
+    });
+
+    let report = format_error_report(&entry);
+    assert!(report.contains("[逐曲元数据诊断]"));
+    assert!(report.contains("输出封面：有（有效图片）"));
+    assert!(report.contains("最终标题：Song；最终歌手：Artist"));
 }
 
 #[test]
