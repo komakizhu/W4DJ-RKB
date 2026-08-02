@@ -1229,25 +1229,32 @@ export function bindApp(
   };
 
   const syncSlidingSelectionControl = (
-    kind: 'conversion-mode' | 'enhanced-mode',
+    kind: 'mode' | 'conversion-mode' | 'enhanced-mode',
     motion: 'none' | 'start' | 'clear' = 'none',
   ) => {
+    const isMode = kind === 'mode';
     const isConversionMode = kind === 'conversion-mode';
     const row = root.querySelector<HTMLElement>(
-      isConversionMode
-        ? '[data-role="conversion-mode-switch"]'
-        : '[data-role="enhanced-mode-switch"]',
+      isMode
+        ? '[data-role="mode-switch"]'
+        : isConversionMode
+          ? '[data-role="conversion-mode-switch"]'
+          : '[data-role="enhanced-mode-switch"]',
     );
     if (!row) {
       render();
       return;
     }
 
-    const selectedValue = isConversionMode
-      ? state.conversionMode
-      : state.enhancedMode ? 'on' : 'off';
+    const selectedValue = isMode
+      ? state.mode
+      : isConversionMode
+        ? state.conversionMode
+        : state.enhancedMode ? 'on' : 'off';
     row.setAttribute(
-      isConversionMode ? 'data-selected-conversion-mode' : 'data-selected-enhanced-mode',
+      isMode
+        ? 'data-selected-mode'
+        : isConversionMode ? 'data-selected-conversion-mode' : 'data-selected-enhanced-mode',
       selectedValue,
     );
 
@@ -1255,9 +1262,11 @@ export function bindApp(
     row.toggleAttribute('data-selection-pending', selectionPending);
     row.setAttribute('aria-busy', selectionPending ? 'true' : 'false');
     row.querySelectorAll<HTMLButtonElement>('.mode-button').forEach((button) => {
-      const selected = isConversionMode
-        ? button.dataset.conversionMode === state.conversionMode
-        : button.dataset.enhancedMode === selectedValue;
+      const selected = isMode
+        ? button.dataset.mode === state.mode
+        : isConversionMode
+          ? button.dataset.conversionMode === state.conversionMode
+          : button.dataset.enhancedMode === selectedValue;
       button.classList.toggle('selected', selected);
 
       // Do not toggle the native disabled state for an in-flight selector
@@ -1265,13 +1274,22 @@ export function bindApp(
       // both Chinese labels visibly flash. The row blocks pointer input while
       // pending and runSelectionAction serializes keyboard-triggered clicks.
       const unavailable = pendingGlobalAction !== null
-        || (!isConversionMode && state.slots.some((slot) => slot.status === 'running'));
+        || (!isMode && !isConversionMode && state.slots.some((slot) => slot.status === 'running'));
       button.disabled = unavailable;
       button.setAttribute(
         'aria-disabled',
         selectionPending || unavailable ? 'true' : 'false',
       );
     });
+
+    if (isMode) {
+      const formatRow = root.querySelector<HTMLElement>('.format-row');
+      if (formatRow) {
+        const losslessVisible = state.mode === 'lossless';
+        formatRow.dataset.visible = String(losslessVisible);
+        formatRow.setAttribute('aria-hidden', String(!losslessVisible));
+      }
+    }
 
     const shell = root.querySelector<HTMLElement>('.app-shell');
     if (motion === 'start') {
@@ -1327,8 +1345,10 @@ export function bindApp(
   };
 
   const applyDesktopState = (desktopState: DesktopState) => {
-    const slidingControlActive = selectionMotion === 'conversion-mode'
+    const slidingControlActive = selectionMotion === 'mode'
+      || selectionMotion === 'conversion-mode'
       || selectionMotion === 'enhanced-mode'
+      || pendingSelection === 'mode'
       || pendingSelection === 'conversion-mode'
       || pendingSelection === 'enhanced-mode';
     const hydratedState = toViewState(desktopState, state.lang, state.theme);
@@ -1337,6 +1357,8 @@ export function bindApp(
           ...hydratedState,
           // Keep a just-selected preference when a stale background snapshot
           // arrives while that preference's animation is still running.
+          mode: state.mode,
+          losslessFormat: state.losslessFormat,
           conversionMode: state.conversionMode,
           enhancedMode: state.enhancedMode,
         }
@@ -1385,7 +1407,9 @@ export function bindApp(
       return;
     }
     pendingSelection = kind;
-    const patchSlidingControlInPlace = kind === 'conversion-mode' || kind === 'enhanced-mode';
+    const patchSlidingControlInPlace = kind === 'mode'
+      || kind === 'conversion-mode'
+      || kind === 'enhanced-mode';
     if (patchSlidingControlInPlace) {
       syncSlidingSelectionControl(kind, 'none');
     } else {
@@ -1422,7 +1446,7 @@ export function bindApp(
             }
             flushDeferredDesktopRender();
           }
-        }, 520);
+        }, kind === 'mode' ? 820 : 520);
       }
       flushDeferredDesktopRender();
     }

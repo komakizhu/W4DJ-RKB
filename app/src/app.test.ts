@@ -1013,14 +1013,41 @@ describe('bindApp', () => {
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
+    const formatRow = root.querySelector('.format-row');
 
     (root.querySelector('[data-mode="lossless"]') as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(root.querySelector('.format-row')).not.toBeNull());
+    await vi.waitFor(() => {
+      expect(root.querySelector('.format-row')).toBe(formatRow);
+      expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('true');
+      expect(root.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('false');
+    });
 
     (root.querySelector('[data-format="aiff"]') as HTMLButtonElement).click();
     await vi.waitFor(() => {
       expect(services.chooseMode).toHaveBeenCalledWith('lossless');
       expect(services.chooseLosslessFormat).toHaveBeenCalledWith('aiff');
+    });
+  });
+
+  it('keeps the lossless selector mounted during a quick mode reversal', async () => {
+    const services = makeMockServices({
+      chooseMode: vi
+        .fn()
+        .mockResolvedValueOnce(makeDesktopState({ mode: 'lossless', lossless_format: 'wav' }))
+        .mockResolvedValueOnce(makeDesktopState({ mode: 'compat', lossless_format: null })),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+    const formatRow = root.querySelector('.format-row');
+
+    (root.querySelector('[data-mode="lossless"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('true'));
+    (root.querySelector('[data-mode="compat"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('.format-row')).toBe(formatRow);
+      expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('false');
+      expect(root.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('true');
     });
   });
 
