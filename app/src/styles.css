@@ -479,6 +479,30 @@ h1 {
 .format-slot {
   height: var(--format-slot-height);
   min-height: var(--format-slot-height);
+  overflow: hidden;
+}
+
+.format-slot .format-row {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(calc(var(--format-slot-height) + 8px));
+  transition:
+    transform 360ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 220ms ease,
+    visibility 0s linear 360ms;
+  will-change: transform, opacity;
+}
+
+.format-slot .format-row[data-visible="true"] {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0);
+  transition:
+    transform 360ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 220ms ease,
+    visibility 0s;
 }
 
 .analysis-panel {
@@ -1332,7 +1356,8 @@ h1 {
 .app-shell[data-onboarding-active="true"][data-onboarding-step="0"] [data-onboarding-target="mode"],
 .app-shell[data-onboarding-active="true"][data-onboarding-step="1"] [data-onboarding-target="source"],
 .app-shell[data-onboarding-active="true"][data-onboarding-step="2"] [data-onboarding-target="destination"],
-.app-shell[data-onboarding-active="true"][data-onboarding-step="3"] [data-onboarding-target="start"] {
+.app-shell[data-onboarding-active="true"][data-onboarding-step="3"] [data-onboarding-target="start"],
+.app-shell[data-onboarding-active="true"][data-onboarding-step="4"] [data-onboarding-target="tutorial"] {
   filter: saturate(1.04) brightness(1.04);
   outline: none;
   box-shadow: none;
@@ -1348,6 +1373,20 @@ h1 {
   left: 24px;
   width: min(360px, calc(100% - 48px));
   transform: none;
+}
+
+.app-shell[data-onboarding-active="true"][data-onboarding-step="4"] .onboarding-callout {
+  right: auto;
+  bottom: 24px;
+  left: 24px;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .format-slot .format-row,
+  .format-slot .format-row[data-visible="true"] {
+    transition: none;
+  }
 }
 
 @media (max-width: 720px) {

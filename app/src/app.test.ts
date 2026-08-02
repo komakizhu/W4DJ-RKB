@@ -401,13 +401,16 @@ describe('renderApp', () => {
     expect(helpSections[1]?.getAttribute('aria-labelledby')).toBe('help-output-title');
   });
 
-  it('renders the global lossless format selector only in lossless mode', () => {
+  it('keeps the global lossless format selector mounted and changes its visible state', () => {
     const compatRoot = renderApp(makeViewState({ mode: 'compat' }));
-    expect(compatRoot.querySelector('.format-row')).toBeNull();
     expect(compatRoot.querySelector('.format-slot')).not.toBeNull();
+    expect(compatRoot.querySelector('.format-row')?.getAttribute('data-visible')).toBe('false');
+    expect(compatRoot.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('true');
 
     const root = renderApp(makeViewState({ mode: 'lossless', losslessFormat: 'wav' }));
     expect(root.querySelector('.format-slot')).not.toBeNull();
+    expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('true');
+    expect(root.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('false');
     expect(root.querySelector('[data-format="wav"]')?.classList.contains('selected')).toBe(true);
     expect(root.querySelector('[data-format="aiff"]')?.classList.contains('selected')).toBe(false);
   });
@@ -424,6 +427,33 @@ describe('renderApp', () => {
       .toBe('skip');
     expect((root.querySelector('[data-action="choose-filename-rule"]') as HTMLSelectElement).value)
       .toBe('title_artist');
+  });
+
+  it('uses songs and singers in Chinese filename labels without changing option values', () => {
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      null,
+      true,
+    );
+    const filenameRule = root.querySelector('[data-action="choose-filename-rule"]') as HTMLSelectElement;
+    const neteaseRule = root.querySelector('[data-action="choose-netease-filename-format"]') as HTMLSelectElement;
+
+    expect([...filenameRule.options].map((option) => [option.value, option.textContent])).toEqual([
+      ['title_artist', '歌曲名 - 歌手（默认）'],
+      ['artist_title', '歌手 - 歌曲名'],
+      ['original', '保留原文件名'],
+    ]);
+    expect([...neteaseRule.options].map((option) => [option.value, option.textContent])).toEqual([
+      ['title_only', '仅歌曲名'],
+      ['artist_title', '歌手 - 歌曲名'],
+      ['title_artist', '歌曲名 - 歌手'],
+    ]);
   });
 
   it('blocks confirmation when the destination disk is too full', () => {
@@ -543,7 +573,7 @@ describe('renderApp', () => {
     expect(slot.textContent).not.toContain('Desktop shell ready');
   });
 
-  it('shows a first-use onboarding guide with the four core steps', () => {
+  it('shows a first-use onboarding guide with the five core steps', () => {
     const root = renderApp(makeViewState(), null, null, null, [], null, false, null, false, false, true);
 
     expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('先选输出模式');
@@ -558,6 +588,7 @@ describe('renderApp', () => {
       { step: 1, target: 'source' },
       { step: 2, target: 'destination' },
       { step: 3, target: 'start' },
+      { step: 4, target: 'tutorial' },
     ] as const;
 
     steps.forEach(({ step, target }) => {
@@ -587,6 +618,15 @@ describe('renderApp', () => {
 
     const inactiveRoot = renderApp(makeViewState());
     expect(inactiveRoot.querySelectorAll('[data-onboarding-target]')).toHaveLength(0);
+  });
+
+  it('uses the fifth onboarding step to explain how to reopen the guide', () => {
+    const root = renderApp(makeViewState(), null, null, null, [], null, false, null, false, false, true, 4);
+
+    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('随时重新查看教程');
+    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('重新查看使用引导');
+    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('5/5');
+    expect(root.querySelector('[data-onboarding-target="tutorial"]')?.getAttribute('data-action')).toBe('open-help');
   });
 
   it('turns technical conversion errors into recovery-focused user messages', () => {
@@ -630,6 +670,32 @@ describe('bindApp', () => {
     expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('拖入来源');
     expect(services.chooseMode).not.toHaveBeenCalled();
     expect(services.previewAllSync).not.toHaveBeenCalled();
+  });
+
+  it('supports reaching, completing, and reopening the fifth onboarding step', async () => {
+    localStorage.removeItem('w4dj_onboarding_seen');
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), makeMockServices());
+
+    await vi.waitFor(() => expect(root.querySelector('[data-role="onboarding-modal"]')).not.toBeNull());
+    for (let step = 0; step < 4; step += 1) {
+      root.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    }
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="onboarding-modal"]')?.getAttribute('data-step')).toBe('4');
+      expect(root.querySelector('[data-onboarding-target="tutorial"]')).not.toBeNull();
+    });
+
+    root.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await vi.waitFor(() => expect(root.querySelector('[data-role="onboarding-modal"]')).toBeNull());
+    expect(localStorage.getItem('w4dj_onboarding_seen')).toBe('1');
+
+    (root.querySelector('[data-action="open-help"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="help-modal"]')).not.toBeNull());
+    (root.querySelector('[data-action="reopen-onboarding"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="onboarding-modal"]')?.getAttribute('data-step')).toBe('0');
+    });
   });
 
   it('loads and renders both resolved backend slots', async () => {
@@ -1179,6 +1245,9 @@ describe('bindApp', () => {
       chooseFilenameRule: vi.fn().mockResolvedValue(
         makeDesktopState({ filename_rule: 'artist_title' }),
       ),
+      chooseNeteaseFilenameFormat: vi.fn().mockResolvedValue(
+        makeDesktopState({ netease_filename_format: 'artist_title' }),
+      ),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
@@ -1192,6 +1261,11 @@ describe('bindApp', () => {
     filename.value = 'artist_title';
     filename.dispatchEvent(new Event('change', { bubbles: true }));
     await vi.waitFor(() => expect(services.chooseFilenameRule).toHaveBeenCalledWith('artist_title'));
+
+    const neteaseFilename = root.querySelector('[data-action="choose-netease-filename-format"]') as HTMLSelectElement;
+    neteaseFilename.value = 'artist_title';
+    neteaseFilename.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => expect(services.chooseNeteaseFilenameFormat).toHaveBeenCalledWith('artist_title'));
   });
 
   it('shows one combined preview modal before starting both slots', async () => {

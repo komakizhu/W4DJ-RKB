@@ -17,10 +17,10 @@ export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
 type SelectionMotion = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | 'theme' | 'lang' | null;
 type PendingSelection = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | null;
-type OnboardingStep = 0 | 1 | 2 | 3;
-type OnboardingTarget = 'mode' | 'source' | 'destination' | 'start';
+type OnboardingStep = 0 | 1 | 2 | 3 | 4;
+type OnboardingTarget = 'mode' | 'source' | 'destination' | 'start' | 'tutorial';
 
-const ONBOARDING_STEP_COUNT = 4;
+const ONBOARDING_STEP_COUNT = 5;
 
 const LIGHT_PALETTE = 'c' as const;
 
@@ -365,11 +365,11 @@ const translations = {
     conflictMetadata: '高级选项：仅更新元数据',
     filenameRule: '文件名规则',
     neteaseFilenameFormat: '网易云源文件名格式',
-    neteaseTitleOnly: '仅歌名',
-    neteaseArtistTitle: '歌手 - 歌名',
-    neteaseTitleArtist: '歌名 - 歌手',
-    titleArtist: '标题 - 艺术家（默认）',
-    artistTitle: '艺术家 - 标题',
+    neteaseTitleOnly: '仅歌曲名',
+    neteaseArtistTitle: '歌手 - 歌曲名',
+    neteaseTitleArtist: '歌曲名 - 歌手',
+    titleArtist: '歌曲名 - 歌手（默认）',
+    artistTitle: '歌手 - 歌曲名',
     originalName: '保留原文件名',
     availableSpace: '可用空间',
     insufficientSpace: '磁盘空间不足，无法开始转换',
@@ -400,7 +400,7 @@ const translations = {
     pendingCount: '待继续',
     errorCategory: '错误类型',
     onboardingTitle: '第一次使用？看这里',
-    onboardingIntro: '四步完成一次转换，文件夹和单曲会自动识别。',
+    onboardingIntro: '五步完成一次转换，文件夹和单曲会自动识别。',
     onboardingStepOneTitle: '先选输出模式',
     onboardingStepOneBody: '兼容模式导出 MP3；无损模式可以选择 WAV 或 AIFF。',
     onboardingStepTwoTitle: '拖入来源',
@@ -409,6 +409,8 @@ const translations = {
     onboardingStepThreeBody: '设置转换后的文件保存在哪里；任务 2 没有单独目录时会沿用任务 1。',
     onboardingStepFourTitle: '开始转换',
     onboardingStepFourBody: '准备好后点击这里，软件会先扫描并让你确认，再正式转换。',
+    onboardingStepFiveTitle: '随时重新查看教程',
+    onboardingStepFiveBody: '以后可点击右上角「教程」，再选择“重新查看使用引导”，即可再次查看完整教程。',
     onboardingNext: '下一步',
     onboardingPrevious: '上一步',
     onboardingSkip: '跳过教程',
@@ -544,7 +546,7 @@ const translations = {
     pendingCount: 'Pending',
     errorCategory: 'Error type',
     onboardingTitle: 'New to W4DJ?',
-    onboardingIntro: 'Four steps to convert. Folders and single tracks are detected automatically.',
+    onboardingIntro: 'Five steps to convert. Folders and single tracks are detected automatically.',
     onboardingStepOneTitle: 'Choose an output mode',
     onboardingStepOneBody: 'Compat mode exports MP3. Lossless mode lets you choose WAV or AIFF.',
     onboardingStepTwoTitle: 'Drop in a source',
@@ -553,6 +555,8 @@ const translations = {
     onboardingStepThreeBody: 'Set where converted files are saved. Task 2 uses Task 1’s folder when left empty.',
     onboardingStepFourTitle: 'Start converting',
     onboardingStepFourBody: 'When ready, click here. W4DJ scans the tasks first and asks you to confirm.',
+    onboardingStepFiveTitle: 'Review this guide anytime',
+    onboardingStepFiveBody: 'Open Tutorial in the top right, then choose “Review the usage guide” to replay this walkthrough.',
     onboardingNext: 'Next',
     onboardingPrevious: 'Back',
     onboardingSkip: 'Skip tour',
@@ -786,7 +790,7 @@ export function renderApp(
   const hasCancelled = state.slots.some((slot) => slot.status === 'cancelled');
   const configuredTasks = state.slots.filter((slot) => slot.sourceDirectory.trim()).length;
   const onboardingTarget: OnboardingTarget | null = onboardingVisible
-    ? (['mode', 'source', 'destination', 'start'] as const)[onboardingStep]
+    ? (['mode', 'source', 'destination', 'start', 'tutorial'] as const)[onboardingStep]
     : null;
   root.innerHTML = `
     <header class="topbar">
@@ -795,7 +799,7 @@ export function renderApp(
         <h1>${t('title', state.lang)}</h1>
       </div>
       <div class="topbar-actions">
-        <button type="button" class="help-button" data-action="open-help" aria-label="${t('tutorial', state.lang)}" title="${t('tutorial', state.lang)}">
+        <button type="button" class="help-button" data-action="open-help"${onboardingTarget === 'tutorial' ? ' data-onboarding-target="tutorial"' : ''} aria-label="${t('tutorial', state.lang)}" title="${t('tutorial', state.lang)}">
           ${icon('help')}
           <span>${t('tutorial', state.lang)}</span>
         </button>
@@ -2348,19 +2352,17 @@ function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSel
   const formats: AppLosslessFormat[] = ['wav', 'aiff'];
   return `
     <div class="format-slot">
-      ${state.mode === 'lossless' ? `
-        <div class="format-row" data-selected-format="${state.losslessFormat || 'wav'}" aria-label="${t('losslessFormat', state.lang)}">
-          ${formats
-            .map(
-              (format) => `
-                <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}" ${pendingSelection === 'format' ? 'disabled' : ''}>
-                  ${format.toUpperCase()}
-                </button>
-              `,
-            )
-            .join('')}
-        </div>
-      ` : ''}
+      <div class="format-row" data-selected-format="${state.losslessFormat || 'wav'}" data-visible="${state.mode === 'lossless'}" aria-label="${t('losslessFormat', state.lang)}" aria-hidden="${state.mode !== 'lossless'}">
+        ${formats
+          .map(
+            (format) => `
+              <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}" ${pendingSelection === 'format' ? 'disabled' : ''}>
+                ${format.toUpperCase()}
+              </button>
+            `,
+          )
+          .join('')}
+      </div>
     </div>
   `;
 }
@@ -2495,6 +2497,7 @@ function renderOnboardingModal(visible: boolean, lang: AppLanguage, step: Onboar
     { target: 'source', title: t('onboardingStepTwoTitle', lang), body: t('onboardingStepTwoBody', lang) },
     { target: 'destination', title: t('onboardingStepThreeTitle', lang), body: t('onboardingStepThreeBody', lang) },
     { target: 'start', title: t('onboardingStepFourTitle', lang), body: t('onboardingStepFourBody', lang) },
+    { target: 'tutorial', title: t('onboardingStepFiveTitle', lang), body: t('onboardingStepFiveBody', lang) },
   ] as const;
   const currentStep = steps[step];
   const isLastStep = step === ONBOARDING_STEP_COUNT - 1;
