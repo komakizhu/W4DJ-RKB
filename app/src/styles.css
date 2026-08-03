@@ -528,6 +528,7 @@ h1 {
   cursor: pointer;
   font-size: 11px;
   font-weight: 500;
+  font-synthesis: none;
   white-space: nowrap;
   transition: background 260ms cubic-bezier(0.22, 1, 0.36, 1), color 260ms cubic-bezier(0.22, 1, 0.36, 1), border-color 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms cubic-bezier(0.22, 1, 0.36, 1);
 }
@@ -593,6 +594,8 @@ h1 {
 .enhanced-mode-row .mode-button,
 .format-row .format-button {
   color: #fbf8ee !important;
+  font-weight: 500;
+  font-synthesis: none;
   mix-blend-mode: difference;
   transition: background 260ms cubic-bezier(0.22, 1, 0.36, 1), border-color 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms cubic-bezier(0.22, 1, 0.36, 1);
 }
