@@ -583,15 +583,16 @@ h1 {
 }
 
 /*
- * The sliding selectors use a moving highlight. Keep their labels in one
- * stable paint layer and let the highlight determine the contrast through
- * blending. Toggling .selected must not crossfade the glyphs independently
- * from the 460ms highlight transition, otherwise quick reversals briefly put
- * light text on the light pill (or dark text on the dark rail). CSS transitions
- * are sampled by the WebView compositor at the display's native refresh rate.
+ * The mode selectors use a moving highlight. Keep every mode label in the
+ * same paint layer and let the highlight determine the contrast through
+ * blending. This keeps compat/lossless and conversion/enhanced typography
+ * visually identical. Toggling .selected must not crossfade the glyphs
+ * independently from the 460ms highlight transition, otherwise quick
+ * reversals briefly put light text on the light pill (or dark text on the
+ * dark rail). CSS transitions are sampled by the WebView compositor at the
+ * display's native refresh rate.
  */
-.conversion-mode-row .mode-button,
-.enhanced-mode-row .mode-button,
+.mode-row .mode-button,
 .format-row .format-button {
   color: #fbf8ee !important;
   font-weight: 500;
