@@ -380,12 +380,69 @@ h1 {
   transform: translate3d(0, 0, 0);
 }
 
+.conversion-mode-row::before,
+.enhanced-mode-row::before {
+  z-index: 2;
+}
+
 .conversion-mode-row[data-selected-conversion-mode="direct"]::before {
   transform: translate3d(0, 44px, 0);
 }
 
 .enhanced-mode-row[data-selected-enhanced-mode="on"]::before {
   transform: translate3d(calc(100% + 7px), 0, 0);
+}
+
+.mode-selected-labels {
+  position: absolute;
+  z-index: 3;
+  display: grid;
+  pointer-events: none;
+  color: #153a42;
+  backface-visibility: hidden;
+  will-change: clip-path;
+  transition: clip-path 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
+}
+
+.mode-selected-labels-vertical {
+  top: 8px;
+  right: 8px;
+  left: 8px;
+  grid-template-rows: repeat(2, 37px);
+  gap: 7px;
+  height: 81px;
+  clip-path: inset(0 0 44px 0 round 11px);
+}
+
+.conversion-mode-row[data-selected-conversion-mode="direct"] .mode-selected-labels-vertical {
+  clip-path: inset(44px 0 0 0 round 11px);
+}
+
+.mode-selected-labels-horizontal {
+  top: 8px;
+  right: 8px;
+  left: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  height: 37px;
+  clip-path: inset(0 calc(50% + 3.5px) 0 0 round 11px);
+}
+
+.enhanced-mode-row[data-selected-enhanced-mode="on"] .mode-selected-labels-horizontal {
+  clip-path: inset(0 0 0 calc(50% + 3.5px) round 11px);
+}
+
+.mode-selected-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-width: 0;
+  height: 37px;
+  padding: 0 12px;
+  font-size: 11px;
+  font-weight: 500;
+  font-synthesis: none;
+  white-space: nowrap;
 }
 
 .mode-row[data-selected-mode="lossless"]::before {
@@ -583,15 +640,32 @@ h1 {
 }
 
 /*
- * The sliding selectors use a moving highlight. Keep their labels in one
- * stable paint layer and let the highlight determine the contrast through
- * blending. Toggling .selected must not crossfade the glyphs independently
- * from the 460ms highlight transition, otherwise quick reversals briefly put
- * light text on the light pill (or dark text on the dark rail). CSS transitions
- * are sampled by the WebView compositor at the display's native refresh rate.
+ * Conversion and analysis selectors keep their ordinary labels in the button
+ * layer. A clipped duplicate above the moving pill supplies the selected text,
+ * so the glyph color never crossfades or gets re-rasterized during reversals.
  */
 .conversion-mode-row .mode-button,
-.enhanced-mode-row .mode-button,
+.enhanced-mode-row .mode-button {
+  color: var(--rail-muted);
+  font-weight: 500;
+  font-synthesis: none;
+  transition: background 260ms cubic-bezier(0.22, 1, 0.36, 1), border-color 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.conversion-mode-row .mode-button:hover,
+.enhanced-mode-row .mode-button:hover {
+  color: var(--rail-text);
+}
+
+.app-shell[data-theme="light"][data-light-palette="c"] .mode-selected-labels {
+  color: #4b2b24;
+}
+
+.app-shell[data-theme="dark"] .mode-selected-labels {
+  color: #fff0ec;
+}
+
+/* WAV/AIFF keeps its existing blend-based paint layer in this change. */
 .format-row .format-button {
   color: #fbf8ee !important;
   font-weight: 500;

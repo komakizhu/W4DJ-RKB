@@ -416,6 +416,25 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-format="aiff"]')?.classList.contains('selected')).toBe(false);
   });
 
+  it('renders persistent aria-hidden selected-label overlays for sliding mode controls', () => {
+    const root = renderApp(makeViewState());
+    const conversionOverlay = root.querySelector(
+      '[data-role="conversion-mode-label-overlay"]',
+    );
+    const enhancedOverlay = root.querySelector(
+      '[data-role="enhanced-mode-label-overlay"]',
+    );
+
+    expect(conversionOverlay?.getAttribute('aria-hidden')).toBe('true');
+    expect(conversionOverlay?.querySelectorAll('.mode-selected-label')).toHaveLength(2);
+    expect(conversionOverlay?.textContent).toContain('扫描后转换');
+    expect(conversionOverlay?.textContent).toContain('直接转换');
+    expect(enhancedOverlay?.getAttribute('aria-hidden')).toBe('true');
+    expect(enhancedOverlay?.querySelectorAll('.mode-selected-label')).toHaveLength(2);
+    expect(enhancedOverlay?.textContent).toContain('普通转换');
+    expect(enhancedOverlay?.textContent).toContain('增强模式');
+  });
+
   it('keeps secondary output settings collapsed with safe defaults', () => {
     const root = renderApp(makeViewState());
     const settings = root.querySelector(
@@ -1086,7 +1105,13 @@ describe('bindApp', () => {
 
     const conversionSwitch = root.querySelector('[data-role="conversion-mode-switch"]');
     const conversionButton = root.querySelector('[data-conversion-mode="direct"]');
+    const conversionOverlay = root.querySelector(
+      '[data-role="conversion-mode-label-overlay"]',
+    );
     const enhancedSwitchBeforeConversion = root.querySelector('[data-role="enhanced-mode-switch"]');
+    const enhancedOverlay = root.querySelector(
+      '[data-role="enhanced-mode-label-overlay"]',
+    );
     const enhancedButtonsBeforeConversion = Array.from(
       root.querySelectorAll<HTMLButtonElement>('[data-role="enhanced-mode-switch"] .mode-button'),
     );
@@ -1094,6 +1119,9 @@ describe('bindApp', () => {
 
     expect(root.querySelector('[data-role="conversion-mode-switch"]')).toBe(conversionSwitch);
     expect(root.querySelector('[data-conversion-mode="direct"]')).toBe(conversionButton);
+    expect(root.querySelector('[data-role="conversion-mode-label-overlay"]')).toBe(
+      conversionOverlay,
+    );
     expect(conversionSwitch?.hasAttribute('data-selection-pending')).toBe(true);
     expect((conversionButton as HTMLButtonElement).disabled).toBe(false);
     expect((conversionButton as HTMLButtonElement).getAttribute('aria-disabled')).toBe('true');
@@ -1126,6 +1154,9 @@ describe('bindApp', () => {
 
     expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
     expect(root.querySelector('[data-enhanced-mode="on"]')).toBe(enhancedButton);
+    expect(root.querySelector('[data-role="enhanced-mode-label-overlay"]')).toBe(
+      enhancedOverlay,
+    );
     expect((enhancedButton as HTMLButtonElement).disabled).toBe(false);
     expect((enhancedButton as HTMLButtonElement).getAttribute('aria-disabled')).toBe('true');
     expect(root.querySelector('[data-role="conversion-mode-switch"]')
@@ -1186,6 +1217,9 @@ describe('bindApp', () => {
       },
     });
     const enhancedSwitch = root.querySelector('[data-role="enhanced-mode-switch"]');
+    const enhancedOverlay = root.querySelector(
+      '[data-role="enhanced-mode-label-overlay"]',
+    );
     (root.querySelector('[data-enhanced-mode="on"]') as HTMLButtonElement).click();
     enhancedOn.resolve(makeDesktopState({ enhanced_mode: true }));
     await vi.waitFor(() => {
@@ -1200,6 +1234,9 @@ describe('bindApp', () => {
         ?.getAttribute('data-selected-enhanced-mode')).toBe('off');
     });
     expect(root.querySelector('[data-role="enhanced-mode-switch"]')).toBe(enhancedSwitch);
+    expect(root.querySelector('[data-role="enhanced-mode-label-overlay"]')).toBe(
+      enhancedOverlay,
+    );
     expect(forcedLayoutReads).toBe(0);
   });
 
@@ -1223,6 +1260,9 @@ describe('bindApp', () => {
       },
     });
     const conversionSwitch = root.querySelector('[data-role="conversion-mode-switch"]');
+    const conversionOverlay = root.querySelector(
+      '[data-role="conversion-mode-label-overlay"]',
+    );
     (root.querySelector('[data-conversion-mode="direct"]') as HTMLButtonElement).click();
     conversionDirect.resolve(makeDesktopState({ conversion_mode: 'direct' }));
     await vi.waitFor(() => {
@@ -1237,6 +1277,9 @@ describe('bindApp', () => {
         ?.getAttribute('data-selected-conversion-mode')).toBe('scan_then_convert');
     });
     expect(root.querySelector('[data-role="conversion-mode-switch"]')).toBe(conversionSwitch);
+    expect(root.querySelector('[data-role="conversion-mode-label-overlay"]')).toBe(
+      conversionOverlay,
+    );
     expect(forcedLayoutReads).toBe(0);
   });
 

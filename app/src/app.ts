@@ -830,6 +830,20 @@ export function renderApp(
               ${icon('play')}
               ${t('directConvert', state.lang)}
             </button>
+            <span
+              class="mode-selected-labels mode-selected-labels-vertical"
+              data-role="conversion-mode-label-overlay"
+              aria-hidden="true"
+            >
+              <span class="mode-selected-label">
+                ${icon('list')}
+                ${t('scanThenConvert', state.lang)}
+              </span>
+              <span class="mode-selected-label">
+                ${icon('play')}
+                ${t('directConvert', state.lang)}
+              </span>
+            </span>
           </div>
           <div class="global-control-head">
             <span>${t('mode', state.lang)}</span>
@@ -871,6 +885,20 @@ export function renderApp(
               ${icon('disc')}
               ${t('enhancedMode', state.lang)}
             </button>
+            <span
+              class="mode-selected-labels mode-selected-labels-horizontal"
+              data-role="enhanced-mode-label-overlay"
+              aria-hidden="true"
+            >
+              <span class="mode-selected-label">
+                ${icon('convert')}
+                ${t('standardConvert', state.lang)}
+              </span>
+              <span class="mode-selected-label">
+                ${icon('disc')}
+                ${t('enhancedMode', state.lang)}
+              </span>
+            </span>
           </div>
           ${renderOutputSettings(state, outputSettingsExpanded)}
           <div class="global-action-group">
