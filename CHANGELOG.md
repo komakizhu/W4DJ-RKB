@@ -1,6 +1,6 @@
 # W4DJ RKB 更新日志
 
-## v3.1.2
+## v3.0.1-beta.1
 
 ### Improved
 

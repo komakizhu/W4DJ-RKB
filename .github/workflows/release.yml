@@ -95,8 +95,8 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: 'W4DJ ${{ github.ref_name }}'
           releaseBody: ${{ env.RELEASE_BODY }}
-          releaseDraft: true
-          prerelease: false
+          releaseDraft: false
+          prerelease: true
           args: ${{ matrix.args }}
           releaseAssetNamePattern: ${{ matrix.asset_name }}
 
