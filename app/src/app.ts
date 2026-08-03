@@ -1229,18 +1229,20 @@ export function bindApp(
   };
 
   const syncSlidingSelectionControl = (
-    kind: 'mode' | 'conversion-mode' | 'enhanced-mode',
+    kind: 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode',
     motion: 'none' | 'start' | 'clear' = 'none',
   ) => {
     const isMode = kind === 'mode';
+    const isFormat = kind === 'format';
     const isConversionMode = kind === 'conversion-mode';
-    const row = root.querySelector<HTMLElement>(
-      isMode
-        ? '[data-role="mode-switch"]'
+    const rowSelector = isMode
+      ? '[data-role="mode-switch"]'
+      : isFormat
+        ? '.format-row'
         : isConversionMode
           ? '[data-role="conversion-mode-switch"]'
-          : '[data-role="enhanced-mode-switch"]',
-    );
+          : '[data-role="enhanced-mode-switch"]';
+    const row = root.querySelector<HTMLElement>(rowSelector);
     if (!row) {
       render();
       return;
@@ -1248,25 +1250,35 @@ export function bindApp(
 
     const selectedValue = isMode
       ? state.mode
-      : isConversionMode
-        ? state.conversionMode
-        : state.enhancedMode ? 'on' : 'off';
+      : isFormat
+        ? state.losslessFormat || 'wav'
+        : isConversionMode
+          ? state.conversionMode
+          : state.enhancedMode ? 'on' : 'off';
+    const selectedAttribute = isMode
+      ? 'data-selected-mode'
+      : isFormat
+        ? 'data-selected-format'
+        : isConversionMode
+          ? 'data-selected-conversion-mode'
+          : 'data-selected-enhanced-mode';
     row.setAttribute(
-      isMode
-        ? 'data-selected-mode'
-        : isConversionMode ? 'data-selected-conversion-mode' : 'data-selected-enhanced-mode',
+      selectedAttribute,
       selectedValue,
     );
 
     const selectionPending = pendingSelection === kind;
     row.toggleAttribute('data-selection-pending', selectionPending);
     row.setAttribute('aria-busy', selectionPending ? 'true' : 'false');
-    row.querySelectorAll<HTMLButtonElement>('.mode-button').forEach((button) => {
+    const buttonSelector = isFormat ? '.format-button' : '.mode-button';
+    row.querySelectorAll<HTMLButtonElement>(buttonSelector).forEach((button) => {
       const selected = isMode
         ? button.dataset.mode === state.mode
-        : isConversionMode
-          ? button.dataset.conversionMode === state.conversionMode
-          : button.dataset.enhancedMode === selectedValue;
+        : isFormat
+          ? button.dataset.format === selectedValue
+          : isConversionMode
+            ? button.dataset.conversionMode === state.conversionMode
+            : button.dataset.enhancedMode === selectedValue;
       button.classList.toggle('selected', selected);
 
       // Do not toggle the native disabled state for an in-flight selector
@@ -1274,7 +1286,7 @@ export function bindApp(
       // both Chinese labels visibly flash. The row blocks pointer input while
       // pending and runSelectionAction serializes keyboard-triggered clicks.
       const unavailable = pendingGlobalAction !== null
-        || (!isMode && !isConversionMode && state.slots.some((slot) => slot.status === 'running'));
+        || (!isMode && !isFormat && !isConversionMode && state.slots.some((slot) => slot.status === 'running'));
       button.disabled = unavailable;
       button.setAttribute(
         'aria-disabled',
@@ -1346,9 +1358,11 @@ export function bindApp(
 
   const applyDesktopState = (desktopState: DesktopState) => {
     const slidingControlActive = selectionMotion === 'mode'
+      || selectionMotion === 'format'
       || selectionMotion === 'conversion-mode'
       || selectionMotion === 'enhanced-mode'
       || pendingSelection === 'mode'
+      || pendingSelection === 'format'
       || pendingSelection === 'conversion-mode'
       || pendingSelection === 'enhanced-mode';
     const hydratedState = toViewState(desktopState, state.lang, state.theme);
@@ -1408,6 +1422,7 @@ export function bindApp(
     }
     pendingSelection = kind;
     const patchSlidingControlInPlace = kind === 'mode'
+      || kind === 'format'
       || kind === 'conversion-mode'
       || kind === 'enhanced-mode';
     if (patchSlidingControlInPlace) {
@@ -2380,7 +2395,7 @@ function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSel
         ${formats
           .map(
             (format) => `
-              <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}" ${pendingSelection === 'format' ? 'disabled' : ''}>
+              <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}" aria-disabled="${pendingSelection === 'format' ? 'true' : 'false'}">
                 ${format.toUpperCase()}
               </button>
             `,

@@ -356,69 +356,51 @@ h1 {
   box-shadow: 0 8px 20px rgba(0, 16, 20, 0.18);
   content: "";
   pointer-events: none;
+  backface-visibility: hidden;
+  will-change: transform;
   transition: transform 460ms cubic-bezier(0.22, 1.2, 0.36, 1), background 240ms ease, border-color 240ms ease, box-shadow 240ms ease;
 }
 
 .mode-row::before {
   inset: 8px 8px auto;
   height: 37px;
-  transform: translateY(0);
+  transform: translate3d(0, 0, 0);
 }
 
 .conversion-mode-row::before {
   inset: 8px 8px auto;
   height: 37px;
-  transform: translateY(0);
+  transform: translate3d(0, 0, 0);
 }
 
 .enhanced-mode-row::before {
   inset: 8px auto auto 8px;
   width: calc(50% - 11.5px);
   height: 37px;
-  transform: translateX(0);
+  transform: translate3d(0, 0, 0);
 }
 
 .conversion-mode-row[data-selected-conversion-mode="direct"]::before {
-  transform: translateY(44px);
+  transform: translate3d(0, 44px, 0);
 }
 
 .enhanced-mode-row[data-selected-enhanced-mode="on"]::before {
-  transform: translateX(calc(100% + 7px));
+  transform: translate3d(calc(100% + 7px), 0, 0);
 }
 
 .mode-row[data-selected-mode="lossless"]::before {
-  transform: translateY(44px);
+  transform: translate3d(0, 44px, 0);
 }
 
 .format-row::before {
   inset: 8px auto auto 8px;
   width: calc(50% - 11.5px);
   height: 37px;
-  transform: translateX(0);
+  transform: translate3d(0, 0, 0);
 }
 
 .format-row[data-selected-format="aiff"]::before {
-  transform: translateX(calc(100% + 7px));
-}
-
-@keyframes mode-slide-down {
-  from { transform: translateY(0); }
-  to { transform: translateY(44px); }
-}
-
-@keyframes mode-slide-up {
-  from { transform: translateY(44px); }
-  to { transform: translateY(0); }
-}
-
-@keyframes format-slide-right {
-  from { transform: translateX(0); }
-  to { transform: translateX(calc(100% + 7px)); }
-}
-
-@keyframes format-slide-left {
-  from { transform: translateX(calc(100% + 7px)); }
-  to { transform: translateX(0); }
+  transform: translate3d(calc(100% + 7px), 0, 0);
 }
 
 @keyframes theme-crossfade {
@@ -441,26 +423,6 @@ h1 {
     opacity: 1;
     transform: translateY(0);
   }
-}
-
-.app-shell[data-selection-motion="mode"] .mode-row[data-selected-mode="lossless"]::before {
-  animation: mode-slide-down 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
-  animation-fill-mode: both;
-}
-
-.app-shell[data-selection-motion="mode"] .mode-row[data-selected-mode="compat"]::before {
-  animation: mode-slide-up 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
-  animation-fill-mode: both;
-}
-
-.app-shell[data-selection-motion="format"] .format-row[data-selected-format="aiff"]::before {
-  animation: format-slide-right 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
-  animation-fill-mode: both;
-}
-
-.app-shell[data-selection-motion="format"] .format-row[data-selected-format="wav"]::before {
-  animation: format-slide-left 460ms cubic-bezier(0.22, 1.2, 0.36, 1);
-  animation-fill-mode: both;
 }
 
 .app-shell[data-selection-motion="theme"] {
@@ -486,7 +448,7 @@ h1 {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transform: translateY(42px);
+  transform: translate3d(0, 42px, 0);
   transition:
     transform 560ms cubic-bezier(0.42, 0, 0.58, 1),
     opacity 220ms ease,
@@ -498,7 +460,7 @@ h1 {
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
-  transform: translateY(0);
+  transform: translate3d(0, 0, 0);
   transition:
     transform 760ms cubic-bezier(0.22, 0.72, 0.2, 1),
     opacity 440ms cubic-bezier(0.22, 0.72, 0.2, 1) 90ms,
@@ -620,14 +582,16 @@ h1 {
 }
 
 /*
- * The conversion selectors use a moving highlight. Keep their labels in one
+ * The sliding selectors use a moving highlight. Keep their labels in one
  * stable paint layer and let the highlight determine the contrast through
  * blending. Toggling .selected must not crossfade the glyphs independently
  * from the 460ms highlight transition, otherwise quick reversals briefly put
- * light text on the light pill (or dark text on the dark rail).
+ * light text on the light pill (or dark text on the dark rail). CSS transitions
+ * are sampled by the WebView compositor at the display's native refresh rate.
  */
 .conversion-mode-row .mode-button,
-.enhanced-mode-row .mode-button {
+.enhanced-mode-row .mode-button,
+.format-row .format-button {
   color: #fbf8ee !important;
   mix-blend-mode: difference;
   transition: background 260ms cubic-bezier(0.22, 1, 0.36, 1), border-color 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms cubic-bezier(0.22, 1, 0.36, 1);
@@ -1630,12 +1594,14 @@ h1 {
 }
 
 .mode-row[data-selection-pending="true"],
+.format-row[data-selection-pending="true"],
 .conversion-mode-row[data-selection-pending="true"],
 .enhanced-mode-row[data-selection-pending="true"] {
   pointer-events: none;
 }
 
 .mode-row[data-selection-pending="true"] .mode-button,
+.format-row[data-selection-pending="true"] .format-button,
 .conversion-mode-row[data-selection-pending="true"] .mode-button,
 .enhanced-mode-row[data-selection-pending="true"] .mode-button {
   cursor: wait;

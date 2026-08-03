@@ -5,6 +5,7 @@ import {
   resolveDropTargetAt,
   renderApp,
   type AppHistoryEntry,
+  type AppLosslessFormat,
   type AppPreview,
   type AppScanProgress,
   type AppServices,
@@ -1026,6 +1027,8 @@ describe('bindApp', () => {
     await vi.waitFor(() => {
       expect(services.chooseMode).toHaveBeenCalledWith('lossless');
       expect(services.chooseLosslessFormat).toHaveBeenCalledWith('aiff');
+      expect(root.querySelector('.format-row')).toBe(formatRow);
+      expect(root.querySelector('.format-row')?.getAttribute('data-selected-format')).toBe('aiff');
     });
   });
 
@@ -1433,15 +1436,56 @@ describe('bindApp', () => {
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState({ mode: 'lossless', losslessFormat: 'wav' }), services);
+    const formatRow = root.querySelector('.format-row');
+    const wavButton = root.querySelector('[data-format="wav"]');
+    const aiffButton = root.querySelector('[data-format="aiff"]');
 
     (root.querySelector('[data-format="aiff"]') as HTMLButtonElement).click();
-    const wavButton = root.querySelector('[data-format="wav"]') as HTMLButtonElement;
-    expect(wavButton.disabled).toBe(true);
-    wavButton.click();
+    expect(root.querySelector('.format-row')).toBe(formatRow);
+    expect(root.querySelector('[data-format="wav"]')).toBe(wavButton);
+    expect(root.querySelector('[data-format="aiff"]')).toBe(aiffButton);
+    expect((wavButton as HTMLButtonElement).disabled).toBe(false);
+    expect((wavButton as HTMLButtonElement).getAttribute('aria-disabled')).toBe('true');
+    (wavButton as HTMLButtonElement).click();
     expect(services.chooseLosslessFormat).toHaveBeenCalledTimes(1);
 
     deferred.resolve(makeDesktopState({ mode: 'lossless', lossless_format: 'aiff' }));
-    await vi.waitFor(() => expect(root.querySelector('[data-format="aiff"]')).not.toBeNull());
+    await vi.waitFor(() => {
+      expect(root.querySelector('.format-row')).toBe(formatRow);
+      expect(root.querySelector('[data-format="wav"]')).toBe(wavButton);
+      expect(root.querySelector('[data-format="aiff"]')).toBe(aiffButton);
+      expect(root.querySelector('.format-row')?.getAttribute('data-selected-format')).toBe('aiff');
+      expect((aiffButton as HTMLButtonElement).getAttribute('aria-disabled')).toBe('false');
+    });
+  });
+
+  it('keeps the lossless selector stable during a quick WAV/AIFF reversal', async () => {
+    const toAiff = createDeferred<DesktopState>();
+    const toWav = createDeferred<DesktopState>();
+    const services = makeMockServices({
+      chooseLosslessFormat: vi.fn((format: AppLosslessFormat) =>
+        (format === 'aiff' ? toAiff : toWav).promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({ mode: 'lossless', losslessFormat: 'wav' }), services);
+    const formatRow = root.querySelector('.format-row');
+    const wavButton = root.querySelector('[data-format="wav"]');
+    const aiffButton = root.querySelector('[data-format="aiff"]');
+
+    (aiffButton as HTMLButtonElement).click();
+    toAiff.resolve(makeDesktopState({ mode: 'lossless', lossless_format: 'aiff' }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('.format-row')?.getAttribute('data-selected-format')).toBe('aiff');
+    });
+
+    (wavButton as HTMLButtonElement).click();
+    toWav.resolve(makeDesktopState({ mode: 'lossless', lossless_format: 'wav' }));
+    await vi.waitFor(() => {
+      expect(root.querySelector('.format-row')).toBe(formatRow);
+      expect(root.querySelector('[data-format="wav"]')).toBe(wavButton);
+      expect(root.querySelector('[data-format="aiff"]')).toBe(aiffButton);
+      expect(root.querySelector('.format-row')?.getAttribute('data-selected-format')).toBe('wav');
+    });
   });
 
   it('renders history and opens the same preview modal for failed retries', async () => {
