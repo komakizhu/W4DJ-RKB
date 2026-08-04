@@ -129,9 +129,9 @@ Essentia.js 已内置在“加强模式”中。打开“加强模式”后，�
 
 从 Releases 下载对应架构的安装包：
 
-- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v3.0.1-beta.1.dmg`
-- Intel：`W4DJ-RKB-macOS-Intel-v3.0.1-beta.1.dmg`
-- Windows：`W4DJ-RKB-Windows-Installer-v3.0.1-beta.1-setup.exe`
+- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v3.1.2.dmg`
+- Intel：`W4DJ-RKB-macOS-Intel-v3.1.2.dmg`
+- Windows：`W4DJ-RKB-Windows-Installer-v3.1.2-setup.exe`
 
 首次打开时，如果 macOS 提示应用无法验证：
 
