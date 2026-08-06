@@ -16,6 +16,9 @@ export type TrackAnalysis = {
   analyzedAt: string;
   analyzer: string;
   analysisVersion: string;
+  sourceSizeBytes?: number | null;
+  sourceModifiedAt?: number | null;
+  sourceFilenameFormat?: NeteaseFilenameFormat | null;
 };
 
 export type TrackMetadata = {
@@ -23,6 +26,15 @@ export type TrackMetadata = {
   artist: string;
   album: string;
 };
+
+export type NeteaseFilenameFormat = 'title_only' | 'artist_title' | 'title_artist';
+
+export type AnalysisFingerprint = {
+  sizeBytes: number;
+  modifiedAt: number | null;
+};
+
+export const TRACK_ANALYSIS_VERSION = '0.1.5';
 
 type EssentiaInstance = {
   arrayToVector: (input: Float32Array) => any;
@@ -84,18 +96,73 @@ function releaseVector(value: any): void {
   }
 }
 
-function filenameIdentity(path: string): TrackMetadata {
+function normalizedFilenameStem(path: string): string {
   const filename = path.split(/[\\/]/).pop() || path;
-  const stem = filename.replace(/\.[^.]+$/, '');
+  return filename.replace(/\.[^.]+$/, '').trim().replace(/\s+/g, ' ');
+}
+
+function isNeteaseSource(path: string): boolean {
+  const lowerPath = path.toLocaleLowerCase();
+  return /\.ncm$/i.test(path)
+    || lowerPath.split(/[\\/]/).some((segment) => segment.includes('netease') || segment.includes('网易云'));
+}
+
+export function filenameIdentity(
+  path: string,
+  neteaseFilenameFormat: NeteaseFilenameFormat = 'title_artist',
+): TrackMetadata {
+  const stem = normalizedFilenameStem(path);
   const separator = stem.indexOf(' - ');
+  const neteaseSource = isNeteaseSource(path);
+  if (neteaseSource && /\.ncm$/i.test(path) && neteaseFilenameFormat === 'title_only') {
+    return { title: stem, artist: '', album: '' };
+  }
   if (separator > 0) {
+    const left = stem.slice(0, separator).trim();
+    const right = stem.slice(separator + 3).trim();
+    const preferTitleArtist = neteaseSource
+      ? neteaseFilenameFormat !== 'artist_title'
+      : false;
     return {
-      title: stem.slice(0, separator).trim(),
-      artist: stem.slice(separator + 3).trim(),
+      title: preferTitleArtist ? left : right,
+      artist: preferTitleArtist ? right : left,
       album: '',
     };
   }
   return { title: stem.trim(), artist: '', album: '' };
+}
+
+function cleanMetadataValue(value: string | undefined): string {
+  return value?.trim() || '';
+}
+
+export function resolveTrackMetadata(
+  path: string,
+  metadata: TrackMetadata | undefined,
+  neteaseFilenameFormat: NeteaseFilenameFormat = 'title_artist',
+): TrackMetadata {
+  const fallback = filenameIdentity(path, neteaseFilenameFormat);
+  const title = cleanMetadataValue(metadata?.title);
+  const artist = cleanMetadataValue(metadata?.artist);
+  const album = cleanMetadataValue(metadata?.album);
+
+  if (/\.ncm$/i.test(path) && neteaseFilenameFormat !== 'title_only') {
+    const hasSplitName = fallback.artist.length > 0;
+    if (hasSplitName) {
+      return { title: fallback.title, artist: fallback.artist, album };
+    }
+  }
+
+  if (title && artist && fallback.title && fallback.artist
+    && title === fallback.artist && artist === fallback.title) {
+    return { title: fallback.title, artist: fallback.artist, album };
+  }
+
+  return {
+    title: title || fallback.title,
+    artist: artist || fallback.artist,
+    album,
+  };
 }
 
 async function decodeAudio(bytes: Uint8Array): Promise<AudioBuffer> {
@@ -133,8 +200,15 @@ async function resampleTo44100(buffer: AudioBuffer): Promise<AudioBuffer> {
 export async function analyzeAudioFile(
   path: string,
   bytes: Uint8Array,
-  metadata: TrackMetadata = filenameIdentity(path),
+  metadata?: TrackMetadata,
+  options: {
+    fingerprint?: AnalysisFingerprint;
+    neteaseFilenameFormat?: NeteaseFilenameFormat;
+  } = {},
 ): Promise<TrackAnalysis> {
+  const neteaseFilenameFormat = options.neteaseFilenameFormat ?? 'title_artist';
+  const resolvedMetadata = resolveTrackMetadata(path, metadata, neteaseFilenameFormat);
+  const fallbackMetadata = filenameIdentity(path, neteaseFilenameFormat);
   const audio = await resampleTo44100(await decodeAudio(bytes));
   const essentia = await getEssentia();
   const sampleRate = 44100;
@@ -168,9 +242,9 @@ export async function analyzeAudioFile(
     const energy = finiteNumber(energyResult?.energy);
     return {
       path,
-      title: metadata.title || filenameIdentity(path).title,
-      artist: metadata.artist || filenameIdentity(path).artist,
-      album: metadata.album,
+      title: resolvedMetadata.title || fallbackMetadata.title,
+      artist: resolvedMetadata.artist || fallbackMetadata.artist,
+      album: resolvedMetadata.album,
       durationSeconds: finiteNumber(audio.duration),
       bpm: finiteNumber(rhythm?.bpm),
       key: typeof key?.key === 'string' ? key.key : null,
@@ -183,7 +257,10 @@ export async function analyzeAudioFile(
       beatPositions,
       analyzedAt: new Date().toISOString(),
       analyzer: 'Essentia.js',
-      analysisVersion: '0.1.3',
+      analysisVersion: TRACK_ANALYSIS_VERSION,
+      sourceSizeBytes: options.fingerprint?.sizeBytes ?? null,
+      sourceModifiedAt: options.fingerprint?.modifiedAt ?? null,
+      sourceFilenameFormat: neteaseFilenameFormat,
     };
   } finally {
     releaseVector(monoVector);

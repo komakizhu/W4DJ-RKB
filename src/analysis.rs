@@ -34,6 +34,12 @@ pub struct TrackAnalysis {
     pub analyzed_at: String,
     pub analyzer: String,
     pub analysis_version: String,
+    #[serde(default)]
+    pub source_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub source_modified_at: Option<u64>,
+    #[serde(default)]
+    pub source_filename_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +126,14 @@ pub fn load_analysis_file(path: &Path) -> Result<Vec<TrackAnalysis>, String> {
     let contents =
         fs::read_to_string(path).map_err(|error| format!("读取音乐分析库失败：{error}"))?;
     serde_json::from_str(&contents).map_err(|error| format!("解析音乐分析库失败：{error}"))
+}
+
+pub fn clear_analysis_file(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("清除音乐分析缓存失败：{error}")),
+    }
 }
 
 pub fn save_analysis_file(path: &Path, entries: &[TrackAnalysis]) -> Result<(), String> {
@@ -335,7 +349,10 @@ mod tests {
             beat_positions: vec![0.0, 0.428],
             analyzed_at: String::from("2026-07-27T00:00:00Z"),
             analyzer: String::from("Essentia.js"),
-            analysis_version: String::from("0.1.3"),
+            analysis_version: String::from("0.1.5"),
+            source_size_bytes: Some(1024),
+            source_modified_at: Some(1_754_000_000_000),
+            source_filename_format: Some(String::from("title_artist")),
         }
     }
 

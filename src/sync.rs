@@ -956,6 +956,7 @@ fn convert_audio_to_target_format(
         )
     })?;
 
+    let temporary_output = create_persistent_temp_path(output_path, ".w4dj-", true)?;
     let mut command = Command::new(&ffmpeg_path);
     configure_background_process(&mut command);
     command
@@ -979,21 +980,98 @@ fn convert_audio_to_target_format(
         }
     }
 
-    let status = command.arg(output_path).status().map_err(|error| {
-        Error::new(
-            error.kind(),
-            format!("Failed to start FFmpeg at {}: {}", ffmpeg_path, error),
-        )
-    })?;
+    let status = match command.arg(&temporary_output).status() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_output);
+            return Err(Error::new(
+                error.kind(),
+                format!("Failed to start FFmpeg at {}: {}", ffmpeg_path, error),
+            ));
+        }
+    };
 
     if !status.success() {
+        let _ = fs::remove_file(&temporary_output);
         return Err(Error::other(format!(
             "FFmpeg conversion failed for {}",
             name_stem
         )));
     }
 
-    ensure_generated_output(output_path, name_stem)
+    if let Err(error) = ensure_generated_output(&temporary_output, name_stem) {
+        let _ = fs::remove_file(&temporary_output);
+        return Err(error);
+    }
+
+    if let Err(error) = commit_temporary_output(&temporary_output, output_path) {
+        let _ = fs::remove_file(&temporary_output);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn create_persistent_temp_path(
+    output_path: &Path,
+    prefix: &str,
+    remove_placeholder: bool,
+) -> io::Result<PathBuf> {
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let suffix = output_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    let temp_file = tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(&suffix)
+        .tempfile_in(parent)
+        .map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!("Failed to create a temporary output file: {error}"),
+            )
+        })?;
+    let (file, path) = temp_file.keep().map_err(|error| {
+        Error::new(
+            error.error.kind(),
+            format!("Failed to keep a temporary output file: {}", error.error),
+        )
+    })?;
+    drop(file);
+    if remove_placeholder {
+        fs::remove_file(&path)?;
+    }
+    Ok(path)
+}
+
+fn commit_temporary_output(temporary_path: &Path, output_path: &Path) -> io::Result<()> {
+    if !output_path.exists() {
+        return fs::rename(temporary_path, output_path);
+    }
+
+    let backup_path = create_persistent_temp_path(output_path, ".w4dj-backup-", true)?;
+    fs::rename(output_path, &backup_path)?;
+
+    match fs::rename(temporary_path, output_path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&backup_path);
+            Ok(())
+        }
+        Err(error) => {
+            if let Err(restore_error) = fs::rename(&backup_path, output_path) {
+                return Err(Error::other(format!(
+                    "Failed to commit converted output {}: {}; restoring the previous file also failed: {}",
+                    output_path.display(),
+                    error,
+                    restore_error
+                )));
+            }
+            Err(error)
+        }
+    }
 }
 
 fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()> {
@@ -2338,7 +2416,7 @@ fn write_container_tags(
 mod tests {
     use super::{
         EmbeddedAnalysis, SongIdentity, apply_track_analysis_metadata, build_song_name,
-        build_song_name_with_rule, compare_music_dicts, derive_song_name,
+        build_song_name_with_rule, commit_temporary_output, compare_music_dicts, derive_song_name,
         derive_song_name_with_rule, ensure_generated_output, ensure_output_metadata,
         fill_missing_metadata, find_ffmpeg_next_to_exe, infer_song_identity,
         remove_conflicting_outputs, sanitize_filename_component, strip_163_key_from_mp3,
@@ -2614,6 +2692,21 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(error.to_string().contains("missing.aiff"));
+    }
+
+    #[test]
+    fn commits_temporary_output_without_leaving_the_previous_file() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("song.mp3");
+        let temporary = dir.path().join(".w4dj-song.mp3");
+        fs::write(&output, b"old output").unwrap();
+        fs::write(&temporary, b"new output").unwrap();
+
+        commit_temporary_output(&temporary, &output).unwrap();
+
+        assert_eq!(fs::read(&output).unwrap(), b"new output");
+        assert!(!temporary.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

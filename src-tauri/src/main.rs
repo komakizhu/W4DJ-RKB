@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ncmdump::Ncmdump;
 use tauri::Manager;
 use w4dj::analysis::{
-    TrackAnalysis, TrackMetadata, analysis_file_path, build_rekordbox_xml, load_analysis_file,
-    merge_analysis_entries, read_track_metadata, save_analysis_file,
+    TrackAnalysis, TrackMetadata, analysis_file_path, build_rekordbox_xml, clear_analysis_file,
+    load_analysis_file, merge_analysis_entries, read_track_metadata, save_analysis_file,
 };
 use w4dj::config::{
     ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
@@ -395,6 +395,31 @@ fn read_audio_metadata(path: String) -> Result<TrackMetadata, String> {
     Ok(read_track_metadata(&path))
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioFileFingerprint {
+    size_bytes: u64,
+    modified_at: Option<u64>,
+}
+
+#[tauri::command]
+fn get_audio_file_fingerprint(path: String) -> Result<AudioFileFingerprint, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("音频路径为空"));
+    }
+    let metadata = fs::metadata(trimmed).map_err(|error| format!("读取音频文件信息失败：{error}"))?;
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64);
+    Ok(AudioFileFingerprint {
+        size_bytes: metadata.len(),
+        modified_at,
+    })
+}
+
 fn current_analysis_path(state: &tauri::State<'_, AppState>) -> PathBuf {
     let history_path = state
         .history_path
@@ -429,6 +454,16 @@ fn save_track_analyses(
     let count = merged.len();
     save_analysis_file(&path, &merged)?;
     Ok(count)
+}
+
+#[tauri::command]
+fn clear_track_analyses(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let path = current_analysis_path(&state);
+    let _guard = state
+        .history_write_lock
+        .lock()
+        .expect("history write lock poisoned");
+    clear_analysis_file(&path)
 }
 
 #[tauri::command]
@@ -1280,7 +1315,7 @@ fn start_confirmed_sync(
 }
 
 #[tauri::command]
-fn load_history(state: tauri::State<'_, AppState>) -> Vec<HistoryEntry> {
+fn load_history(state: tauri::State<'_, AppState>) -> Result<Vec<HistoryEntry>, String> {
     let history_path = state
         .history_path
         .lock()
@@ -1290,10 +1325,7 @@ fn load_history(state: tauri::State<'_, AppState>) -> Vec<HistoryEntry> {
         .history_write_lock
         .lock()
         .expect("history write lock poisoned");
-    load_history_file(history_path).unwrap_or_else(|error| {
-        eprintln!("Failed to load conversion history: {}", error);
-        Vec::new()
-    })
+    load_history_file(history_path).map_err(|error| format!("读取转换历史失败：{error}"))
 }
 
 #[tauri::command]
@@ -1519,8 +1551,10 @@ fn main() {
             list_audio_files,
             read_audio_file,
             read_audio_metadata,
+            get_audio_file_fingerprint,
             load_track_analyses,
             save_track_analyses,
+            clear_track_analyses,
             export_rekordbox_xml
         ])
         .setup(|app| {

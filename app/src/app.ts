@@ -1,7 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
-import { analyzeAudioFile, type TrackAnalysis, type TrackMetadata } from './analysis';
+import {
+  analyzeAudioFile,
+  TRACK_ANALYSIS_VERSION,
+  type TrackAnalysis,
+  type TrackMetadata,
+} from './analysis';
 
 export type AppMode = 'compat' | 'lossless';
 export type AppLosslessFormat = 'wav' | 'aiff';
@@ -163,6 +168,22 @@ export type AppAnalysisFailure = {
   message: string;
 };
 
+export type AppAudioFileFingerprint = {
+  sizeBytes: number;
+  modifiedAt: number | null;
+};
+
+export function canReuseTrackAnalysis(
+  cached: TrackAnalysis | undefined,
+  fingerprint: AppAudioFileFingerprint,
+  neteaseFilenameFormat: AppNeteaseFilenameFormat,
+): cached is TrackAnalysis {
+  return cached?.analysisVersion === TRACK_ANALYSIS_VERSION
+    && cached.sourceSizeBytes === fingerprint.sizeBytes
+    && (cached.sourceModifiedAt ?? null) === fingerprint.modifiedAt
+    && (cached.sourceFilenameFormat ?? 'title_artist') === neteaseFilenameFormat;
+}
+
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
 
 export type AppHistoryEntry = {
@@ -249,8 +270,10 @@ export type AppServices = {
   listAudioFiles: (path: string) => Promise<string[]>;
   readAudioFile: (path: string) => Promise<number[]>;
   readTrackMetadata: (path: string) => Promise<TrackMetadata>;
+  getAudioFileFingerprint: (path: string) => Promise<AppAudioFileFingerprint>;
   loadTrackAnalyses: () => Promise<TrackAnalysis[]>;
   saveTrackAnalyses: (entries: TrackAnalysis[]) => Promise<number>;
+  clearTrackAnalyses: () => Promise<void>;
   exportRekordboxXml: (path: string) => Promise<void>;
 };
 
@@ -377,6 +400,7 @@ const translations = {
     resumeTasks: '继续未完成任务',
     deleteHistory: '删除记录',
     clearHistory: '清空历史',
+    historyLoadError: '转换历史读取失败，原记录未被覆盖。请检查历史文件后再重试。',
     about: '关于',
     tutorial: '教程',
     helpTitle: '使用帮助',
@@ -425,6 +449,9 @@ const translations = {
     analysisComplete: '已保存 {count} 首分析结果，可导入 Rekordbox。',
     analysisPartial: '完成 {done}/{total} 首，{failed} 首失败。',
     analysisNoResults: '没有成功的分析结果。',
+    clearAnalysisCache: '清除分析缓存',
+    clearAnalysisCacheConfirm: '确定清除已保存的音乐分析缓存吗？不会删除音频文件或转换历史。',
+    analysisCacheCleared: '音乐分析缓存已清除。',
     scanTitle: '扫描歌曲',
     scanPreparing: '正在准备扫描',
     scanSource: '正在扫描输入目录',
@@ -523,6 +550,7 @@ const translations = {
     resumeTasks: 'Resume unfinished tasks',
     deleteHistory: 'Delete entry',
     clearHistory: 'Clear history',
+    historyLoadError: 'Conversion history could not be read. Existing records were not overwritten. Check the history file and try again.',
     about: 'About',
     tutorial: 'Tutorial',
     helpTitle: 'Help',
@@ -571,6 +599,9 @@ const translations = {
     analysisComplete: '{count} results saved. Ready for Rekordbox.',
     analysisPartial: 'Completed {done}/{total}; {failed} failed.',
     analysisNoResults: 'No analysis result was completed.',
+    clearAnalysisCache: 'Clear analysis cache',
+    clearAnalysisCacheConfirm: 'Clear the saved music analysis cache? Audio files and conversion history will not be deleted.',
+    analysisCacheCleared: 'Music analysis cache cleared.',
     scanTitle: 'Scanning songs',
     scanPreparing: 'Preparing scan',
     scanSource: 'Scanning input folders',
@@ -753,8 +784,10 @@ const defaultServices: AppServices = {
   listAudioFiles: (path) => invoke<string[]>('list_audio_files', { path }),
   readAudioFile: (path) => invoke<number[]>('read_audio_file', { path }),
   readTrackMetadata: (path) => invoke<TrackMetadata>('read_audio_metadata', { path }),
+  getAudioFileFingerprint: (path) => invoke<AppAudioFileFingerprint>('get_audio_file_fingerprint', { path }),
   loadTrackAnalyses: () => invoke<TrackAnalysis[]>('load_track_analyses'),
   saveTrackAnalyses: (entries) => invoke<number>('save_track_analyses', { entries }),
+  clearTrackAnalyses: () => invoke<void>('clear_track_analyses'),
   exportRekordboxXml: (path) => invoke<void>('export_rekordbox_xml', { path }),
 };
 
@@ -775,6 +808,7 @@ export function renderApp(
   scanProgress: AppScanProgress | null = null,
   helpVisible = false,
   updateInfo: AppUpdateCheck | null = null,
+  historyLoadError: string | null = null,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -925,7 +959,7 @@ export function renderApp(
           )}
           ${renderSyncSlot(state, 1)}
         </div>
-        ${renderHistory(history, state.lang, historyExpanded)}
+        ${renderHistory(history, state.lang, historyExpanded, historyLoadError)}
       </div>
     </section>
     ${renderScanModal(scanProgress, state.lang)}
@@ -1074,7 +1108,12 @@ function previewHasRetryErrors(modal: AppPreviewModalState): boolean {
   return modal.retryOf !== null && modal.previews.some((item) => item.preview.error_count > 0);
 }
 
-function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage, expanded = false): string {
+function renderHistory(
+  entries: AppHistoryEntry[],
+  lang: AppLanguage,
+  expanded = false,
+  historyLoadError: string | null = null,
+): string {
   return `
     <details class="history-panel" data-role="history" ${expanded ? 'open' : ''}>
       <summary class="history-head">
@@ -1084,8 +1123,10 @@ function renderHistory(entries: AppHistoryEntry[], lang: AppLanguage, expanded =
         </div>
       </summary>
       <div class="history-body">
-        ${entries.length > 0 ? `<div class="history-body-actions"><button type="button" class="secondary-action history-clear" data-action="clear-history">${t('clearHistory', lang)}</button></div>` : ''}
-        ${entries.length === 0
+        ${(entries.length > 0 || historyLoadError) ? `<div class="history-body-actions"><button type="button" class="secondary-action history-clear" data-action="clear-history">${t('clearHistory', lang)}</button></div>` : ''}
+        ${historyLoadError
+          ? `<p class="history-error">${escapeHtml(historyLoadError)}</p>`
+          : entries.length === 0
           ? `<p class="history-empty">${t('noHistory', lang)}</p>`
           : `<div class="history-list">${entries.map((entry) => renderHistoryEntry(entry, lang)).join('')}</div>`}
       </div>
@@ -1210,6 +1251,7 @@ export function bindApp(
   let previewModal: AppPreviewModalState | null = null;
   let previewBusy = false;
   let history: AppHistoryEntry[] = [];
+  let historyLoadError: string | null = null;
   let aboutInfo: AppInfo | null = null;
   let updateInfo: AppUpdateCheck | null = null;
   let helpVisible = false;
@@ -1241,6 +1283,7 @@ export function bindApp(
         scanProgress,
         helpVisible,
         updateInfo,
+        historyLoadError,
       ),
     );
 
@@ -1376,11 +1419,17 @@ export function bindApp(
   const refreshHistory = async (renderAfter = true) => {
     try {
       history = await services.loadHistory();
+      historyLoadError = null;
       if (renderAfter && selectionMotion === null && pendingSelection === null) {
         render();
       }
     } catch (error) {
       console.error('Failed to load conversion history:', error);
+      history = [];
+      historyLoadError = t('historyLoadError', state.lang);
+      if (renderAfter && selectionMotion === null && pendingSelection === null) {
+        render();
+      }
     }
   };
 
@@ -1749,6 +1798,20 @@ export function bindApp(
     }
   };
 
+  const clearAnalysisCache = async () => {
+    if (!window.confirm(t('clearAnalysisCacheConfirm', state.lang))) {
+      return;
+    }
+    try {
+      await services.clearTrackAnalyses();
+      analysisState = { ...defaultAnalysisState, message: t('analysisCacheCleared', state.lang) };
+      render();
+      window.alert(t('analysisCacheCleared', state.lang));
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
   const yieldToUi = async () => {
     await new Promise<void>((resolve) => {
       if (typeof requestAnimationFrame === 'function') {
@@ -1791,8 +1854,17 @@ export function bindApp(
     render();
 
     const results: TrackAnalysis[] = [];
+    const freshResults: TrackAnalysis[] = [];
     const failures: AppAnalysisFailure[] = [];
     let failedCount = 0;
+    let cachedEntries: TrackAnalysis[] = [];
+    try {
+      cachedEntries = await services.loadTrackAnalyses();
+    } catch (error) {
+      console.warn('Failed to load Essentia analysis cache; rebuilding entries:', error);
+    }
+    const cacheByPath = new Map(cachedEntries.map((entry) => [entry.path, entry]));
+
     for (const candidate of candidates) {
       if (analysisCancelRequested) {
         analysisState = {
@@ -1809,24 +1881,47 @@ export function bindApp(
         render();
         return { analyses: [], failures: [] };
       }
+      let fingerprint: AppAudioFileFingerprint | null = null;
       try {
-        const bytes = await services.readAudioFile(candidate.source_path);
-        let metadata: TrackMetadata | undefined;
-        try {
-          metadata = await services.readTrackMetadata(candidate.source_path);
-        } catch {
-          // Analysis can continue using the filename identity.
-        }
-        results.push(
-          await analyzeAudioFile(candidate.source_path, Uint8Array.from(bytes), metadata),
-        );
+        fingerprint = await services.getAudioFileFingerprint(candidate.source_path);
       } catch (error) {
-        failedCount += 1;
-        failures.push({
-          path: candidate.source_path,
-          message: error instanceof Error ? error.message : String(error),
-        });
-        console.warn(`Essentia analysis failed for ${candidate.source_path}`, error);
+        console.warn(`Failed to fingerprint ${candidate.source_path}; reanalyzing it:`, error);
+      }
+
+      const cached = cacheByPath.get(candidate.source_path);
+      const canReuse = fingerprint !== null
+        && canReuseTrackAnalysis(cached, fingerprint, state.neteaseFilenameFormat);
+
+      if (canReuse && cached) {
+        results.push(cached);
+      } else {
+        try {
+          const bytes = await services.readAudioFile(candidate.source_path);
+          let metadata: TrackMetadata | undefined;
+          try {
+            metadata = await services.readTrackMetadata(candidate.source_path);
+          } catch {
+            // Analysis can continue using the filename identity.
+          }
+          const analysis = await analyzeAudioFile(
+            candidate.source_path,
+            Uint8Array.from(bytes),
+            metadata,
+            {
+              fingerprint: fingerprint || undefined,
+              neteaseFilenameFormat: state.neteaseFilenameFormat,
+            },
+          );
+          results.push(analysis);
+          freshResults.push(analysis);
+        } catch (error) {
+          failedCount += 1;
+          failures.push({
+            path: candidate.source_path,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          console.warn(`Essentia analysis failed for ${candidate.source_path}`, error);
+        }
       }
       analysisState = {
         ...analysisState,
@@ -1855,9 +1950,9 @@ export function bindApp(
           .replace('{failed}', String(failedCount))
         : t('analysisComplete', state.lang).replace('{count}', String(results.length)),
     };
-    if (results.length > 0) {
+    if (freshResults.length > 0) {
       try {
-        await services.saveTrackAnalyses(results);
+        await services.saveTrackAnalyses(freshResults);
       } catch (error) {
         console.warn('Failed to save Essentia analysis cache:', error);
       }
@@ -2106,6 +2201,11 @@ export function bindApp(
 
     if (action === 'clear-history') {
       void clearAllHistory();
+      return;
+    }
+
+    if (action === 'clear-analysis-cache') {
+      void clearAnalysisCache();
       return;
     }
 
@@ -2463,6 +2563,9 @@ function renderOutputSettings(state: AppViewState, expanded = false): string {
             <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('neteaseTitleArtist', state.lang)}</option>
           </select>
         </label>
+        <button type="button" class="secondary-action analysis-cache-clear" data-action="clear-analysis-cache">
+          ${t('clearAnalysisCache', state.lang)}
+        </button>
       </div>
     </details>
   `;

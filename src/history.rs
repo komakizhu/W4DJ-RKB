@@ -155,7 +155,7 @@ pub fn load_history(path: impl AsRef<Path>) -> io::Result<Vec<HistoryEntry>> {
 
 pub fn append_history(path: impl AsRef<Path>, entry: HistoryEntry) -> io::Result<()> {
     let path = path.as_ref();
-    let mut entries = load_history(path).unwrap_or_default();
+    let mut entries = load_history(path)?;
     entries.insert(0, entry);
     entries.truncate(MAX_HISTORY_ENTRIES);
 
@@ -164,7 +164,7 @@ pub fn append_history(path: impl AsRef<Path>, entry: HistoryEntry) -> io::Result
 
 pub fn upsert_history(path: impl AsRef<Path>, entry: HistoryEntry) -> io::Result<()> {
     let path = path.as_ref();
-    let mut entries = load_history(path).unwrap_or_default();
+    let mut entries = load_history(path)?;
     entries.retain(|existing| existing.id != entry.id);
     entries.insert(0, entry);
     entries.truncate(MAX_HISTORY_ENTRIES);
@@ -403,5 +403,63 @@ fn candidate_operation_label(operation: CandidateOperation) -> &'static str {
     match operation {
         CandidateOperation::Convert => "转换",
         CandidateOperation::UpdateMetadata => "更新元数据",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Mode;
+
+    fn test_entry() -> HistoryEntry {
+        HistoryEntry {
+            id: String::from("history-1"),
+            batch_id: String::from("batch-1"),
+            slot_index: 0,
+            started_at: String::from("2026-08-06 12:00"),
+            finished_at: String::from("2026-08-06 12:01"),
+            duration_seconds: 60,
+            source_directory: String::from("/music/in"),
+            destination_directory: String::from("/music/out"),
+            mode: Mode::Compat,
+            lossless_format: None,
+            new_count: 1,
+            existing_count: 0,
+            skipped_count: 0,
+            error_count: 0,
+            completed_count: 1,
+            failed_count: 0,
+            failed_files: Vec::new(),
+            pending_files: Vec::new(),
+            metadata_diagnostics: Vec::new(),
+            logs: Vec::new(),
+            status: HistoryStatus::Completed,
+            retry_of: None,
+            conflict_strategy: ConflictStrategy::default(),
+            filename_rule: FilenameRule::default(),
+            report_path: None,
+        }
+    }
+
+    #[test]
+    fn corrupted_history_is_not_replaced_by_append_or_upsert() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("history.json");
+        let original = b"{ this is not valid history }";
+        fs::write(&path, original).expect("corrupt history should be written");
+
+        let append_error = append_history(&path, test_entry()).expect_err("append should fail");
+        assert_eq!(append_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).expect("history should remain readable"),
+            original
+        );
+
+        let upsert_error = upsert_history(&path, test_entry()).expect_err("upsert should fail");
+        assert_eq!(upsert_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).expect("history should remain readable"),
+            original
+        );
     }
 }

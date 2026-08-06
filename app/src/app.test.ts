@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   bindApp,
+  canReuseTrackAnalysis,
   humanizeError,
   resolveDropTargetAt,
   renderApp,
@@ -196,6 +197,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   chooseEnhancedMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseConflictStrategy: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseFilenameRule: vi.fn().mockResolvedValue(makeDesktopState()),
+  chooseNeteaseFilenameFormat: vi.fn().mockResolvedValue(makeDesktopState()),
   previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
   startScan: vi.fn().mockResolvedValue({
     status: 'completed',
@@ -259,8 +261,10 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   listAudioFiles: vi.fn().mockResolvedValue([]),
   readAudioFile: vi.fn().mockResolvedValue([]),
   readTrackMetadata: vi.fn().mockResolvedValue({ title: '', artist: '', album: '' }),
+  getAudioFileFingerprint: vi.fn().mockResolvedValue({ sizeBytes: 0, modifiedAt: null }),
   loadTrackAnalyses: vi.fn().mockResolvedValue([]),
   saveTrackAnalyses: vi.fn().mockResolvedValue(0),
+  clearTrackAnalyses: vi.fn().mockResolvedValue(undefined),
   exportRekordboxXml: vi.fn().mockResolvedValue(undefined),
   ...overrides,
 });
@@ -1434,6 +1438,37 @@ describe('bindApp', () => {
     );
   });
 
+  it('reuses an unchanged analysis cache entry only for the same filename setting', () => {
+    const cached = {
+      path: '/music/Artist - Song.mp3',
+      title: 'Song',
+      artist: 'Artist',
+      album: '',
+      durationSeconds: 180,
+      bpm: 140,
+      key: 'F',
+      scale: 'minor',
+      keyStrength: 0.8,
+      integratedLoudnessLufs: -8,
+      loudnessRangeLu: 4,
+      energy: 0.9,
+      danceability: 0.7,
+      beatPositions: [],
+      analyzedAt: '2026-08-06T00:00:00Z',
+      analyzer: 'Essentia.js',
+      analysisVersion: '0.1.5',
+      sourceSizeBytes: 1234,
+      sourceModifiedAt: 1_754_000_000_000,
+      sourceFilenameFormat: 'artist_title' as const,
+    };
+
+    const fingerprint = { sizeBytes: 1234, modifiedAt: 1_754_000_000_000 };
+    expect(canReuseTrackAnalysis(cached, fingerprint, 'artist_title')).toBe(true);
+    expect(canReuseTrackAnalysis(cached, fingerprint, 'title_artist')).toBe(false);
+    expect(canReuseTrackAnalysis({ ...cached, sourceSizeBytes: 1235 }, fingerprint, 'artist_title'))
+      .toBe(false);
+  });
+
   it('cancels a running scan without starting conversion', async () => {
     const deferred = createDeferred<AppScanProgress>();
     const services = makeMockServices({
@@ -1653,6 +1688,34 @@ describe('bindApp', () => {
       new MouseEvent('click', { bubbles: true }),
     );
     await vi.waitFor(() => expect(root.querySelector('[data-role="about-modal"]')).toBeNull());
+  });
+
+  it('shows a history read error instead of replacing a damaged history with an empty state', async () => {
+    const services = makeMockServices({
+      loadHistory: vi.fn().mockRejectedValue(new Error('invalid history JSON')),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('.history-error')?.textContent).toContain('转换历史读取失败');
+      expect(root.querySelector('.history-empty')).toBeNull();
+    });
+  });
+
+  it('clears the saved analysis cache only after confirmation', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
+    const services = makeMockServices();
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="clear-analysis-cache"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.clearTrackAnalyses).toHaveBeenCalledTimes(1));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('音乐分析缓存'));
+    expect(alert).toHaveBeenCalledWith('音乐分析缓存已清除。');
+    confirm.mockRestore();
+    alert.mockRestore();
   });
 
   it('deletes one history entry and clears all history', async () => {
