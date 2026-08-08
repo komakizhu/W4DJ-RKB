@@ -1,3 +1,4 @@
+use crate::netease::recover_local_metadata;
 use id3::TagLike;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -57,7 +58,7 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    match extension.as_str() {
+    let mut metadata = match extension.as_str() {
         "flac" => metaflac::Tag::read_from_path(path)
             .ok()
             .and_then(|tag| {
@@ -100,7 +101,26 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
             })
             .unwrap_or_default(),
         _ => TrackMetadata::default(),
+    };
+
+    // Plain MP3/FLAC downloads from NetEase may have no embedded tags even
+    // though the desktop client still knows the track.  Merge only missing
+    // values so user-authored tags remain authoritative.
+    if !matches!(extension.as_str(), "ncm")
+        && let Some(recovered) = recover_local_metadata(path)
+    {
+        if metadata.title.trim().is_empty() {
+            metadata.title = recovered.title;
+        }
+        if metadata.artist.trim().is_empty() {
+            metadata.artist = recovered.artist;
+        }
+        if metadata.album.trim().is_empty() {
+            metadata.album = recovered.album;
+        }
     }
+
+    metadata
 }
 
 fn first_metadata_value(values: Option<&Vec<String>>) -> String {

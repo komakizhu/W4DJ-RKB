@@ -2,6 +2,7 @@ use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
+use crate::netease::RecoveredMetadata;
 use crate::task::{TaskController, TaskSnapshot};
 use id3::frame::{Comment, ExtendedText, Picture};
 use id3::{TagLike, Version};
@@ -1297,7 +1298,7 @@ fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    match extension.as_str() {
+    let mut tag = match extension.as_str() {
         "flac" => metaflac::Tag::read_from_path(source_path)
             .map(|tag| build_id3_tag_from_flac(&tag))
             .unwrap_or_else(|_| id3::Tag::new()),
@@ -1315,7 +1316,50 @@ fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
             build_id3_tag(&info, &image)
         }
         _ => read_id3_tag_or_empty(source_path),
+    };
+
+    if !matches!(extension.as_str(), "ncm")
+        && let Some(recovered) = crate::netease::recover_local_metadata(source_path)
+    {
+        merge_recovered_metadata(&mut tag, &recovered);
     }
+
+    tag
+}
+
+fn merge_recovered_metadata(tag: &mut id3::Tag, recovered: &RecoveredMetadata) -> bool {
+    let mut changed = false;
+
+    if is_blank(tag.title()) && !recovered.title.trim().is_empty() {
+        tag.set_title(recovered.title.trim());
+        changed = true;
+    }
+    if is_blank(tag.artist()) && !recovered.artist.trim().is_empty() {
+        tag.set_artist(recovered.artist.trim());
+        changed = true;
+    }
+    if is_blank(tag.album()) && !recovered.album.trim().is_empty() {
+        tag.set_album(recovered.album.trim());
+        changed = true;
+    }
+
+    let has_cover = tag
+        .pictures()
+        .any(|picture| crate::metadata::get_image_mime_type(&picture.data) != "image/*");
+    if !has_cover
+        && let Some(cover) = recovered.cover.as_deref()
+        && crate::metadata::get_image_mime_type(cover) != "image/*"
+    {
+        tag.add_frame(Picture {
+            mime_type: crate::metadata::get_image_mime_type(cover).to_string(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: cover.to_vec(),
+        });
+        changed = true;
+    }
+
+    changed
 }
 
 fn read_id3_tag_or_empty(path: &Path) -> id3::Tag {
@@ -1809,13 +1853,12 @@ fn song_name_from_flac(
     filename_rule: FilenameRule,
     fallback_name: &str,
 ) -> Option<String> {
-    let tag = metaflac::Tag::read_from_path(path).ok()?;
-    let comments = tag.vorbis_comments();
-    let title = comments.and_then(|comments| first_non_empty(comments.title()));
-    let artist = comments.and_then(|comments| {
-        join_non_empty(comments.artist()).or_else(|| join_non_empty(comments.album_artist()))
-    });
-    let identity = infer_song_identity(fallback_name, title, artist.as_deref());
+    let tag = source_metadata_as_id3(path);
+    let identity = infer_song_identity(
+        fallback_name,
+        tag.title(),
+        tag.artist().or_else(|| tag.album_artist()),
+    );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
@@ -1824,7 +1867,7 @@ fn song_name_from_audio_tag(
     filename_rule: FilenameRule,
     fallback_name: &str,
 ) -> Option<String> {
-    let tag = id3::Tag::read_from_path(path).ok()?;
+    let tag = source_metadata_as_id3(path);
     let artist = tag.artist().or_else(|| tag.album_artist());
     let identity = infer_song_identity(fallback_name, tag.title(), artist);
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
@@ -1963,26 +2006,6 @@ fn normalize_filename_part(value: Option<&str>) -> Option<String> {
     let value = value?;
     let normalized = sanitize_filename_component(&normalize_display_text(value));
     (!normalized.is_empty()).then_some(normalized)
-}
-
-fn first_non_empty(values: Option<&Vec<String>>) -> Option<&str> {
-    values.and_then(|values| {
-        values
-            .iter()
-            .map(String::as_str)
-            .find(|value| !value.trim().is_empty())
-    })
-}
-
-fn join_non_empty(values: Option<&Vec<String>>) -> Option<String> {
-    let values = values?;
-    let joined = values
-        .iter()
-        .map(String::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .collect::<Vec<&str>>()
-        .join(", ");
-    (!joined.is_empty()).then_some(joined)
 }
 
 #[cfg(test)]
@@ -2419,7 +2442,8 @@ mod tests {
         build_song_name_with_rule, commit_temporary_output, compare_music_dicts, derive_song_name,
         derive_song_name_with_rule, ensure_generated_output, ensure_output_metadata,
         fill_missing_metadata, find_ffmpeg_next_to_exe, infer_song_identity,
-        remove_conflicting_outputs, sanitize_filename_component, strip_163_key_from_mp3,
+        merge_recovered_metadata, remove_conflicting_outputs, sanitize_filename_component,
+        strip_163_key_from_mp3,
     };
     use crate::config::{FilenameRule, LosslessFormat, Mode};
     use id3::{Tag, TagLike, Version};
@@ -2791,6 +2815,28 @@ mod tests {
         let tag = Tag::read_from_path(&output_path).unwrap();
         assert_eq!(tag.title(), Some("Mystic State, Third Degree"));
         assert_eq!(tag.artist(), Some("Mr Wankerman"));
+    }
+
+    #[test]
+    fn merges_recovered_netease_tags_and_cover_without_overwriting_existing_values() {
+        let mut tag = Tag::new();
+        let recovered = crate::netease::RecoveredMetadata {
+            title: String::from("网易云歌曲"),
+            artist: String::from("网易云歌手"),
+            album: String::from("网易云专辑"),
+            cover: Some(vec![0xFF, 0xD8, 0xFF, 0x00]),
+            source: String::from("网易云本地数据库 + 本地封面"),
+        };
+
+        assert!(merge_recovered_metadata(&mut tag, &recovered));
+        assert_eq!(tag.title(), Some("网易云歌曲"));
+        assert_eq!(tag.artist(), Some("网易云歌手"));
+        assert_eq!(tag.album(), Some("网易云专辑"));
+        assert_eq!(tag.pictures().count(), 1);
+
+        tag.set_title("用户标题");
+        assert!(!merge_recovered_metadata(&mut tag, &recovered));
+        assert_eq!(tag.title(), Some("用户标题"));
     }
 
     #[test]

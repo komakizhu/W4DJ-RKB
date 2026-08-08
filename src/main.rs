@@ -1,6 +1,7 @@
 mod config;
 pub mod gui;
 mod metadata;
+mod netease;
 mod sync;
 pub mod task;
 use crate::config::{Cmd, Config};

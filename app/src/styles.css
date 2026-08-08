@@ -1179,9 +1179,21 @@ h1 {
 .analysis-cache-clear {
   justify-self: start;
   min-height: 30px;
-  color: var(--rail-muted);
+  border-color: transparent;
+  border-radius: 11px;
+  background: var(--rail-text);
+  color: var(--rail);
   font-size: 10px;
-  font-weight: 400;
+  font-weight: 500;
+  transition: background 180ms ease, border-color 180ms ease, color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.analysis-cache-clear:hover {
+  border-color: var(--cyan);
+  background: var(--cyan-soft);
+  color: var(--rail-text);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--cyan) 14%, transparent);
 }
 
 .output-settings label {
