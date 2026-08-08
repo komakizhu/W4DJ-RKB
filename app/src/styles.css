@@ -1176,12 +1176,14 @@ h1 {
   padding-top: 0;
 }
 
-.analysis-cache-clear {
+.output-settings .analysis-cache-clear {
   justify-self: start;
+  display: inline-flex;
+  align-items: center;
   min-height: 30px;
-  border-color: transparent;
+  border: 1px solid var(--orange);
   border-radius: 11px;
-  background: var(--rail-text);
+  background: var(--orange);
   color: var(--rail);
   font-size: 10px;
   font-weight: 500;
@@ -1189,11 +1191,11 @@ h1 {
     box-shadow 180ms ease;
 }
 
-.analysis-cache-clear:hover {
-  border-color: var(--cyan);
-  background: var(--cyan-soft);
-  color: var(--rail-text);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--cyan) 14%, transparent);
+.output-settings .analysis-cache-clear:hover {
+  border-color: var(--rail-text);
+  background: var(--rail-text);
+  color: var(--rail);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--orange) 18%, transparent);
 }
 
 .output-settings label {
