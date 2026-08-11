@@ -1,4 +1,6 @@
-use crate::config::{CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode};
+use crate::config::{
+    CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
+};
 use crate::sync::MetadataDiagnostic;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -134,6 +136,8 @@ pub struct HistoryEntry {
     pub conflict_strategy: ConflictStrategy,
     #[serde(default)]
     pub filename_rule: FilenameRule,
+    #[serde(default)]
+    pub netease_filename_format: NeteaseFilenameFormat,
     #[serde(default)]
     pub report_path: Option<String>,
 }
@@ -409,7 +413,7 @@ fn candidate_operation_label(operation: CandidateOperation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Mode;
+    use crate::config::{Mode, NeteaseFilenameFormat};
 
     fn test_entry() -> HistoryEntry {
         HistoryEntry {
@@ -437,6 +441,7 @@ mod tests {
             retry_of: None,
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
+            netease_filename_format: NeteaseFilenameFormat::default(),
             report_path: None,
         }
     }
@@ -460,6 +465,35 @@ mod tests {
         assert_eq!(
             fs::read(&path).expect("history should remain readable"),
             original
+        );
+    }
+
+    #[test]
+    fn history_defaults_legacy_netease_format_and_roundtrips_selected_format() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("history.json");
+
+        let mut legacy = serde_json::to_value(test_entry()).expect("entry should serialize");
+        legacy
+            .as_object_mut()
+            .expect("history entry should be an object")
+            .remove("netease_filename_format");
+        fs::write(&path, serde_json::to_vec(&vec![legacy]).unwrap()).unwrap();
+
+        let loaded_legacy = load_history(&path).expect("legacy history should load");
+        assert_eq!(
+            loaded_legacy[0].netease_filename_format,
+            NeteaseFilenameFormat::default()
+        );
+
+        let mut selected = test_entry();
+        selected.netease_filename_format = NeteaseFilenameFormat::ArtistTitle;
+        append_history(&path, selected).expect("selected format should be saved");
+
+        let loaded = load_history(&path).expect("history should reload");
+        assert_eq!(
+            loaded[0].netease_filename_format,
+            NeteaseFilenameFormat::ArtistTitle
         );
     }
 }

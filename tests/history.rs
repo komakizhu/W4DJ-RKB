@@ -33,6 +33,7 @@ fn test_entry(index: usize) -> HistoryEntry {
         retry_of: None,
         conflict_strategy: Default::default(),
         filename_rule: Default::default(),
+        netease_filename_format: Default::default(),
         report_path: None,
     }
 }

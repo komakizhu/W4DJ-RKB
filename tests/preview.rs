@@ -320,6 +320,7 @@ fn retry_preview_restores_pending_files_saved_before_app_exit() {
         retry_of: None,
         conflict_strategy: ConflictStrategy::Skip,
         filename_rule: FilenameRule::TitleArtist,
+        netease_filename_format: Default::default(),
         report_path: None,
     };
 
@@ -380,6 +381,7 @@ fn retry_preview_ignores_old_macos_appledouble_failures_and_pending_files() {
         retry_of: None,
         conflict_strategy: ConflictStrategy::Skip,
         filename_rule: FilenameRule::TitleArtist,
+        netease_filename_format: Default::default(),
         report_path: None,
     };
 

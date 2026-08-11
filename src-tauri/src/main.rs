@@ -35,7 +35,8 @@ use w4dj::sync::{
     count_music_files_with_cancel,
     EmbeddedAnalysis, inspect_metadata_diagnostic,
     get_destination_music_dict, get_music_dict_with_scan_issues, is_supported_source_file,
-    sync_music_library_with_observer, update_existing_metadata, ScanPhase,
+    sync_music_library_transactional_with_observer, sync_music_library_with_observer,
+    update_existing_metadata_transactionally, ScanPhase,
 };
 
 #[cfg(target_os = "macos")]
@@ -112,6 +113,7 @@ struct ConfirmedSyncJob {
     lossless_format: Option<LosslessFormat>,
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
     candidates: Vec<PreviewCandidate>,
     analyses: Vec<EmbeddedAnalysis>,
     analysis_failures: Vec<AnalysisFailure>,
@@ -998,7 +1000,16 @@ fn run_scan_task(
 }
 
 fn validate_scan_previews(previews: &[SlotPreview]) -> Result<(), String> {
-    for preview in previews {
+    let processable = previews
+        .iter()
+        .filter(|preview| !preview.preview.candidates.is_empty())
+        .collect::<Vec<_>>();
+
+    if processable.is_empty() {
+        return Err(String::from("没有可处理的转换任务"));
+    }
+
+    for preview in &processable {
         validate_source_input(&preview.preview.source_directory)?;
         let source_path = Path::new(&preview.preview.source_directory);
         if source_path.is_file() {
@@ -1015,11 +1026,10 @@ fn validate_scan_previews(previews: &[SlotPreview]) -> Result<(), String> {
         if matches!(preview.preview.disk_space_sufficient, Some(false)) {
             return Err(format!("输出目录磁盘空间不足：{}", preview.preview.destination_directory));
         }
-        if preview.preview.candidates.is_empty() {
-            return Err(format!("任务 {} 没有可转换的歌曲", preview.slot_index + 1));
-        }
     }
-    validate_unique_planned_outputs(previews)
+
+    let processable = processable.into_iter().cloned().collect::<Vec<_>>();
+    validate_unique_planned_outputs(&processable)
 }
 
 fn finish_scan_cancelled(
@@ -1236,6 +1246,7 @@ fn start_confirmed_sync(
                 lossless_format: slot_preview.lossless_format,
                 conflict_strategy: slot_preview.conflict_strategy,
                 filename_rule: slot_preview.filename_rule,
+                netease_filename_format: slot_preview.netease_filename_format,
                 candidates: slot_preview.preview.candidates.clone(),
                 analyses: if enhanced_mode {
                     requested_analyses
@@ -1355,7 +1366,7 @@ fn retry_history_failures(
         lossless_format: entry.lossless_format,
         conflict_strategy: entry.conflict_strategy,
         filename_rule: entry.filename_rule,
-        netease_filename_format: NeteaseFilenameFormat::default(),
+        netease_filename_format: entry.netease_filename_format,
         preview,
         retry_of: Some(entry.id),
     })
@@ -1651,14 +1662,15 @@ fn persist_preferences(state: &tauri::State<'_, AppState>) {
     }
 }
 
-fn apply_analysis_for_candidate(
+fn apply_analysis_for_candidate_to_path(
     candidate: &PreviewCandidate,
+    output_path: &Path,
     analyses: &HashMap<String, EmbeddedAnalysis>,
 ) -> io::Result<()> {
     let Some(analysis) = analyses.get(&candidate.source_path) else {
         return Ok(());
     };
-    apply_track_analysis_metadata(Path::new(&candidate.destination_path), analysis)
+    apply_track_analysis_metadata(output_path, analysis)
 }
 
 fn embedded_analysis_from_track(analysis: &TrackAnalysis) -> EmbeddedAnalysis {
@@ -1731,6 +1743,7 @@ fn run_confirmed_sync_task(
         retry_of: job.retry_of.clone(),
         conflict_strategy: job.conflict_strategy,
         filename_rule: job.filename_rule,
+        netease_filename_format: job.netease_filename_format,
         report_path: None,
     }));
     persist_recovery_entry(&history_path, &history_write_lock, &recovery_entry);
@@ -1808,11 +1821,18 @@ fn run_confirmed_sync_task(
                     break;
                 }
 
-                let result = update_existing_metadata(
+                let result = update_existing_metadata_transactionally(
                     Path::new(&candidate.source_path),
                     Path::new(&candidate.destination_path),
-                )
-                .and_then(|()| apply_analysis_for_candidate(candidate, &analysis_lookup));
+                    job.netease_filename_format,
+                    |temporary_output| {
+                        apply_analysis_for_candidate_to_path(
+                            candidate,
+                            temporary_output,
+                            &analysis_lookup,
+                        )
+                    },
+                );
                 let mut controller_guard = controller.lock().expect("desktop lock poisoned");
                 let failed_file = match result {
                     Ok(()) => {
@@ -1862,22 +1882,26 @@ fn run_confirmed_sync_task(
             let sync_result = if queued_files.is_empty() {
                 Ok(task_controller.snapshot())
             } else {
-                sync_music_library_with_observer(
+                sync_music_library_transactional_with_observer(
                     &queued_files,
                     &job.destination,
                     &job.mode,
                     job.lossless_format,
+                    job.netease_filename_format,
                     &task_controller,
+                    |name, temporary_output| {
+                        let Some(candidate) = candidate_lookup.get(name) else {
+                            return Ok(());
+                        };
+                        apply_analysis_for_candidate_to_path(
+                            candidate,
+                            temporary_output,
+                            &analysis_lookup,
+                        )
+                    },
                     |name, task, error| {
                         let candidate = candidate_lookup.get(name);
-                        let analysis_error = if error.is_none() {
-                            candidate.and_then(|candidate| {
-                                apply_analysis_for_candidate(candidate, &analysis_lookup).err()
-                            })
-                        } else {
-                            None
-                        };
-                        let failed_file = if let Some(error) = error.or(analysis_error.as_ref()) {
+                        let failed_file = if let Some(error) = error {
                             let failed_file = FailedFile {
                                 name: name.to_string(),
                                 source_path: candidate
@@ -1996,6 +2020,7 @@ fn run_confirmed_sync_task(
         retry_of: job.retry_of,
         conflict_strategy: job.conflict_strategy,
         filename_rule: job.filename_rule,
+        netease_filename_format: job.netease_filename_format,
         report_path: None,
     };
 
@@ -2551,6 +2576,7 @@ mod tests {
     use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
     use super::validate_destination_directory;
+    use super::validate_scan_previews;
     use super::validate_source_input;
     use super::validate_unique_planned_outputs;
     use std::fs;
@@ -2682,6 +2708,32 @@ mod tests {
 
         assert_eq!(processable.len(), 1);
         assert_eq!(processable[0].slot_index, 1);
+    }
+
+    #[test]
+    fn direct_validation_allows_a_valid_slot_when_another_slot_is_empty() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-direct-validation-{}-{}",
+            std::process::id(),
+            super::unique_timestamp()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let mut valid = sample_preview(0, true);
+        valid.preview.source_directory = source.to_string_lossy().into_owned();
+        valid.preview.destination_directory = destination.to_string_lossy().into_owned();
+
+        let mut empty = sample_preview(1, false);
+        empty.preview.source_directory = source.to_string_lossy().into_owned();
+        empty.preview.destination_directory = destination.to_string_lossy().into_owned();
+
+        let result = validate_scan_previews(&[valid, empty]);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(result.is_ok());
     }
 
     #[test]

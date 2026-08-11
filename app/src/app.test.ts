@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   bindApp,
   canReuseTrackAnalysis,
+  pickSourceWithPlatformDialog,
   humanizeError,
   resolveDropTargetAt,
   renderApp,
@@ -236,7 +237,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '3.1.2',
+    version: '3.2.0',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -507,13 +508,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '3.1.2',
+        version: '3.2.0',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.1.2');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.0');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
     expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();
@@ -835,6 +836,60 @@ describe('bindApp', () => {
       expect(services.selectSourceDirectory).toHaveBeenCalledWith(1, '/music/single-track.flac');
       expect(root.textContent).toContain('/music/single-track.flac');
     });
+  });
+
+  it('lets the platform fallback picker choose a source folder', async () => {
+    const openSource = vi.fn().mockResolvedValue('/music/folder');
+
+    const selected = await pickSourceWithPlatformDialog(
+      '选择来源 2',
+      'zh',
+      async () => 'folder',
+      openSource,
+    );
+
+    expect(selected).toBe('/music/folder');
+    expect(openSource).toHaveBeenCalledWith({
+      directory: true,
+      title: '选择来源 2',
+    });
+  });
+
+  it('keeps the platform fallback picker able to choose a single track', async () => {
+    const openSource = vi.fn().mockResolvedValue('/music/track.flac');
+
+    const selected = await pickSourceWithPlatformDialog(
+      'Choose source 2',
+      'en',
+      async () => 'track',
+      openSource,
+    );
+
+    expect(selected).toBe('/music/track.flac');
+    expect(openSource).toHaveBeenCalledWith({
+      directory: false,
+      title: 'Choose source 2',
+      filters: [
+        {
+          name: 'Supported audio files',
+          extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
+        },
+      ],
+    });
+  });
+
+  it('does not open a platform picker after cancelling the source type prompt', async () => {
+    const openSource = vi.fn();
+
+    const selected = await pickSourceWithPlatformDialog(
+      '选择来源 2',
+      'zh',
+      async () => 'cancel',
+      openSource,
+    );
+
+    expect(selected).toBeNull();
+    expect(openSource).not.toHaveBeenCalled();
   });
 
   it('shows a source picker failure in the affected task status', async () => {

@@ -10,7 +10,7 @@ use ncmdump::Ncmdump;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Error, ErrorKind, Read, Write};
+use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "windows")]
@@ -662,6 +662,29 @@ pub fn sync_music_library_with_observer(
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
     task_controller: &TaskController,
+    after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
+) -> io::Result<TaskSnapshot> {
+    sync_music_library_transactional_with_observer(
+        new_songs,
+        dest_folder,
+        mode,
+        lossless_format,
+        NeteaseFilenameFormat::default(),
+        task_controller,
+        |_, _| Ok(()),
+        after_file,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sync_music_library_transactional_with_observer(
+    new_songs: &HashMap<&String, &(String, PathBuf)>,
+    dest_folder: &str,
+    mode: &Mode,
+    lossless_format: Option<LosslessFormat>,
+    netease_filename_format: NeteaseFilenameFormat,
+    task_controller: &TaskController,
+    mut finalize_output: impl FnMut(&str, &Path) -> io::Result<()>,
     mut after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
 ) -> io::Result<TaskSnapshot> {
     if new_songs.is_empty() {
@@ -692,7 +715,16 @@ pub fn sync_music_library_with_observer(
             return Ok(task_controller.snapshot());
         }
 
-        let task_result = process_music_file(name, info, dest_folder, mode, lossless_format, &bar);
+        let task_result = process_music_file(
+            name,
+            info,
+            dest_folder,
+            mode,
+            lossless_format,
+            netease_filename_format,
+            &bar,
+            &mut finalize_output,
+        );
         match task_result {
             Ok(()) => {
                 task_controller.complete_current_file();
@@ -726,6 +758,7 @@ pub fn sync_music_library_with_observer(
 }
 
 #[allow(dead_code)]
+#[allow(deprecated)]
 pub fn update_existing_metadata(source_path: &Path, destination_path: &Path) -> io::Result<()> {
     let source_extension = source_path
         .extension()
@@ -768,11 +801,14 @@ pub fn update_existing_metadata(source_path: &Path, destination_path: &Path) -> 
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    #[allow(deprecated)]
-    let result = match destination_extension.as_str() {
-        "wav" => source_tag.write_to_wav_path(destination_path, Version::Id3v24),
-        "aiff" | "aif" => source_tag.write_to_aiff_path(destination_path, Version::Id3v24),
-        "mp3" => source_tag.write_to_path(destination_path, Version::Id3v24),
+    let result: io::Result<()> = match destination_extension.as_str() {
+        "wav" => write_id3_tag_for_output(&source_tag, destination_path),
+        "aiff" | "aif" => source_tag
+            .write_to_aiff_path(destination_path, Version::Id3v24)
+            .map_err(io::Error::other),
+        "mp3" => source_tag
+            .write_to_path(destination_path, Version::Id3v24)
+            .map_err(io::Error::other),
         _ => {
             return Err(Error::new(
                 ErrorKind::Unsupported,
@@ -789,13 +825,39 @@ pub fn update_existing_metadata(source_path: &Path, destination_path: &Path) -> 
     })
 }
 
+#[allow(dead_code)]
+pub fn update_existing_metadata_transactionally(
+    source_path: &Path,
+    destination_path: &Path,
+    netease_filename_format: NeteaseFilenameFormat,
+    finalize_output: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let name_stem = destination_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("metadata-update");
+    run_output_transaction(destination_path, name_stem, |temporary_output| {
+        copy_file(destination_path, temporary_output)?;
+        update_existing_metadata(source_path, temporary_output)?;
+        ensure_output_metadata_with_settings(
+            source_path,
+            temporary_output,
+            netease_filename_format,
+        )?;
+        finalize_output(temporary_output)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_music_file(
     name: &str,
     info: &(String, PathBuf),
     dest_folder: &str,
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
+    netease_filename_format: NeteaseFilenameFormat,
     bar: &indicatif::ProgressBar,
+    finalize_output: &mut impl FnMut(&str, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let src_path = info.1.as_path();
     if !src_path.exists() {
@@ -810,116 +872,59 @@ fn process_music_file(
         .unwrap_or("")
         .to_lowercase();
 
-    match extension.as_str() {
-        "mp3" => {
-            bar.set_message(format!("Copying MP3: {}", name));
-            let output_policy = resolve_output_policy(*mode, lossless_format, &extension);
-            let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
-            let result = match output_policy.target_profile {
-                TargetProfile::CompatMp3 => copy_file(src_path, &output_path),
-                _ => convert_audio_to_target_format(
-                    src_path,
-                    &output_path,
-                    output_policy.target_profile,
-                    name,
-                ),
-            };
+    let source_format = if extension == "ncm" {
+        detect_ncm_output_extension(src_path).unwrap_or_else(|_| "flac".to_string())
+    } else {
+        extension.clone()
+    };
+    let output_policy = resolve_output_policy(*mode, lossless_format, &source_format);
+    let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
 
-            if result.is_ok() {
-                ensure_output_metadata(src_path, &output_path)?;
-                if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
-                    strip_163_key_from_mp3(&output_path)?;
-                }
-                remove_conflicting_outputs(
-                    dest_folder,
-                    name,
-                    output_policy.output_extension,
-                    src_path,
-                )?;
-            }
-
-            result
-        }
-        "wav" | "aiff" => {
+    let result = match extension.as_str() {
+        "mp3" | "wav" | "aiff" | "flac" | "ncm" => {
             bar.set_message(format!("Processing {}: {}", extension.to_uppercase(), name));
-            let output_policy = resolve_output_policy(*mode, lossless_format, &extension);
-            let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
-            let result = match output_policy.target_profile {
-                TargetProfile::CompatMp3
-                | TargetProfile::LosslessWav
-                | TargetProfile::LosslessAiff => convert_audio_to_target_format(
-                    src_path,
-                    &output_path,
-                    output_policy.target_profile,
-                    name,
-                ),
-            };
-
-            if result.is_ok() {
-                ensure_output_metadata(src_path, &output_path)?;
-                remove_conflicting_outputs(
-                    dest_folder,
-                    name,
-                    output_policy.output_extension,
-                    src_path,
-                )?;
-            }
-
-            result
-        }
-        "flac" => {
-            bar.set_message(format!("Processing FLAC: {}", name));
-            let output_policy = resolve_output_policy(*mode, lossless_format, &extension);
-            let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
-            let result = match mode {
-                Mode::Lossless => convert_audio_to_target_format(
-                    src_path,
-                    &output_path,
-                    output_policy.target_profile,
-                    name,
-                ),
-                Mode::Compat => convert_flac_to_mp3(src_path, dest_folder, name),
-            };
-
-            if result.is_ok() {
-                ensure_output_metadata(src_path, &output_path)?;
-                remove_conflicting_outputs(
-                    dest_folder,
-                    name,
-                    output_policy.output_extension,
-                    src_path,
-                )?;
-            }
-
-            result
-        }
-        "ncm" => {
-            bar.set_message(format!("Dumping NCM: {}", name));
-            let result = process_ncm_file(src_path, dest_folder, name, *mode, lossless_format);
-            if result.is_ok() {
-                let file_format =
-                    detect_ncm_output_extension(src_path).unwrap_or_else(|_| "flac".to_string());
-                let output_policy = resolve_output_policy(*mode, lossless_format, &file_format);
-                let output_path =
-                    target_output_path(dest_folder, name, output_policy.output_extension);
-                ensure_output_metadata(src_path, &output_path)?;
-                if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
-                    strip_163_key_from_mp3(&output_path)?;
+            run_output_transaction(&output_path, name, |temporary_output| {
+                match extension.as_str() {
+                    "mp3" if matches!(output_policy.target_profile, TargetProfile::CompatMp3) => {
+                        copy_file(src_path, temporary_output)?;
+                    }
+                    "ncm" => process_ncm_file_to_output(
+                        src_path,
+                        temporary_output,
+                        name,
+                        *mode,
+                        lossless_format,
+                    )?,
+                    _ => convert_audio_to_output_path(
+                        src_path,
+                        temporary_output,
+                        output_policy.target_profile,
+                        name,
+                    )?,
                 }
-                remove_conflicting_outputs(
-                    dest_folder,
-                    name,
-                    output_policy.output_extension,
+
+                ensure_output_metadata_with_settings(
                     src_path,
+                    temporary_output,
+                    netease_filename_format,
                 )?;
-            }
-            result
+                if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
+                    strip_163_key_from_mp3(temporary_output)?;
+                }
+                finalize_output(name, temporary_output)
+            })
         }
         _ => unreachable!(
             "Invalid file extension '{}' for song '{}'. Filter failed.",
             extension, name
         ),
+    };
+
+    if result.is_ok() {
+        remove_conflicting_outputs(dest_folder, name, output_policy.output_extension, src_path)?;
     }
+
+    result
 }
 
 fn copy_file(src_path: &Path, dest_path: &Path) -> io::Result<()> {
@@ -939,12 +944,7 @@ fn copy_file(src_path: &Path, dest_path: &Path) -> io::Result<()> {
     })
 }
 
-fn convert_flac_to_mp3(src_path: &Path, dest_folder: &str, name_stem: &str) -> io::Result<()> {
-    let output_path = target_output_path(dest_folder, name_stem, "mp3");
-    convert_audio_to_target_format(src_path, &output_path, TargetProfile::CompatMp3, name_stem)
-}
-
-fn convert_audio_to_target_format(
+fn convert_audio_to_output_path(
     src_path: &Path,
     output_path: &Path,
     target_profile: TargetProfile,
@@ -957,7 +957,6 @@ fn convert_audio_to_target_format(
         )
     })?;
 
-    let temporary_output = create_persistent_temp_path(output_path, ".w4dj-", true)?;
     let mut command = Command::new(&ffmpeg_path);
     configure_background_process(&mut command);
     command
@@ -981,10 +980,10 @@ fn convert_audio_to_target_format(
         }
     }
 
-    let status = match command.arg(&temporary_output).status() {
+    let status = match command.arg(output_path).status() {
         Ok(status) => status,
         Err(error) => {
-            let _ = fs::remove_file(&temporary_output);
+            let _ = fs::remove_file(output_path);
             return Err(Error::new(
                 error.kind(),
                 format!("Failed to start FFmpeg at {}: {}", ffmpeg_path, error),
@@ -993,24 +992,14 @@ fn convert_audio_to_target_format(
     };
 
     if !status.success() {
-        let _ = fs::remove_file(&temporary_output);
+        let _ = fs::remove_file(output_path);
         return Err(Error::other(format!(
             "FFmpeg conversion failed for {}",
             name_stem
         )));
     }
 
-    if let Err(error) = ensure_generated_output(&temporary_output, name_stem) {
-        let _ = fs::remove_file(&temporary_output);
-        return Err(error);
-    }
-
-    if let Err(error) = commit_temporary_output(&temporary_output, output_path) {
-        let _ = fs::remove_file(&temporary_output);
-        return Err(error);
-    }
-
-    Ok(())
+    ensure_generated_output(output_path, name_stem)
 }
 
 fn create_persistent_temp_path(
@@ -1075,6 +1064,23 @@ fn commit_temporary_output(temporary_path: &Path, output_path: &Path) -> io::Res
     }
 }
 
+fn run_output_transaction(
+    output_path: &Path,
+    name_stem: &str,
+    operation: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let temporary_output = create_persistent_temp_path(output_path, ".w4dj-", true)?;
+    let result = operation(&temporary_output)
+        .and_then(|()| ensure_generated_output(&temporary_output, name_stem))
+        .and_then(|()| commit_temporary_output(&temporary_output, output_path));
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_output);
+    }
+
+    result
+}
+
 fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()> {
     let metadata = fs::metadata(output_path).map_err(|error| {
         Error::new(
@@ -1102,7 +1108,21 @@ fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()
     Ok(())
 }
 
+#[allow(dead_code)]
 fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<()> {
+    let netease_filename_format = if source_prefers_title_artist_filename(source_path) {
+        NeteaseFilenameFormat::TitleArtist
+    } else {
+        NeteaseFilenameFormat::ArtistTitle
+    };
+    ensure_output_metadata_with_settings(source_path, output_path, netease_filename_format)
+}
+
+fn ensure_output_metadata_with_settings(
+    source_path: &Path,
+    output_path: &Path,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> io::Result<()> {
     let source_tag = source_metadata_as_id3(source_path);
     let mut output_tag = read_id3_tag_or_empty(output_path);
     let fallback_name = source_path
@@ -1110,11 +1130,12 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
 
-    let identity = infer_song_identity_with_filename_preference(
+    let source_artist = source_tag.artist().or_else(|| source_tag.album_artist());
+    let identity = infer_song_identity_with_netease_filename_format(
         fallback_name,
         source_tag.title(),
-        source_tag.artist().or_else(|| source_tag.album_artist()),
-        source_prefers_title_artist_filename(source_path),
+        source_artist,
+        netease_filename_format,
     );
     let source_has_valid_cover = source_tag
         .pictures()
@@ -1531,12 +1552,144 @@ fn write_id3_tag_for_output(tag: &id3::Tag, output_path: &Path) -> io::Result<()
     #[allow(deprecated)]
     let result = match extension.as_str() {
         "mp3" => tag.write_to_path(output_path, Version::Id3v24),
-        "wav" => tag.write_to_wav_path(output_path, Version::Id3v24),
+        "wav" => {
+            tag.write_to_wav_path(output_path, Version::Id3v24)
+                .map_err(io::Error::other)?;
+            return write_riff_info_metadata(output_path, tag);
+        }
         "aiff" | "aif" => tag.write_to_aiff_path(output_path, Version::Id3v24),
         _ => return Ok(()),
     };
 
     result.map_err(io::Error::other)
+}
+
+fn write_riff_info_metadata(output_path: &Path, tag: &id3::Tag) -> io::Result<()> {
+    let mut input = File::open(output_path)?;
+    let mut header = [0u8; 12];
+    input.read_exact(&mut header)?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("不是有效的 RIFF/WAVE 文件：{}", output_path.display()),
+        ));
+    }
+
+    let temporary_path = create_persistent_temp_path(output_path, ".w4dj-riff-", true)?;
+    let result = (|| {
+        let mut output = File::create(&temporary_path)?;
+        output.write_all(&header)?;
+        let mut chunk_header = [0u8; 8];
+
+        loop {
+            let bytes_read = input.read(&mut chunk_header)?;
+            if bytes_read == 0 {
+                break;
+            }
+            if bytes_read != chunk_header.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "WAV 文件包含不完整的 chunk 头",
+                ));
+            }
+
+            let chunk_id: [u8; 4] = chunk_header[0..4]
+                .try_into()
+                .expect("chunk id is four bytes");
+            let chunk_size = u32::from_le_bytes(
+                chunk_header[4..8]
+                    .try_into()
+                    .expect("chunk size is four bytes"),
+            ) as u64;
+            let padded_size = chunk_size + (chunk_size & 1);
+            let is_info_list = chunk_id == *b"LIST" && chunk_size >= 4;
+
+            if is_info_list {
+                let mut list_type = [0u8; 4];
+                input.read_exact(&mut list_type)?;
+                if &list_type == b"INFO" {
+                    skip_bytes(&mut input, padded_size - 4)?;
+                    continue;
+                }
+
+                output.write_all(&chunk_header)?;
+                output.write_all(&list_type)?;
+                copy_bytes(&mut input, &mut output, padded_size - 4)?;
+            } else {
+                output.write_all(&chunk_header)?;
+                copy_bytes(&mut input, &mut output, padded_size)?;
+            }
+        }
+
+        let mut info_payload = Vec::from(*b"INFO");
+        append_riff_info_field(&mut info_payload, *b"INAM", tag.title());
+        append_riff_info_field(&mut info_payload, *b"IART", tag.artist());
+        append_riff_info_field(&mut info_payload, *b"IPRD", tag.album());
+        if info_payload.len() > 4 {
+            output.write_all(b"LIST")?;
+            let info_size = u32::try_from(info_payload.len())
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "WAV INFO 元数据过大"))?;
+            output.write_all(&info_size.to_le_bytes())?;
+            output.write_all(&info_payload)?;
+            if info_payload.len() & 1 == 1 {
+                output.write_all(&[0])?;
+            }
+        }
+
+        output.flush()?;
+        output.sync_all()?;
+        let file_size = output.metadata()?.len();
+        let riff_size = u32::try_from(file_size.saturating_sub(8))
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "WAV 文件超过 RIFF 支持的大小"))?;
+        output.seek(SeekFrom::Start(4))?;
+        output.write_all(&riff_size.to_le_bytes())?;
+        output.flush()?;
+        output.sync_all()?;
+        commit_temporary_output(&temporary_path, output_path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn append_riff_info_field(payload: &mut Vec<u8>, id: [u8; 4], value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(0);
+    let Ok(size) = u32::try_from(bytes.len()) else {
+        return;
+    };
+    payload.extend_from_slice(&id);
+    payload.extend_from_slice(&size.to_le_bytes());
+    payload.extend_from_slice(&bytes);
+    if bytes.len() & 1 == 1 {
+        payload.push(0);
+    }
+}
+
+fn copy_bytes(input: &mut File, output: &mut File, mut bytes: u64) -> io::Result<()> {
+    let mut buffer = [0u8; 8192];
+    while bytes > 0 {
+        let requested = usize::try_from(bytes.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        input.read_exact(&mut buffer[..requested])?;
+        output.write_all(&buffer[..requested])?;
+        bytes -= requested as u64;
+    }
+    Ok(())
+}
+
+fn skip_bytes(input: &mut File, mut bytes: u64) -> io::Result<()> {
+    let mut buffer = [0u8; 8192];
+    while bytes > 0 {
+        let requested = usize::try_from(bytes.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        input.read_exact(&mut buffer[..requested])?;
+        bytes -= requested as u64;
+    }
+    Ok(())
 }
 
 fn is_blank(value: Option<&str>) -> bool {
@@ -1556,9 +1709,9 @@ fn configure_background_process(command: &mut Command) {
 #[cfg(not(target_os = "windows"))]
 fn configure_background_process(_command: &mut Command) {}
 
-fn process_ncm_file(
+fn process_ncm_file_to_output(
     src_path: &Path,
-    dest_folder: &str,
+    output_path: &Path,
     name_stem: &str,
     mode: Mode,
     lossless_format: Option<LosslessFormat>,
@@ -1607,7 +1760,6 @@ fn process_ncm_file(
         ncm_metadata.format.to_lowercase()
     };
     let output_policy = resolve_output_policy(mode, lossless_format, &file_format);
-    let output_path = target_output_path(dest_folder, name_stem, output_policy.output_extension);
     let temp_source_extension = if file_format.as_str() == "mp3" {
         "mp3"
     } else {
@@ -1661,26 +1813,26 @@ fn process_ncm_file(
     match output_policy.target_profile {
         TargetProfile::CompatMp3 => {
             if file_format.as_str() == "mp3" {
-                fs::copy(&temp_source_path, &output_path)?;
+                fs::copy(&temp_source_path, output_path)?;
             } else {
-                convert_audio_to_target_format(
+                convert_audio_to_output_path(
                     &temp_source_path,
-                    &output_path,
+                    output_path,
                     TargetProfile::CompatMp3,
                     name_stem,
                 )?;
             }
         }
         TargetProfile::LosslessWav | TargetProfile::LosslessAiff => {
-            convert_audio_to_target_format(
+            convert_audio_to_output_path(
                 &temp_source_path,
-                &output_path,
+                output_path,
                 output_policy.target_profile,
                 name_stem,
             )?;
 
             write_container_tags(
-                &output_path,
+                output_path,
                 output_policy.target_profile,
                 &ncm_metadata,
                 &image_data,
@@ -1814,7 +1966,14 @@ fn derive_song_name(path: &Path) -> String {
 }
 
 fn derive_song_name_with_rule(path: &Path, filename_rule: FilenameRule) -> String {
-    derive_song_name_with_settings(path, filename_rule, NeteaseFilenameFormat::default())
+    let netease_filename_format = if source_prefers_title_artist_filename(path) {
+        NeteaseFilenameFormat::TitleArtist
+    } else {
+        // Keep the legacy smart fallback for ordinary audio files. The explicit
+        // NetEase setting is applied by derive_song_name_with_settings.
+        NeteaseFilenameFormat::ArtistTitle
+    };
+    derive_song_name_with_settings(path, filename_rule, netease_filename_format)
 }
 
 fn derive_song_name_with_settings(
@@ -1839,8 +1998,10 @@ fn derive_song_name_with_settings(
         .to_lowercase();
 
     let candidate = match extension.as_str() {
-        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(path, filename_rule, &fallback_name),
-        "flac" => song_name_from_flac(path, filename_rule, &fallback_name),
+        "mp3" | "wav" | "aiff" => {
+            song_name_from_audio_tag(path, filename_rule, &fallback_name, netease_filename_format)
+        }
+        "flac" => song_name_from_flac(path, filename_rule, &fallback_name, netease_filename_format),
         "ncm" => song_name_from_ncm(path, filename_rule, &fallback_name, netease_filename_format),
         _ => None,
     };
@@ -1852,12 +2013,14 @@ fn song_name_from_flac(
     path: &Path,
     filename_rule: FilenameRule,
     fallback_name: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> Option<String> {
     let tag = source_metadata_as_id3(path);
-    let identity = infer_song_identity(
+    let identity = infer_song_identity_with_netease_filename_format(
         fallback_name,
         tag.title(),
         tag.artist().or_else(|| tag.album_artist()),
+        netease_filename_format,
     );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
@@ -1866,10 +2029,16 @@ fn song_name_from_audio_tag(
     path: &Path,
     filename_rule: FilenameRule,
     fallback_name: &str,
+    netease_filename_format: NeteaseFilenameFormat,
 ) -> Option<String> {
     let tag = source_metadata_as_id3(path);
     let artist = tag.artist().or_else(|| tag.album_artist());
-    let identity = infer_song_identity(fallback_name, tag.title(), artist);
+    let identity = infer_song_identity_with_netease_filename_format(
+        fallback_name,
+        tag.title(),
+        artist,
+        netease_filename_format,
+    );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
@@ -1888,16 +2057,12 @@ fn song_name_from_ncm(
         .map(|item| item.0.as_str())
         .collect::<Vec<&str>>()
         .join(", ");
-    let metadata_identity = infer_song_identity(fallback_name, Some(&info.name), Some(&artist));
-    let identity = match netease_filename_format {
-        NeteaseFilenameFormat::TitleOnly => metadata_identity,
-        NeteaseFilenameFormat::ArtistTitle => split_filename_identity(fallback_name)
-            .map(|(artist, title)| SongIdentity { title, artist })
-            .unwrap_or(metadata_identity),
-        NeteaseFilenameFormat::TitleArtist => split_filename_identity(fallback_name)
-            .map(|(title, artist)| SongIdentity { title, artist })
-            .unwrap_or(metadata_identity),
-    };
+    let identity = infer_song_identity_with_netease_filename_format(
+        fallback_name,
+        Some(&info.name),
+        Some(&artist),
+        netease_filename_format,
+    );
     build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
@@ -1918,6 +2083,38 @@ fn infer_song_identity(
         metadata_artist,
         false,
     )
+}
+
+fn infer_song_identity_with_netease_filename_format(
+    fallback_name: &str,
+    metadata_title: Option<&str>,
+    metadata_artist: Option<&str>,
+    netease_filename_format: NeteaseFilenameFormat,
+) -> SongIdentity {
+    let title = normalize_filename_part(metadata_title);
+    let artist = normalize_filename_part(metadata_artist);
+    if title.is_some() && artist.is_some() {
+        return SongIdentity {
+            title: title.unwrap_or_default(),
+            artist: artist.unwrap_or_default(),
+        };
+    }
+
+    let fallback = normalize_display_text(fallback_name);
+    let (fallback_title, fallback_artist) = match netease_filename_format {
+        NeteaseFilenameFormat::TitleOnly => (fallback, String::new()),
+        NeteaseFilenameFormat::ArtistTitle => split_filename_identity(&fallback)
+            .map(|(artist, title)| (title, artist))
+            .unwrap_or_else(|| (fallback, String::new())),
+        NeteaseFilenameFormat::TitleArtist => {
+            split_filename_identity(&fallback).unwrap_or_else(|| (fallback, String::new()))
+        }
+    };
+
+    SongIdentity {
+        title: title.unwrap_or_else(|| sanitize_filename_component(&fallback_title)),
+        artist: artist.unwrap_or_else(|| sanitize_filename_component(&fallback_artist)),
+    }
 }
 
 fn infer_song_identity_with_filename_preference(
@@ -2425,9 +2622,7 @@ fn write_container_tags(
 
     #[allow(deprecated)]
     match target_profile {
-        TargetProfile::LosslessWav => tag
-            .write_to_wav_path(output_path, Version::Id3v24)
-            .map_err(io::Error::other),
+        TargetProfile::LosslessWav => write_id3_tag_for_output(&tag, output_path),
         TargetProfile::LosslessAiff => tag
             .write_to_aiff_path(output_path, Version::Id3v24)
             .map_err(io::Error::other),
@@ -2440,12 +2635,13 @@ mod tests {
     use super::{
         EmbeddedAnalysis, SongIdentity, apply_track_analysis_metadata, build_song_name,
         build_song_name_with_rule, commit_temporary_output, compare_music_dicts, derive_song_name,
-        derive_song_name_with_rule, ensure_generated_output, ensure_output_metadata,
-        fill_missing_metadata, find_ffmpeg_next_to_exe, infer_song_identity,
-        merge_recovered_metadata, remove_conflicting_outputs, sanitize_filename_component,
-        strip_163_key_from_mp3,
+        derive_song_name_with_rule, derive_song_name_with_settings, ensure_generated_output,
+        ensure_output_metadata, ensure_output_metadata_with_settings, fill_missing_metadata,
+        find_ffmpeg_next_to_exe, infer_song_identity, merge_recovered_metadata,
+        remove_conflicting_outputs, run_output_transaction, sanitize_filename_component,
+        strip_163_key_from_mp3, write_riff_info_metadata,
     };
-    use crate::config::{FilenameRule, LosslessFormat, Mode};
+    use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
     use id3::{Tag, TagLike, Version};
     use std::collections::HashMap;
     use std::fs;
@@ -2734,6 +2930,28 @@ mod tests {
     }
 
     #[test]
+    fn failed_metadata_finalization_does_not_publish_or_replace_output() {
+        let dir = tempdir().unwrap();
+        let output = dir.path().join("song.mp3");
+        fs::write(&output, b"previous good output").unwrap();
+
+        let error = run_output_transaction(&output, "song", |temporary| {
+            fs::write(temporary, b"new converted audio")?;
+            Err(std::io::Error::other("metadata write failed"))
+        })
+        .expect_err("metadata failure must abort the output transaction");
+
+        assert_eq!(error.to_string(), "metadata write failed");
+        assert_eq!(fs::read(&output).unwrap(), b"previous good output");
+        let temporary_files = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".w4dj-"))
+            .count();
+        assert_eq!(temporary_files, 0);
+    }
+
+    #[test]
     fn does_not_rewrite_an_mp3_without_163_metadata() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cover-song.mp3");
@@ -2815,6 +3033,96 @@ mod tests {
         let tag = Tag::read_from_path(&output_path).unwrap();
         assert_eq!(tag.title(), Some("Mystic State, Third Degree"));
         assert_eq!(tag.artist(), Some("Mr Wankerman"));
+    }
+
+    #[test]
+    fn applies_selected_netease_filename_format_to_untagged_mp3_and_flac() {
+        let dir = tempdir().unwrap();
+        let mp3 = dir.path().join("歌手 - 歌曲.mp3");
+        let flac = dir.path().join("歌曲 - 歌手.flac");
+        fs::write(&mp3, b"audio").unwrap();
+        fs::write(&flac, b"audio").unwrap();
+
+        assert_eq!(
+            derive_song_name_with_settings(
+                &mp3,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::ArtistTitle,
+            ),
+            "歌曲 - 歌手"
+        );
+        assert_eq!(
+            derive_song_name_with_settings(
+                &flac,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::TitleArtist,
+            ),
+            "歌曲 - 歌手"
+        );
+    }
+
+    #[test]
+    fn writes_selected_netease_identity_to_untagged_output_metadata() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("歌手 - 歌曲.mp3");
+        let output = dir.path().join("歌曲 - 歌手.mp3");
+        fs::write(&source, b"audio").unwrap();
+        fs::write(&output, b"audio").unwrap();
+
+        ensure_output_metadata_with_settings(&source, &output, NeteaseFilenameFormat::ArtistTitle)
+            .unwrap();
+
+        let tag = Tag::read_from_path(&output).unwrap();
+        assert_eq!(tag.title(), Some("歌曲"));
+        assert_eq!(tag.artist(), Some("歌手"));
+    }
+
+    #[test]
+    fn writes_rekordbox_readable_riff_info_to_wav() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Song.wav");
+        let data_len = 4u32;
+        let riff_size = 36 + data_len;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&riff_size.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        wav.extend_from_slice(&88_200u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(&[0, 0, 0, 0]);
+        fs::write(&path, wav).unwrap();
+
+        let mut tag = Tag::new();
+        tag.set_title("歌曲名");
+        tag.set_artist("歌手");
+        tag.set_album("专辑");
+        write_riff_info_metadata(&path, &tag).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.windows(4).any(|window| window == b"LIST"));
+        assert!(bytes.windows("INAM".len()).any(|window| window == b"INAM"));
+        assert!(
+            bytes
+                .windows("歌曲名".len())
+                .any(|window| window == "歌曲名".as_bytes())
+        );
+        assert!(
+            bytes
+                .windows("歌手".len())
+                .any(|window| window == "歌手".as_bytes())
+        );
+        assert!(
+            bytes
+                .windows("专辑".len())
+                .any(|window| window == "专辑".as_bytes())
+        );
     }
 
     #[test]

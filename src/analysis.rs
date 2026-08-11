@@ -238,18 +238,20 @@ pub fn build_rekordbox_xml(entries: &[TrackAnalysis], product_version: &str) -> 
             escape_xml(&location),
         );
 
-        for beat_position in entry
+        for (beat_index, beat_position) in entry
             .beat_positions
             .iter()
             .copied()
             .filter(|value| value.is_finite() && *value >= 0.0)
             .take(2000)
+            .enumerate()
         {
             let bpm = entry.bpm.unwrap_or_default();
             if bpm.is_finite() && bpm > 0.0 {
                 let _ = writeln!(
                     xml,
-                    "      <TEMPO Inizio=\"{beat_position:.3}\" Bpm=\"{bpm:.3}\" Metro=\"4/4\" Battito=\"1\"/>"
+                    "      <TEMPO Inizio=\"{beat_position:.3}\" Bpm=\"{bpm:.3}\" Metro=\"4/4\" Battito=\"{}\"/>",
+                    beat_index % 4 + 1
                 );
             }
         }
@@ -260,13 +262,13 @@ pub fn build_rekordbox_xml(entries: &[TrackAnalysis], product_version: &str) -> 
     xml.push_str("  </COLLECTION>\n");
     let _ = writeln!(
         xml,
-        "  <PLAYLISTS>\n    <NODE Type=\"0\" Name=\"W4DJ RKB Essentia Analysis\" Entries=\"{}\" KeyType=\"0\">",
+        "  <PLAYLISTS>\n    <NODE Type=\"0\" Name=\"ROOT\" Count=\"1\">\n      <NODE Type=\"1\" Name=\"W4DJ RKB Analysis\" Entries=\"{}\" KeyType=\"0\">",
         entries.len()
     );
     for entry in entries {
         let _ = writeln!(xml, "      <TRACK Key=\"{}\"/>", entry.track_id());
     }
-    xml.push_str("    </NODE>\n  </PLAYLISTS>\n</DJ_PLAYLISTS>\n");
+    xml.push_str("      </NODE>\n    </NODE>\n  </PLAYLISTS>\n</DJ_PLAYLISTS>\n");
     xml
 }
 
@@ -328,6 +330,11 @@ fn escape_xml(value: &str) -> String {
 
 fn file_uri(path: &Path) -> String {
     let value = path.to_string_lossy().replace('\\', "/");
+    let value = if value.starts_with('/') {
+        value
+    } else {
+        format!("/{value}")
+    };
     let mut uri = String::from("file://localhost");
     for byte in value.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'.' | b'-' | b'_' | b'~' | b':')
@@ -387,6 +394,41 @@ mod tests {
         assert!(xml.contains("<TEMPO Inizio=\"0.000\""));
         assert!(xml.contains("Mr &amp; DJ"));
         assert!(xml.contains("Mr%20%26%20DJ%20-%20Song.mp3"));
+    }
+
+    #[test]
+    fn rekordbox_xml_uses_root_and_nested_playlist_nodes() {
+        let xml = build_rekordbox_xml(&[sample()], "3.0.0");
+
+        assert!(xml.contains("<NODE Type=\"0\" Name=\"ROOT\" Count=\"1\">"));
+        assert!(
+            xml.contains(
+                "<NODE Type=\"1\" Name=\"W4DJ RKB Analysis\" Entries=\"1\" KeyType=\"0\">"
+            )
+        );
+        assert!(!xml.contains("<PLAYLISTS>\n    <NODE Type=\"0\" Name=\"W4DJ"));
+    }
+
+    #[test]
+    fn rekordbox_xml_numbers_beats_within_each_bar() {
+        let mut entry = sample();
+        entry.beat_positions = vec![0.0, 0.428, 0.856, 1.284, 1.712];
+        let xml = build_rekordbox_xml(&[entry], "3.0.0");
+
+        assert!(xml.contains("Inizio=\"0.000\" Bpm=\"140.250\" Metro=\"4/4\" Battito=\"1\""));
+        assert!(xml.contains("Inizio=\"0.428\" Bpm=\"140.250\" Metro=\"4/4\" Battito=\"2\""));
+        assert!(xml.contains("Inizio=\"1.712\" Bpm=\"140.250\" Metro=\"4/4\" Battito=\"1\""));
+    }
+
+    #[test]
+    fn rekordbox_xml_uses_a_valid_windows_file_uri() {
+        let mut entry = sample();
+        entry.path = String::from("C:\\Music\\Mr & DJ - Song.mp3");
+        let xml = build_rekordbox_xml(&[entry], "3.0.0");
+
+        assert!(
+            xml.contains("Location=\"file://localhost/C:/Music/Mr%20%26%20DJ%20-%20Song.mp3\"")
+        );
     }
 
     #[test]

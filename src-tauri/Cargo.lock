@@ -4231,7 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj"
-version = "3.1.2"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4253,7 +4253,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj-desktop"
-version = "3.1.2"
+version = "3.2.0"
 dependencies = [
  "libc",
  "ncmdump",

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { open, save } from '@tauri-apps/plugin-dialog';
+import { message, open, save } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
 import {
   analyzeAudioFile,
@@ -20,6 +20,7 @@ export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destinati
 export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
+export type SourcePickerChoice = 'folder' | 'track' | 'cancel';
 type SelectionMotion = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | 'theme' | 'lang' | null;
 type PendingSelection = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | null;
 type OnboardingStep = 0 | 1 | 2 | 3 | 4;
@@ -693,6 +694,39 @@ const defaultAnalysisState: AppAnalysisState = {
   message: '',
 };
 
+type SourcePickerOpenOptions = {
+  directory: boolean;
+  title: string;
+  filters?: Array<{ name: string; extensions: string[] }>;
+};
+
+export async function pickSourceWithPlatformDialog(
+  title: string,
+  lang: AppLanguage,
+  chooseSourceType: () => Promise<SourcePickerChoice>,
+  openSource: (options: SourcePickerOpenOptions) => Promise<string | null>,
+): Promise<string | null> {
+  const choice = await chooseSourceType();
+  if (choice === 'cancel') {
+    return null;
+  }
+
+  return openSource({
+    directory: choice === 'folder',
+    title,
+    ...(choice === 'folder'
+      ? {}
+      : {
+          filters: [
+            {
+              name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
+              extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
+            },
+          ],
+        }),
+  });
+}
+
 const defaultServices: AppServices = {
   loadDesktopState: () => invoke<DesktopState>('load_desktop_state'),
   pickDirectory: async (_kind, slotIndex) => {
@@ -718,20 +752,36 @@ const defaultServices: AppServices = {
         throw error;
       }
 
-      console.warn('Unified source picker unavailable; falling back to file picker.', error);
-      const selected = await open({
-        directory: false,
-        multiple: false,
-        title,
-        filters: [
-          {
-            name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
-            extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
-          },
-        ],
-      });
+      console.warn('Unified source picker unavailable; falling back to the platform picker.', error);
+      const choice = await message(
+        lang === 'zh'
+          ? '请选择来源类型。选择“文件夹”可扫描整组歌曲，选择“单曲”可转换一个音频文件。'
+          : 'Choose a source type. Select “Folder” to scan a music folder, or “Track” to convert one audio file.',
+        {
+          title,
+          kind: 'info',
+          buttons: lang === 'zh'
+            ? { yes: '文件夹', no: '单曲', cancel: '取消' }
+            : { yes: 'Folder', no: 'Track', cancel: 'Cancel' },
+        },
+      );
 
-      return typeof selected === 'string' ? selected : null;
+      const sourceType: SourcePickerChoice =
+        choice === '文件夹' || choice === 'Folder'
+          ? 'folder'
+          : choice === '取消' || choice === 'Cancel'
+            ? 'cancel'
+            : 'track';
+
+      return pickSourceWithPlatformDialog(
+        title,
+        lang,
+        async () => sourceType,
+        async (options) => {
+          const selected = await open({ ...options, multiple: false });
+          return typeof selected === 'string' ? selected : null;
+        },
+      );
     }
   },
   selectSourceDirectory: (slotIndex, path) =>
