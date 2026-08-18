@@ -35,6 +35,7 @@ fn test_entry(index: usize) -> HistoryEntry {
         filename_rule: Default::default(),
         netease_filename_format: Default::default(),
         report_path: None,
+        analysis_reports: Vec::new(),
     }
 }
 

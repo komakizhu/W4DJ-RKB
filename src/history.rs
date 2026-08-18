@@ -140,6 +140,25 @@ pub struct HistoryEntry {
     pub netease_filename_format: NeteaseFilenameFormat,
     #[serde(default)]
     pub report_path: Option<String>,
+    #[serde(default)]
+    pub analysis_reports: Vec<AnalysisReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnalysisReport {
+    pub source_path: String,
+    pub destination_path: String,
+    pub status: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub drop_status: Option<String>,
+    #[serde(default)]
+    pub drop_loudness_lufs: Option<String>,
+    #[serde(default)]
+    pub model_status: Option<String>,
+    #[serde(default)]
+    pub model_details: Option<String>,
 }
 
 pub fn load_history(path: impl AsRef<Path>) -> io::Result<Vec<HistoryEntry>> {
@@ -189,6 +208,37 @@ pub fn delete_history_entry(path: impl AsRef<Path>, id: &str) -> io::Result<bool
 
 pub fn clear_history(path: impl AsRef<Path>) -> io::Result<()> {
     write_history(path.as_ref(), &[])
+}
+
+pub fn append_analysis_reports(
+    path: impl AsRef<Path>,
+    batch_id: &str,
+    reports: Vec<AnalysisReport>,
+) -> io::Result<bool> {
+    if reports.is_empty() {
+        return Ok(false);
+    }
+
+    let path = path.as_ref();
+    let mut entries = load_history(path)?;
+    let mut updated = false;
+    for entry in &mut entries {
+        if entry.batch_id != batch_id {
+            continue;
+        }
+        for report in &reports {
+            entry
+                .analysis_reports
+                .retain(|existing| existing.source_path != report.source_path);
+            entry.analysis_reports.push(report.clone());
+        }
+        updated = true;
+    }
+
+    if updated {
+        write_history(path, &entries)?;
+    }
+    Ok(updated)
 }
 
 fn write_history(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
@@ -324,6 +374,25 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     if entry.metadata_diagnostics.is_empty() {
         report.push_str("未记录（旧版任务或尚未处理歌曲）\n\n");
     }
+
+    report.push_str("[增强分析报告]\n");
+    if entry.analysis_reports.is_empty() {
+        report.push_str("未记录\n\n");
+    }
+    for (index, analysis) in entry.analysis_reports.iter().enumerate() {
+        report.push_str(&format!(
+            "{}. 源文件：{}\n目标文件：{}\n状态：{}\n原因：{}\nDrop 状态：{}\nDrop LUFS：{}\n模型状态：{}\n模型详情：{}\n\n",
+            index + 1,
+            analysis.source_path,
+            analysis.destination_path,
+            analysis.status,
+            analysis.message.as_deref().unwrap_or("无"),
+            analysis.drop_status.as_deref().unwrap_or("无"),
+            analysis.drop_loudness_lufs.as_deref().unwrap_or("无"),
+            analysis.model_status.as_deref().unwrap_or("无"),
+            analysis.model_details.as_deref().unwrap_or("无"),
+        ));
+    }
     for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
         report.push_str(&format!(
             "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n源封面：{}\n输出封面：{}\n最终校验：{}\n\n",
@@ -443,6 +512,7 @@ mod tests {
             filename_rule: FilenameRule::default(),
             netease_filename_format: NeteaseFilenameFormat::default(),
             report_path: None,
+            analysis_reports: Vec::new(),
         }
     }
 

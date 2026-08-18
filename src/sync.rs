@@ -1,10 +1,12 @@
+use crate::analysis::{DropAnalysisDetails, HighLevelAnalysis};
 use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
 use crate::netease::RecoveredMetadata;
+use crate::scan_cache::{ScanCache, ScanCacheEntry, can_reuse_entry, modified_at_ms};
 use crate::task::{TaskController, TaskSnapshot};
-use id3::frame::{Comment, ExtendedText, Picture};
+use id3::frame::{Comment, ExtendedText, Lyrics, Picture};
 use id3::{TagLike, Version};
 use ncmdump::Ncmdump;
 use std::collections::HashMap;
@@ -61,6 +63,7 @@ pub struct EmbeddedAnalysis {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub genre: String,
     pub bpm: Option<f64>,
     pub key: Option<String>,
     pub scale: Option<String>,
@@ -72,6 +75,9 @@ pub struct EmbeddedAnalysis {
     pub beat_positions: Vec<f64>,
     pub analyzer: String,
     pub analysis_version: String,
+    pub drop_loudness_lufs: Option<f64>,
+    pub drop_analysis: Option<DropAnalysisDetails>,
+    pub high_level: Option<HighLevelAnalysis>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +342,151 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_observer(
         Some(observer),
         ScanPhase::Source,
     )
+}
+
+/// Scan source files while reusing the derived identity from the independent
+/// scan cache when the file fingerprint and naming context are unchanged.
+/// Destination files are intentionally not cached: their current state is
+/// needed for every preview.
+pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer(
+    folder: &str,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    output_directory: &Path,
+    cache: &mut ScanCache,
+    observer: &mut ScanObserver<'_>,
+) -> (
+    HashMap<String, (String, PathBuf)>,
+    Vec<MusicScanIssue>,
+    bool,
+) {
+    let source_path = Path::new(folder);
+    if source_path.is_file() && !is_supported_source_file(source_path) {
+        return (HashMap::new(), Vec::new(), false);
+    }
+
+    let source_root = source_path.to_path_buf();
+    let mut music_dict = HashMap::new();
+    let mut scan_issues = Vec::new();
+    let mut cancelled = false;
+
+    for entry_result in walkdir::WalkDir::new(folder) {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                if let Some(path) = error.path().filter(|path| !is_ignored_music_file(path)) {
+                    scan_issues.push(MusicScanIssue {
+                        path: path.to_path_buf(),
+                        message: format!("无法扫描歌曲文件：{error}"),
+                    });
+                }
+                continue;
+            }
+        };
+
+        if !entry.file_type().is_file()
+            || is_ignored_music_file(entry.path())
+            || !has_allowed_extension(entry.path(), SUPPORTED_SOURCE_EXTENSIONS)
+        {
+            continue;
+        }
+
+        if !observer(ScanPhase::Source, entry.path()) {
+            cancelled = true;
+            break;
+        }
+
+        let path = entry.path().to_path_buf();
+        let path_key = crate::scan_cache::normalize_path(&path)
+            .to_string_lossy()
+            .into_owned();
+        let metadata = entry.metadata().ok();
+        let size_bytes = metadata.as_ref().map_or(0, std::fs::Metadata::len);
+        let modified_at = modified_at_ms(&path);
+        let cached = cache
+            .entries
+            .get(&path_key)
+            .filter(|cached| {
+                can_reuse_entry(
+                    cached,
+                    &path,
+                    &source_root,
+                    output_directory,
+                    filename_rule_cache_key(filename_rule),
+                    netease_filename_format_cache_key(netease_filename_format),
+                    size_bytes,
+                    modified_at,
+                )
+            })
+            .cloned();
+
+        let (song_name, cached_issue) = if let Some(cached) = cached {
+            (cached.derived_name, cached.scan_issue)
+        } else {
+            let song_name =
+                derive_song_name_with_settings(&path, filename_rule, netease_filename_format);
+            let entry = ScanCacheEntry {
+                source_path: path_key,
+                source_root: crate::scan_cache::normalize_path(&source_root)
+                    .to_string_lossy()
+                    .into_owned(),
+                output_directory: crate::scan_cache::normalize_path(output_directory)
+                    .to_string_lossy()
+                    .into_owned(),
+                filename_rule: filename_rule_cache_key(filename_rule).to_string(),
+                netease_filename_format: netease_filename_format_cache_key(netease_filename_format)
+                    .to_string(),
+                size_bytes,
+                modified_at_ms: modified_at,
+                derived_name: song_name.clone(),
+                source_extension: path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase(),
+                scan_issue: None,
+            };
+            cache.insert(entry);
+            (song_name, None)
+        };
+
+        if let Some(issue) = cached_issue {
+            scan_issues.push(MusicScanIssue {
+                path: path.clone(),
+                message: issue,
+            });
+        }
+
+        let size = size_bytes.to_string();
+        let should_replace = music_dict
+            .get(&song_name)
+            .map(|existing| should_prefer_file(&path, &size, existing))
+            .unwrap_or(true);
+        if should_replace {
+            music_dict.insert(song_name, (size, path));
+        }
+    }
+
+    if !cancelled {
+        cache.remove_missing_sources(&source_root);
+    }
+    (music_dict, scan_issues, cancelled)
+}
+
+fn filename_rule_cache_key(rule: FilenameRule) -> &'static str {
+    match rule {
+        FilenameRule::TitleArtist => "title_artist",
+        FilenameRule::ArtistTitle => "artist_title",
+        FilenameRule::Original => "original",
+    }
+}
+
+fn netease_filename_format_cache_key(format: NeteaseFilenameFormat) -> &'static str {
+    match format {
+        NeteaseFilenameFormat::TitleOnly => "title_only",
+        NeteaseFilenameFormat::ArtistTitle => "artist_title",
+        NeteaseFilenameFormat::TitleArtist => "title_artist",
+    }
 }
 
 pub fn is_supported_source_file(path: &Path) -> bool {
@@ -922,6 +1073,15 @@ fn process_music_file(
 
     if result.is_ok() {
         remove_conflicting_outputs(dest_folder, name, output_policy.output_extension, src_path)?;
+        if let Some(recovered) = crate::netease::recover_local_metadata(src_path)
+            && !recovered.lyric_lrc_text.trim().is_empty()
+            && let Err(error) = write_lrc_sidecar(&output_path, &recovered.lyric_lrc_text)
+        {
+            bar.println(format!(
+                "歌词 sidecar 写入失败（不影响音频）：{}: {}",
+                name, error
+            ));
+        }
     }
 
     result
@@ -1141,7 +1301,9 @@ fn ensure_output_metadata_with_settings(
         .pictures()
         .any(|picture| crate::metadata::get_image_mime_type(&picture.data) != "image/*");
 
-    if !fill_missing_metadata(&mut output_tag, &source_tag, &identity) {
+    let changed_identity = fill_missing_metadata(&mut output_tag, &source_tag, &identity);
+    let changed_lyrics = merge_lyrics_metadata(&mut output_tag, &source_tag);
+    if !changed_identity && !changed_lyrics {
         return Ok(());
     }
 
@@ -1161,6 +1323,9 @@ pub fn apply_track_analysis_metadata(
     analysis: &EmbeddedAnalysis,
 ) -> io::Result<()> {
     let mut tag = read_id3_tag_or_empty(output_path);
+    if let Some(recovered) = crate::netease::recover_local_metadata(Path::new(&analysis.path)) {
+        merge_recovered_metadata(&mut tag, &recovered);
+    }
 
     if is_blank(tag.title()) && !analysis.title.trim().is_empty() {
         tag.set_title(analysis.title.trim());
@@ -1170,6 +1335,21 @@ pub fn apply_track_analysis_metadata(
     }
     if is_blank(tag.album()) && !analysis.album.trim().is_empty() {
         tag.set_album(analysis.album.trim());
+    }
+    if is_blank(tag.genre())
+        && let Some(genre) = (!analysis.genre.trim().is_empty())
+            .then_some(analysis.genre.trim())
+            .or_else(|| {
+                analysis.high_level.as_ref().and_then(|high_level| {
+                    high_level.genre.iter().find_map(|label| {
+                        (label.confidence.is_finite() && label.confidence >= 0.75)
+                            .then(|| label.label.trim())
+                            .filter(|label| !label.is_empty())
+                    })
+                })
+            })
+    {
+        tag.set_genre(genre);
     }
 
     if let Some(bpm) = analysis
@@ -1217,6 +1397,13 @@ pub fn apply_track_analysis_metadata(
                 .key_strength
                 .filter(|value| value.is_finite())
                 .map(|value| format!("{value:.4}")),
+        ),
+        (
+            "W4DJ-Drop-Loudness-LUFS",
+            analysis
+                .drop_loudness_lufs
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:.2}")),
         ),
         (
             "W4DJ-Beat-Positions",
@@ -1305,6 +1492,41 @@ fn analysis_summary(analysis: &EmbeddedAnalysis) -> String {
     if let Some(value) = analysis.danceability.filter(|value| value.is_finite()) {
         values.push(format!("Danceability {value:.4}"));
     }
+    if let Some(value) = analysis
+        .drop_loudness_lufs
+        .filter(|value| value.is_finite())
+    {
+        values.push(format!("Drop {value:.2} LUFS"));
+    }
+    if let Some(high_level) = &analysis.high_level {
+        let moods = high_level
+            .mood
+            .iter()
+            .map(|label| label.label.trim())
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+        if !moods.is_empty() {
+            values.push(format!("Mood {}", moods.join(", ")));
+        }
+        let instruments = high_level
+            .instrument
+            .iter()
+            .map(|label| label.label.trim())
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+        if !instruments.is_empty() {
+            values.push(format!("Instrument {}", instruments.join(", ")));
+        }
+        let genres = high_level
+            .genre
+            .iter()
+            .map(|label| label.label.trim())
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+        if !genres.is_empty() {
+            values.push(format!("Genre {}", genres.join(", ")));
+        }
+    }
     if values.is_empty() {
         String::from("W4DJ Essentia analysis")
     } else {
@@ -1363,6 +1585,17 @@ fn merge_recovered_metadata(tag: &mut id3::Tag, recovered: &RecoveredMetadata) -
         tag.set_album(recovered.album.trim());
         changed = true;
     }
+    if is_blank(tag.genre()) && !recovered.genre.trim().is_empty() {
+        tag.set_genre(recovered.genre.trim());
+        changed = true;
+    }
+    if tag.get("TDRC").is_none() && !recovered.publish_date.trim().is_empty() {
+        tag.set_text("TDRC", recovered.publish_date.trim());
+        changed = true;
+    }
+    changed |= add_extended_text_if_missing(tag, "W4DJ-Netease-Aliases", &recovered.aliases_json);
+    changed |=
+        add_extended_text_if_missing(tag, "W4DJ-Netease-Copyright", &recovered.copyright_text);
 
     let has_cover = tag
         .pictures()
@@ -1380,7 +1613,130 @@ fn merge_recovered_metadata(tag: &mut id3::Tag, recovered: &RecoveredMetadata) -
         changed = true;
     }
 
+    changed |= add_lyrics_if_missing(
+        tag,
+        &recovered.lyric_plain_text,
+        &recovered.lyric_language,
+        "W4DJ NetEase",
+    );
+    changed |= add_lyrics_if_missing(
+        tag,
+        &recovered.lyric_translated_text,
+        &recovered.lyric_language,
+        "W4DJ NetEase (translated)",
+    );
+    changed |= add_lyrics_if_missing(
+        tag,
+        &recovered.lyric_romanized_text,
+        &recovered.lyric_language,
+        "W4DJ NetEase (romanized)",
+    );
+
     changed
+}
+
+fn add_extended_text_if_missing(tag: &mut id3::Tag, description: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty()
+        || tag
+            .extended_texts()
+            .any(|frame| frame.description == description)
+    {
+        return false;
+    }
+    tag.add_frame(ExtendedText {
+        description: description.to_string(),
+        value: value.to_string(),
+    });
+    true
+}
+
+fn add_lyrics_if_missing(
+    tag: &mut id3::Tag,
+    text: &str,
+    language: &str,
+    description: &str,
+) -> bool {
+    let text = text.trim();
+    if text.is_empty()
+        || tag
+            .lyrics()
+            .any(|frame| frame.description == description && frame.text.trim() == text)
+    {
+        return false;
+    }
+    tag.add_frame(Lyrics {
+        lang: id3_language(language),
+        description: description.to_string(),
+        text: text.to_string(),
+    });
+    true
+}
+
+fn merge_lyrics_metadata(target: &mut id3::Tag, source: &id3::Tag) -> bool {
+    let source_lyrics = source
+        .lyrics()
+        .map(|frame| {
+            (
+                frame.lang.clone(),
+                frame.description.clone(),
+                frame.text.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for (lang, description, text) in source_lyrics {
+        if text.trim().is_empty()
+            || target
+                .lyrics()
+                .any(|frame| frame.description == description && frame.text.trim() == text.trim())
+        {
+            continue;
+        }
+        target.add_frame(Lyrics {
+            lang,
+            description,
+            text,
+        });
+        changed = true;
+    }
+    changed
+}
+
+fn write_lrc_sidecar(audio_path: &Path, value: &str) -> io::Result<Option<PathBuf>> {
+    #[cfg(test)]
+    {
+        let contents = value
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .trim()
+            .to_string();
+        if contents.is_empty() {
+            return Ok(None);
+        }
+        let parent = audio_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let stem = audio_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("track");
+        let path = parent.join(format!("{stem}.lrc"));
+        fs::write(&path, contents)?;
+        Ok(Some(path))
+    }
+    #[cfg(not(test))]
+    {
+        crate::lyrics::write_lrc_sidecar(audio_path, value)
+    }
+}
+
+fn id3_language(value: &str) -> String {
+    let value = value.trim();
+    if value.len() == 3 && value.is_ascii() {
+        value.to_ascii_lowercase()
+    } else {
+        String::from("und")
+    }
 }
 
 fn read_id3_tag_or_empty(path: &Path) -> id3::Tag {
@@ -3133,6 +3489,17 @@ mod tests {
             artist: String::from("网易云歌手"),
             album: String::from("网易云专辑"),
             cover: Some(vec![0xFF, 0xD8, 0xFF, 0x00]),
+            genre: String::new(),
+            aliases_json: String::new(),
+            copyright_text: String::new(),
+            publish_date: String::new(),
+            lyric_plain_text: String::new(),
+            lyric_translated_text: String::new(),
+            lyric_romanized_text: String::new(),
+            lyric_lrc_text: String::new(),
+            lyric_language: String::new(),
+            lyric_sync_type: String::new(),
+            lyric_source: String::new(),
             source: String::from("网易云本地数据库 + 本地封面"),
         };
 
@@ -3161,6 +3528,7 @@ mod tests {
             title: "Song".into(),
             artist: "Artist".into(),
             album: "Album".into(),
+            genre: String::new(),
             bpm: Some(140.25),
             key: Some("F#".into()),
             scale: Some("minor".into()),
@@ -3172,6 +3540,9 @@ mod tests {
             beat_positions: vec![0.0, 0.428],
             analyzer: "Essentia.js".into(),
             analysis_version: "0.1.3".into(),
+            drop_loudness_lufs: None,
+            drop_analysis: None,
+            high_level: None,
         };
 
         apply_track_analysis_metadata(&path, &analysis).unwrap();

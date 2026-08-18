@@ -3,10 +3,28 @@ import { message, open, save } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
 import {
   analyzeAudioFile,
+  ESSENTIA_MODEL_IDS,
   TRACK_ANALYSIS_VERSION,
+  type EssentiaModelFile,
   type TrackAnalysis,
   type TrackMetadata,
 } from './analysis';
+import {
+  renderLibraryDashboard,
+  libraryColumnIds,
+  saveLibraryColumnOrder,
+  toggleLibraryColumn,
+  type LibraryDashboardState,
+  type LibraryField,
+  type LibraryFilter,
+  type LibraryLyricsTab,
+  type LibraryOperator,
+  type LibraryPage,
+  type LibraryQuery,
+  type LibrarySourceRecord,
+  type LibraryStatus,
+  type LibraryTrack,
+} from './library-dashboard';
 
 export type AppMode = 'compat' | 'lossless';
 export type AppLosslessFormat = 'wav' | 'aiff';
@@ -23,10 +41,17 @@ export type SyncSlotIndex = 0 | 1;
 export type SourcePickerChoice = 'folder' | 'track' | 'cancel';
 type SelectionMotion = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | 'theme' | 'lang' | null;
 type PendingSelection = 'mode' | 'format' | 'conversion-mode' | 'enhanced-mode' | null;
+type PendingGlobalAction = 'start-all' | 'pause-all' | 'cancel-scan' | 'cancel-all' | 'cancel-analysis' | null;
 type OnboardingStep = 0 | 1 | 2 | 3 | 4;
 type OnboardingTarget = 'mode' | 'source' | 'destination' | 'start' | 'tutorial';
 
 const ONBOARDING_STEP_COUNT = 5;
+
+function createAnalysisBatchId(): string {
+  const timestamp = Date.now().toString(36);
+  const random = Math.random().toString(36).slice(2, 8);
+  return `batch-${timestamp}-${random}`;
+}
 
 const LIGHT_PALETTE = 'c' as const;
 
@@ -156,7 +181,7 @@ export type AppUpdateCheck = {
 };
 
 export type AppAnalysisState = {
-  status: 'idle' | 'running' | 'completed' | 'error';
+  status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
   completed: number;
   total: number;
   resultCount: number;
@@ -178,11 +203,21 @@ export function canReuseTrackAnalysis(
   cached: TrackAnalysis | undefined,
   fingerprint: AppAudioFileFingerprint,
   neteaseFilenameFormat: AppNeteaseFilenameFormat,
+  highLevelModelVersion: string | null = null,
+  highLevelModelsAvailable = false,
 ): cached is TrackAnalysis {
-  return cached?.analysisVersion === TRACK_ANALYSIS_VERSION
+  const basicMatch = cached?.analysisVersion === TRACK_ANALYSIS_VERSION
     && cached.sourceSizeBytes === fingerprint.sizeBytes
     && (cached.sourceModifiedAt ?? null) === fingerprint.modifiedAt
     && (cached.sourceFilenameFormat ?? 'title_artist') === neteaseFilenameFormat;
+  if (!basicMatch) {
+    return false;
+  }
+  if (!highLevelModelsAvailable) {
+    return true;
+  }
+  return cached.highLevel?.status === 'completed'
+    && cached.highLevel.modelVersion === highLevelModelVersion;
 }
 
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
@@ -226,6 +261,15 @@ export type AppScanProgress = {
   total: number;
   current_file: string;
   message: string;
+  tasks?: AppScanTaskProgress[];
+};
+
+export type AppScanTaskProgress = {
+  slot_index: SyncSlotIndex;
+  phase: AppScanPhase;
+  processed: number;
+  total: number;
+  current_file: string;
 };
 
 export type AppServices = {
@@ -249,11 +293,19 @@ export type AppServices = {
   loadScanState: () => Promise<AppScanProgress>;
   loadScanResult: () => Promise<AppPreview[]>;
   cancelScan: () => Promise<AppScanProgress>;
+  clearScanCache?: () => Promise<void>;
   startConfirmedSync: (
     previews: AppPreview[],
     retryOf?: string | null,
     analyses?: TrackAnalysis[],
     analysisFailures?: AppAnalysisFailure[],
+    batchId?: string,
+  ) => Promise<DesktopState>;
+  applyTrackAnalysisResults: (
+    batchId: string,
+    previews: AppPreview[],
+    analyses: TrackAnalysis[],
+    analysisFailures: AppAnalysisFailure[],
   ) => Promise<DesktopState>;
   loadHistory: () => Promise<AppHistoryEntry[]>;
   retryHistoryFailures: (id: string) => Promise<AppPreview>;
@@ -264,6 +316,7 @@ export type AppServices = {
   checkForUpdates: () => Promise<AppUpdateCheck>;
   openExternalUrl: (url: string) => Promise<void>;
   openDestination: (path: string) => Promise<void>;
+  openSource: (path: string) => Promise<void>;
   startAllSync: () => Promise<DesktopState>;
   pauseAllSync: () => Promise<DesktopState>;
   cancelSync: (slotIndex: SyncSlotIndex) => Promise<DesktopState>;
@@ -276,6 +329,35 @@ export type AppServices = {
   saveTrackAnalyses: (entries: TrackAnalysis[]) => Promise<number>;
   clearTrackAnalyses: () => Promise<void>;
   exportRekordboxXml: (path: string) => Promise<void>;
+  getEssentiaModelStatus?: () => Promise<EssentiaModelStatus>;
+  downloadEssentiaModels?: () => Promise<EssentiaModelStatus>;
+  loadEssentiaModel?: (id: string) => Promise<EssentiaModelFile>;
+  loadLibraryStatus?: () => Promise<LibraryStatus>;
+  locateNeteaseLibrary?: () => Promise<LibraryStatus['netease']>;
+  refreshLibraryCatalog?: () => Promise<unknown>;
+  queryLibraryCatalog?: (query: LibraryQuery) => Promise<LibraryPage>;
+  getLibraryTrackDetail?: (trackKey: string) => Promise<LibraryTrack | null>;
+  getLibraryTrackSourceRecords?: (trackKey: string) => Promise<LibrarySourceRecord[]>;
+  getLibraryTrackCover?: (trackKey: string) => Promise<string | null>;
+  clearLibraryCatalogCache?: () => Promise<void>;
+};
+
+export type EssentiaModelStatus = {
+  version: string;
+  embedding: boolean;
+  genre: boolean;
+  mood: boolean;
+  instrument: boolean;
+  downloading: boolean;
+};
+
+const defaultEssentiaModelStatus: EssentiaModelStatus = {
+  version: '',
+  embedding: false,
+  genre: false,
+  mood: false,
+  instrument: false,
+  downloading: false,
 };
 
 export type DropTargetRect = {
@@ -326,6 +408,7 @@ const translations = {
     destLabel: '输出目录',
     clearSource: '清空输入来源',
     clearDestination: '清空输出目录',
+    openSource: '打开输入来源',
     openDestination: '打开输出目录',
     pickFolder: '选择文件夹',
     pickSource: '选择来源',
@@ -447,12 +530,26 @@ const translations = {
     exportRekordbox: '导出 Rekordbox XML',
     analysisIdle: '先设置输出目录，再开始分析。',
     analysisRunning: '正在分析音乐库…',
+    analysisCancelled: '增强分析已取消，已完成的结果已保存。',
     analysisComplete: '已保存 {count} 首分析结果，可导入 Rekordbox。',
     analysisPartial: '完成 {done}/{total} 首，{failed} 首失败。',
     analysisNoResults: '没有成功的分析结果。',
     clearAnalysisCache: '清除分析缓存',
     clearAnalysisCacheConfirm: '确定清除已保存的音乐分析缓存吗？不会删除音频文件或转换历史。',
     analysisCacheCleared: '音乐分析缓存已清除。',
+    clearEnhancedCache: '清除增强模式缓存',
+    clearEnhancedCacheConfirm: '确定清除增强模式缓存吗？不会删除音频文件、扫描缓存或已下载模型。',
+    enhancedCacheCleared: '增强模式缓存已清除。',
+    clearScanCache: '清除扫描缓存',
+    clearScanCacheConfirm: '确定清除扫描缓存吗？下一次开始时会重新扫描全部歌曲。不会删除增强模式缓存或模型。',
+    scanCacheCleared: '扫描缓存已清除。',
+    essentiaModelsTitle: 'Essentia 预训练模型',
+    essentiaModelsReady: '已下载，增强模式会识别流派、情绪和人声/器乐。',
+    essentiaModelsMissing: '未下载；增强模式仍可进行基础分析和 Drop LUFS。',
+    essentiaModelsDownload: '下载分析模型',
+    essentiaModelsDownloading: '正在下载模型…',
+    essentiaModelsDownloaded: 'Essentia 预训练模型已下载。',
+    essentiaModelsPartial: '模型未全部下载完成，增强模式仍可运行基础分析。',
     scanTitle: '扫描歌曲',
     scanPreparing: '正在准备扫描',
     scanSource: '正在扫描输入目录',
@@ -464,6 +561,9 @@ const translations = {
     scanError: '扫描失败',
     scanCurrentFile: '当前文件',
     scanCancel: '取消扫描',
+    conversionCancel: '取消转换',
+    conversionRunning: '正在转换',
+    analysisCancel: '取消分析',
     scanClose: '关闭',
   },
   en: {
@@ -476,6 +576,7 @@ const translations = {
     destLabel: 'Output Folder',
     clearSource: 'Clear input source',
     clearDestination: 'Clear output folder',
+    openSource: 'Open input source',
     openDestination: 'Open output folder',
     pickFolder: 'Select Folder',
     pickSource: 'Choose Source',
@@ -597,12 +698,26 @@ const translations = {
     exportRekordbox: 'Export Rekordbox XML',
     analysisIdle: 'Choose an output folder before analyzing.',
     analysisRunning: 'Analyzing music library…',
+    analysisCancelled: 'Enhanced analysis cancelled; completed results were saved.',
     analysisComplete: '{count} results saved. Ready for Rekordbox.',
     analysisPartial: 'Completed {done}/{total}; {failed} failed.',
     analysisNoResults: 'No analysis result was completed.',
     clearAnalysisCache: 'Clear analysis cache',
     clearAnalysisCacheConfirm: 'Clear the saved music analysis cache? Audio files and conversion history will not be deleted.',
     analysisCacheCleared: 'Music analysis cache cleared.',
+    clearEnhancedCache: 'Clear enhanced-mode cache',
+    clearEnhancedCacheConfirm: 'Clear enhanced-mode cache? Audio files, scan cache, and downloaded models will not be deleted.',
+    enhancedCacheCleared: 'Enhanced-mode cache cleared.',
+    clearScanCache: 'Clear scan cache',
+    clearScanCacheConfirm: 'Clear the scan cache? The next run will scan all songs again. Enhanced-mode cache and models will not be deleted.',
+    scanCacheCleared: 'Scan cache cleared.',
+    essentiaModelsTitle: 'Essentia pretrained models',
+    essentiaModelsReady: 'Downloaded; Enhanced mode can identify genre, mood, and voice/instrument.',
+    essentiaModelsMissing: 'Not downloaded; basic analysis and Drop LUFS still work.',
+    essentiaModelsDownload: 'Download analysis models',
+    essentiaModelsDownloading: 'Downloading models…',
+    essentiaModelsDownloaded: 'Essentia pretrained models downloaded.',
+    essentiaModelsPartial: 'The full model set is not ready; basic analysis still works.',
     scanTitle: 'Scanning songs',
     scanPreparing: 'Preparing scan',
     scanSource: 'Scanning input folders',
@@ -614,6 +729,9 @@ const translations = {
     scanError: 'Scan failed',
     scanCurrentFile: 'Current file',
     scanCancel: 'Cancel scan',
+    conversionCancel: 'Cancel conversion',
+    conversionRunning: 'Converting',
+    analysisCancel: 'Cancel analysis',
     scanClose: 'Close',
   },
 } as const;
@@ -805,15 +923,25 @@ const defaultServices: AppServices = {
   loadScanState: () => invoke<AppScanProgress>('load_scan_state'),
   loadScanResult: () => invoke<AppPreview[]>('load_scan_result'),
   cancelScan: () => invoke<AppScanProgress>('cancel_scan'),
+  clearScanCache: () => invoke<void>('clear_scan_cache'),
   startConfirmedSync: (
     previews,
     retryOf = null,
     analyses = [],
     analysisFailures = [],
+    batchId = null,
   ) =>
     invoke<DesktopState>('start_confirmed_sync', {
       previews,
       retryOf,
+      analyses,
+      analysisFailures,
+      batchId,
+    }),
+  applyTrackAnalysisResults: (batchId, previews, analyses, analysisFailures) =>
+    invoke<DesktopState>('apply_track_analysis_results', {
+      batchId,
+      previews,
       analyses,
       analysisFailures,
     }),
@@ -827,6 +955,7 @@ const defaultServices: AppServices = {
   checkForUpdates: () => invoke<AppUpdateCheck>('check_for_updates'),
   openExternalUrl: (url) => invoke<void>('open_external_url', { url }),
   openDestination: (path) => invoke<void>('open_destination', { path }),
+  openSource: (path) => invoke<void>('open_source', { path }),
   startAllSync: () => invoke<DesktopState>('start_all_sync'),
   pauseAllSync: () => invoke<DesktopState>('pause_all_sync'),
   cancelSync: (slotIndex) => invoke<DesktopState>('cancel_sync', { slotIndex }),
@@ -839,11 +968,22 @@ const defaultServices: AppServices = {
   saveTrackAnalyses: (entries) => invoke<number>('save_track_analyses', { entries }),
   clearTrackAnalyses: () => invoke<void>('clear_track_analyses'),
   exportRekordboxXml: (path) => invoke<void>('export_rekordbox_xml', { path }),
+  getEssentiaModelStatus: () => invoke<EssentiaModelStatus>('get_essentia_model_status'),
+  downloadEssentiaModels: () => invoke<EssentiaModelStatus>('download_essentia_models'),
+  loadEssentiaModel: (id) => invoke<EssentiaModelFile>('load_essentia_model', { id }),
+  loadLibraryStatus: () => invoke<LibraryStatus>('load_library_status'),
+  locateNeteaseLibrary: () => invoke<LibraryStatus['netease']>('locate_netease_library'),
+  refreshLibraryCatalog: () => invoke<unknown>('refresh_library_catalog'),
+  queryLibraryCatalog: (query) => invoke<LibraryPage>('query_library_catalog', { query }),
+  getLibraryTrackDetail: (trackKey) => invoke<LibraryTrack | null>('get_library_track_detail', { trackKey }),
+  getLibraryTrackSourceRecords: (trackKey) => invoke<LibrarySourceRecord[]>('get_library_track_source_records', { trackKey }),
+  getLibraryTrackCover: (trackKey) => invoke<string | null>('get_library_track_cover', { trackKey }),
+  clearLibraryCatalogCache: () => invoke<void>('clear_library_catalog_cache'),
 };
 
 export function renderApp(
   state: AppViewState = defaultState,
-  pendingAction: 'start-all' | 'pause-all' | null = null,
+  pendingAction: PendingGlobalAction = null,
   selectionMotion: SelectionMotion = null,
   previewModal: AppPreviewModalState | null = null,
   history: AppHistoryEntry[] = [],
@@ -859,6 +999,8 @@ export function renderApp(
   helpVisible = false,
   updateInfo: AppUpdateCheck | null = null,
   historyLoadError: string | null = null,
+  modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus,
+  libraryState: LibraryDashboardState | null = null,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -871,6 +1013,9 @@ export function renderApp(
     root.dataset.selectionMotion = selectionMotion;
   }
   const isRunning = state.slots.some((slot) => slot.status === 'running');
+  const scanRunning = scanProgress?.status === 'running';
+  const analysisRunning = analysisState.status === 'running';
+  const conversionRunning = isRunning && !scanRunning && !analysisRunning;
   const hasCancelled = state.slots.some((slot) => slot.status === 'cancelled');
   const configuredTasks = state.slots.filter((slot) => slot.sourceDirectory.trim()).length;
   const onboardingTarget: OnboardingTarget | null = onboardingVisible
@@ -886,6 +1031,10 @@ export function renderApp(
         <button type="button" class="help-button" data-action="open-help"${onboardingTarget === 'tutorial' ? ' data-onboarding-target="tutorial"' : ''} aria-label="${t('tutorial', state.lang)}" title="${t('tutorial', state.lang)}">
           ${icon('help')}
           <span>${t('tutorial', state.lang)}</span>
+        </button>
+        <button type="button" class="help-button" data-action="open-library" aria-label="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" title="${state.lang === 'zh' ? '歌曲库' : 'Song library'}">
+          ${icon('list')}
+          <span>${state.lang === 'zh' ? '歌曲库' : 'Library'}</span>
         </button>
         <button type="button" class="lang-button" data-action="open-about">${t('about', state.lang)}</button>
         <button type="button" class="theme-button" data-action="toggle-theme" aria-label="${
@@ -984,15 +1133,29 @@ export function renderApp(
               </span>
             </span>
           </div>
-          ${renderOutputSettings(state, outputSettingsExpanded)}
+          ${renderOutputSettings(state, outputSettingsExpanded, modelStatus)}
           <div class="global-action-group">
-            <button type="button" class="global-action"${onboardingTarget === 'start' ? ' data-onboarding-target="start"' : ''} data-action="${isRunning ? 'pause-all' : 'start-all'}" ${
-              configuredTasks === 0 || pendingAction !== null ? 'disabled' : ''
+            <button type="button" class="global-action"${onboardingTarget === 'start' ? ' data-onboarding-target="start"' : ''} data-action="${scanRunning ? 'cancel-scan' : analysisRunning ? 'cancel-analysis' : conversionRunning ? 'cancel-all' : 'start-all'}" ${
+              !scanRunning && !analysisRunning && !conversionRunning && (configuredTasks === 0 || pendingAction !== null) ? 'disabled' : ''
             } aria-busy="${pendingAction !== null}">
-              ${isRunning ? icon('pause') : icon('play')}
-              ${isRunning ? t('pauseAll', state.lang) : hasCancelled ? t('resumeTasks', state.lang) : t('startAll', state.lang)}
+              ${scanRunning || analysisRunning || conversionRunning ? icon('pause') : icon('play')}
+              ${scanRunning
+                ? t('scanCancel', state.lang)
+                : analysisRunning
+                  ? t('analysisCancel', state.lang)
+                  : conversionRunning
+                    ? t('conversionCancel', state.lang)
+                    : hasCancelled ? t('resumeTasks', state.lang) : t('startAll', state.lang)}
             </button>
-            ${isRunning ? `<button type="button" class="secondary-action cancel-all" data-action="cancel-all">${t('cancelTask', state.lang)}</button>` : ''}
+            ${scanProgress && (scanProgress.status === 'error' || scanProgress.status === 'cancelled')
+              ? `<small class="global-stage-message" data-role="scan-message">${escapeHtml(scanProgress.message || scanPhaseLabel(scanProgress.phase, state.lang))}</small>`
+              : analysisRunning
+                ? `<small class="global-stage-message" data-role="analysis-message">${t('analysisRunning', state.lang)} ${analysisState.completed}/${analysisState.total}</small>`
+                : analysisState.status === 'cancelled'
+                  ? `<small class="global-stage-message" data-role="analysis-message">${escapeHtml(analysisState.message || t('analysisCancelled', state.lang))}</small>`
+                : conversionRunning
+                  ? `<small class="global-stage-message" data-role="conversion-message">${t('conversionRunning', state.lang)}</small>`
+                  : ''}
           </div>
         </div>
       </aside>
@@ -1006,75 +1169,22 @@ export function renderApp(
             state,
             0,
             onboardingTarget === 'source' || onboardingTarget === 'destination' ? onboardingTarget : null,
+            scanProgress?.tasks?.find((task) => task.slot_index === 0),
+            scanRunning,
           )}
-          ${renderSyncSlot(state, 1)}
+          ${renderSyncSlot(state, 1, null, scanProgress?.tasks?.find((task) => task.slot_index === 1), scanRunning)}
         </div>
         ${renderHistory(history, state.lang, historyExpanded, historyLoadError)}
       </div>
     </section>
-    ${renderScanModal(scanProgress, state.lang)}
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, updateInfo, state.lang)}
     ${renderHelpModal(helpVisible, state.lang)}
     ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
+    ${renderLibraryDashboard(libraryState, state.lang)}
   `;
 
   return root;
-}
-
-function renderScanModal(progress: AppScanProgress | null, lang: AppLanguage): string {
-  if (!progress) {
-    return '';
-  }
-
-  const percent = progress.total > 0
-    ? Math.min(100, Math.round((progress.processed / progress.total) * 100))
-    : progress.status === 'completed' ? 100 : 0;
-  const stageKey: keyof typeof translations.zh = progress.phase === 'scanning_source'
-    ? 'scanSource'
-    : progress.phase === 'scanning_destination'
-      ? 'scanDestination'
-      : progress.phase === 'checking'
-        ? 'scanChecking'
-        : progress.phase === 'analyzing'
-          ? 'scanAnalyzing'
-        : progress.status === 'completed'
-          ? 'scanCompleted'
-          : progress.status === 'cancelled'
-            ? 'scanCancelled'
-            : progress.status === 'error'
-              ? 'scanError'
-              : 'scanPreparing';
-  const isRunning = progress.status === 'running';
-  const message = progress.message || t(stageKey, lang);
-  return `
-    <div class="scan-modal" data-role="scan-modal" role="dialog" aria-modal="true" aria-label="${t('scanTitle', lang)}">
-      <section class="scan-dialog">
-        <div class="scan-dialog-head">
-          <div>
-            <p class="panel-kicker">W4DJ RKB</p>
-            <h2>${t('scanTitle', lang)}</h2>
-          </div>
-          <span class="scan-stage">${t(stageKey, lang)}</span>
-        </div>
-        <p class="scan-message">${message}</p>
-        <div class="scan-progress-summary">
-          <strong>${progress.processed} / ${progress.total}</strong>
-          <span>${percent}%</span>
-        </div>
-        <div class="scan-progress-track" aria-label="${percent}%"><span style="width: ${percent}%"></span></div>
-        <div class="scan-current-file">
-          <span>${t('scanCurrentFile', lang)}</span>
-          <strong title="${progress.current_file}">${progress.current_file || '—'}</strong>
-        </div>
-        <footer class="scan-actions">
-          ${isRunning
-            ? `<button type="button" class="secondary-action" data-action="cancel-scan">${t('scanCancel', lang)}</button>`
-            : `<button type="button" class="global-action" data-action="close-scan">${t('scanClose', lang)}</button>`}
-        </footer>
-      </section>
-    </div>
-  `;
 }
 
 function renderPreviewModal(
@@ -1213,15 +1323,24 @@ function renderSyncSlot(
   state: AppViewState,
   slotIndex: SyncSlotIndex,
   onboardingTarget: 'source' | 'destination' | null = null,
+  scanTask: AppScanTaskProgress | undefined = undefined,
+  scanActive = false,
 ): string {
   const slot = state.slots[slotIndex];
   const fallbackDestination = state.slots[0].destinationDirectory;
   const usesFallback = slotIndex === 1 && slot.destinationDirectory.trim() === '';
   const displayedDestination = usesFallback ? fallbackDestination : slot.destinationDirectory;
   const slotNumber = slotIndex + 1;
-  const showProgressText =
-    slot.status !== 'idle' && slot.progressText !== t('idle', state.lang);
-  const isNumericProgress = /^\d+\/\d+$/.test(slot.progressText);
+  const scanPercent = scanTask && scanTask.total > 0
+    ? Math.min(100, Math.round((scanTask.processed / scanTask.total) * 100))
+    : 0;
+  const displayedProgressText = scanActive && scanTask
+    ? `${scanPhaseLabel(scanTask.phase, state.lang)} ${scanTask.processed}/${scanTask.total}`
+    : slot.progressText;
+  const showProgressText = scanActive && scanTask
+    ? true
+    : slot.status !== 'idle' && slot.progressText !== t('idle', state.lang);
+  const isNumericProgress = /^\d+\/\d+$/.test(displayedProgressText);
   return `
     <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${slot.status}">
       <header class="sync-slot-head">
@@ -1241,6 +1360,9 @@ function renderSyncSlot(
             <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
               ${icon('folder')}
               <span class="path-copy">${displayPath(slot.sourceDirectory, state.lang, t('pickSource', state.lang))}</span>
+            </button>
+            <button type="button" class="path-action path-open" data-action="open-source" data-slot="${slotIndex}" aria-label="${t('openSource', state.lang)}" title="${t('openSource', state.lang)}" ${slot.sourceDirectory.trim() ? '' : 'disabled'}>
+              ${icon('open')}
             </button>
             <button type="button" class="path-action path-clear" data-action="clear-source" data-slot="${slotIndex}" aria-label="${t('clearSource', state.lang)}" title="${t('clearSource', state.lang)}" ${slot.sourceDirectory.trim() ? '' : 'disabled'}>
               ${icon('trash')}
@@ -1277,9 +1399,9 @@ function renderSyncSlot(
       </div>
 
       <footer class="slot-status-strip">
-        ${showProgressText ? `<span class="status-copy progress-copy ${isNumericProgress ? 'progress-copy--numeric' : ''}">${escapeHtml(slot.progressText)}</span>` : ''}
+        ${showProgressText ? `<span class="status-copy progress-copy ${isNumericProgress ? 'progress-copy--numeric' : ''}">${escapeHtml(displayedProgressText)}</span>` : ''}
         <div class="progress-track" aria-hidden="true">
-          <div class="progress-fill" style="width: ${progressPercent(slot)}%"></div>
+          <div class="progress-fill" style="width: ${scanActive && scanTask ? scanPercent : progressPercent(slot)}%"></div>
         </div>
       </footer>
     </article>
@@ -1293,7 +1415,7 @@ export function bindApp(
 ): void {
   let state = initialState;
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
-  let pendingGlobalAction: 'start-all' | 'pause-all' | null = null;
+  let pendingGlobalAction: PendingGlobalAction = null;
   let selectionMotion: SelectionMotion = null;
   let selectionMotionToken = 0;
   let pendingSelection: PendingSelection = null;
@@ -1304,6 +1426,7 @@ export function bindApp(
   let historyLoadError: string | null = null;
   let aboutInfo: AppInfo | null = null;
   let updateInfo: AppUpdateCheck | null = null;
+  let modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus;
   let helpVisible = false;
   let outputSettingsExpanded = false;
   let historyExpanded = false;
@@ -1313,6 +1436,35 @@ export function bindApp(
   let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
   let onboardingStep: OnboardingStep = 0;
   let analysisState: AppAnalysisState = { ...defaultAnalysisState };
+  let analysisCache: TrackAnalysis[] = [];
+  let analysisCacheLoadPromise: Promise<void> = Promise.resolve();
+  let analysisCacheRevision = 0;
+  let libraryState: LibraryDashboardState | null = null;
+  let librarySearchTimer: ReturnType<typeof setTimeout> | null = null;
+  let draggedLibraryColumn: string | null = null;
+  let neteaseDiscoveryStarted = false;
+
+  const loadAnalysisCache = async () => {
+    const loadRevision = analysisCacheRevision;
+    try {
+      const entries = await services.loadTrackAnalyses();
+      if (loadRevision === analysisCacheRevision) {
+        analysisCache = entries;
+      }
+    } catch (error) {
+      if (loadRevision === analysisCacheRevision) {
+        analysisCache = [];
+      }
+      console.warn('Failed to load Essentia analysis cache; rebuilding entries:', error);
+    }
+  };
+
+  const mergeAnalysisCache = (updates: TrackAnalysis[]) => {
+    const entriesByPath = new Map(analysisCache.map((entry) => [entry.path, entry]));
+    updates.forEach((entry) => entriesByPath.set(entry.path, entry));
+    analysisCache = Array.from(entriesByPath.values()).sort((left, right) =>
+      left.path.localeCompare(right.path));
+  };
 
   const render = () => {
     root.replaceChildren(
@@ -1334,6 +1486,8 @@ export function bindApp(
         helpVisible,
         updateInfo,
         historyLoadError,
+        modelStatus,
+        libraryState,
       ),
     );
 
@@ -1635,20 +1789,23 @@ export function bindApp(
       }
 
       previewBusy = true;
+      const batchId = createAnalysisBatchId();
+      const shouldAnalyze = state.enhancedMode;
       render();
-      const analysis = state.enhancedMode
-        ? await analyzePreviewCandidates(previews)
-        : { analyses: [], failures: [] };
-      if (state.enhancedMode && analysisCancelRequested) {
-        return;
-      }
       const nextState = await services.startConfirmedSync(
         previews,
         null,
-        analysis.analyses,
-        analysis.failures,
+        [],
+        [],
+        batchId,
       );
       applyDesktopState(nextState);
+      previewBusy = false;
+      pendingGlobalAction = null;
+      render();
+      if (shouldAnalyze) {
+        void runPostConversionAnalysis(batchId, previews);
+      }
     } catch (error) {
       scanProgress = {
         ...progress,
@@ -1729,19 +1886,8 @@ export function bindApp(
     if (!scanProgress || scanProgress.status !== 'running') {
       return;
     }
-    if (scanProgress.phase === 'analyzing') {
-      analysisCancelRequested = true;
-      scanProgress = {
-        ...scanProgress,
-        status: 'cancelled',
-        phase: 'cancelled',
-        message: t('scanCancelled', state.lang),
-      };
-      pendingGlobalAction = null;
-      render();
-      return;
-    }
     try {
+      pendingGlobalAction = 'cancel-scan';
       scanProgress = await services.cancelScan();
       render();
     } catch (error) {
@@ -1749,6 +1895,20 @@ export function bindApp(
       pendingGlobalAction = null;
       render();
     }
+  };
+
+  const cancelAnalysisFlow = () => {
+    if (analysisState.status !== 'running') {
+      return;
+    }
+    analysisCancelRequested = true;
+    analysisState = {
+      ...analysisState,
+      status: 'cancelled',
+      message: t('analysisCancelled', state.lang),
+    };
+    pendingGlobalAction = null;
+    render();
   };
 
   const confirmPreview = async () => {
@@ -1769,20 +1929,25 @@ export function bindApp(
     pendingGlobalAction = 'start-all';
     render();
     try {
-      const analysis = state.enhancedMode
-        ? await analyzePreviewCandidates(previewModal.previews)
-        : { analyses: [], failures: [] };
-      if (state.enhancedMode && analysisCancelRequested) {
-        return;
-      }
+      const previews = previewModal.previews;
+      const retryOf = previewModal.retryOf;
+      const batchId = createAnalysisBatchId();
+      const shouldAnalyze = state.enhancedMode;
       const nextState = await services.startConfirmedSync(
-        previewModal.previews,
-        previewModal.retryOf,
-        analysis.analyses,
-        analysis.failures,
+        previews,
+        retryOf,
+        [],
+        [],
+        batchId,
       );
       previewModal = null;
       applyDesktopState(nextState);
+      previewBusy = false;
+      pendingGlobalAction = null;
+      render();
+      if (shouldAnalyze) {
+        void runPostConversionAnalysis(batchId, previews);
+      }
     } catch (error) {
       reportError(error);
     } finally {
@@ -1848,17 +2013,263 @@ export function bindApp(
     }
   };
 
-  const clearAnalysisCache = async () => {
-    if (!window.confirm(t('clearAnalysisCacheConfirm', state.lang))) {
+  const clearEnhancedCache = async () => {
+    if (!window.confirm(t('clearEnhancedCacheConfirm', state.lang))) {
       return;
     }
     try {
+      analysisCacheRevision += 1;
+      const clearedRevision = analysisCacheRevision;
       await services.clearTrackAnalyses();
-      analysisState = { ...defaultAnalysisState, message: t('analysisCacheCleared', state.lang) };
+      if (clearedRevision === analysisCacheRevision) {
+        analysisCache = [];
+      }
+      analysisState = { ...defaultAnalysisState, message: t('enhancedCacheCleared', state.lang) };
       render();
-      window.alert(t('analysisCacheCleared', state.lang));
+      window.alert(t('enhancedCacheCleared', state.lang));
     } catch (error) {
       reportError(error);
+    }
+  };
+
+  const clearScanCache = async () => {
+    if (!services.clearScanCache) {
+      return;
+    }
+    if (!window.confirm(t('clearScanCacheConfirm', state.lang))) {
+      return;
+    }
+    try {
+      await services.clearScanCache();
+      window.alert(t('scanCacheCleared', state.lang));
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const downloadEssentiaModels = async () => {
+    if (!services.downloadEssentiaModels) {
+      return;
+    }
+    modelStatus = { ...modelStatus, downloading: true };
+    render();
+    try {
+      modelStatus = await services.downloadEssentiaModels();
+      window.alert(modelStatus.embedding && modelStatus.genre && modelStatus.mood && modelStatus.instrument
+        ? t('essentiaModelsDownloaded', state.lang)
+        : t('essentiaModelsPartial', state.lang));
+    } catch (error) {
+      reportError(error);
+    } finally {
+      modelStatus = { ...modelStatus, downloading: false };
+      render();
+    }
+  };
+
+  const defaultLibraryQuery = (): LibraryQuery => ({
+    text: '',
+    filters: [],
+    filterLogic: 'and',
+    sorts: [],
+    limit: 100,
+    offset: 0,
+  });
+
+  const loadLibraryPage = async (query: LibraryQuery) => {
+    if (!services.queryLibraryCatalog) return null;
+    return services.queryLibraryCatalog(query);
+  };
+
+  const loadLibraryCovers = async (page: LibraryPage | null) => {
+    if (!page || !services.getLibraryTrackCover || !libraryState) return;
+    const candidates = page.items
+      // The database can contain only a relative cover reference while the
+      // real image lives in NetEase's neighbouring `meta` directory. Ask the
+      // backend for every visible row so that this recovery path is not
+      // hidden behind the database's boolean hint.
+      .filter((track) => !libraryState?.coverData?.[track.trackKey])
+      .slice(0, 24);
+    if (candidates.length === 0) return;
+    const resolved = await Promise.all(candidates.map(async (track) => {
+      try {
+        return [track.trackKey, await services.getLibraryTrackCover!(track.trackKey)] as const;
+      } catch {
+        return [track.trackKey, null] as const;
+      }
+    }));
+    if (!libraryState?.visible) return;
+    const coverData = { ...(libraryState.coverData || {}) };
+    resolved.forEach(([key, data]) => {
+      if (data) coverData[key] = data;
+    });
+    if (Object.keys(coverData).length !== Object.keys(libraryState.coverData || {}).length) {
+      libraryState = { ...libraryState, coverData };
+      render();
+    }
+  };
+
+  const openLibrary = async () => {
+    if (!services.loadLibraryStatus || !services.queryLibraryCatalog) {
+      libraryState = {
+        visible: true,
+        busy: false,
+        status: null,
+        page: null,
+        query: defaultLibraryQuery(),
+        detail: null,
+        error: state.lang === 'zh' ? '当前版本没有启用歌曲库服务。' : 'Song library service is unavailable.',
+        coverData: {},
+      };
+      render();
+      return;
+    }
+    const query = defaultLibraryQuery();
+    libraryState = { visible: true, busy: true, status: null, page: null, query, detail: null, error: null, coverData: {} };
+    render();
+    try {
+      const status = await services.loadLibraryStatus();
+      const page = await loadLibraryPage(query);
+      libraryState = { visible: true, busy: false, status, page, query, detail: null, error: null, coverData: {} };
+      void loadLibraryCovers(page);
+    } catch (error) {
+      libraryState = {
+        ...libraryState,
+        busy: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    render();
+  };
+
+  const refreshLibrary = async () => {
+    if (!libraryState || !services.refreshLibraryCatalog || !services.loadLibraryStatus) return;
+    libraryState = { ...libraryState, busy: true, error: null };
+    render();
+    try {
+      await services.refreshLibraryCatalog();
+      const status = await services.loadLibraryStatus();
+      const page = services.queryLibraryCatalog
+        ? await services.queryLibraryCatalog(libraryState.query)
+        : libraryState.page;
+      libraryState = { ...libraryState, busy: false, status, page };
+      void loadLibraryCovers(page);
+    } catch (error) {
+      libraryState = { ...libraryState, busy: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    render();
+  };
+
+  const clearLibraryCache = async () => {
+    if (!libraryState || !services.clearLibraryCatalogCache) return;
+    if (!window.confirm(state.lang === 'zh'
+      ? '确定清除歌曲库索引吗？网易云数据库、音乐文件、扫描缓存和增强分析缓存不会被删除。'
+      : 'Clear the song-library index? NetEase data, audio files, scan cache and analysis cache will stay intact.')) {
+      return;
+    }
+    try {
+      await services.clearLibraryCatalogCache();
+      libraryState = { ...libraryState, page: null, status: null, detail: null, error: null };
+      render();
+    } catch (error) {
+      libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
+      render();
+    }
+  };
+
+  const queryLibrary = async (query: LibraryQuery) => {
+    if (!libraryState || !services.queryLibraryCatalog) return;
+    try {
+      const page = await services.queryLibraryCatalog(query);
+      if (libraryState.visible) {
+        libraryState = { ...libraryState, query, page, error: null };
+        void loadLibraryCovers(page);
+        render();
+      }
+    } catch (error) {
+      libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
+      render();
+    }
+  };
+
+  const openLibraryDetail = async (trackKey: string) => {
+    if (!libraryState || !services.getLibraryTrackDetail) return;
+    try {
+      const [detail, sourceRecords] = await Promise.all([
+        services.getLibraryTrackDetail(trackKey),
+        services.getLibraryTrackSourceRecords?.(trackKey) ?? Promise.resolve([]),
+      ]);
+      if (libraryState.visible) {
+        libraryState = { ...libraryState, detail, sourceRecords };
+        render();
+      }
+    } catch (error) {
+      libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
+      render();
+    }
+  };
+
+  const selectedLibraryLyrics = (): string => {
+    const track = libraryState?.detail;
+    if (!track) return '';
+    switch (libraryState?.lyricsTab || 'plain') {
+      case 'translated': return track.lyricTranslatedText;
+      case 'romanized': return track.lyricRomanizedText;
+      case 'lrc': return track.lyricLrcText;
+      default: return track.lyricPlainText;
+    }
+  };
+
+  const copyLibraryLyrics = async () => {
+    const text = selectedLibraryLyrics();
+    if (!text) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.append(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        textarea.remove();
+      }
+    } catch (error) {
+      reportError(error);
+    }
+  };
+
+  const downloadLibraryLyrics = () => {
+    const track = libraryState?.detail;
+    const text = selectedLibraryLyrics();
+    if (!track || !text) return;
+    const extension = libraryState?.lyricsTab === 'lrc' ? 'lrc' : 'txt';
+    const filename = `${(track.title || 'lyrics').replace(/[\\/:*?"<>|]/g, '_')}.${extension}`;
+    const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const discoverNeteaseAfterOnboarding = async () => {
+    if (neteaseDiscoveryStarted || !services.locateNeteaseLibrary) return;
+    neteaseDiscoveryStarted = true;
+    try {
+      const discovery = await services.locateNeteaseLibrary();
+      if (discovery.musicFolder && !state.slots[0].sourceDirectory.trim()) {
+        const nextState = await services.selectSourceDirectory(0, discovery.musicFolder);
+        applyDesktopState(nextState);
+      }
+      if (discovery.databasePath && services.refreshLibraryCatalog) {
+        void services.refreshLibraryCatalog().catch((error) => {
+          console.warn('NetEase library auto-refresh failed:', error);
+        });
+      }
+    } catch (error) {
+      console.warn('NetEase library auto-discovery failed:', error);
     }
   };
 
@@ -1874,7 +2285,7 @@ export function bindApp(
 
   const analyzePreviewCandidates = async (
     previews: AppPreview[],
-  ): Promise<{ analyses: TrackAnalysis[]; failures: AppAnalysisFailure[] }> => {
+  ): Promise<{ analyses: TrackAnalysis[]; failures: AppAnalysisFailure[]; cancelled: boolean }> => {
     analysisCancelRequested = false;
     const candidates = Array.from(new Map(
       previews
@@ -1882,7 +2293,7 @@ export function bindApp(
         .map((candidate) => [candidate.source_path, candidate]),
     ).values());
     if (candidates.length === 0) {
-      return { analyses: [], failures: [] };
+      return { analyses: [], failures: [], cancelled: false };
     }
 
     analysisState = {
@@ -1893,43 +2304,59 @@ export function bindApp(
       failedCount: 0,
       message: t('scanAnalyzing', state.lang),
     };
-    scanProgress = {
-      status: 'running',
-      phase: 'analyzing',
-      processed: 0,
-      total: candidates.length,
-      current_file: '',
-      message: t('scanAnalyzing', state.lang),
-    };
     render();
 
     const results: TrackAnalysis[] = [];
     const freshResults: TrackAnalysis[] = [];
     const failures: AppAnalysisFailure[] = [];
     let failedCount = 0;
-    let cachedEntries: TrackAnalysis[] = [];
-    try {
-      cachedEntries = await services.loadTrackAnalyses();
-    } catch (error) {
-      console.warn('Failed to load Essentia analysis cache; rebuilding entries:', error);
+    const analysisCacheRevisionAtStart = analysisCacheRevision;
+    const persistFreshResults = async () => {
+      if (freshResults.length === 0 || analysisCacheRevisionAtStart !== analysisCacheRevision) {
+        return;
+      }
+      try {
+        await services.saveTrackAnalyses(freshResults);
+        if (analysisCacheRevisionAtStart === analysisCacheRevision) {
+          mergeAnalysisCache(freshResults);
+        }
+      } catch (error) {
+        console.warn('Failed to save Essentia analysis cache:', error);
+      }
+    };
+    const finishCancelledAnalysis = async () => {
+      await persistFreshResults();
+      analysisState = {
+        ...analysisState,
+        status: 'cancelled',
+        resultCount: results.length,
+        failedCount,
+        message: t('analysisCancelled', state.lang),
+      };
+      render();
+      return { analyses: results, failures, cancelled: true };
+    };
+    await analysisCacheLoadPromise;
+    const cacheByPath = new Map(analysisCache.map((entry) => [entry.path, entry]));
+    let highLevelModels: EssentiaModelFile[] | undefined;
+    if (state.enhancedMode && services.loadEssentiaModel
+      && modelStatus.embedding && modelStatus.genre && modelStatus.mood && modelStatus.instrument) {
+      try {
+        highLevelModels = await Promise.all(
+          ESSENTIA_MODEL_IDS.map((id) => services.loadEssentiaModel?.(id) as Promise<EssentiaModelFile>),
+        );
+      } catch (error) {
+        console.warn('Failed to load Essentia high-level models; continuing with basic analysis:', error);
+      }
     }
-    const cacheByPath = new Map(cachedEntries.map((entry) => [entry.path, entry]));
+
+    if (analysisCancelRequested) {
+      return finishCancelledAnalysis();
+    }
 
     for (const candidate of candidates) {
       if (analysisCancelRequested) {
-        analysisState = {
-          ...analysisState,
-          status: 'error',
-          message: t('scanCancelled', state.lang),
-        };
-        scanProgress = {
-          ...scanProgress!,
-          status: 'cancelled',
-          phase: 'cancelled',
-          message: t('scanCancelled', state.lang),
-        };
-        render();
-        return { analyses: [], failures: [] };
+        return finishCancelledAnalysis();
       }
       let fingerprint: AppAudioFileFingerprint | null = null;
       try {
@@ -1939,8 +2366,19 @@ export function bindApp(
       }
 
       const cached = cacheByPath.get(candidate.source_path);
+      const highLevelModelsAvailable = Boolean(
+        state.enhancedMode
+        && highLevelModels?.length === ESSENTIA_MODEL_IDS.length
+        && modelStatus.version,
+      );
       const canReuse = fingerprint !== null
-        && canReuseTrackAnalysis(cached, fingerprint, state.neteaseFilenameFormat);
+        && canReuseTrackAnalysis(
+          cached,
+          fingerprint,
+          state.neteaseFilenameFormat,
+          modelStatus.version || null,
+          highLevelModelsAvailable,
+        );
 
       if (canReuse && cached) {
         results.push(cached);
@@ -1960,6 +2398,7 @@ export function bindApp(
             {
               fingerprint: fingerprint || undefined,
               neteaseFilenameFormat: state.neteaseFilenameFormat,
+              highLevelModels,
             },
           );
           results.push(analysis);
@@ -1973,16 +2412,14 @@ export function bindApp(
           console.warn(`Essentia analysis failed for ${candidate.source_path}`, error);
         }
       }
+      if (analysisCancelRequested) {
+        return finishCancelledAnalysis();
+      }
       analysisState = {
         ...analysisState,
         completed: analysisState.completed + 1,
         failedCount,
         message: t('scanAnalyzing', state.lang),
-      };
-      scanProgress = {
-        ...scanProgress!,
-        processed: analysisState.completed,
-        current_file: candidate.source_path,
       };
       render();
       await yieldToUi();
@@ -2000,16 +2437,59 @@ export function bindApp(
           .replace('{failed}', String(failedCount))
         : t('analysisComplete', state.lang).replace('{count}', String(results.length)),
     };
-    if (freshResults.length > 0) {
-      try {
-        await services.saveTrackAnalyses(freshResults);
-      } catch (error) {
-        console.warn('Failed to save Essentia analysis cache:', error);
-      }
-    }
-    scanProgress = null;
+    await persistFreshResults();
     render();
-    return { analyses: results, failures };
+    return { analyses: results, failures, cancelled: false };
+  };
+
+  const waitForConversionBatch = async (previews: AppPreview[]) => {
+    const slots = previews.map((preview) => preview.slot_index);
+    for (let attempt = 0; attempt < 600; attempt += 1) {
+      if (analysisCancelRequested) {
+        return false;
+      }
+      const desktopState = await services.loadDesktopState();
+      if (slots.every((slotIndex) => desktopState.slots[slotIndex]?.status !== 'running')) {
+        applyDesktopState(desktopState);
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('转换仍在进行，增强分析未能及时开始');
+  };
+
+  const runPostConversionAnalysis = async (batchId: string, previews: AppPreview[]) => {
+    try {
+      const conversionReady = await waitForConversionBatch(previews);
+      if (!conversionReady) {
+        analysisState = {
+          ...analysisState,
+          status: 'cancelled',
+          message: t('analysisCancelled', state.lang),
+        };
+        render();
+        return;
+      }
+      const analysis = await analyzePreviewCandidates(previews);
+      if (analysis.analyses.length === 0 && analysis.failures.length === 0) {
+        return;
+      }
+      const nextState = await services.applyTrackAnalysisResults(
+        batchId,
+        previews,
+        analysis.analyses,
+        analysis.failures,
+      );
+      applyDesktopState(nextState);
+    } catch (error) {
+      analysisState = {
+        ...analysisState,
+        status: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      };
+      console.warn('Enhanced analysis did not complete:', error);
+      render();
+    }
   };
 
   const openAbout = async () => {
@@ -2024,7 +2504,7 @@ export function bindApp(
   const runAction = async (
     action: () => Promise<DesktopState | void>,
     errorTarget?: SyncSlotIndex | 'all',
-    pendingAction: 'start-all' | 'pause-all' | null = null,
+    pendingAction: PendingGlobalAction = null,
     motion: SelectionMotion = null,
   ) => {
     if (motion) {
@@ -2061,10 +2541,51 @@ export function bindApp(
     }
   };
 
+  root.addEventListener('dragstart', (event) => {
+    const header = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-library-column-header]');
+    if (!header || !libraryState?.visible) return;
+    draggedLibraryColumn = header.dataset.libraryColumnHeader || null;
+    if (draggedLibraryColumn && event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', draggedLibraryColumn);
+    }
+  });
+
+  root.addEventListener('dragover', (event) => {
+    const header = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-library-column-header]');
+    if (header && draggedLibraryColumn) event.preventDefault();
+  });
+
+  root.addEventListener('drop', (event) => {
+    const header = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-library-column-header]');
+    const target = header?.dataset.libraryColumnHeader;
+    if (!target || !draggedLibraryColumn || target === draggedLibraryColumn) {
+      draggedLibraryColumn = null;
+      return;
+    }
+    event.preventDefault();
+    const order = libraryColumnIds();
+    const from = order.indexOf(draggedLibraryColumn);
+    const to = order.indexOf(target);
+    if (from >= 0 && to >= 0) {
+      order.splice(from, 1);
+      order.splice(order.indexOf(target), 0, draggedLibraryColumn);
+      saveLibraryColumnOrder(order);
+      render();
+    }
+    draggedLibraryColumn = null;
+  });
+
   root.addEventListener('click', (event) => {
     const target = event.target as HTMLElement | null;
     const modal = target?.closest('.about-modal');
-    const dialog = target?.closest('.about-dialog, .help-dialog');
+    const libraryModal = target?.closest('.library-modal');
+    const dialog = target?.closest('.about-dialog, .help-dialog, .library-dialog');
+    if (libraryModal && !dialog) {
+      libraryState = null;
+      render();
+      return;
+    }
     if (modal && !dialog) {
       if (modal.classList.contains('help-modal')) {
         helpVisible = false;
@@ -2072,6 +2593,13 @@ export function bindApp(
         aboutInfo = null;
       }
       render();
+      return;
+    }
+
+    const libraryRow = target?.closest<HTMLElement>('[data-action="library-track-detail"]');
+    if (libraryRow && libraryState?.visible) {
+      const trackKey = libraryRow.dataset.trackKey;
+      if (trackKey) void openLibraryDetail(trackKey);
       return;
     }
 
@@ -2122,11 +2650,122 @@ export function bindApp(
       return;
     }
 
+    if (action === 'open-library') {
+      void openLibrary();
+      return;
+    }
+
+    if (action === 'close-library') {
+      libraryState = null;
+      render();
+      return;
+    }
+
+    if (action === 'refresh-library') {
+      void refreshLibrary();
+      return;
+    }
+
+    if (action === 'clear-library-cache') {
+      void clearLibraryCache();
+      return;
+    }
+
+    if (action === 'close-library-detail') {
+      if (libraryState) {
+        libraryState = { ...libraryState, detail: null };
+        render();
+      }
+      return;
+    }
+
+    if (action === 'library-track-detail') {
+      const trackKey = button.dataset.trackKey;
+      if (trackKey) void openLibraryDetail(trackKey);
+      return;
+    }
+
+    if (action === 'library-sort') {
+      if (!libraryState) return;
+      const field = button.dataset.libraryField as LibraryField | undefined;
+      if (!field) return;
+      const current = libraryState.query.sorts.find((sort) => sort.field === field);
+      const sorts = current
+        ? current.direction === 'asc'
+          ? libraryState.query.sorts.map((sort) => sort.field === field ? { ...sort, direction: 'desc' as const } : sort)
+          : libraryState.query.sorts.filter((sort) => sort.field !== field)
+        : [{ field, direction: 'asc' as const }];
+      void queryLibrary({ ...libraryState.query, sorts, offset: 0 });
+      return;
+    }
+
+    if (action === 'library-toggle-column') {
+      const columnId = button.dataset.libraryColumn;
+      if (columnId) {
+        toggleLibraryColumn(columnId);
+        render();
+      }
+      return;
+    }
+
+    if (action === 'library-apply-filter') {
+      if (!libraryState) return;
+      const fieldSelect = root.querySelector<HTMLSelectElement>('select[data-action="library-filter-field"]');
+      const operatorSelect = root.querySelector<HTMLSelectElement>('select[data-action="library-filter-operator"]');
+      const valueInput = root.querySelector<HTMLInputElement>('input[data-action="library-filter-value"]');
+      if (!fieldSelect || !operatorSelect || !valueInput) return;
+      const operator = operatorSelect.value as LibraryOperator;
+      const filter: LibraryFilter = {
+        field: fieldSelect.value as LibraryField,
+        operator,
+        value: ['is_empty', 'is_not_empty', 'is_true', 'is_false'].includes(operator)
+          ? null
+          : valueInput.value,
+      };
+      if (!filter.value && !['is_empty', 'is_not_empty', 'is_true', 'is_false'].includes(operator)) return;
+      void queryLibrary({ ...libraryState.query, filters: [...libraryState.query.filters, filter], offset: 0 });
+      return;
+    }
+
+    if (action === 'library-clear-filters') {
+      if (libraryState) void queryLibrary({ ...libraryState.query, filters: [], offset: 0 });
+      return;
+    }
+
+    if (action === 'library-lyrics-tab') {
+      const tab = button.dataset.lyricsTab as LibraryLyricsTab | undefined;
+      if (libraryState && tab) {
+        libraryState = { ...libraryState, lyricsTab: tab, lyricsSearch: '' };
+        render();
+      }
+      return;
+    }
+
+    if (action === 'library-copy-lyrics') {
+      void copyLibraryLyrics();
+      return;
+    }
+
+    if (action === 'library-download-lyrics') {
+      downloadLibraryLyrics();
+      return;
+    }
+
+    if (action === 'library-prev' || action === 'library-next') {
+      if (libraryState) {
+        const delta = action === 'library-prev' ? -libraryState.query.limit : libraryState.query.limit;
+        const query = { ...libraryState.query, offset: Math.max(0, libraryState.query.offset + delta) };
+        void queryLibrary(query);
+      }
+      return;
+    }
+
     if (action === 'dismiss-onboarding') {
       onboardingVisible = false;
       onboardingStep = 0;
       localStorage.setItem('w4dj_onboarding_seen', '1');
       render();
+      void discoverNeteaseAfterOnboarding();
       return;
     }
 
@@ -2139,6 +2778,9 @@ export function bindApp(
         onboardingStep = (onboardingStep + 1) as OnboardingStep;
       }
       render();
+      if (!onboardingVisible) {
+        void discoverNeteaseAfterOnboarding();
+      }
       return;
     }
 
@@ -2255,7 +2897,17 @@ export function bindApp(
     }
 
     if (action === 'clear-analysis-cache') {
-      void clearAnalysisCache();
+      void clearEnhancedCache();
+      return;
+    }
+
+    if (action === 'clear-scan-cache') {
+      void clearScanCache();
+      return;
+    }
+
+    if (action === 'download-essentia-models') {
+      void downloadEssentiaModels();
       return;
     }
 
@@ -2265,7 +2917,12 @@ export function bindApp(
     }
 
     if (action === 'cancel-all') {
-      void runAction(() => services.cancelAllSync(), 'all');
+      void runAction(() => services.cancelAllSync(), 'all', 'cancel-all');
+      return;
+    }
+
+    if (action === 'cancel-analysis') {
+      cancelAnalysisFlow();
       return;
     }
 
@@ -2279,6 +2936,14 @@ export function bindApp(
 
     if (action === 'clear-source' && slotIndex !== null) {
       void runAction(() => services.selectSourceDirectory(slotIndex, ''), slotIndex);
+      return;
+    }
+
+    if (action === 'open-source' && slotIndex !== null) {
+      const source = state.slots[slotIndex].sourceDirectory.trim();
+      if (source) {
+        void runAction(() => services.openSource(source), slotIndex);
+      }
       return;
     }
 
@@ -2349,6 +3014,12 @@ export function bindApp(
   });
 
   root.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && libraryState?.visible) {
+      event.preventDefault();
+      libraryState = null;
+      render();
+      return;
+    }
     if (event.key === 'Escape' && helpVisible) {
       event.preventDefault();
       helpVisible = false;
@@ -2366,6 +3037,7 @@ export function bindApp(
       onboardingStep = 0;
       localStorage.setItem('w4dj_onboarding_seen', '1');
       render();
+      void discoverNeteaseAfterOnboarding();
       return;
     }
 
@@ -2382,6 +3054,7 @@ export function bindApp(
         onboardingVisible = false;
         onboardingStep = 0;
         localStorage.setItem('w4dj_onboarding_seen', '1');
+        void discoverNeteaseAfterOnboarding();
       } else {
         onboardingStep = (onboardingStep + 1) as OnboardingStep;
       }
@@ -2426,6 +3099,23 @@ export function bindApp(
       if (format !== state.neteaseFilenameFormat) {
         void runAction(() => services.chooseNeteaseFilenameFormat(format), 'all');
       }
+    }
+  });
+
+  root.addEventListener('input', (event) => {
+    const target = event.target as HTMLElement | null;
+    const input = target?.closest<HTMLInputElement>('input');
+    if (!input || !libraryState) return;
+    if (input.dataset.action === 'library-search') {
+      const query = { ...libraryState.query, text: input.value, offset: 0 };
+      if (librarySearchTimer) clearTimeout(librarySearchTimer);
+      librarySearchTimer = setTimeout(() => {
+        librarySearchTimer = null;
+        void queryLibrary(query);
+      }, 180);
+    } else if (input.dataset.action === 'library-lyrics-search') {
+      libraryState = { ...libraryState, lyricsSearch: input.value };
+      render();
     }
   });
 
@@ -2561,8 +3251,20 @@ export function bindApp(
   }
 
   render();
+  analysisCacheLoadPromise = loadAnalysisCache();
   void runAction(() => services.loadDesktopState());
   void refreshHistory();
+  if (!onboardingVisible) {
+    void discoverNeteaseAfterOnboarding();
+  }
+  if (services.getEssentiaModelStatus) {
+    void services.getEssentiaModelStatus()
+      .then((status) => {
+        modelStatus = status;
+        render();
+      })
+      .catch((error) => console.warn('Failed to load Essentia model status:', error));
+  }
 }
 
 function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSelection = null): string {
@@ -2584,7 +3286,12 @@ function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSel
   `;
 }
 
-function renderOutputSettings(state: AppViewState, expanded = false): string {
+function renderOutputSettings(
+  state: AppViewState,
+  expanded = false,
+  modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus,
+): string {
+  const modelsReady = modelStatus.embedding && modelStatus.genre && modelStatus.mood && modelStatus.instrument;
   return `
     <details class="output-settings" data-role="advanced-output-settings" aria-label="${t('advancedOptions', state.lang)}" ${expanded ? 'open' : ''}>
       <summary>${t('advancedOptions', state.lang)}</summary>
@@ -2613,8 +3320,20 @@ function renderOutputSettings(state: AppViewState, expanded = false): string {
             <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('neteaseTitleArtist', state.lang)}</option>
           </select>
         </label>
-        <button type="button" class="secondary-action analysis-cache-clear" data-action="clear-analysis-cache">
-          ${t('clearAnalysisCache', state.lang)}
+        <div class="essentia-model-settings">
+          <span class="essentia-model-title">${t('essentiaModelsTitle', state.lang)}</span>
+          <small>${modelsReady ? t('essentiaModelsReady', state.lang) : t('essentiaModelsMissing', state.lang)}</small>
+          <div class="essentia-model-actions">
+            <button type="button" class="secondary-action essentia-model-download" data-action="download-essentia-models" ${modelStatus.downloading ? 'disabled' : ''}>
+              ${modelStatus.downloading ? t('essentiaModelsDownloading', state.lang) : t('essentiaModelsDownload', state.lang)}
+            </button>
+            <button type="button" class="secondary-action enhanced-cache-clear" data-action="clear-analysis-cache">
+              ${t('clearEnhancedCache', state.lang)}
+            </button>
+          </div>
+        </div>
+        <button type="button" class="secondary-action scan-cache-clear" data-action="clear-scan-cache">
+          ${t('clearScanCache', state.lang)}
         </button>
       </div>
     </details>
@@ -2791,6 +3510,20 @@ function formatProgressText(state: AppSyncSlotViewState, lang: AppLanguage): str
 
 function statusLabel(status: AppStatus, lang: AppLanguage): string {
   return t(status, lang);
+}
+
+function scanPhaseLabel(phase: AppScanPhase, lang: AppLanguage): string {
+  const keys: Record<AppScanPhase, keyof typeof translations.zh> = {
+    preparing: 'scanPreparing',
+    scanning_source: 'scanSource',
+    scanning_destination: 'scanDestination',
+    checking: 'scanChecking',
+    analyzing: 'scanAnalyzing',
+    completed: 'scanCompleted',
+    cancelled: 'scanCancelled',
+    error: 'scanError',
+  };
+  return t(keys[phase], lang);
 }
 
 function historyStatusLabel(status: AppHistoryStatus, lang: AppLanguage): string {

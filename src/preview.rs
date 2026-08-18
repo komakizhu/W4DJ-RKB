@@ -2,10 +2,12 @@ use crate::config::{
     CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
 };
 use crate::history::HistoryEntry;
+use crate::scan_cache::ScanCache;
 use crate::sync::{
     ScanObserver, effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
     get_destination_music_dict_with_rule_and_observer,
     get_music_dict_with_scan_issues_with_settings,
+    get_music_dict_with_scan_issues_with_settings_and_cache_observer,
     get_music_dict_with_scan_issues_with_settings_and_observer, is_ignored_music_file,
     is_supported_source_file, resolve_output_policy, target_output_path,
 };
@@ -17,6 +19,50 @@ use std::io;
 use std::path::Path;
 
 pub use crate::config::CandidateOperation as PreviewOperation;
+
+/// Recover a single-file source after the original downloaded file was
+/// replaced in the same directory, for example `Track.ncm` -> `Track.mp3`.
+/// Prefer an exact stem match. If the downloaded replacement also changed its
+/// filename, accept it only when it is the *only* supported audio file left in
+/// the parent directory. An ambiguous directory is left unresolved so the
+/// caller cannot convert the wrong track silently.
+pub fn resolve_missing_single_source_path(source: &Path) -> Option<std::path::PathBuf> {
+    if source.exists() || source.extension().is_none() {
+        return None;
+    }
+
+    let parent = source.parent()?;
+    let source_stem = source.file_stem()?.to_string_lossy();
+    let files = fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| is_supported_source_file(path))
+        .collect::<Vec<_>>();
+
+    let mut exact_matches = files
+        .iter()
+        .filter(|path| {
+            path.file_stem()
+                .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(&source_stem))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact_matches.len() == 1 {
+        return exact_matches.pop();
+    }
+
+    if files.len() == 1 {
+        files.into_iter().next()
+    } else {
+        None
+    }
+}
+
+pub fn is_recovered_single_source(original: &str, resolved: &str) -> bool {
+    resolve_missing_single_source_path(Path::new(original))
+        .is_some_and(|candidate| candidate == Path::new(resolved))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreviewCandidate {
@@ -156,7 +202,57 @@ pub fn build_sync_preview_with_settings_and_netease_observed(
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
+    observer: Option<&mut ScanObserver<'_>>,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_internal(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        observer,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_cache(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    observer: Option<&mut ScanObserver<'_>>,
+    cache: &mut ScanCache,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_internal(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        observer,
+        Some((cache, Path::new(source_directory))),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sync_preview_with_settings_and_netease_observed_internal(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
     mut observer: Option<&mut ScanObserver<'_>>,
+    scan_cache: Option<(&mut ScanCache, &Path)>,
 ) -> io::Result<Option<SyncPreview>> {
     let mut preview = SyncPreview {
         source_directory: source_directory.to_string(),
@@ -175,6 +271,14 @@ pub fn build_sync_preview_with_settings_and_netease_observed(
     };
 
     let source_path = Path::new(source_directory);
+    let resolved_source_path = resolve_missing_single_source_path(source_path);
+    let effective_source_directory = resolved_source_path
+        .as_deref()
+        .unwrap_or(source_path)
+        .to_string_lossy()
+        .into_owned();
+    preview.source_directory = effective_source_directory.clone();
+    let source_path = Path::new(&effective_source_directory);
     if !source_path.exists() {
         preview.warnings.push(PreviewIssue {
             path: source_directory.to_string(),
@@ -222,20 +326,36 @@ pub fn build_sync_preview_with_settings_and_netease_observed(
         }
     }
 
-    let (source_files, scan_issues, cancelled) = if let Some(observer) = observer.as_deref_mut() {
-        get_music_dict_with_scan_issues_with_settings_and_observer(
-            source_directory,
-            filename_rule,
-            netease_filename_format,
-            observer,
-        )
-    } else {
-        let (files, issues) = get_music_dict_with_scan_issues_with_settings(
-            source_directory,
-            filename_rule,
-            netease_filename_format,
-        );
-        (files, issues, false)
+    let (source_files, scan_issues, cancelled) = match scan_cache {
+        Some((cache, _source_root)) => {
+            let mut no_op_observer = |_: crate::sync::ScanPhase, _: &Path| true;
+            let scan_observer = observer.as_deref_mut().unwrap_or(&mut no_op_observer);
+            get_music_dict_with_scan_issues_with_settings_and_cache_observer(
+                &effective_source_directory,
+                filename_rule,
+                netease_filename_format,
+                Path::new(destination_directory),
+                cache,
+                scan_observer,
+            )
+        }
+        None => {
+            if let Some(observer) = observer.as_deref_mut() {
+                get_music_dict_with_scan_issues_with_settings_and_observer(
+                    &effective_source_directory,
+                    filename_rule,
+                    netease_filename_format,
+                    observer,
+                )
+            } else {
+                let (files, issues) = get_music_dict_with_scan_issues_with_settings(
+                    &effective_source_directory,
+                    filename_rule,
+                    netease_filename_format,
+                );
+                (files, issues, false)
+            }
+        }
     };
     if cancelled {
         return Ok(None);

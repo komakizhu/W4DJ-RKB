@@ -1,11 +1,15 @@
 #![allow(dead_code)]
 
+#[path = "../src/analysis.rs"]
+mod analysis;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/metadata.rs"]
 mod metadata;
 #[path = "../src/netease.rs"]
 mod netease;
+#[path = "../src/scan_cache.rs"]
+mod scan_cache;
 #[path = "../src/sync.rs"]
 mod sync;
 #[path = "../src/task.rs"]

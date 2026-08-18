@@ -53,6 +53,120 @@ fn preview_reports_missing_source_and_invalid_destination() {
 }
 
 #[test]
+fn preview_recovers_replaced_single_file_when_extension_changes() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let stale_source = source.path().join("Track.ncm");
+    let replacement = source.path().join("Track.mp3");
+    write_file(&replacement, 120);
+
+    let preview = build_sync_preview(
+        stale_source.to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.source_directory, replacement.display().to_string());
+    assert_eq!(preview.new_count, 1);
+    assert_eq!(preview.candidates.len(), 1);
+    assert_eq!(
+        preview.candidates[0].source_path,
+        replacement.display().to_string()
+    );
+}
+
+#[test]
+fn preview_recovers_single_file_when_downloaded_name_changes() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let stale_source = source.path().join("Track-A1.ncm");
+    let replacement = source.path().join("Track-A2.mp3");
+    write_file(&replacement, 120);
+
+    let preview = build_sync_preview(
+        stale_source.to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.source_directory, replacement.display().to_string());
+    assert_eq!(preview.new_count, 1);
+    assert_eq!(preview.candidates.len(), 1);
+    assert_eq!(
+        preview.candidates[0].source_path,
+        replacement.display().to_string()
+    );
+}
+
+#[test]
+fn preview_rechecks_current_folder_after_previous_input_and_output_are_removed() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let first_source = source.path().join("Track-A1.mp3");
+    let first_output = destination.path().join("Track-A1.mp3");
+    write_file(&first_source, 120);
+    write_file(&first_output, 120);
+
+    let first_preview = build_sync_preview(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+    assert_eq!(first_preview.new_count, 0);
+    assert_eq!(first_preview.existing_count, 1);
+    assert_eq!(first_preview.skipped_count, 1);
+
+    fs::remove_file(first_source).unwrap();
+    fs::remove_file(first_output).unwrap();
+    let replacement = source.path().join("Track-A2.mp3");
+    write_file(&replacement, 120);
+
+    let second_preview = build_sync_preview(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+    assert_eq!(second_preview.new_count, 1);
+    assert_eq!(second_preview.existing_count, 0);
+    assert_eq!(second_preview.skipped_count, 0);
+    assert_eq!(second_preview.candidates.len(), 1);
+    assert_eq!(
+        second_preview.candidates[0].source_path,
+        replacement.display().to_string()
+    );
+}
+
+#[test]
+fn preview_does_not_guess_between_ambiguous_replaced_single_files() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let stale_source = source.path().join("Track.ncm");
+    write_file(source.path().join("Track.mp3"), 120);
+    write_file(source.path().join("Track.flac"), 120);
+
+    let preview = build_sync_preview(
+        stale_source.to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.source_directory, stale_source.display().to_string());
+    assert!(preview.candidates.is_empty());
+    assert_eq!(preview.new_count, 0);
+    assert_eq!(preview.warnings.len(), 1);
+}
+
+#[test]
 fn preview_counts_unreadable_song_files_as_errors() {
     let source = tempdir().unwrap();
     let destination = tempdir().unwrap();
@@ -322,6 +436,7 @@ fn retry_preview_restores_pending_files_saved_before_app_exit() {
         filename_rule: FilenameRule::TitleArtist,
         netease_filename_format: Default::default(),
         report_path: None,
+        analysis_reports: Vec::new(),
     };
 
     let preview = build_retry_preview(&entry);
@@ -383,6 +498,7 @@ fn retry_preview_ignores_old_macos_appledouble_failures_and_pending_files() {
         filename_rule: FilenameRule::TitleArtist,
         netease_filename_format: Default::default(),
         report_path: None,
+        analysis_reports: Vec::new(),
     };
 
     let preview = build_retry_preview(&entry);

@@ -1,7 +1,10 @@
+mod analysis;
 mod config;
 pub mod gui;
+mod lyrics;
 mod metadata;
 mod netease;
+mod scan_cache;
 mod sync;
 pub mod task;
 use crate::config::{Cmd, Config};

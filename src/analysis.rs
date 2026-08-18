@@ -22,6 +22,8 @@ pub struct TrackAnalysis {
     pub title: String,
     pub artist: String,
     pub album: String,
+    #[serde(default)]
+    pub genre: String,
     pub duration_seconds: Option<f64>,
     pub bpm: Option<f64>,
     pub key: Option<String>,
@@ -41,6 +43,65 @@ pub struct TrackAnalysis {
     pub source_modified_at: Option<u64>,
     #[serde(default)]
     pub source_filename_format: Option<String>,
+    #[serde(default)]
+    pub drop_loudness_lufs: Option<f64>,
+    #[serde(default)]
+    pub drop_analysis: Option<DropAnalysisDetails>,
+    #[serde(default)]
+    pub high_level: Option<HighLevelAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DropAnalysisDetails {
+    pub status: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub beat_start_index: Option<usize>,
+    #[serde(default)]
+    pub beat_end_index: Option<usize>,
+    #[serde(default)]
+    pub beat_count: Option<usize>,
+    #[serde(default)]
+    pub segment_start_seconds: Option<f64>,
+    #[serde(default)]
+    pub segment_end_seconds: Option<f64>,
+    #[serde(default)]
+    pub selected_average_beat_loudness: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisLabel {
+    pub label: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HighLevelAnalysis {
+    pub status: String,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub genre: Vec<AnalysisLabel>,
+    #[serde(default)]
+    pub mood: Vec<AnalysisLabel>,
+    #[serde(default)]
+    pub instrument: Vec<AnalysisLabel>,
+    #[serde(default)]
+    pub filtered: Vec<FilteredAnalysisLabel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilteredAnalysisLabel {
+    pub label: String,
+    pub confidence: f64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +110,8 @@ pub struct TrackMetadata {
     pub title: String,
     pub artist: String,
     pub album: String,
+    #[serde(default)]
+    pub genre: String,
 }
 
 pub fn read_track_metadata(path: &Path) -> TrackMetadata {
@@ -70,6 +133,10 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
                         .map(|values| values.join(", "))
                         .unwrap_or_default(),
                     album: first_metadata_value(comments.album()),
+                    genre: comments
+                        .genre()
+                        .map(|values| values.join(", "))
+                        .unwrap_or_default(),
                 })
             })
             .unwrap_or_default(),
@@ -83,6 +150,7 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
                     .unwrap_or_default()
                     .to_string(),
                 album: tag.album().unwrap_or_default().to_string(),
+                genre: tag.genre().unwrap_or_default().to_string(),
             })
             .unwrap_or_default(),
         "ncm" => File::open(path)
@@ -98,6 +166,7 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
                     .collect::<Vec<_>>()
                     .join(", "),
                 album: info.album.to_string(),
+                genre: String::new(),
             })
             .unwrap_or_default(),
         _ => TrackMetadata::default(),
@@ -220,16 +289,35 @@ pub fn build_rekordbox_xml(entries: &[TrackAnalysis], product_version: &str) -> 
             .map(|value| value.round().to_string())
             .unwrap_or_default();
         let tonality = tonality(entry.key.as_deref(), entry.scale.as_deref());
+        let genre = if !entry.genre.trim().is_empty() {
+            entry.genre.trim().to_string()
+        } else {
+            entry
+                .high_level
+                .as_ref()
+                .map(|high_level| {
+                    high_level
+                        .genre
+                        .iter()
+                        .filter(|label| label.confidence.is_finite() && label.confidence >= 0.75)
+                        .map(|label| label.label.trim())
+                        .filter(|label| !label.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+        };
         let comments = analysis_comments(entry);
         let location = file_uri(Path::new(&entry.path));
 
         let _ = writeln!(
             xml,
-            "    <TRACK TrackID=\"{}\" Name=\"{}\" Artist=\"{}\" Album=\"{}\" Genre=\"\" Kind=\"{}\" TotalTime=\"{}\" AverageBpm=\"{}\" Tonality=\"{}\" Comments=\"{}\" Location=\"{}\">",
+            "    <TRACK TrackID=\"{}\" Name=\"{}\" Artist=\"{}\" Album=\"{}\" Genre=\"{}\" Kind=\"{}\" TotalTime=\"{}\" AverageBpm=\"{}\" Tonality=\"{}\" Comments=\"{}\" Location=\"{}\">",
             track_id,
             escape_xml(name),
             escape_xml(artist),
             escape_xml(album),
+            escape_xml(&genre),
             escape_xml(&kind_for_path(&entry.path)),
             escape_xml(&total_time),
             escape_xml(&average_bpm),
@@ -296,6 +384,29 @@ fn analysis_comments(entry: &TrackAnalysis) -> String {
     }
     if let Some(value) = entry.key_strength.filter(|value| value.is_finite()) {
         values.push(format!("Key confidence {value:.3}"));
+    }
+    if let Some(value) = entry.drop_loudness_lufs.filter(|value| value.is_finite()) {
+        values.push(format!("Drop {value:.2} LUFS"));
+    }
+    if let Some(high_level) = &entry.high_level {
+        let moods = high_level
+            .mood
+            .iter()
+            .map(|label| label.label.trim())
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+        if !moods.is_empty() {
+            values.push(format!("Mood {}", moods.join(", ")));
+        }
+        let instruments = high_level
+            .instrument
+            .iter()
+            .map(|label| label.label.trim())
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+        if !instruments.is_empty() {
+            values.push(format!("Instrument {}", instruments.join(", ")));
+        }
     }
     if values.is_empty() {
         String::from("W4DJ Essentia analysis")
@@ -364,6 +475,7 @@ mod tests {
             title: String::from("Song"),
             artist: String::from("Mr & DJ"),
             album: String::from("Album"),
+            genre: String::new(),
             duration_seconds: Some(180.4),
             bpm: Some(140.25),
             key: Some(String::from("F#")),
@@ -380,6 +492,9 @@ mod tests {
             source_size_bytes: Some(1024),
             source_modified_at: Some(1_754_000_000_000),
             source_filename_format: Some(String::from("title_artist")),
+            drop_loudness_lufs: None,
+            drop_analysis: None,
+            high_level: None,
         }
     }
 
@@ -394,6 +509,15 @@ mod tests {
         assert!(xml.contains("<TEMPO Inizio=\"0.000\""));
         assert!(xml.contains("Mr &amp; DJ"));
         assert!(xml.contains("Mr%20%26%20DJ%20-%20Song.mp3"));
+    }
+
+    #[test]
+    fn rekordbox_xml_preserves_source_genre() {
+        let mut entry = sample();
+        entry.genre = String::from("Electronic");
+        let xml = build_rekordbox_xml(&[entry], "3.0.0");
+
+        assert!(xml.contains("Genre=\"Electronic\""));
     }
 
     #[test]
@@ -443,6 +567,21 @@ mod tests {
     }
 
     #[test]
+    fn analysis_cache_round_trips_and_creates_parent_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("nested").join("track-analysis.json");
+        let entries = vec![sample()];
+
+        save_analysis_file(&path, &entries).expect("analysis cache should be saved");
+
+        assert!(path.is_file());
+        assert_eq!(
+            load_analysis_file(&path).expect("analysis cache should load"),
+            entries
+        );
+    }
+
+    #[test]
     fn reads_existing_id3_metadata_before_filename_fallback() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("Title - Artist.mp3");
@@ -460,6 +599,7 @@ mod tests {
                 title: String::from("Tagged title"),
                 artist: String::from("Tagged artist"),
                 album: String::from("Tagged album"),
+                genre: String::new(),
             }
         );
     }

@@ -1,10 +1,14 @@
 #![allow(dead_code)]
+#[path = "../src/analysis.rs"]
+mod analysis;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/metadata.rs"]
 mod metadata;
 #[path = "../src/netease.rs"]
 mod netease;
+#[path = "../src/scan_cache.rs"]
+mod scan_cache;
 #[path = "../src/sync.rs"]
 mod sync;
 #[path = "../src/task.rs"]
@@ -424,6 +428,7 @@ fn build_id3_tag_from_flac_carries_cover_and_text() {
     flac_tag.vorbis_comments_mut().set_title(vec!["Song"]);
     flac_tag.vorbis_comments_mut().set_album(vec!["Album"]);
     flac_tag.vorbis_comments_mut().set_artist(vec!["Artist"]);
+    flac_tag.vorbis_comments_mut().set_genre(vec!["Electronic"]);
     flac_tag.add_picture(
         "image/png",
         metaflac::block::PictureType::CoverFront,
@@ -435,5 +440,6 @@ fn build_id3_tag_from_flac_carries_cover_and_text() {
     assert_eq!(tag.title(), Some("Song"));
     assert_eq!(tag.album(), Some("Album"));
     assert_eq!(tag.artist(), Some("Artist"));
+    assert_eq!(tag.genre(), Some("Electronic"));
     assert_eq!(tag.pictures().count(), 1);
 }

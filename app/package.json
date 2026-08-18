@@ -18,6 +18,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tensorflow/tfjs": "4.22.0",
     "essentia.js": "^0.1.3"
   }
 }

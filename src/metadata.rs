@@ -85,6 +85,10 @@ pub(crate) fn build_id3_tag_from_flac(tag: &metaflac::Tag) -> id3::Tag {
         .and_then(|block| block.artist())
         .cloned()
         .unwrap_or_default();
+    let genres = comments
+        .and_then(|block| block.genre())
+        .cloned()
+        .unwrap_or_default();
     let image = tag
         .pictures()
         .filter(|picture| get_image_mime_type(&picture.data) != "image/*")
@@ -96,7 +100,16 @@ pub(crate) fn build_id3_tag_from_flac(tag: &metaflac::Tag) -> id3::Tag {
         .map(|picture| picture.data.as_slice())
         .unwrap_or_default();
 
-    build_id3_tag_from_parts(title, album, &artists, image)
+    let mut result = build_id3_tag_from_parts(title, album, &artists, image);
+    if let Some(genre) = genres
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .find(|genre| !genre.is_empty())
+    {
+        result.set_genre(genre);
+    }
+    result
 }
 
 pub(crate) struct Mp3Metadata(id3::Tag);

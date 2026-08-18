@@ -3,13 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use base64::Engine as _;
+use flate2::read::DeflateDecoder;
 use ncmdump::Ncmdump;
 use tauri::Manager;
 use w4dj::analysis::{
@@ -21,15 +23,23 @@ use w4dj::config::{
 };
 use w4dj::desktop::{DesktopController, DesktopState};
 use w4dj::history::{
-    FailedFile, HistoryEntry, HistoryStatus, PendingFile, classify_error, clear_history,
-    delete_history_entry, format_error_report, load_history as load_history_file, upsert_history,
+    AnalysisReport, FailedFile, HistoryEntry, HistoryStatus, PendingFile, append_analysis_reports,
+    classify_error, clear_history, delete_history_entry, format_error_report,
+    load_history as load_history_file, upsert_history,
+};
+use w4dj::library_catalog::{CatalogSourceRecord, LibraryCatalog};
+use w4dj::library_query::{LibraryPage, LibraryQuery};
+use w4dj::netease_library::{
+    NeteaseDiscovery, build_catalog_snapshot_incremental, discover_netease_library,
 };
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
     PreviewCandidate, PreviewIssue, PreviewOperation, SlotPreview, SyncPreview,
     build_retry_preview, build_sync_preview_with_settings_and_netease,
-    build_sync_preview_with_settings_and_netease_observed,
+    build_sync_preview_with_settings_and_netease_observed_with_cache,
+    is_recovered_single_source, resolve_missing_single_source_path,
 };
+use w4dj::scan_cache::{ScanCache, clear_scan_cache as clear_scan_cache_file, load_scan_cache, save_scan_cache_atomic};
 use w4dj::sync::{
     apply_track_analysis_metadata, cleanup_temporary_outputs, compare_music_dicts,
     count_music_files_with_cancel,
@@ -52,11 +62,285 @@ struct AppState {
     controller: Arc<Mutex<DesktopController>>,
     preferences_path: Arc<Mutex<PathBuf>>,
     history_path: Arc<Mutex<PathBuf>>,
+    models_path: Arc<Mutex<PathBuf>>,
+    scan_cache_path: Arc<Mutex<PathBuf>>,
+    library_catalog_path: Arc<Mutex<PathBuf>>,
     history_write_lock: Arc<Mutex<()>>,
     destination_coordinator: DestinationCoordinator,
     scan_progress: Arc<Mutex<ScanProgress>>,
     scan_cancel: Arc<AtomicBool>,
     scan_result: Arc<Mutex<Option<Vec<SlotPreview>>>>,
+    test_monitor_path: Arc<Mutex<PathBuf>>,
+    test_monitors: Arc<Mutex<HashMap<String, Arc<TestMonitor>>>>,
+}
+
+// Debug-only delivery switch. Remove this block before creating a formal release build.
+const DEBUG_TEST_MONITOR_ENABLED: bool = true;
+const TEST_MONITOR_DIRECTORY: &str = "W4DJ-test-monitor";
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TestMonitorSession {
+    schema_version: u32,
+    monitor: &'static str,
+    app_version: &'static str,
+    session_id: String,
+    batch_id: String,
+    started_at: String,
+    updated_at: String,
+    finished_at: Option<String>,
+    status: String,
+    settings: serde_json::Value,
+    tasks: serde_json::Value,
+    task_results: Vec<serde_json::Value>,
+}
+
+#[derive(Clone)]
+struct TestMonitor {
+    session_dir: PathBuf,
+    session_path: PathBuf,
+    events_path: PathBuf,
+    lock: Arc<Mutex<()>>,
+    session: Arc<Mutex<TestMonitorSession>>,
+    remaining_jobs: Arc<AtomicUsize>,
+}
+
+impl TestMonitor {
+    fn new(
+        root: &Path,
+        batch_id: &str,
+        settings: serde_json::Value,
+        previews: &[SlotPreview],
+        job_count: usize,
+    ) -> io::Result<Self> {
+        let session_id = format!(
+            "{}-{}",
+            unique_timestamp(),
+            monitor_safe_component(batch_id)
+        );
+        let session_dir = root.join(format!("session-{session_id}"));
+        fs::create_dir_all(&session_dir)?;
+
+        let tasks = serde_json::to_value(previews)
+            .map_err(|error| io::Error::other(format!("serialize monitor tasks: {error}")))?;
+        let now = timestamp_string();
+        let session = TestMonitorSession {
+            schema_version: 1,
+            monitor: "W4DJ local debug test monitor",
+            app_version: env!("CARGO_PKG_VERSION"),
+            session_id: session_id.clone(),
+            batch_id: batch_id.to_string(),
+            started_at: now.clone(),
+            updated_at: now,
+            finished_at: None,
+            status: "running".to_string(),
+            settings,
+            tasks,
+            task_results: Vec::new(),
+        };
+
+        let monitor = Self {
+            session_path: session_dir.join("session.json"),
+            events_path: session_dir.join("events.jsonl"),
+            session_dir,
+            lock: Arc::new(Mutex::new(())),
+            session: Arc::new(Mutex::new(session)),
+            remaining_jobs: Arc::new(AtomicUsize::new(job_count)),
+        };
+        monitor.write_session_file()?;
+        fs::write(
+            monitor.session_dir.join("candidates.json"),
+            serde_json::to_string_pretty(previews).map_err(|error| {
+                io::Error::other(format!("serialize monitor candidates: {error}"))
+            })?,
+        )?;
+        fs::write(
+            monitor.session_dir.join("README.md"),
+            "# W4DJ 本地调试测试记录\n\n此目录由当前调试版自动生成，仅保存在本机下载目录，不会上传。\n\n- `candidates.json`：本次任务的输入与计划输出。\n- `events.jsonl`：按时间追加的任务和单曲结果。\n- `summary-slot-*.json`：每个任务结束后的完整转换历史、错误和元数据诊断。\n- `analysis-reports.json`：增强分析和分析元数据回写结果（增强模式生成）。\n- `session.json`：本次测试的设置、状态和任务汇总。\n\n路径和元数据诊断可能包含本机文件信息，请分享给开发者前自行确认。\n",
+        )?;
+        monitor.record_event("session_started", serde_json::json!({
+            "session_directory": monitor.session_dir.display().to_string(),
+            "candidate_count": previews.iter().map(|preview| preview.preview.candidates.len()).sum::<usize>(),
+        }));
+        Ok(monitor)
+    }
+
+    fn record_event(&self, event: &str, details: serde_json::Value) {
+        let Ok(_guard) = self.lock.lock() else {
+            return;
+        };
+        let record = serde_json::json!({
+            "at": timestamp_string(),
+            "event": event,
+            "details": details,
+        });
+        if let Ok(line) = serde_json::to_string(&record)
+            && let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.events_path)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+    }
+
+    fn record_task_started(&self, slot_index: usize, source: &str, destination: &str, count: usize) {
+        self.record_event(
+            "task_started",
+            serde_json::json!({
+                "slot_index": slot_index,
+                "source_directory": source,
+                "destination_directory": destination,
+                "candidate_count": count,
+            }),
+        );
+    }
+
+    fn record_candidate_result(
+        &self,
+        candidate: &PreviewCandidate,
+        status: &str,
+        error: Option<&str>,
+    ) {
+        let input_snapshot = monitor_file_snapshot(Path::new(&candidate.source_path));
+        let output_snapshot = monitor_file_snapshot(Path::new(&candidate.destination_path));
+        self.record_event(
+            "candidate_result",
+            serde_json::json!({
+                "status": status,
+                "error": error,
+                "input_snapshot": input_snapshot,
+                "output_snapshot": output_snapshot,
+                "input": {
+                    "path": candidate.source_path,
+                    "name": candidate.name,
+                    "size_bytes": candidate.source_size_bytes,
+                },
+                "output": {
+                    "path": candidate.destination_path,
+                    "estimated_size_bytes": candidate.estimated_output_bytes,
+                    "operation": candidate.operation,
+                },
+            }),
+        );
+    }
+
+    fn record_task_finished(&self, entry: &HistoryEntry) {
+        let summary_path = self
+            .session_dir
+            .join(format!("summary-slot-{}.json", entry.slot_index + 1));
+        if let Ok(contents) = serde_json::to_string_pretty(entry)
+            && let Err(error) = fs::write(summary_path, contents)
+        {
+            eprintln!("Failed to save local test monitor summary: {error}");
+        }
+
+        let Ok(_guard) = self.lock.lock() else {
+            return;
+        };
+        if let Ok(mut session) = self.session.lock() {
+            session.updated_at = timestamp_string();
+            session.task_results.push(serde_json::json!({
+                "slot_index": entry.slot_index,
+                "history_id": entry.id,
+                "status": entry.status,
+                "completed_count": entry.completed_count,
+                "failed_count": entry.failed_count,
+                "report_path": entry.report_path,
+            }));
+            if self.remaining_jobs.fetch_sub(1, Ordering::SeqCst) == 1 {
+                session.status = "completed".to_string();
+                session.finished_at = Some(timestamp_string());
+            }
+            let _ = write_json_file(&self.session_path, &*session);
+        }
+        drop(_guard);
+        self.record_event(
+            "task_finished",
+            serde_json::json!({
+                "slot_index": entry.slot_index,
+                "history_id": entry.id,
+                "status": entry.status,
+                "completed_count": entry.completed_count,
+                "failed_count": entry.failed_count,
+                "report_path": entry.report_path,
+            }),
+        );
+    }
+
+    fn record_analysis_reports(&self, reports: &[AnalysisReport]) {
+        let path = self.session_dir.join("analysis-reports.json");
+        if let Ok(contents) = serde_json::to_string_pretty(reports)
+            && let Err(error) = fs::write(path, contents)
+        {
+            eprintln!("Failed to save local test monitor analysis reports: {error}");
+        }
+        self.record_event(
+            "analysis_reports_updated",
+            serde_json::json!({
+                "report_count": reports.len(),
+                "reports": reports,
+            }),
+        );
+    }
+
+    fn write_session_file(&self) -> io::Result<()> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| io::Error::other("test monitor session lock poisoned"))?;
+        write_json_file(&self.session_path, &*session)
+    }
+}
+
+fn write_json_file<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    let contents = serde_json::to_vec_pretty(value)
+        .map_err(|error| io::Error::other(format!("serialize json: {error}")))?;
+    fs::write(path, contents)
+}
+
+fn monitor_safe_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "batch".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn monitor_file_snapshot(path: &Path) -> serde_json::Value {
+    match fs::metadata(path) {
+        Ok(metadata) => serde_json::json!({
+            "path": path,
+            "exists": true,
+            "is_file": metadata.is_file(),
+            "size_bytes": metadata.len(),
+            "modified_at": metadata.modified().ok().and_then(|modified| {
+                modified.duration_since(UNIX_EPOCH).ok().map(|duration| duration.as_secs())
+            }),
+        }),
+        Err(error) => serde_json::json!({
+            "path": path,
+            "exists": false,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn default_download_directory() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join("Downloads"))
+        .unwrap_or_else(|| PathBuf::from("Downloads"))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -89,6 +373,17 @@ struct ScanProgress {
     total: usize,
     current_file: String,
     message: String,
+    tasks: Vec<ScanTaskProgress>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ScanTaskProgress {
+    slot_index: usize,
+    phase: ScanProgressPhase,
+    processed: usize,
+    total: usize,
+    current_file: String,
 }
 
 impl Default for ScanProgress {
@@ -100,6 +395,7 @@ impl Default for ScanProgress {
             total: 0,
             current_file: String::new(),
             message: String::new(),
+            tasks: Vec::new(),
         }
     }
 }
@@ -119,6 +415,7 @@ struct ConfirmedSyncJob {
     analysis_failures: Vec<AnalysisFailure>,
     preview: SyncPreview,
     retry_of: Option<String>,
+    test_monitor: Option<Arc<TestMonitor>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -134,6 +431,7 @@ struct ScanJob {
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
+    scan_cache_path: PathBuf,
     tasks: Vec<(usize, String, String)>,
 }
 
@@ -142,6 +440,382 @@ struct AppInfo {
     version: &'static str,
     developer: &'static str,
     project_url: &'static str,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryStatus {
+    catalog_path: String,
+    track_count: u64,
+    netease: NeteaseDiscovery,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryRefreshSummary {
+    track_count: u64,
+    local_file_count: usize,
+    readable_file_count: usize,
+    reused_file_count: usize,
+    database_path: String,
+    music_folder: Option<String>,
+}
+
+const ESSENTIA_MODEL_VERSION: &str = "essentia-musicnn-2022-v2";
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EssentiaModelStatus {
+    version: &'static str,
+    embedding: bool,
+    genre: bool,
+    mood: bool,
+    instrument: bool,
+    downloading: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EssentiaModelSpec {
+    id: &'static str,
+    kind: &'static str,
+    model_url: &'static str,
+    weights_url: Option<&'static str>,
+    classes: &'static [&'static str],
+}
+
+fn essentia_model_specs() -> Vec<EssentiaModelSpec> {
+    vec![
+        EssentiaModelSpec {
+            id: "musicnn_embedding",
+            kind: "embedding",
+            model_url: "https://essentia.upf.edu/models/feature-extractors/musicnn/msd-musicnn-1-tfjs.zip",
+            weights_url: None,
+            classes: &[],
+        },
+        EssentiaModelSpec {
+            id: "genre_rosamerica",
+            kind: "genre",
+            model_url: "https://essentia.upf.edu/models/classification-heads/genre_rosamerica/genre_rosamerica-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/genre_rosamerica/genre_rosamerica-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["cla", "dan", "hip", "jaz", "pop", "rhy", "roc", "spe"],
+        },
+        EssentiaModelSpec {
+            id: "mood_aggressive",
+            kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_aggressive/mood_aggressive-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_aggressive/mood_aggressive-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["aggressive", "non_aggressive"],
+        },
+        EssentiaModelSpec {
+            id: "mood_happy",
+            kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_happy/mood_happy-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_happy/mood_happy-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["happy", "non_happy"],
+        },
+        EssentiaModelSpec {
+            id: "mood_relaxed",
+            kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_relaxed/mood_relaxed-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_relaxed/mood_relaxed-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["relaxed", "non_relaxed"],
+        },
+        EssentiaModelSpec {
+            id: "mood_party",
+            kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_party/mood_party-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_party/mood_party-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["party", "non_party"],
+        },
+        EssentiaModelSpec {
+            id: "mood_sad",
+            kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_sad/mood_sad-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_sad/mood_sad-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["sad", "non_sad"],
+        },
+        EssentiaModelSpec {
+            id: "voice_instrumental",
+            kind: "instrument",
+            model_url: "https://essentia.upf.edu/models/classification-heads/voice_instrumental/voice_instrumental-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/voice_instrumental/voice_instrumental-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["instrumental", "voice"],
+        },
+    ]
+}
+
+fn essentia_models_path(state: &tauri::State<'_, AppState>) -> PathBuf {
+    state
+        .models_path
+        .lock()
+        .expect("models path lock poisoned")
+        .clone()
+}
+
+fn essentia_model_file_path(models_path: &Path, id: &str, extension: &str) -> PathBuf {
+    models_path.join(format!("{id}.{extension}"))
+}
+
+fn essentia_model_is_installed(models_path: &Path, spec: EssentiaModelSpec) -> bool {
+    let json_path = essentia_model_file_path(models_path, spec.id, "json");
+    let weights_path = essentia_model_file_path(models_path, spec.id, "bin");
+    if !json_path.is_file() || !weights_path.is_file() {
+        return false;
+    }
+    let Ok(model_json) = fs::read_to_string(json_path) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&model_json) else {
+        return false;
+    };
+    parsed.get("modelTopology").is_some()
+        && parsed
+            .get("weightsManifest")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|manifests| !manifests.is_empty())
+        && fs::metadata(weights_path)
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
+}
+
+fn essentia_embedding_is_installed(models_path: &Path) -> bool {
+    essentia_model_is_installed(
+        models_path,
+        EssentiaModelSpec {
+            id: "musicnn_embedding",
+            kind: "embedding",
+            model_url: "",
+            weights_url: None,
+            classes: &[],
+        },
+    )
+}
+
+fn essentia_model_status_for_path(models_path: &Path) -> EssentiaModelStatus {
+    let specs = essentia_model_specs();
+    let embedding = essentia_embedding_is_installed(models_path);
+    EssentiaModelStatus {
+        version: ESSENTIA_MODEL_VERSION,
+        embedding,
+        genre: specs
+            .iter()
+            .any(|spec| spec.kind == "genre" && essentia_model_is_installed(models_path, *spec))
+            && embedding,
+        mood: specs
+            .iter()
+            .filter(|spec| spec.kind == "mood")
+            .all(|spec| essentia_model_is_installed(models_path, *spec))
+            && embedding,
+        instrument: specs
+            .iter()
+            .any(|spec| spec.kind == "instrument" && essentia_model_is_installed(models_path, *spec))
+            && embedding,
+        downloading: false,
+    }
+}
+
+fn download_essentia_model_file(url: &str, destination: &Path) -> Result<(), String> {
+    let response = ureq::get(url)
+        .set("User-Agent", "W4DJ-RKB")
+        .call()
+        .map_err(|error| format!("下载 Essentia 模型失败：{error}"))?;
+    if response.status() != 200 {
+        return Err(format!("下载 Essentia 模型失败：HTTP {}", response.status()));
+    }
+    let temporary = destination.with_extension(format!(
+        "{}.part",
+        destination.extension().and_then(|value| value.to_str()).unwrap_or("bin")
+    ));
+    let mut reader = response.into_reader();
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取 Essentia 模型失败：{error}"))?;
+    if bytes.is_empty() {
+        return Err("下载的 Essentia 模型为空".to_string());
+    }
+    fs::write(&temporary, bytes).map_err(|error| format!("保存 Essentia 模型失败：{error}"))?;
+    fs::rename(&temporary, destination)
+        .map_err(|error| format!("安装 Essentia 模型失败：{error}"))
+}
+
+fn download_essentia_embedding_model(url: &str, models_path: &Path) -> Result<(), String> {
+    let response = ureq::get(url)
+        .set("User-Agent", "W4DJ-RKB")
+        .call()
+        .map_err(|error| format!("下载 Essentia MusiCNN 模型失败：{error}"))?;
+    if response.status() != 200 {
+        return Err(format!("下载 Essentia MusiCNN 模型失败：HTTP {}", response.status()));
+    }
+    let mut archive_bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut archive_bytes)
+        .map_err(|error| format!("读取 Essentia MusiCNN 模型失败：{error}"))?;
+    let entries = extract_malformed_essentia_zip_entries(&archive_bytes)?;
+    let model_json = entries
+        .first()
+        .cloned()
+        .ok_or_else(|| "Essentia MusiCNN 模型包缺少 model.json".to_string())?;
+    let weight_data = entries
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "Essentia MusiCNN 模型包缺少权重".to_string())?;
+    if model_json.is_empty() || weight_data.is_empty() {
+        return Err("Essentia MusiCNN 模型包缺少 model.json 或权重".to_string());
+    }
+    let json_path = essentia_model_file_path(models_path, "musicnn_embedding", "json");
+    let bin_path = essentia_model_file_path(models_path, "musicnn_embedding", "bin");
+    let json_temp = json_path.with_extension("json.part");
+    let bin_temp = bin_path.with_extension("bin.part");
+    fs::write(&json_temp, model_json).map_err(|error| format!("保存 Essentia 模型结构失败：{error}"))?;
+    fs::write(&bin_temp, weight_data).map_err(|error| format!("保存 Essentia 模型权重失败：{error}"))?;
+    fs::rename(&json_temp, &json_path).map_err(|error| format!("安装 Essentia 模型结构失败：{error}"))?;
+    fs::rename(&bin_temp, &bin_path).map_err(|error| format!("安装 Essentia 模型权重失败：{error}"))
+}
+
+/// The official Essentia MusiCNN archive currently contains a malformed local
+/// extra-field length. Its central directory is therefore rejected by the
+/// standard ZIP reader even though both deflate streams are intact. Read the
+/// two local entries defensively and locate each stream by validating its
+/// expected decompressed size. This keeps the downloader limited to the
+/// official archive format without accepting arbitrary filesystem paths.
+fn extract_malformed_essentia_zip_entries(archive: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = archive[cursor..]
+        .windows(4)
+        .position(|window| window == b"PK\x03\x04")
+    {
+        let offset = cursor + relative;
+        if offset + 30 > archive.len() {
+            break;
+        }
+        let compression = u16::from_le_bytes([archive[offset + 8], archive[offset + 9]]);
+        let compressed_size = u32::from_le_bytes([
+            archive[offset + 18],
+            archive[offset + 19],
+            archive[offset + 20],
+            archive[offset + 21],
+        ]) as usize;
+        let uncompressed_size = u32::from_le_bytes([
+            archive[offset + 22],
+            archive[offset + 23],
+            archive[offset + 24],
+            archive[offset + 25],
+        ]) as usize;
+        let name_length = u16::from_le_bytes([archive[offset + 26], archive[offset + 27]]) as usize;
+        let extra_length = u16::from_le_bytes([archive[offset + 28], archive[offset + 29]]) as usize;
+        let data_floor = offset
+            .checked_add(30)
+            .and_then(|value| value.checked_add(name_length))
+            .and_then(|value| value.checked_add(extra_length))
+            .ok_or_else(|| "Essentia 模型包的条目头损坏".to_string())?;
+        if compression != 8 || compressed_size == 0 || uncompressed_size == 0 {
+            cursor = offset + 30 + name_length;
+            continue;
+        }
+
+        let mut decoded = None;
+        let search_end = data_floor
+            .saturating_add(64)
+            .min(archive.len().saturating_sub(compressed_size));
+        for data_start in data_floor..=search_end {
+            let data_end = data_start + compressed_size;
+            let mut decoder = DeflateDecoder::new(&archive[data_start..data_end]);
+            let mut output = Vec::with_capacity(uncompressed_size);
+            if decoder.read_to_end(&mut output).is_ok() && output.len() == uncompressed_size {
+                decoded = Some(output);
+                break;
+            }
+        }
+        if let Some(output) = decoded {
+            entries.push(output);
+            if entries.len() == 2 {
+                return Ok(entries);
+            }
+        }
+        cursor = data_floor.saturating_add(compressed_size).min(archive.len());
+    }
+    Err("Essentia MusiCNN 模型包缺少可读取的 model.json 或权重".to_string())
+}
+
+#[tauri::command]
+fn get_essentia_model_status(state: tauri::State<'_, AppState>) -> Result<EssentiaModelStatus, String> {
+    let path = essentia_models_path(&state);
+    if path.as_os_str().is_empty() {
+        return Err("Essentia 模型目录尚未准备好".to_string());
+    }
+    Ok(essentia_model_status_for_path(&path))
+}
+
+#[tauri::command]
+fn download_essentia_models(state: tauri::State<'_, AppState>) -> Result<EssentiaModelStatus, String> {
+    let path = essentia_models_path(&state);
+    if path.as_os_str().is_empty() {
+        return Err("Essentia 模型目录尚未准备好".to_string());
+    }
+    fs::create_dir_all(&path).map_err(|error| format!("创建 Essentia 模型目录失败：{error}"))?;
+    for spec in essentia_model_specs() {
+        let model_path = essentia_model_file_path(&path, spec.id, "json");
+        let weights_path = essentia_model_file_path(&path, spec.id, "bin");
+        if spec.kind == "embedding" {
+            if !essentia_model_is_installed(&path, spec) {
+                download_essentia_embedding_model(spec.model_url, &path)?;
+            }
+            continue;
+        }
+        if !model_path.is_file() {
+            download_essentia_model_file(spec.model_url, &model_path)?;
+        }
+        if !weights_path.is_file() {
+            download_essentia_model_file(
+                spec.weights_url.ok_or_else(|| "Essentia 模型缺少权重地址".to_string())?,
+                &weights_path,
+            )?;
+        }
+    }
+    Ok(essentia_model_status_for_path(&path))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EssentiaModelFile {
+    id: String,
+    model_json: String,
+    weight_data: Vec<u8>,
+    classes: Vec<String>,
+    kind: String,
+    version: &'static str,
+}
+
+#[tauri::command]
+fn load_essentia_model(
+    id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<EssentiaModelFile, String> {
+    let spec = essentia_model_specs()
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .ok_or_else(|| "未知的 Essentia 模型".to_string())?;
+    let path = essentia_models_path(&state);
+    let model_path = essentia_model_file_path(&path, spec.id, "json");
+    let weights_path = essentia_model_file_path(&path, spec.id, "bin");
+    if !essentia_model_is_installed(&path, spec) {
+        return Err("Essentia 模型尚未下载".to_string());
+    }
+    let model_json = fs::read_to_string(model_path)
+        .map_err(|error| format!("读取 Essentia 模型结构失败：{error}"))?;
+    let weight_data = fs::read(weights_path)
+        .map_err(|error| format!("读取 Essentia 模型权重失败：{error}"))?;
+    Ok(EssentiaModelFile {
+        id: spec.id.to_string(),
+        model_json,
+        weight_data,
+        classes: spec.classes.iter().map(|value| (*value).to_string()).collect(),
+        kind: spec.kind.to_string(),
+        version: ESSENTIA_MODEL_VERSION,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -301,6 +975,42 @@ fn open_destination(path: String) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("无法打开输出目录：{error}"))
+}
+
+#[tauri::command]
+fn open_source(path: String) -> Result<(), String> {
+    let source = PathBuf::from(path.trim());
+    if source.as_os_str().is_empty() {
+        return Err(String::from("输入来源为空"));
+    }
+    if !source.exists() {
+        return Err(format!("输入来源不存在：{}", source.display()));
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        if source.is_file() {
+            command.arg("-R");
+        }
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        if source.is_file() {
+            command.arg("/select,");
+        }
+        command
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = Command::new("xdg-open");
+
+    command
+        .arg(&source)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开输入来源：{error}"))
 }
 
 fn is_analyzable_audio_file(path: &Path) -> bool {
@@ -787,6 +1497,16 @@ fn cancel_scan(state: tauri::State<'_, AppState>) -> ScanProgress {
 }
 
 #[tauri::command]
+fn clear_scan_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let path = state
+        .scan_cache_path
+        .lock()
+        .expect("scan cache path lock poisoned")
+        .clone();
+    clear_scan_cache_file(&path).map_err(|error| format!("清除扫描缓存失败：{error}"))
+}
+
+#[tauri::command]
 fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String> {
     {
         let progress = state
@@ -805,6 +1525,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         conflict_strategy,
         filename_rule,
         netease_filename_format,
+        scan_cache_path,
         tasks,
     ) = {
         let controller = state.controller.lock().expect("desktop lock poisoned");
@@ -824,6 +1545,11 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
                 Ok((*slot_index, slot.source_directory.clone(), destination))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let scan_cache_path = state
+            .scan_cache_path
+            .lock()
+            .expect("scan cache path lock poisoned")
+            .clone();
         (
             controller.state().conversion_mode,
             controller.state().mode,
@@ -831,6 +1557,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
             controller.state().conflict_strategy,
             controller.state().filename_rule,
             controller.state().netease_filename_format,
+            scan_cache_path,
             tasks,
         )
     };
@@ -848,6 +1575,16 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
             total: 0,
             current_file: String::new(),
             message: "正在准备扫描".to_string(),
+            tasks: tasks
+                .iter()
+                .map(|(slot_index, _, _)| ScanTaskProgress {
+                    slot_index: *slot_index,
+                    phase: ScanProgressPhase::Preparing,
+                    processed: 0,
+                    total: 0,
+                    current_file: String::new(),
+                })
+                .collect(),
         };
     });
 
@@ -861,6 +1598,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         conflict_strategy,
         filename_rule,
         netease_filename_format,
+        scan_cache_path,
         tasks,
     };
     thread::spawn(move || run_scan_task(progress, scan_cancel, scan_result, job));
@@ -881,16 +1619,22 @@ fn run_scan_task(
         conflict_strategy,
         filename_rule,
         netease_filename_format,
+        scan_cache_path,
         tasks,
     } = job;
+    let mut scan_cache = load_scan_cache(&scan_cache_path).unwrap_or_else(|_| ScanCache::empty());
     let mut total = 0;
+    let mut task_totals = HashMap::<usize, usize>::new();
     for (_, source, destination) in &tasks {
+        let scan_source = resolve_missing_single_source_path(Path::new(source))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.clone());
         let (source_count, cancelled) = count_music_files_with_cancel(
-            source,
+            &scan_source,
             w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
             || scan_cancel.load(Ordering::SeqCst),
         );
-        total += source_count;
+        let mut task_total = source_count;
         if cancelled {
             finish_scan_cancelled(&progress, &scan_result);
             return;
@@ -900,7 +1644,13 @@ fn run_scan_task(
             &["mp3", "wav", "aiff"],
             || scan_cancel.load(Ordering::SeqCst),
         );
-        total += destination_count;
+        task_total += destination_count;
+        total += task_total;
+        if let Some((slot_index, _, _)) = tasks.iter().find(|(_, task_source, task_destination)| {
+            task_source == source && task_destination == destination
+        }) {
+            task_totals.insert(*slot_index, task_total);
+        }
         if cancelled {
             finish_scan_cancelled(&progress, &scan_result);
             return;
@@ -909,34 +1659,45 @@ fn run_scan_task(
     update_scan_progress(&progress, |state| {
         state.total = total;
         state.message = "正在准备扫描".to_string();
+        for task in &mut state.tasks {
+            task.total = task_totals.get(&task.slot_index).copied().unwrap_or(0);
+        }
     });
     let mut previews = Vec::with_capacity(tasks.len());
-    let mut observer = |phase: ScanPhase, path: &Path| {
-        if scan_cancel.load(Ordering::SeqCst) {
-            return false;
-        }
-        update_scan_progress(&progress, |state| {
-            state.phase = match phase {
-                ScanPhase::Source => ScanProgressPhase::ScanningSource,
-                ScanPhase::Destination => ScanProgressPhase::ScanningDestination,
-            };
-            state.processed = state.processed.saturating_add(1);
-            state.current_file = path.display().to_string();
-            state.message = match phase {
-                ScanPhase::Source => "正在扫描输入目录".to_string(),
-                ScanPhase::Destination => "正在扫描输出目录".to_string(),
-            };
-        });
-        !scan_cancel.load(Ordering::SeqCst)
-    };
-
     for (slot_index, source, destination) in tasks {
         if scan_cancel.load(Ordering::SeqCst) {
             finish_scan_cancelled(&progress, &scan_result);
             return;
         }
 
-        let preview = match build_sync_preview_with_settings_and_netease_observed(
+        let mut observer = |phase: ScanPhase, path: &Path| {
+            if scan_cancel.load(Ordering::SeqCst) {
+                return false;
+            }
+            update_scan_progress(&progress, |state| {
+                state.phase = match phase {
+                    ScanPhase::Source => ScanProgressPhase::ScanningSource,
+                    ScanPhase::Destination => ScanProgressPhase::ScanningDestination,
+                };
+                state.processed = state.processed.saturating_add(1);
+                state.current_file = path.display().to_string();
+                state.message = match phase {
+                    ScanPhase::Source => "正在扫描输入目录".to_string(),
+                    ScanPhase::Destination => "正在扫描输出目录".to_string(),
+                };
+                if let Some(task) = state
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.slot_index == slot_index)
+                {
+                    task.phase = state.phase.clone();
+                    task.processed = task.processed.saturating_add(1);
+                    task.current_file = path.display().to_string();
+                }
+            });
+            !scan_cancel.load(Ordering::SeqCst)
+        };
+        let preview = match build_sync_preview_with_settings_and_netease_observed_with_cache(
             &source,
             &destination,
             mode,
@@ -945,6 +1706,7 @@ fn run_scan_task(
             filename_rule,
             netease_filename_format,
             Some(&mut observer),
+            &mut scan_cache,
         ) {
             Ok(Some(preview)) => preview,
             Ok(None) => {
@@ -966,6 +1728,24 @@ fn run_scan_task(
             preview,
             retry_of: None,
         });
+        update_scan_progress(&progress, |state| {
+            if let Some(task) = state
+                .tasks
+                .iter_mut()
+                .find(|task| task.slot_index == slot_index)
+            {
+                task.phase = ScanProgressPhase::Completed;
+                task.current_file.clear();
+            }
+        });
+        if let Err(error) = save_scan_cache_atomic(&scan_cache_path, &scan_cache) {
+            finish_scan_error(
+                &progress,
+                &scan_result,
+                format!("扫描缓存保存失败：{error}"),
+            );
+            return;
+        }
     }
 
     if scan_cancel.load(Ordering::SeqCst) {
@@ -1155,13 +1935,16 @@ fn start_confirmed_sync(
     retry_of: Option<String>,
     analyses: Option<Vec<TrackAnalysis>>,
     analysis_failures: Option<Vec<AnalysisFailure>>,
+    batch_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
     if previews.is_empty() {
         return Err(String::from("没有可处理的转换任务"));
     }
 
-    let batch_id = format!("batch-{}", unique_timestamp());
+    let batch_id = batch_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("batch-{}", unique_timestamp()));
     let history_path = state
         .history_path
         .lock()
@@ -1173,12 +1956,17 @@ fn start_confirmed_sync(
     let requested_analysis_failures = analysis_failures.unwrap_or_default();
     let mut jobs = Vec::with_capacity(previews.len());
     let mut seen_slots = Vec::with_capacity(previews.len());
+    let monitor_previews;
+    let monitor_settings;
+    let monitor_needs_analysis;
+    let mut recovered_source_updated = false;
 
     {
         let mut controller = state.controller.lock().expect("desktop lock poisoned");
         let state_mode = controller.state().mode;
         let state_lossless_format = controller.state().lossless_format;
         let enhanced_mode = controller.state().enhanced_mode;
+        monitor_needs_analysis = enhanced_mode;
         let state_conflict_strategy = controller.state().conflict_strategy;
         let state_filename_rule = controller.state().filename_rule;
         let state_netease_filename_format = controller.state().netease_filename_format;
@@ -1200,13 +1988,18 @@ fn start_confirmed_sync(
                 return Err(format!("任务 {} 正在运行", slot_index + 1));
             }
             let is_history_retry = retry_of.is_some() || slot_preview.retry_of.is_some();
+            let source_matches = slot_preview.preview.source_directory == slot.source_directory
+                || is_recovered_single_source(
+                    &slot.source_directory,
+                    &slot_preview.preview.source_directory,
+                );
             if !is_history_retry
                 && (slot_preview.mode != state_mode
                     || slot_preview.lossless_format != state_lossless_format
                     || slot_preview.conflict_strategy != state_conflict_strategy
                     || slot_preview.filename_rule != state_filename_rule
                     || slot_preview.netease_filename_format != state_netease_filename_format
-                    || slot_preview.preview.source_directory != slot.source_directory
+                    || !source_matches
                     || slot_preview.preview.destination_directory
                         != controller
                             .effective_destination(slot_index)?
@@ -1220,6 +2013,25 @@ fn start_confirmed_sync(
             validated_previews.push(slot_preview);
         }
 
+        let recovered_source_updates = validated_previews
+            .iter()
+            .filter_map(|slot_preview| {
+                let original_source = controller
+                    .state()
+                    .slots
+                    .get(slot_preview.slot_index)?
+                    .source_directory
+                    .clone();
+                let resolved_source = slot_preview.preview.source_directory.clone();
+                is_recovered_single_source(&original_source, &resolved_source)
+                    .then_some((slot_preview.slot_index, resolved_source))
+            })
+            .collect::<Vec<_>>();
+        for (slot_index, source) in recovered_source_updates {
+            controller.select_source_directory(slot_index, source)?;
+            recovered_source_updated = true;
+        }
+
         validate_unique_planned_outputs(&validated_previews)?;
 
         let allow_error_only_retry = retry_of.is_some()
@@ -1228,6 +2040,9 @@ fn start_confirmed_sync(
                 .any(|preview| preview.retry_of.is_some());
         let processable_previews =
             collect_processable_previews(validated_previews.clone(), allow_error_only_retry)?;
+        monitor_previews = validated_previews.clone();
+        monitor_settings = serde_json::to_value(controller.state())
+            .unwrap_or_else(|_| serde_json::json!({"serialization": "failed"}));
 
         for slot_preview in processable_previews {
             let slot_index = slot_preview.slot_index;
@@ -1268,6 +2083,7 @@ fn start_confirmed_sync(
                 },
                 preview: slot_preview.preview,
                 retry_of: retry_of.clone().or(slot_preview.retry_of),
+                test_monitor: None,
             });
         }
 
@@ -1301,7 +2117,43 @@ fn start_confirmed_sync(
         }
     }
 
-    for job in jobs {
+    if recovered_source_updated {
+        persist_preferences(&state);
+    }
+
+    let test_monitor = if DEBUG_TEST_MONITOR_ENABLED && !jobs.is_empty() {
+        let root = state
+            .test_monitor_path
+            .lock()
+            .expect("test monitor path lock poisoned")
+            .clone();
+        match TestMonitor::new(
+            &root,
+            &batch_id,
+            monitor_settings,
+            &monitor_previews,
+            jobs.len(),
+        ) {
+            Ok(monitor) => Some(Arc::new(monitor)),
+            Err(error) => {
+                eprintln!("Failed to initialize local test monitor: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if monitor_needs_analysis && let Some(monitor) = test_monitor.as_ref() {
+        state
+            .test_monitors
+            .lock()
+            .expect("test monitor map lock poisoned")
+            .insert(batch_id.clone(), Arc::clone(monitor));
+    }
+
+    for mut job in jobs {
+        job.test_monitor = test_monitor.clone();
         let controller = Arc::clone(&state.controller);
         let destination_coordinator = destination_coordinator.clone();
         let history_path = history_path.clone();
@@ -1315,6 +2167,145 @@ fn start_confirmed_sync(
                 job,
             )
         });
+    }
+
+    Ok(state
+        .controller
+        .lock()
+        .expect("desktop lock poisoned")
+        .state()
+        .clone())
+}
+
+#[tauri::command]
+fn apply_track_analysis_results(
+    batch_id: String,
+    previews: Vec<SlotPreview>,
+    analyses: Vec<TrackAnalysis>,
+    analysis_failures: Vec<AnalysisFailure>,
+    state: tauri::State<'_, AppState>,
+) -> Result<DesktopState, String> {
+    if batch_id.trim().is_empty() {
+        return Err(String::from("增强分析缺少批次 ID"));
+    }
+
+    let analysis_lookup = analyses
+        .iter()
+        .map(|analysis| (analysis.path.clone(), embedded_analysis_from_track(analysis)))
+        .collect::<HashMap<_, _>>();
+    let failure_lookup = analysis_failures
+        .iter()
+        .map(|failure| (failure.path.clone(), failure.message.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut reports = Vec::new();
+
+    for slot_preview in &previews {
+        for candidate in &slot_preview.preview.candidates {
+            let destination_path = Path::new(&candidate.destination_path);
+            let base_report = || AnalysisReport {
+                source_path: candidate.source_path.clone(),
+                destination_path: candidate.destination_path.clone(),
+                status: String::from("completed"),
+                message: None,
+                drop_status: None,
+                drop_loudness_lufs: None,
+                model_status: None,
+                model_details: None,
+            };
+
+            if let Some(message) = failure_lookup.get(&candidate.source_path) {
+                let mut report = base_report();
+                report.status = String::from("failed");
+                report.message = Some(message.clone());
+                reports.push(report);
+                continue;
+            }
+
+            let Some(analysis) = analysis_lookup.get(&candidate.source_path) else {
+                let mut report = base_report();
+                report.status = String::from("failed");
+                report.message = Some(String::from("未收到该歌曲的 Essentia 分析结果"));
+                reports.push(report);
+                continue;
+            };
+
+            let mut report = base_report();
+            report.drop_status = analysis
+                .drop_analysis
+                .as_ref()
+                .map(|value| value.status.clone());
+            report.drop_loudness_lufs = analysis
+                .drop_loudness_lufs
+                .filter(|value| value.is_finite())
+                .map(|value| format!("{value:.2}"));
+            report.model_status = analysis.high_level.as_ref().map(|value| value.status.clone());
+            report.model_details = analysis
+                .high_level
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok());
+
+            if !destination_path.is_file() {
+                report.status = String::from("failed");
+                report.message = Some(String::from("转换输出不存在，未执行分析元数据回写"));
+                reports.push(report);
+                continue;
+            }
+
+            let result = update_existing_metadata_transactionally(
+                Path::new(&candidate.source_path),
+                destination_path,
+                slot_preview.netease_filename_format,
+                |temporary_output| apply_track_analysis_metadata(temporary_output, analysis),
+            );
+            if let Err(error) = result {
+                report.status = String::from("failed");
+                report.message = Some(format!("分析元数据回写失败：{error}"));
+            }
+            reports.push(report);
+        }
+    }
+
+    let history_path = state
+        .history_path
+        .lock()
+        .expect("history path lock poisoned")
+        .clone();
+    let _history_guard = state
+        .history_write_lock
+        .lock()
+        .expect("history write lock poisoned");
+    append_analysis_reports(&history_path, &batch_id, reports.clone())
+        .map_err(|error| format!("保存增强分析报告失败：{error}"))?;
+
+    let monitor = if DEBUG_TEST_MONITOR_ENABLED {
+        state
+            .test_monitors
+            .lock()
+            .expect("test monitor map lock poisoned")
+            .get(&batch_id)
+            .cloned()
+    } else {
+        None
+    };
+    if let Some(monitor) = monitor {
+        monitor.record_analysis_reports(&reports);
+        state
+            .test_monitors
+            .lock()
+            .expect("test monitor map lock poisoned")
+            .remove(&batch_id);
+    }
+
+    if !reports.is_empty()
+        && let Ok(entries) = load_history_file(&history_path)
+    {
+        for entry in entries.iter().filter(|entry| entry.batch_id == batch_id) {
+                if let Some(report_path) = entry.report_path.as_deref()
+                    && let Err(error) = fs::write(report_path, format_error_report(entry))
+                {
+                    eprintln!("Failed to update enhanced analysis report: {error}");
+                }
+            }
     }
 
     Ok(state
@@ -1475,6 +2466,230 @@ fn open_external_url(url: String) -> Result<(), String> {
         })
 }
 
+fn library_catalog_path(state: &tauri::State<'_, AppState>) -> PathBuf {
+    state
+        .library_catalog_path
+        .lock()
+        .expect("library catalog path lock poisoned")
+        .clone()
+}
+
+fn open_library_catalog(path: &Path) -> Result<(LibraryCatalog, Option<PathBuf>), String> {
+    LibraryCatalog::open_or_recover(path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn load_library_status(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, String> {
+    let path = library_catalog_path(&state);
+    let (catalog, _) = open_library_catalog(&path)?;
+    let netease = discover_netease_library();
+    let track_count = catalog
+        .count_tracks()
+        .map_err(|error| error.to_string())?
+        .max(0) as u64;
+    Ok(LibraryStatus {
+        catalog_path: path.display().to_string(),
+        track_count,
+        netease,
+    })
+}
+
+#[tauri::command]
+fn locate_netease_library() -> NeteaseDiscovery {
+    discover_netease_library()
+}
+
+#[tauri::command]
+fn refresh_library_catalog(
+    state: tauri::State<'_, AppState>,
+) -> Result<LibraryRefreshSummary, String> {
+    let discovery = discover_netease_library();
+    let database_path = discovery
+        .database_path
+        .as_deref()
+        .ok_or_else(|| "未找到网易云音乐本地数据库，请手动选择歌曲来源".to_string())?;
+    let path = library_catalog_path(&state);
+    let (mut catalog, _) = open_library_catalog(&path)?;
+    let previous_files = discovery
+        .music_folder
+        .as_deref()
+        .map(|folder| {
+            let mut files = Vec::new();
+            let _ = collect_analyzable_audio_files(folder, &mut files);
+            files
+                .iter()
+                .filter_map(|file| {
+                    catalog
+                        .local_file_by_path(Path::new(file))
+                        .ok()
+                        .flatten()
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let snapshot = build_catalog_snapshot_incremental(
+        database_path,
+        discovery.music_folder.as_deref(),
+        Some(&catalog),
+    )
+    .map_err(|error| error.to_string())?;
+    let local_file_count = snapshot.local_files.len();
+    let readable_file_count = snapshot
+        .local_files
+        .iter()
+        .filter(|file| file.readable)
+        .count();
+    catalog
+        .upsert_snapshot(&snapshot)
+        .map_err(|error| error.to_string())?;
+
+    let analysis_path = {
+        let history_path = state
+            .history_path
+            .lock()
+            .expect("history path lock poisoned")
+            .clone();
+        analysis_file_path(&history_path)
+    };
+    if let Ok(entries) = load_analysis_file(&analysis_path) {
+        catalog
+            .apply_analysis_entries(&entries)
+            .map_err(|error| error.to_string())?;
+    }
+    let track_count = catalog
+        .count_tracks()
+        .map_err(|error| error.to_string())?
+        .max(0) as u64;
+    Ok(LibraryRefreshSummary {
+        track_count,
+        local_file_count,
+        readable_file_count,
+        reused_file_count: previous_files,
+        database_path: database_path.display().to_string(),
+        music_folder: discovery
+            .music_folder
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    })
+}
+
+#[tauri::command]
+fn query_library_catalog(
+    query: LibraryQuery,
+    state: tauri::State<'_, AppState>,
+) -> Result<LibraryPage, String> {
+    let path = library_catalog_path(&state);
+    let (catalog, _) = open_library_catalog(&path)?;
+    catalog.query(&query).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_library_track_detail(
+    track_key: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<w4dj::library_catalog::CatalogTrack>, String> {
+    let path = library_catalog_path(&state);
+    let (catalog, _) = open_library_catalog(&path)?;
+    catalog
+        .track_detail(&track_key)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_library_track_source_records(
+    track_key: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<CatalogSourceRecord>, String> {
+    let path = library_catalog_path(&state);
+    let (catalog, _) = open_library_catalog(&path)?;
+    catalog
+        .source_records_for_track(&track_key)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn get_library_track_cover(
+    track_key: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let path = library_catalog_path(&state);
+    let (catalog, _) = open_library_catalog(&path)?;
+    let Some(track) = catalog
+        .track_detail(&track_key)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let source_path = catalog
+        .local_files_for_track(&track_key)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|file| file.readable)
+        .map(|file| file.path)
+        .or_else(|| {
+            track
+                .cover_path
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+        });
+    let Some(source_path) = source_path else {
+        return Ok(None);
+    };
+    let bytes = w4dj::netease::recover_local_cover(&source_path)
+        .or_else(|| fs::read(&source_path).ok().filter(|bytes| is_image_bytes(bytes)));
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let Some(mime) = image_mime_type(&bytes) else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )))
+}
+
+fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
+fn is_image_bytes(bytes: &[u8]) -> bool {
+    image_mime_type(bytes).is_some()
+}
+
+#[tauri::command]
+fn clear_library_catalog_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let path = library_catalog_path(&state);
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    for candidate in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("清除歌曲库缓存失败：{error}")),
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn export_history_error_report(
     id: String,
@@ -1519,11 +2734,16 @@ fn main() {
             controller: Arc::new(Mutex::new(controller)),
             preferences_path: Arc::new(Mutex::new(PathBuf::new())),
             history_path: Arc::new(Mutex::new(PathBuf::new())),
+            models_path: Arc::new(Mutex::new(PathBuf::new())),
+            scan_cache_path: Arc::new(Mutex::new(PathBuf::new())),
+            library_catalog_path: Arc::new(Mutex::new(PathBuf::new())),
             history_write_lock: Arc::new(Mutex::new(())),
             destination_coordinator: DestinationCoordinator::default(),
             scan_progress: Arc::new(Mutex::new(ScanProgress::default())),
             scan_cancel: Arc::new(AtomicBool::new(false)),
             scan_result: Arc::new(Mutex::new(None)),
+            test_monitor_path: Arc::new(Mutex::new(PathBuf::new())),
+            test_monitors: Arc::new(Mutex::new(HashMap::new())),
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -1549,7 +2769,9 @@ fn main() {
             load_scan_result,
             start_scan,
             cancel_scan,
+            clear_scan_cache,
             start_confirmed_sync,
+            apply_track_analysis_results,
             load_history,
             retry_history_failures,
             export_history_error_report,
@@ -1559,6 +2781,7 @@ fn main() {
             check_for_updates,
             open_external_url,
             open_destination,
+            open_source,
             list_audio_files,
             read_audio_file,
             read_audio_metadata,
@@ -1566,7 +2789,18 @@ fn main() {
             load_track_analyses,
             save_track_analyses,
             clear_track_analyses,
-            export_rekordbox_xml
+            get_essentia_model_status,
+            download_essentia_models,
+            load_essentia_model,
+            export_rekordbox_xml,
+            load_library_status,
+            locate_netease_library,
+            refresh_library_catalog,
+            query_library_catalog,
+            get_library_track_detail,
+            get_library_track_source_records,
+            get_library_track_cover,
+            clear_library_catalog_cache
         ])
         .setup(|app| {
             let preferences_path = app
@@ -1578,6 +2812,23 @@ fn main() {
                 .parent()
                 .expect("preferences path should have a parent")
                 .join("history.json");
+            let models_path = preferences_path
+                .parent()
+                .expect("preferences path should have a parent")
+                .join("essentia-models");
+            let scan_cache_path = preferences_path
+                .parent()
+                .expect("preferences path should have a parent")
+                .join("scan-cache.json");
+            let library_catalog_path = preferences_path
+                .parent()
+                .expect("preferences path should have a parent")
+                .join("library-dashboard.sqlite3");
+            let test_monitor_path = app
+                .path()
+                .download_dir()
+                .unwrap_or_else(|_| default_download_directory())
+                .join(TEST_MONITOR_DIRECTORY);
 
             {
                 let state = app.state::<AppState>();
@@ -1595,6 +2846,42 @@ fn main() {
                     .lock()
                     .expect("history path lock poisoned");
                 *path_guard = history_path;
+            }
+
+            {
+                let state = app.state::<AppState>();
+                let mut path_guard = state
+                    .models_path
+                    .lock()
+                    .expect("models path lock poisoned");
+                *path_guard = models_path;
+            }
+
+            {
+                let state = app.state::<AppState>();
+                let mut path_guard = state
+                    .scan_cache_path
+                    .lock()
+                    .expect("scan cache path lock poisoned");
+                *path_guard = scan_cache_path;
+            }
+
+            {
+                let state = app.state::<AppState>();
+                let mut path_guard = state
+                    .library_catalog_path
+                    .lock()
+                    .expect("library catalog path lock poisoned");
+                *path_guard = library_catalog_path;
+            }
+
+            {
+                let state = app.state::<AppState>();
+                let mut path_guard = state
+                    .test_monitor_path
+                    .lock()
+                    .expect("test monitor path lock poisoned");
+                *path_guard = test_monitor_path;
             }
 
             {
@@ -1679,6 +2966,7 @@ fn embedded_analysis_from_track(analysis: &TrackAnalysis) -> EmbeddedAnalysis {
         title: analysis.title.clone(),
         artist: analysis.artist.clone(),
         album: analysis.album.clone(),
+        genre: analysis.genre.clone(),
         bpm: analysis.bpm,
         key: analysis.key.clone(),
         scale: analysis.scale.clone(),
@@ -1690,6 +2978,9 @@ fn embedded_analysis_from_track(analysis: &TrackAnalysis) -> EmbeddedAnalysis {
         beat_positions: analysis.beat_positions.clone(),
         analyzer: analysis.analyzer.clone(),
         analysis_version: analysis.analysis_version.clone(),
+        drop_analysis: analysis.drop_analysis.clone(),
+        drop_loudness_lufs: analysis.drop_loudness_lufs,
+        high_level: analysis.high_level.clone(),
     }
 }
 
@@ -1703,6 +2994,21 @@ fn run_confirmed_sync_task(
     let started_at = timestamp_string();
     let started = Instant::now();
     let history_id = format!("{}-slot{}", job.batch_id, job.slot_index + 1);
+    if let Some(monitor) = job.test_monitor.as_ref() {
+        monitor.record_task_started(
+            job.slot_index,
+            &job.source,
+            &job.destination,
+            job.candidates.len(),
+        );
+        monitor.record_event(
+            "task_candidates",
+            serde_json::json!({
+                "slot_index": job.slot_index,
+                "candidates": job.candidates,
+            }),
+        );
+    }
     let task_controller = {
         let controller_guard = controller.lock().expect("desktop lock poisoned");
         controller_guard
@@ -1745,6 +3051,7 @@ fn run_confirmed_sync_task(
         filename_rule: job.filename_rule,
         netease_filename_format: job.netease_filename_format,
         report_path: None,
+        analysis_reports: Vec::new(),
     }));
     persist_recovery_entry(&history_path, &history_write_lock, &recovery_entry);
 
@@ -1806,6 +3113,9 @@ fn run_confirmed_sync_task(
                             category: classify_error(message),
                         }),
                     );
+                    if let Some(monitor) = job.test_monitor.as_ref() {
+                        monitor.record_candidate_result(candidate, "failed", Some(message));
+                    }
                 }
             }
 
@@ -1867,6 +3177,13 @@ fn run_confirmed_sync_task(
                     }
                 };
                 drop(controller_guard);
+                if let Some(monitor) = job.test_monitor.as_ref() {
+                    monitor.record_candidate_result(
+                        candidate,
+                        if failed_file.is_some() { "failed" } else { "completed" },
+                        failed_file.as_ref().map(|file| file.message.as_str()),
+                    );
+                }
                 record_metadata_diagnostic(&recovery_entry, candidate);
                 mark_recovery_processed(
                     &history_path,
@@ -1932,6 +3249,17 @@ fn run_confirmed_sync_task(
                             None
                         };
                         if let Some(candidate) = candidate {
+                            if let Some(monitor) = job.test_monitor.as_ref() {
+                                monitor.record_candidate_result(
+                                    candidate,
+                                    if failed_file.is_some() {
+                                        "failed"
+                                    } else {
+                                        "completed"
+                                    },
+                                    failed_file.as_ref().map(|file| file.message.as_str()),
+                                );
+                            }
                             record_metadata_diagnostic(&recovery_entry, candidate);
                         }
                         mark_recovery_processed(
@@ -1960,6 +3288,9 @@ fn run_confirmed_sync_task(
 
     if let Some(error) = setup_error {
         for candidate in &job.candidates {
+            if let Some(monitor) = job.test_monitor.as_ref() {
+                monitor.record_candidate_result(candidate, "failed", Some(&error));
+            }
             record_failed_candidate(
                 &controller,
                 job.slot_index,
@@ -2022,6 +3353,7 @@ fn run_confirmed_sync_task(
         filename_rule: job.filename_rule,
         netease_filename_format: job.netease_filename_format,
         report_path: None,
+        analysis_reports: Vec::new(),
     };
 
     let report_path = automatic_report_path(&history_path, &history_entry);
@@ -2036,6 +3368,10 @@ fn run_confirmed_sync_task(
     } else if let Err(error) = fs::write(&report_path, format_error_report(&history_entry)) {
         history_entry.report_path = None;
         eprintln!("Failed to save automatic conversion report: {error}");
+    }
+
+    if let Some(monitor) = job.test_monitor.as_ref() {
+        monitor.record_task_finished(&history_entry);
     }
 
     let _history_guard = history_write_lock
@@ -2570,6 +3906,7 @@ fn fail_sync(
 
 #[cfg(test)]
 mod tests {
+    use super::TestMonitor;
     use super::DestinationCoordinator;
     use super::apply_preflight_summary;
     use super::collect_processable_previews;
@@ -2625,6 +3962,41 @@ mod tests {
                 disk_space_sufficient: None,
             },
         }
+    }
+
+    #[test]
+    fn local_test_monitor_writes_input_output_and_summary_files() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-test-monitor-{}",
+            super::unique_timestamp()
+        ));
+        let preview = sample_preview(0, true);
+        let monitor = TestMonitor::new(
+            &root,
+            "batch/test",
+            serde_json::json!({"enhanced_mode": true}),
+            std::slice::from_ref(&preview),
+            1,
+        )
+        .unwrap();
+
+        let candidate = &preview.preview.candidates[0];
+        monitor.record_candidate_result(candidate, "completed", None);
+
+        let session = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(monitor.session_dir.join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session["status"], "running");
+        assert!(monitor.session_dir.join("candidates.json").is_file());
+        assert!(monitor.session_dir.join("events.jsonl").is_file());
+        assert!(monitor.session_dir.join("README.md").is_file());
+
+        let event_text = fs::read_to_string(monitor.session_dir.join("events.jsonl")).unwrap();
+        assert!(event_text.contains("candidate_result"));
+        assert!(event_text.contains("/music/in/song.mp3"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

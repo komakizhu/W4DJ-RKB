@@ -53,6 +53,7 @@ const makeDesktopState = (overrides: Partial<DesktopState> = {}): DesktopState =
   enhanced_mode: false,
   conflict_strategy: 'skip',
   filename_rule: 'title_artist',
+  netease_filename_format: 'title_artist',
   ...overrides,
 });
 
@@ -96,6 +97,7 @@ const makeViewState = (overrides: Partial<AppViewState> = {}): AppViewState => (
   enhancedMode: false,
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
+  neteaseFilenameFormat: 'title_artist',
   lang: 'zh',
   theme: 'light',
   ...overrides,
@@ -225,12 +227,14 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
     current_file: '',
     message: '扫描已取消',
   }),
+  clearScanCache: vi.fn().mockResolvedValue(undefined),
   startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
     slots: [
       makeDesktopSlot({ status: 'running', progress_total: 2 }),
       makeDesktopSlot({ status: 'running', progress_total: 2 }),
     ],
   })),
+  applyTrackAnalysisResults: vi.fn().mockResolvedValue(makeDesktopState()),
   loadHistory: vi.fn().mockResolvedValue([]),
   retryHistoryFailures: vi.fn().mockResolvedValue(makePreview(0)),
   exportHistoryErrorReport: vi.fn().mockResolvedValue(undefined),
@@ -243,6 +247,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   }),
   openExternalUrl: vi.fn().mockResolvedValue(undefined),
   openDestination: vi.fn().mockResolvedValue(undefined),
+  openSource: vi.fn().mockResolvedValue(undefined),
   startAllSync: vi
     .fn()
     .mockResolvedValue(makeDesktopState({
@@ -454,6 +459,65 @@ describe('renderApp', () => {
       .toBe('title_artist');
   });
 
+  it('renders independent scan progress inside each task card', () => {
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      null,
+      false,
+      false,
+      false,
+      0,
+      undefined,
+      {
+        status: 'running',
+        phase: 'scanning_source',
+        processed: 5,
+        total: 12,
+        current_file: '/music/in-1/track.wav',
+        message: '正在扫描输入目录',
+        tasks: [
+          { slot_index: 0, phase: 'scanning_source', processed: 5, total: 10, current_file: '/music/in-1/track.wav' },
+          { slot_index: 1, phase: 'scanning_destination', processed: 2, total: 8, current_file: '/music/out-2/track.mp3' },
+        ],
+      },
+    );
+
+    const slots = root.querySelectorAll('[data-role="sync-slot"]');
+    expect(slots[0]?.querySelector('.progress-copy')?.textContent).toContain('5/10');
+    expect((slots[0]?.querySelector('.progress-fill') as HTMLElement).style.width).toBe('50%');
+    expect(slots[1]?.querySelector('.progress-copy')?.textContent).toContain('2/8');
+    expect((slots[1]?.querySelector('.progress-fill') as HTMLElement).style.width).toBe('25%');
+    expect(root.querySelector('[data-action="cancel-scan"]')).not.toBeNull();
+    expect(root.querySelector('[data-role="scan-modal"]')).toBeNull();
+  });
+
+  it('keeps enhanced and scan cache actions separate and visible', () => {
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      null,
+      true,
+    );
+
+    expect(root.querySelector('[data-action="clear-analysis-cache"]')?.textContent)
+      .toContain('清除增强模式缓存');
+    expect(root.querySelector('[data-action="clear-scan-cache"]')?.textContent)
+      .toContain('清除扫描缓存');
+    expect(root.querySelector('.essentia-model-actions [data-action="clear-analysis-cache"]'))
+      .not.toBeNull();
+  });
+
   it('uses songs and singers in Chinese filename labels without changing option values', () => {
     const root = renderApp(
       makeViewState(),
@@ -564,7 +628,7 @@ describe('renderApp', () => {
     const slotTwo = root.querySelector('[data-role="sync-slot"][data-slot="1"]') as HTMLElement;
     expect(slotOne.dataset.status).toBe('idle');
     expect(slotTwo.dataset.status).toBe('running');
-    expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
+    expect(root.querySelector('[data-action="cancel-all"]')).not.toBeNull();
     expect((slotTwo.querySelector('.progress-fill') as HTMLElement).style.width).toBe('45%');
     expect(slotTwo.querySelector('.progress-copy')?.textContent).toBe('45/100');
     expect(slotTwo.querySelector('.progress-copy--numeric')).not.toBeNull();
@@ -1422,8 +1486,7 @@ describe('bindApp', () => {
     bindApp(root, makeViewState(), services);
 
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
-    expect(root.querySelector('[data-role="scan-modal"]')).not.toBeNull();
-    expect(root.querySelector('[data-role="scan-modal"]')?.textContent).toContain('0 / 0');
+    expect(root.querySelector('[data-role="scan-modal"]')).toBeNull();
     expect(root.querySelector('[data-action="cancel-scan"]')).not.toBeNull();
     expect(services.startConfirmedSync).not.toHaveBeenCalled();
 
@@ -1474,23 +1537,107 @@ describe('bindApp', () => {
     bindApp(root, makeViewState({
       conversionMode: 'direct',
       enhancedMode: true,
+      neteaseFilenameFormat: 'title_artist',
     }), services);
 
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(services.readAudioFile).toHaveBeenCalledWith('/music/in-1/Song.mp3');
       expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
+    });
+    await vi.waitFor(() => {
+      expect(services.readAudioFile).toHaveBeenCalledWith('/music/in-1/Song.mp3');
+      expect(services.applyTrackAnalysisResults).toHaveBeenCalledTimes(1);
     });
     expect(services.startConfirmedSync).toHaveBeenCalledWith(
       expect.any(Array),
       null,
+      [],
+      [],
+      expect.any(String),
+    );
+    expect(services.applyTrackAnalysisResults).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Array),
       [],
       [{
         path: '/music/in-1/Song.mp3',
         message: 'test decode failure',
       }],
     );
+  });
+
+  it('cancels enhanced analysis without applying an incomplete result', async () => {
+    const readDeferred = createDeferred<number[]>();
+    const services = makeMockServices({
+      loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState({
+        conversion_mode: 'direct',
+        enhanced_mode: true,
+      })),
+      loadScanResult: vi.fn().mockResolvedValue([makePreview(0)]),
+      readAudioFile: vi.fn().mockReturnValue(readDeferred.promise),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({
+      conversionMode: 'direct',
+      enhancedMode: true,
+    }), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-action="cancel-analysis"]')).not.toBeNull());
+    (root.querySelector('[data-action="cancel-analysis"]') as HTMLButtonElement).click();
+
+    expect(root.querySelector('[data-role="analysis-message"]')?.textContent).toContain('已取消');
+    readDeferred.resolve([]);
+    await vi.waitFor(() => expect(services.applyTrackAnalysisResults).not.toHaveBeenCalled());
+    expect(services.saveTrackAnalyses).not.toHaveBeenCalled();
+  });
+
+  it('loads the analysis cache at startup and does not reload it for each scan', async () => {
+    const cached = {
+      path: '/music/in-1/Song.mp3',
+      title: 'Song',
+      artist: 'Artist',
+      album: '',
+      durationSeconds: 180,
+      bpm: 140,
+      key: 'F',
+      scale: 'minor',
+      keyStrength: 0.8,
+      integratedLoudnessLufs: -8,
+      loudnessRangeLu: 4,
+      energy: 0.9,
+      danceability: 0.7,
+      beatPositions: [],
+      analyzedAt: '2026-08-06T00:00:00Z',
+      analyzer: 'Essentia.js',
+      analysisVersion: '0.2.0',
+      sourceSizeBytes: 0,
+      sourceModifiedAt: null,
+    };
+    const loadTrackAnalyses = vi.fn().mockResolvedValue([cached]);
+    const services = makeMockServices({
+      loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState({
+        conversion_mode: 'direct',
+        enhanced_mode: true,
+      })),
+      loadScanResult: vi.fn().mockResolvedValue([makePreview(0)]),
+      loadTrackAnalyses,
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({
+      conversionMode: 'direct',
+      enhancedMode: true,
+      neteaseFilenameFormat: 'title_artist',
+    }), services);
+
+    await vi.waitFor(() => expect(loadTrackAnalyses).toHaveBeenCalledTimes(1));
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => expect(services.applyTrackAnalysisResults).toHaveBeenCalledTimes(1));
+    expect(services.readAudioFile).not.toHaveBeenCalled();
+    expect(services.saveTrackAnalyses).not.toHaveBeenCalled();
+    expect(loadTrackAnalyses).toHaveBeenCalledTimes(1);
   });
 
   it('reuses an unchanged analysis cache entry only for the same filename setting', () => {
@@ -1511,7 +1658,7 @@ describe('bindApp', () => {
       beatPositions: [],
       analyzedAt: '2026-08-06T00:00:00Z',
       analyzer: 'Essentia.js',
-      analysisVersion: '0.1.5',
+      analysisVersion: '0.2.0',
       sourceSizeBytes: 1234,
       sourceModifiedAt: 1_754_000_000_000,
       sourceFilenameFormat: 'artist_title' as const,
@@ -1521,6 +1668,17 @@ describe('bindApp', () => {
     expect(canReuseTrackAnalysis(cached, fingerprint, 'artist_title')).toBe(true);
     expect(canReuseTrackAnalysis(cached, fingerprint, 'title_artist')).toBe(false);
     expect(canReuseTrackAnalysis({ ...cached, sourceSizeBytes: 1235 }, fingerprint, 'artist_title'))
+      .toBe(false);
+
+    expect(canReuseTrackAnalysis(cached, fingerprint, 'artist_title', 'essentia-v2', true))
+      .toBe(false);
+    const withHighLevel = {
+      ...cached,
+      highLevel: { status: 'completed' as const, modelVersion: 'essentia-v2' },
+    };
+    expect(canReuseTrackAnalysis(withHighLevel, fingerprint, 'artist_title', 'essentia-v2', true))
+      .toBe(true);
+    expect(canReuseTrackAnalysis(withHighLevel, fingerprint, 'artist_title', 'essentia-v3', true))
       .toBe(false);
   });
 
@@ -1545,7 +1703,8 @@ describe('bindApp', () => {
       current_file: '', message: '扫描已取消',
     });
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-role="scan-modal"]')?.textContent).toContain('扫描已取消');
+      expect(root.querySelector('[data-role="scan-modal"]')).toBeNull();
+      expect(root.querySelector('[data-role="scan-message"]')?.textContent).toContain('扫描已取消');
       expect(services.startConfirmedSync).not.toHaveBeenCalled();
     });
   });
@@ -1767,8 +1926,24 @@ describe('bindApp', () => {
 
     (root.querySelector('[data-action="clear-analysis-cache"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(services.clearTrackAnalyses).toHaveBeenCalledTimes(1));
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('音乐分析缓存'));
-    expect(alert).toHaveBeenCalledWith('音乐分析缓存已清除。');
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('增强模式缓存'));
+    expect(alert).toHaveBeenCalledWith('增强模式缓存已清除。');
+    confirm.mockRestore();
+    alert.mockRestore();
+  });
+
+  it('clears scan cache independently from enhanced-mode cache', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
+    const services = makeMockServices();
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="clear-scan-cache"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.clearScanCache).toHaveBeenCalledTimes(1));
+    expect(services.clearTrackAnalyses).not.toHaveBeenCalled();
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('扫描缓存'));
+    expect(alert).toHaveBeenCalledWith('扫描缓存已清除。');
     confirm.mockRestore();
     alert.mockRestore();
   });
@@ -1829,12 +2004,12 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="confirm-start"]') as HTMLButtonElement).click();
     await vi.waitFor(() => {
       expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
-      expect(root.querySelector('[data-action="pause-all"]')).not.toBeNull();
+      expect(root.querySelector('[data-action="cancel-all"]')).not.toBeNull();
       expect(root.querySelectorAll('[data-status="running"][data-role="sync-slot"]')).toHaveLength(2);
     });
 
-    (root.querySelector('[data-action="pause-all"]') as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(services.pauseAllSync).toHaveBeenCalledTimes(1));
+    (root.querySelector('[data-action="cancel-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.cancelAllSync).toHaveBeenCalledTimes(1));
   });
 
   it('ignores repeated global start clicks while the first start is pending', async () => {
@@ -1846,8 +2021,8 @@ describe('bindApp', () => {
     bindApp(root, makeViewState(), services);
 
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
-    const pendingButton = root.querySelector('[data-action="start-all"]') as HTMLButtonElement;
-    expect(pendingButton.disabled).toBe(true);
+    const pendingButton = root.querySelector('[data-action="cancel-scan"]') as HTMLButtonElement;
+    expect(pendingButton.disabled).toBe(false);
     pendingButton.click();
 
     expect(services.startScan).toHaveBeenCalledTimes(1);
@@ -1905,9 +2080,9 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-role="scan-modal"]')?.textContent)
+      expect(root.querySelector('[data-role="scan-message"]')?.textContent)
         .toContain('Sync failed dramatically');
-      expect(root.querySelector('[data-action="close-scan"]')).not.toBeNull();
+      expect(root.querySelector('[data-role="scan-modal"]')).toBeNull();
     });
   });
 });
