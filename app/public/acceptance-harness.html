@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>W4DJ acceptance harness</title>
+<pre id="result">starting</pre>
+<script type="module">
+import { analyzeAudioFile } from '/src/analysis.ts';
+import { AnalysisWorkerClient } from '/src/analysis-worker-client.ts';
+
+const output = document.querySelector('#result');
+const setResult = (value) => { output.textContent = JSON.stringify(value, null, 2); };
+const ids = [
+  'musicnn_embedding', 'mood_aggressive', 'mood_happy', 'mood_relaxed', 'mood_party',
+  'mood_sad', 'voice_instrumental', 'emomusic', 'muse', 'mirex', 'discogs_effnet_embedding',
+  'genre_discogs400', 'discogs_mood_theme', 'discogs_approachability',
+  'discogs_instrumentation', 'discogs_timbre', 'discogs_danceability',
+];
+const kinds = {
+  musicnn_embedding: 'embedding', mood_aggressive: 'mood', mood_happy: 'mood',
+  mood_relaxed: 'mood', mood_party: 'mood', mood_sad: 'mood', voice_instrumental: 'instrument',
+  emomusic: 'emotionContinuous', muse: 'emotionContinuous', mirex: 'emotionCluster',
+  discogs_effnet_embedding: 'discogsEffnetEmbedding', genre_discogs400: 'genre',
+  discogs_mood_theme: 'discogsEffnetHead', discogs_approachability: 'discogsEffnetHead',
+  discogs_instrumentation: 'discogsEffnetHead', discogs_timbre: 'discogsEffnetHead',
+  discogs_danceability: 'discogsEffnetHead',
+};
+const outputNames = {
+  musicnn_embedding: 'model/dense/Relu', mood_aggressive: 'model/Sigmoid', mood_happy: 'model/Sigmoid',
+  mood_relaxed: 'model/Sigmoid', mood_party: 'model/Sigmoid', mood_sad: 'model/Sigmoid',
+  voice_instrumental: 'model/Sigmoid', emomusic: 'model/Identity', muse: 'model/Identity',
+  mirex: 'PartitionedCall', discogs_effnet_embedding: 'discogs_embedding', genre_discogs400: 'discogs_genre',
+  discogs_mood_theme: 'model/Sigmoid', discogs_approachability: 'model/Softmax',
+  discogs_instrumentation: 'model/Sigmoid', discogs_timbre: 'model/Softmax', discogs_danceability: 'model/Softmax',
+};
+const classes = {
+  mood_aggressive: ['aggressive', 'non_aggressive'], mood_happy: ['happy', 'non_happy'],
+  mood_relaxed: ['relaxed', 'non_relaxed'], mood_party: ['party', 'non_party'],
+  mood_sad: ['sad', 'non_sad'], voice_instrumental: ['instrumental', 'voice'],
+  emomusic: ['valence', 'arousal'], muse: ['valence', 'arousal'],
+  mirex: ['passionate', 'rollicking', 'literate', 'humorous', 'aggressive'],
+  discogs_mood_theme: ['action', 'adventure', 'advertising', 'background', 'ballad', 'calm', 'children', 'christmas', 'commercial', 'cool', 'corporate', 'dark', 'deep', 'documentary', 'drama', 'dramatic', 'dream', 'emotional', 'energetic', 'epic', 'fast', 'film', 'fun', 'funny', 'game', 'groovy', 'happy', 'heavy', 'holiday', 'hopeful', 'inspiring', 'love', 'meditative', 'melancholic', 'melodic', 'motivational', 'movie', 'nature', 'party', 'positive', 'powerful', 'relaxing', 'retro', 'romantic', 'sad', 'sexy', 'slow', 'soft', 'soundscape', 'space', 'sport', 'summer', 'trailer', 'travel', 'upbeat', 'uplifting'],
+  discogs_approachability: ['not approachable', 'approachable'],
+  discogs_instrumentation: ['accordion', 'acousticbassguitar', 'acousticguitar', 'bass', 'beat', 'bell', 'bongo', 'brass', 'cello', 'clarinet', 'classicalguitar', 'computer', 'doublebass', 'drummachine', 'drums', 'electricguitar', 'electricpiano', 'flute', 'guitar', 'harmonica', 'harp', 'horn', 'keyboard', 'oboe', 'orchestra', 'organ', 'pad', 'percussion', 'piano', 'pipeorgan', 'rhodes', 'sampler', 'saxophone', 'strings', 'synthesizer', 'trombone', 'trumpet', 'viola', 'violin', 'voice'],
+  discogs_timbre: ['bright', 'dark'], discogs_danceability: ['danceable', 'not_danceable'],
+};
+const inputShapes = { discogs_effnet_embedding: [64, 128, 96] };
+const inputWidths = { genre_discogs400: 1280, discogs_mood_theme: 1280, discogs_approachability: 1280, discogs_instrumentation: 1280, discogs_timbre: 1280, discogs_danceability: 1280 };
+
+async function loadModel(id) {
+  const json = await fetch(`/essentia-models/${id}.json`).then((response) => response.json());
+  const bin = await fetch(`/essentia-models/${id}.bin`).then((response) => response.arrayBuffer());
+  const modelClasses = classes[id] || (id === 'genre_discogs400'
+    ? await fetch('/essentia-models/genre_discogs400.labels.json').then((response) => response.json())
+    : []);
+  return {
+    id, modelJson: JSON.stringify(json), weightData: Array.from(new Uint8Array(bin)), classes: modelClasses,
+    kind: kinds[id], outputName: outputNames[id], outputUnits: modelClasses.length || null,
+    inputShape: inputShapes[id] || null, inputWidth: inputWidths[id] || null, version: 'acceptance-v1',
+  };
+}
+
+async function run() {
+  const requested = new URLSearchParams(location.search).get('file');
+  if (!requested) throw new Error('missing ?file=...');
+  const fileName = decodeURIComponent(requested);
+  const path = `/Users/mac2/Music/test/${fileName}`;
+  const bytes = new Uint8Array(await fetch(`/acceptance-audio/${encodeURIComponent(fileName)}`).then((response) => response.arrayBuffer()));
+  const modelLimit = Number(new URLSearchParams(location.search).get('models') || ids.length);
+  const models = await Promise.all(ids.slice(0, modelLimit).map(loadModel));
+  const worker = new AnalysisWorkerClient();
+  const progress = [];
+  try {
+    const jobId = `acceptance-${Date.now()}`;
+    await worker.start(jobId, models);
+    const analysis = await analyzeAudioFile(path, bytes, { title: fileName, artist: '', album: '' }, {
+      fingerprint: { sizeBytes: bytes.byteLength, modifiedAt: null },
+      neteaseFilenameFormat: 'title_artist', highLevelModels: models, workerClient: worker,
+      workerJobId: jobId,
+      onProgress: (event) => progress.push({ stage: event.stage, modelId: event.modelId, processed: event.processed, total: event.total }),
+    });
+    setResult({ status: 'ok', fileName, analysis, progress: progress.slice(-40) });
+  } finally {
+    worker.terminate();
+  }
+}
+
+run().catch((error) => setResult({ status: 'error', message: error?.stack || String(error) }));
+</script>

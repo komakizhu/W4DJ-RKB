@@ -1,22 +1,32 @@
+use crate::analysis::read_track_metadata;
+use crate::concurrency::GlobalConcurrencyBudget;
 use crate::config::{
-    CandidateOperation, ConflictStrategy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
+    CandidateOperation, ConflictStrategy, FilenameNormalizationPolicy, FilenameRule,
+    LosslessFormat, Mode, NeteaseFilenameFormat,
 };
+use crate::filename_policy::sanitize_filename_component;
 use crate::history::HistoryEntry;
+use crate::netease::NeteaseMetadataResolver;
 use crate::scan_cache::ScanCache;
 use crate::sync::{
-    ScanObserver, effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
+    ScanObserver, derive_song_name_with_policy_and_resolver_cancellable,
+    effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
     get_destination_music_dict_with_rule_and_observer,
-    get_music_dict_with_scan_issues_with_settings,
-    get_music_dict_with_scan_issues_with_settings_and_cache_observer,
-    get_music_dict_with_scan_issues_with_settings_and_observer, is_ignored_music_file,
-    is_supported_source_file, resolve_output_policy, target_output_path,
+    get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy,
+    get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy,
+    get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy,
+    get_music_dict_with_scan_issues_with_settings_and_observer_with_policy,
+    get_music_dict_with_scan_issues_with_settings_and_policy, is_ignored_music_file,
+    is_supported_source_file, resolve_output_policy, source_entry_name,
+    target_output_path_with_policy,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::AtomicBool};
 
 pub use crate::config::CandidateOperation as PreviewOperation;
 
@@ -71,8 +81,233 @@ pub struct PreviewCandidate {
     pub destination_path: String,
     pub source_size_bytes: u64,
     pub estimated_output_bytes: Option<u64>,
+    /// Existing output to remove after a successful overwrite when the
+    /// selected filename rule produces a new destination path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_destination_path: Option<String>,
     #[serde(default)]
     pub operation: CandidateOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netease_track_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netease_album_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netease_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netease_artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disambiguation_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputTrackIdentity {
+    pub track_id: Option<String>,
+    pub album_id: Option<String>,
+    pub title: String,
+    pub artists: String,
+    pub album: String,
+    pub source_path: PathBuf,
+}
+
+impl OutputTrackIdentity {
+    /// Stable identity used to decide whether two same-name candidates are
+    /// actually the same track.  NetEase track IDs take precedence; for
+    /// files without a database match, the normalized metadata and source
+    /// path keep the fallback deterministic without affecting ordinary names.
+    pub fn stable_key(&self) -> String {
+        if let Some(track_id) = self
+            .track_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return format!("track:{track_id}");
+        }
+        let normalize = |value: &str| value.trim().to_ascii_lowercase();
+        format!(
+            "fallback:{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            normalize(&self.title),
+            normalize(&self.artists),
+            normalize(&self.album),
+            normalize(self.album_id.as_deref().unwrap_or_default()),
+            self.source_path.display()
+        )
+    }
+
+    fn same_metadata(&self, metadata: &crate::analysis::TrackMetadata) -> bool {
+        let title_matches = !self.title.trim().is_empty()
+            && self
+                .title
+                .trim()
+                .eq_ignore_ascii_case(metadata.title.trim());
+        let artists_matches = !self.artists.trim().is_empty()
+            && self
+                .artists
+                .trim()
+                .eq_ignore_ascii_case(metadata.artist.trim());
+        let album_matches = !self.album.trim().is_empty()
+            && self
+                .album
+                .trim()
+                .eq_ignore_ascii_case(metadata.album.trim());
+        title_matches && artists_matches && (album_matches || self.album.trim().is_empty())
+    }
+}
+
+/// Resolve only true output-name collisions. A candidate without a collision
+/// is left byte-for-byte unchanged, including its filename and destination.
+pub fn disambiguate_duplicate_output_names(
+    preview: &mut SyncPreview,
+    identities: &HashMap<String, OutputTrackIdentity>,
+) {
+    let mut groups = HashMap::<String, Vec<usize>>::new();
+    for (index, candidate) in preview.candidates.iter().enumerate() {
+        groups
+            .entry(candidate.destination_path.clone())
+            .or_default()
+            .push(index);
+    }
+
+    let mut removals = HashSet::new();
+    for indices in groups.into_values().filter(|indices| indices.len() > 1) {
+        let base_path = PathBuf::from(&preview.candidates[indices[0]].destination_path);
+        let existing_metadata = base_path.is_file().then(|| read_track_metadata(&base_path));
+        let existing_index = existing_metadata.as_ref().and_then(|metadata| {
+            indices.iter().copied().find(|index| {
+                identities
+                    .get(&preview.candidates[*index].source_path)
+                    .is_some_and(|identity| identity.same_metadata(metadata))
+            })
+        });
+
+        let distinct_albums = indices
+            .iter()
+            .filter_map(|index| identities.get(&preview.candidates[*index].source_path))
+            .map(|identity| identity.album.trim())
+            .filter(|album| !album.is_empty())
+            .collect::<HashSet<_>>()
+            .len()
+            > 1;
+        let distinct_track_ids = indices
+            .iter()
+            .filter_map(|index| {
+                identities
+                    .get(&preview.candidates[*index].source_path)
+                    .and_then(|identity| identity.track_id.as_deref())
+            })
+            .collect::<HashSet<_>>()
+            .len()
+            > 1;
+
+        let mut ordered = indices.clone();
+        ordered.sort_by(|left, right| {
+            preview.candidates[*left]
+                .source_path
+                .cmp(&preview.candidates[*right].source_path)
+        });
+        let mut occupied = HashSet::<PathBuf>::new();
+        for index in ordered {
+            if Some(index) == existing_index {
+                removals.insert(index);
+                continue;
+            }
+            let candidate = &mut preview.candidates[index];
+            let identity = identities.get(&candidate.source_path);
+            let suffix = if distinct_albums {
+                identity
+                    .map(|identity| sanitize_filename_component(&identity.album))
+                    .filter(|album| !album.is_empty())
+            } else if distinct_track_ids {
+                identity.and_then(|identity| identity.track_id.clone())
+            } else {
+                None
+            };
+            let base_name = candidate.name.clone();
+            let mut name = suffix
+                .filter(|suffix| !suffix.is_empty())
+                .map(|suffix| format!("{base_name} [{suffix}]"))
+                .unwrap_or_else(|| base_name.clone());
+            let extension = Path::new(&candidate.destination_path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default();
+            let mut destination = target_output_path_with_policy(
+                &preview.destination_directory,
+                &name,
+                extension,
+                FilenameNormalizationPolicy::PreserveSource,
+            );
+            let mut ordinal = 2usize;
+            while destination.exists() || occupied.contains(&destination) {
+                name = format!("{base_name} ({ordinal})");
+                destination = target_output_path_with_policy(
+                    &preview.destination_directory,
+                    &name,
+                    extension,
+                    FilenameNormalizationPolicy::PreserveSource,
+                );
+                ordinal += 1;
+            }
+            candidate.name = name;
+            candidate.destination_path = destination.display().to_string();
+            candidate.disambiguation_reason = Some(if distinct_albums {
+                "同名歌曲，已按专辑区分".to_string()
+            } else if distinct_track_ids {
+                "同名歌曲，已按网易云歌曲 ID 区分".to_string()
+            } else {
+                "同名歌曲，已按稳定序号区分".to_string()
+            });
+            occupied.insert(destination);
+        }
+    }
+
+    if !removals.is_empty() {
+        let mut retained = Vec::with_capacity(preview.candidates.len() - removals.len());
+        for (index, candidate) in std::mem::take(&mut preview.candidates)
+            .into_iter()
+            .enumerate()
+        {
+            if removals.contains(&index) {
+                preview.existing_count += 1;
+                preview.skipped_count += 1;
+                preview.new_count = preview.new_count.saturating_sub(1);
+                if let Some(removed_bytes) = candidate.estimated_output_bytes {
+                    preview.estimated_output_bytes = preview
+                        .estimated_output_bytes
+                        .and_then(|total| total.checked_sub(removed_bytes));
+                }
+            } else {
+                retained.push(candidate);
+            }
+        }
+        preview.candidates = retained;
+    }
+}
+
+/// Attach the immutable NetEase identity to candidates after scanning.  This
+/// is intentionally metadata-only: the final path selected by the collision
+/// pass is never changed here, and the identity is not reconstructed from a
+/// disambiguation suffix.
+pub fn attach_netease_identities(preview: &mut SyncPreview, resolver: &NeteaseMetadataResolver) {
+    for candidate in &mut preview.candidates {
+        if let Some(identity) =
+            resolver.track_identity_for_preview(Path::new(&candidate.source_path))
+        {
+            candidate.netease_track_id = identity.track_id;
+            candidate.netease_album_id = identity.album_id;
+            if !identity.title.trim().is_empty() {
+                candidate.netease_title = Some(identity.title);
+            }
+            if !identity.artists.trim().is_empty() {
+                candidate.netease_artist = Some(identity.artists);
+            }
+            if !identity.album.trim().is_empty() {
+                candidate.album = Some(identity.album);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,7 +394,7 @@ pub fn build_sync_preview_with_settings_and_netease(
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
 ) -> io::Result<SyncPreview> {
-    build_sync_preview_with_settings_and_netease_observed(
+    build_sync_preview_with_settings_and_netease_observed_with_policy(
         source_directory,
         destination_directory,
         mode,
@@ -167,6 +402,7 @@ pub fn build_sync_preview_with_settings_and_netease(
         conflict_strategy,
         filename_rule,
         netease_filename_format,
+        FilenameNormalizationPolicy::SoundCloud,
         None,
     )?
     .ok_or_else(|| io::Error::other("扫描被取消"))
@@ -204,6 +440,31 @@ pub fn build_sync_preview_with_settings_and_netease_observed(
     netease_filename_format: NeteaseFilenameFormat,
     observer: Option<&mut ScanObserver<'_>>,
 ) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_with_policy(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        FilenameNormalizationPolicy::SoundCloud,
+        observer,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_policy(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    observer: Option<&mut ScanObserver<'_>>,
+) -> io::Result<Option<SyncPreview>> {
     build_sync_preview_with_settings_and_netease_observed_internal(
         source_directory,
         destination_directory,
@@ -212,7 +473,10 @@ pub fn build_sync_preview_with_settings_and_netease_observed(
         conflict_strategy,
         filename_rule,
         netease_filename_format,
+        filename_policy,
         observer,
+        None,
+        None,
         None,
     )
 }
@@ -229,6 +493,33 @@ pub fn build_sync_preview_with_settings_and_netease_observed_with_cache(
     observer: Option<&mut ScanObserver<'_>>,
     cache: &mut ScanCache,
 ) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_with_cache_and_policy(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        FilenameNormalizationPolicy::SoundCloud,
+        observer,
+        cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_policy(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    observer: Option<&mut ScanObserver<'_>>,
+    cache: &mut ScanCache,
+) -> io::Result<Option<SyncPreview>> {
     build_sync_preview_with_settings_and_netease_observed_internal(
         source_directory,
         destination_directory,
@@ -237,8 +528,136 @@ pub fn build_sync_preview_with_settings_and_netease_observed_with_cache(
         conflict_strategy,
         filename_rule,
         netease_filename_format,
+        filename_policy,
         observer,
         Some((cache, Path::new(source_directory))),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    observer: Option<&mut ScanObserver<'_>>,
+    cache: &mut ScanCache,
+    budget: Arc<GlobalConcurrencyBudget>,
+    cancel: Arc<AtomicBool>,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        FilenameNormalizationPolicy::SoundCloud,
+        observer,
+        cache,
+        budget,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    observer: Option<&mut ScanObserver<'_>>,
+    cache: &mut ScanCache,
+    budget: Arc<GlobalConcurrencyBudget>,
+    cancel: Arc<AtomicBool>,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_internal(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        observer,
+        Some((cache, Path::new(source_directory))),
+        Some((budget, cancel)),
+        None,
+    )
+}
+
+/// Task 1 preview variant. It keeps the existing scanning APIs intact while
+/// allowing the coordinator to apply a read-only NetEase identity before it
+/// calculates expected paths and conflict groups.
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_policy_and_resolver(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    observer: Option<&mut ScanObserver<'_>>,
+    resolver: &NeteaseMetadataResolver,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_internal(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        observer,
+        None,
+        None,
+        Some(resolver),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy_and_resolver(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    observer: Option<&mut ScanObserver<'_>>,
+    cache: &mut ScanCache,
+    budget: Arc<GlobalConcurrencyBudget>,
+    cancel: Arc<AtomicBool>,
+    resolver: &NeteaseMetadataResolver,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_internal(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        observer,
+        Some((cache, Path::new(source_directory))),
+        Some((budget, cancel)),
+        Some(resolver),
     )
 }
 
@@ -251,8 +670,11 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     conflict_strategy: ConflictStrategy,
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
     mut observer: Option<&mut ScanObserver<'_>>,
     scan_cache: Option<(&mut ScanCache, &Path)>,
+    budget: Option<(Arc<GlobalConcurrencyBudget>, Arc<AtomicBool>)>,
+    metadata_resolver: Option<&NeteaseMetadataResolver>,
 ) -> io::Result<Option<SyncPreview>> {
     let mut preview = SyncPreview {
         source_directory: source_directory.to_string(),
@@ -326,32 +748,49 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         }
     }
 
-    let (source_files, scan_issues, cancelled) = match scan_cache {
+    let (mut source_files, scan_issues, cancelled) = match scan_cache {
         Some((cache, _source_root)) => {
             let mut no_op_observer = |_: crate::sync::ScanPhase, _: &Path| true;
             let scan_observer = observer.as_deref_mut().unwrap_or(&mut no_op_observer);
-            get_music_dict_with_scan_issues_with_settings_and_cache_observer(
-                &effective_source_directory,
-                filename_rule,
-                netease_filename_format,
-                Path::new(destination_directory),
-                cache,
-                scan_observer,
-            )
+            if let Some((budget, cancel)) = budget.as_ref() {
+                get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy(
+                    &effective_source_directory,
+                    filename_rule,
+                    netease_filename_format,
+                    filename_policy,
+                    Path::new(destination_directory),
+                    cache,
+                    Arc::clone(budget),
+                    Arc::clone(cancel),
+                    scan_observer,
+                )
+            } else {
+                get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy(
+                    &effective_source_directory,
+                    filename_rule,
+                    netease_filename_format,
+                    filename_policy,
+                    Path::new(destination_directory),
+                    cache,
+                    scan_observer,
+                )
+            }
         }
         None => {
             if let Some(observer) = observer.as_deref_mut() {
-                get_music_dict_with_scan_issues_with_settings_and_observer(
+                get_music_dict_with_scan_issues_with_settings_and_observer_with_policy(
                     &effective_source_directory,
                     filename_rule,
                     netease_filename_format,
+                    filename_policy,
                     observer,
                 )
             } else {
-                let (files, issues) = get_music_dict_with_scan_issues_with_settings(
+                let (files, issues) = get_music_dict_with_scan_issues_with_settings_and_policy(
                     &effective_source_directory,
                     filename_rule,
                     netease_filename_format,
+                    filename_policy,
                 );
                 (files, issues, false)
             }
@@ -360,6 +799,45 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     if cancelled {
         return Ok(None);
     }
+
+    // The scanner/cache intentionally remains resolver-agnostic so ordinary
+    // Task 2 folders keep their historical behavior. Task 1 applies the
+    // matched database identity here, before any expected path, collision or
+    // conflict decision is made.
+    if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
+        && !matches!(filename_rule, FilenameRule::Original)
+        && let Some(resolver) = metadata_resolver
+    {
+        let scan_cancel = budget.as_ref().map(|(_, cancel)| cancel.as_ref());
+        let mut resolved = HashMap::with_capacity(source_files.len());
+        for (_, (size, path)) in source_files.into_iter() {
+            if scan_cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Ok(None);
+            }
+            if let Some(observer) = observer.as_deref_mut()
+                && !observer(crate::sync::ScanPhase::Metadata, &path)
+            {
+                return Ok(None);
+            }
+            let name = derive_song_name_with_policy_and_resolver_cancellable(
+                &path,
+                filename_rule,
+                netease_filename_format,
+                filename_policy,
+                Some(resolver),
+                scan_cancel,
+            );
+            if scan_cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst)) {
+                return Ok(None);
+            }
+            let mut key = name.clone();
+            if resolved.contains_key(&key) {
+                key = format!("{name}\u{1f}{}", path.display());
+            }
+            resolved.insert(key, (size, path));
+        }
+        source_files = resolved;
+    }
     for issue in scan_issues {
         preview.errors.push(PreviewIssue {
             path: issue.path.display().to_string(),
@@ -367,23 +845,40 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         });
         preview.error_count += 1;
     }
-    let (destination_files, cancelled) =
-        if !destination_directory.trim().is_empty() && Path::new(destination_directory).is_dir() {
-            if let Some(observer) = observer.as_mut() {
+    let (destination_files, cancelled) = if !destination_directory.trim().is_empty()
+        && Path::new(destination_directory).is_dir()
+    {
+        if let Some(observer) = observer.as_mut() {
+            if let Some((budget, cancel)) = budget.as_ref() {
+                let (files, _issues, cancelled) =
+                        get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy(
+                            destination_directory,
+                            &["mp3", "wav", "aiff"],
+                            filename_rule,
+                            NeteaseFilenameFormat::default(),
+                            filename_policy,
+                            Arc::clone(budget),
+                            Arc::clone(cancel),
+                            crate::sync::ScanPhase::Destination,
+                            observer,
+                        );
+                (files, cancelled)
+            } else {
                 get_destination_music_dict_with_rule_and_observer(
                     destination_directory,
                     filename_rule,
                     observer,
                 )
-            } else {
-                (
-                    get_destination_music_dict_with_rule(destination_directory, filename_rule),
-                    false,
-                )
             }
         } else {
-            (Default::default(), false)
-        };
+            (
+                get_destination_music_dict_with_rule(destination_directory, filename_rule),
+                false,
+            )
+        }
+    } else {
+        (Default::default(), false)
+    };
     if cancelled {
         return Ok(None);
     };
@@ -391,10 +886,31 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         .values()
         .map(|(_, path)| path.clone())
         .collect::<HashSet<_>>();
+    let mut planned_paths = HashSet::new();
     let mut source_entries = source_files.iter().collect::<Vec<_>>();
     source_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    for (name, (_, path)) in source_entries {
+    // Count the paths before applying conflict handling.  A collision group
+    // is the only case where the duplicate-name disambiguation rule applies;
+    // ordinary candidates continue through the existing conflict strategy
+    // unchanged.
+    let mut expected_path_counts = HashMap::<PathBuf, usize>::new();
+    for (raw_name, (_, path)) in &source_entries {
+        let source_extension = effective_source_extension(path);
+        let output_extension =
+            resolve_output_policy(mode, lossless_format, &source_extension).output_extension;
+        let source_name = source_entry_name(raw_name);
+        let expected_path = target_output_path_with_policy(
+            destination_directory,
+            source_name,
+            output_extension,
+            filename_policy,
+        );
+        *expected_path_counts.entry(expected_path).or_default() += 1;
+    }
+
+    for (raw_name, (_, path)) in source_entries {
+        let name = source_entry_name(raw_name);
         let source_size = match fs::metadata(path) {
             Ok(metadata) if metadata.len() > 0 => metadata.len(),
             Ok(_) => {
@@ -418,18 +934,55 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         let source_extension = effective_source_extension(path);
         let output_extension =
             resolve_output_policy(mode, lossless_format, &source_extension).output_extension;
-        let expected_path = target_output_path(destination_directory, name, output_extension);
-        let existing_path = destination_files
-            .get(name)
-            .filter(|(_, path)| {
-                path.extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case(output_extension))
-            })
-            .map(|(_, path)| path.clone())
-            .or_else(|| expected_path.exists().then_some(expected_path.clone()));
+        let expected_path = target_output_path_with_policy(
+            destination_directory,
+            name,
+            output_extension,
+            filename_policy,
+        );
+        let collision_group = expected_path_counts
+            .get(&expected_path)
+            .copied()
+            .unwrap_or_default()
+            > 1;
+        let in_batch_collision = planned_paths.contains(&expected_path);
+        if in_batch_collision && !collision_group {
+            match conflict_strategy {
+                ConflictStrategy::Rename => {}
+                ConflictStrategy::Skip => {
+                    preview.skipped_count += 1;
+                    preview.skipped.push(PreviewIssue {
+                        path: path.display().to_string(),
+                        message: "输出文件名与本批次其他歌曲冲突，已跳过".to_string(),
+                    });
+                    continue;
+                }
+                ConflictStrategy::Overwrite | ConflictStrategy::UpdateMetadata => {
+                    preview.error_count += 1;
+                    preview.errors.push(PreviewIssue {
+                        path: path.display().to_string(),
+                        message: "本批次歌曲生成相同输出文件名，已拒绝覆盖或仅更新元数据"
+                            .to_string(),
+                    });
+                    continue;
+                }
+            }
+        }
+        let existing_path = if collision_group {
+            None
+        } else {
+            destination_files
+                .get(name)
+                .filter(|(_, path)| {
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case(output_extension))
+                })
+                .map(|(_, path)| path.clone())
+                .or_else(|| expected_path.exists().then_some(expected_path.clone()))
+        };
         let has_existing = existing_path.is_some();
-        let mut candidate_name = name.clone();
+        let mut candidate_name = name.to_string();
         let mut operation = CandidateOperation::Convert;
 
         if has_existing {
@@ -460,15 +1013,25 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         }
 
         if matches!(conflict_strategy, ConflictStrategy::Rename)
+            && !collision_group
             && matches!(operation, CandidateOperation::Convert)
         {
-            let desired_path =
-                target_output_path(destination_directory, &candidate_name, output_extension);
-            if has_existing || desired_path.exists() || occupied_paths.contains(&desired_path) {
+            let desired_path = target_output_path_with_policy(
+                destination_directory,
+                &candidate_name,
+                output_extension,
+                filename_policy,
+            );
+            if has_existing
+                || in_batch_collision
+                || desired_path.exists()
+                || occupied_paths.contains(&desired_path)
+            {
                 candidate_name = next_available_name(
                     destination_directory,
                     name,
                     output_extension,
+                    filename_policy,
                     &mut occupied_paths,
                 );
             } else {
@@ -483,11 +1046,32 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         };
         let estimated_output_bytes = Some(estimated_bytes);
         let destination_path = if matches!(operation, CandidateOperation::UpdateMetadata) {
-            existing_path.unwrap_or_else(|| {
-                target_output_path(destination_directory, &candidate_name, output_extension)
+            existing_path.clone().unwrap_or_else(|| {
+                target_output_path_with_policy(
+                    destination_directory,
+                    &candidate_name,
+                    output_extension,
+                    filename_policy,
+                )
             })
         } else {
-            target_output_path(destination_directory, &candidate_name, output_extension)
+            target_output_path_with_policy(
+                destination_directory,
+                &candidate_name,
+                output_extension,
+                filename_policy,
+            )
+        };
+        let previous_destination_path = if matches!(conflict_strategy, ConflictStrategy::Overwrite)
+            && existing_path
+                .as_ref()
+                .is_some_and(|existing| existing != &destination_path)
+        {
+            existing_path
+                .as_ref()
+                .map(|existing| existing.display().to_string())
+        } else {
+            None
         };
         if paths_refer_to_same_file(path, &destination_path) {
             preview.errors.push(PreviewIssue {
@@ -503,13 +1087,63 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             destination_path: destination_path.display().to_string(),
             source_size_bytes: source_size,
             estimated_output_bytes,
+            previous_destination_path,
             operation,
+            netease_track_id: None,
+            netease_album_id: None,
+            album: None,
+            netease_title: None,
+            netease_artist: None,
+            disambiguation_reason: None,
         });
+        planned_paths.insert(destination_path);
         preview.new_count += 1;
         preview.estimated_output_bytes = preview
             .estimated_output_bytes
             .and_then(|total| total.checked_add(estimated_bytes));
     }
+
+    if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
+        && let Some(resolver) = metadata_resolver
+    {
+        attach_netease_identities(&mut preview, resolver);
+    }
+
+    let identities = preview
+        .candidates
+        .iter()
+        .filter_map(|candidate| {
+            let destination = Path::new(&candidate.destination_path);
+            let collision_group = expected_path_counts
+                .get(&target_output_path_with_policy(
+                    destination_directory,
+                    &candidate.name,
+                    destination
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default(),
+                    filename_policy,
+                ))
+                .copied()
+                .unwrap_or_default()
+                > 1;
+            collision_group.then(|| {
+                let metadata = read_track_metadata(Path::new(&candidate.source_path));
+                (
+                    candidate.source_path.clone(),
+                    OutputTrackIdentity {
+                        title: candidate.netease_title.clone().unwrap_or(metadata.title),
+                        artists: candidate.netease_artist.clone().unwrap_or(metadata.artist),
+                        album: candidate.album.clone().unwrap_or(metadata.album),
+                        track_id: candidate.netease_track_id.clone(),
+                        album_id: candidate.netease_album_id.clone(),
+                        source_path: PathBuf::from(&candidate.source_path),
+                    },
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    disambiguate_duplicate_output_names(&mut preview, &identities);
 
     let requires_ffmpeg = preview.candidates.iter().any(|candidate| {
         if matches!(candidate.operation, CandidateOperation::UpdateMetadata) {
@@ -597,7 +1231,14 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
                     destination_path: pending_file.destination_path.clone(),
                     source_size_bytes: metadata.len(),
                     estimated_output_bytes: estimated,
+                    previous_destination_path: pending_file.previous_destination_path.clone(),
                     operation: pending_file.operation,
+                    netease_track_id: None,
+                    netease_album_id: None,
+                    album: None,
+                    netease_title: None,
+                    netease_artist: None,
+                    disambiguation_reason: None,
                 });
                 preview.new_count += 1;
             }
@@ -631,7 +1272,14 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
                     destination_path: failed_file.destination_path.clone(),
                     source_size_bytes: metadata.len(),
                     estimated_output_bytes: Some(metadata.len()),
+                    previous_destination_path: None,
                     operation: CandidateOperation::Convert,
+                    netease_track_id: None,
+                    netease_album_id: None,
+                    album: None,
+                    netease_title: None,
+                    netease_artist: None,
+                    disambiguation_reason: None,
                 };
                 preview.estimated_output_bytes = preview
                     .estimated_output_bytes
@@ -673,12 +1321,18 @@ fn next_available_name(
     destination_directory: &str,
     base_name: &str,
     extension: &str,
+    filename_policy: FilenameNormalizationPolicy,
     occupied_paths: &mut HashSet<std::path::PathBuf>,
 ) -> String {
     let mut index = 2usize;
     loop {
         let candidate = format!("{} ({})", base_name, index);
-        let path = target_output_path(destination_directory, &candidate, extension);
+        let path = target_output_path_with_policy(
+            destination_directory,
+            &candidate,
+            extension,
+            filename_policy,
+        );
         if !path.exists() && !occupied_paths.contains(&path) {
             occupied_paths.insert(path);
             return candidate;

@@ -1,9 +1,12 @@
 mod analysis;
+mod concurrency;
 mod config;
+mod filename_policy;
 pub mod gui;
 mod lyrics;
 mod metadata;
 mod netease;
+mod netease_cache;
 mod scan_cache;
 mod sync;
 pub mod task;

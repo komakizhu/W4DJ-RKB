@@ -1,12 +1,18 @@
 #![allow(dead_code)]
 #[path = "../src/analysis.rs"]
 mod analysis;
+#[path = "../src/concurrency.rs"]
+mod concurrency;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/filename_policy.rs"]
+mod filename_policy;
 #[path = "../src/metadata.rs"]
 mod metadata;
 #[path = "../src/netease.rs"]
 mod netease;
+#[path = "../src/netease_cache.rs"]
+mod netease_cache;
 #[path = "../src/scan_cache.rs"]
 mod scan_cache;
 #[path = "../src/sync.rs"]
@@ -14,16 +20,21 @@ mod sync;
 #[path = "../src/task.rs"]
 mod task;
 
-use config::{LosslessFormat, Mode};
-use id3::TagLike;
+use config::{FilenameNormalizationPolicy, LosslessFormat, Mode, NeteaseFilenameFormat};
+use id3::{Tag, TagLike};
 use ncmdump::NcmInfo;
+use netease::NeteaseMetadataResolver;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, atomic::AtomicBool};
 use sync::{
-    TargetProfile, cleanup_temporary_outputs, compare_music_dicts, get_destination_music_dict,
-    resolve_output_policy,
+    ConversionMetadataContext, TargetProfile, cleanup_temporary_outputs, compare_music_dicts,
+    get_destination_music_dict, resolve_output_policy,
+    update_existing_metadata_transactionally_with_context_and_policy,
 };
+use tempfile::tempdir;
 
 #[test]
 fn compat_mode_always_targets_mp3() {
@@ -51,6 +62,46 @@ fn lossless_mode_preserves_mp3_sources() {
     let policy = resolve_output_policy(Mode::Lossless, Some(LosslessFormat::Aiff), "mp3");
     assert_eq!(policy.output_extension, "mp3");
     assert!(matches!(policy.target_profile, TargetProfile::CompatMp3));
+}
+
+#[test]
+fn real_mass_destruction_metadata_round_trip_uses_database_identity() {
+    let Ok(database) = env::var("W4DJ_REAL_NETEASE_DB") else {
+        return;
+    };
+    let Ok(source) = env::var("W4DJ_REAL_NETEASE_SOURCE") else {
+        return;
+    };
+    let source_path = PathBuf::from(&source);
+    if !source_path.is_file() {
+        return;
+    }
+    let temporary = tempdir().unwrap();
+    let output = temporary.path().join("database-identity.mp3");
+    fs::write(&output, b"temporary audio").unwrap();
+    let source_before = fs::read(&source_path).unwrap();
+    let resolver =
+        Arc::new(NeteaseMetadataResolver::load_exact(PathBuf::from(database).as_path()).unwrap());
+    let context = ConversionMetadataContext { netease: resolver };
+
+    update_existing_metadata_transactionally_with_context_and_policy(
+        &source_path,
+        &output,
+        NeteaseFilenameFormat::TitleArtist,
+        |_| Ok(()),
+        &context,
+        FilenameNormalizationPolicy::PreserveSource,
+    )
+    .unwrap();
+
+    let tag = Tag::read_from_path(&output).unwrap();
+    assert_eq!(
+        tag.title(),
+        Some("Mass Destruction (\"P3\" + \"P3F\" ver.)")
+    );
+    assert_eq!(tag.artist(), Some("川村ゆみ, Lotus Juice"));
+    assert_eq!(tag.album(), Some("『P3D』＆『P5D』フルサウンドトラック"));
+    assert_eq!(fs::read(&source_path).unwrap(), source_before);
 }
 
 #[test]
@@ -144,7 +195,7 @@ fn compare_music_dicts_rebuilds_zero_byte_destination_files() {
 }
 
 #[test]
-fn get_music_dict_prefers_higher_quality_duplicate_stem() {
+fn get_music_dict_preserves_distinct_duplicate_stems() {
     let temp_dir = std::env::temp_dir().join(format!("w4dj-sync-policy-{}", std::process::id()));
     fs::create_dir_all(&temp_dir).unwrap();
 
@@ -154,9 +205,9 @@ fn get_music_dict_prefers_higher_quality_duplicate_stem() {
     fs::write(&flac_path, b"flac").unwrap();
 
     let dict = sync::get_music_dict(temp_dir.to_str().unwrap());
-    let (_, selected_path) = dict.get("same").unwrap();
-
-    assert_eq!(selected_path, &flac_path);
+    assert_eq!(dict.len(), 2);
+    assert!(dict.values().any(|(_, path)| path == &mp3_path));
+    assert!(dict.values().any(|(_, path)| path == &flac_path));
 
     let _ = fs::remove_dir_all(temp_dir);
 }
@@ -215,6 +266,42 @@ fn observed_scan_reports_each_song_and_supports_cancellation() {
     assert_eq!(count, 0);
     assert!(cancelled);
 
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn enumerate_music_files_reports_one_pass_paths_issues_and_total() {
+    let temp_dir = std::env::temp_dir().join(format!("w4dj-enumerate-once-{}", std::process::id()));
+    fs::create_dir_all(temp_dir.join("nested")).unwrap();
+    fs::write(temp_dir.join("one.mp3"), b"mp3").unwrap();
+    fs::write(temp_dir.join("nested/two.flac"), b"flac").unwrap();
+    fs::write(temp_dir.join("ignored.txt"), b"not audio").unwrap();
+
+    let mut observations = Vec::new();
+    let result = sync::enumerate_music_files_observed(
+        temp_dir.to_str().unwrap(),
+        sync::SUPPORTED_SOURCE_EXTENSIONS,
+        &AtomicBool::new(false),
+        |processed, total, path| {
+            observations.push((processed, total, path.to_path_buf()));
+        },
+    )
+    .unwrap();
+
+    assert_eq!(result.paths.len(), 2);
+    assert!(result.issues.is_empty());
+    assert_eq!(observations.last().unwrap().0, 2);
+    assert_eq!(observations.last().unwrap().1, Some(2));
+
+    let cancelled = AtomicBool::new(true);
+    let error = sync::enumerate_music_files_observed(
+        temp_dir.to_str().unwrap(),
+        sync::SUPPORTED_SOURCE_EXTENSIONS,
+        &cancelled,
+        |_, _, _| {},
+    )
+    .unwrap_err();
+    assert_eq!(error, sync::ScanEnumerationError::Cancelled);
     let _ = fs::remove_dir_all(temp_dir);
 }
 

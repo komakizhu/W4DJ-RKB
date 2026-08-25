@@ -2,12 +2,18 @@
 
 #[path = "../src/analysis.rs"]
 mod analysis;
+#[path = "../src/concurrency.rs"]
+mod concurrency;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/filename_policy.rs"]
+mod filename_policy;
 #[path = "../src/metadata.rs"]
 mod metadata;
 #[path = "../src/netease.rs"]
 mod netease;
+#[path = "../src/netease_cache.rs"]
+mod netease_cache;
 #[path = "../src/scan_cache.rs"]
 mod scan_cache;
 #[path = "../src/sync.rs"]

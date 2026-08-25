@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCAN_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const SCAN_CACHE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanCache {
@@ -13,13 +13,15 @@ pub struct ScanCache {
     pub entries: BTreeMap<String, ScanCacheEntry>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanCacheEntry {
     pub source_path: String,
     pub source_root: String,
     pub output_directory: String,
     pub filename_rule: String,
     pub netease_filename_format: String,
+    #[serde(default)]
+    pub filename_policy: String,
     pub size_bytes: u64,
     pub modified_at_ms: Option<u64>,
     pub derived_name: String,
@@ -27,6 +29,23 @@ pub struct ScanCacheEntry {
     pub source_extension: String,
     #[serde(default)]
     pub scan_issue: Option<String>,
+    /// Authoritative identity is kept separate from the legacy derived name.
+    /// These fields are optional so older cache entries remain readable while
+    /// a schema upgrade forces a safe rescan.
+    #[serde(default)]
+    pub identity_basis: Option<String>,
+    #[serde(default)]
+    pub source_title: Option<String>,
+    #[serde(default)]
+    pub source_artist: Option<String>,
+    #[serde(default)]
+    pub safe_output_stem: Option<String>,
+    #[serde(default)]
+    pub collision_key: Option<String>,
+    #[serde(default)]
+    pub transformations: Vec<String>,
+    #[serde(default)]
+    pub collision_resolution: Option<String>,
 }
 
 impl ScanCache {
@@ -60,10 +79,10 @@ pub fn load_scan_cache(path: &Path) -> io::Result<ScanCache> {
     let cache: ScanCache = serde_json::from_str(&contents)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if cache.schema_version != SCAN_CACHE_SCHEMA_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported scan cache schema {}", cache.schema_version),
-        ));
+        // A cache is an optimization, never authoritative input.  Discarding
+        // an older schema is safer than reusing a cleaned name as identity;
+        // the next scan will atomically write the current schema.
+        return Ok(ScanCache::empty());
     }
     Ok(cache)
 }
@@ -104,14 +123,44 @@ pub fn can_reuse_entry(
     output_directory: &Path,
     filename_rule: &str,
     netease_filename_format: &str,
+    filename_policy: &str,
     size_bytes: u64,
     modified_at_ms: Option<u64>,
 ) -> bool {
-    normalize_path(Path::new(&entry.source_path)) == normalize_path(source_path)
-        && normalize_path(Path::new(&entry.source_root)) == normalize_path(source_root)
-        && normalize_path(Path::new(&entry.output_directory)) == normalize_path(output_directory)
+    can_reuse_entry_normalized(
+        entry,
+        &normalize_path(source_path),
+        &normalize_path(source_root),
+        &normalize_path(output_directory),
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        size_bytes,
+        modified_at_ms,
+    )
+}
+
+/// Fast path for a scan that has already normalized its roots once.  File
+/// paths still carry their own fingerprint, but the expensive root
+/// canonicalization is no longer repeated for every candidate.
+#[allow(clippy::too_many_arguments)]
+pub fn can_reuse_entry_normalized(
+    entry: &ScanCacheEntry,
+    normalized_source_path: &Path,
+    normalized_source_root: &Path,
+    normalized_output_directory: &Path,
+    filename_rule: &str,
+    netease_filename_format: &str,
+    filename_policy: &str,
+    size_bytes: u64,
+    modified_at_ms: Option<u64>,
+) -> bool {
+    normalize_path(Path::new(&entry.source_path)) == normalized_source_path
+        && normalize_path(Path::new(&entry.source_root)) == normalized_source_root
+        && normalize_path(Path::new(&entry.output_directory)) == normalized_output_directory
         && entry.filename_rule == filename_rule
         && entry.netease_filename_format == netease_filename_format
+        && entry.filename_policy == filename_policy
         && entry.size_bytes == size_bytes
         && entry.modified_at_ms == modified_at_ms
 }
@@ -160,11 +209,13 @@ mod tests {
             output_directory: output.display().to_string(),
             filename_rule: "title_artist".to_string(),
             netease_filename_format: "title_artist".to_string(),
+            filename_policy: "soundcloud".to_string(),
             size_bytes: 3,
             modified_at_ms: modified_at_ms(source),
             derived_name: "Song - Artist".to_string(),
             source_extension: "mp3".to_string(),
             scan_issue: None,
+            ..Default::default()
         }
     }
 
@@ -199,6 +250,7 @@ mod tests {
             &output,
             "title_artist",
             "title_artist",
+            "soundcloud",
             3,
             modified_at_ms(&source),
         ));
@@ -209,6 +261,7 @@ mod tests {
             &directory.path().join("other"),
             "title_artist",
             "title_artist",
+            "soundcloud",
             3,
             modified_at_ms(&source),
         ));
@@ -219,13 +272,14 @@ mod tests {
             &output,
             "artist_title",
             "title_artist",
+            "soundcloud",
             3,
             modified_at_ms(&source),
         ));
     }
 
     #[test]
-    fn damaged_or_old_cache_is_rejected_without_becoming_a_valid_empty_cache() {
+    fn damaged_cache_is_rejected_but_old_schema_is_safely_discarded() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("scan-cache.json");
         fs::write(&path, "{not-json").unwrap();
@@ -243,10 +297,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            load_scan_cache(&path).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        let cache = load_scan_cache(&path).unwrap();
+        assert_eq!(cache.schema_version, SCAN_CACHE_SCHEMA_VERSION);
+        assert!(cache.entries.is_empty());
     }
 
     #[test]

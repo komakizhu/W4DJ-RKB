@@ -2,7 +2,10 @@ use crate::config::{
     ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
 };
 use crate::history::FailedFile;
-use crate::preferences::{AppPreferences, SYNC_SLOT_COUNT, SyncSlotPreferences};
+use crate::preferences::{
+    AppPreferences, SYNC_SLOT_COUNT, SyncSlotPreferences, default_concurrency_limit,
+    normalize_concurrency_limit,
+};
 use crate::task::{TaskController, TaskSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +35,8 @@ pub struct SyncSlotState {
     pub failed_files: Vec<FailedFile>,
     pub current_file: String,
     pub logs: Vec<String>,
+    #[serde(default)]
+    pub active_concurrency_limit: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +49,7 @@ pub struct DesktopState {
     pub conflict_strategy: ConflictStrategy,
     pub filename_rule: FilenameRule,
     pub netease_filename_format: NeteaseFilenameFormat,
+    pub concurrency_limit: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +74,7 @@ impl SyncSlotState {
             failed_files: Vec::new(),
             current_file: String::new(),
             logs: vec![String::from("Desktop shell ready")],
+            active_concurrency_limit: None,
         }
     }
 }
@@ -83,6 +90,8 @@ impl DesktopState {
             conflict_strategy,
             filename_rule,
             netease_filename_format,
+            netease_database_path: _,
+            concurrency_limit,
         } = preferences;
 
         Self {
@@ -94,6 +103,10 @@ impl DesktopState {
             conflict_strategy,
             filename_rule,
             netease_filename_format,
+            concurrency_limit: normalize_concurrency_limit(
+                f64::from(concurrency_limit),
+                default_concurrency_limit(),
+            ),
         }
     }
 
@@ -110,6 +123,8 @@ impl DesktopState {
             conflict_strategy: self.conflict_strategy,
             filename_rule: self.filename_rule,
             netease_filename_format: self.netease_filename_format,
+            netease_database_path: None,
+            concurrency_limit: self.concurrency_limit,
         }
     }
 }
@@ -132,6 +147,8 @@ impl DesktopController {
             conflict_strategy,
             filename_rule,
             netease_filename_format,
+            netease_database_path: _,
+            concurrency_limit,
         } = preferences;
 
         for (state_slot, preferences_slot) in self.state.slots.iter_mut().zip(slots) {
@@ -145,6 +162,8 @@ impl DesktopController {
         self.state.conflict_strategy = conflict_strategy;
         self.state.filename_rule = filename_rule;
         self.state.netease_filename_format = netease_filename_format;
+        self.state.concurrency_limit =
+            normalize_concurrency_limit(f64::from(concurrency_limit), default_concurrency_limit());
     }
 
     pub fn state(&self) -> &DesktopState {
@@ -213,12 +232,19 @@ impl DesktopController {
         self.push_log_to_all("NetEase input filename format updated");
     }
 
+    pub fn choose_concurrency_limit(&mut self, limit: u8) {
+        self.state.concurrency_limit =
+            normalize_concurrency_limit(f64::from(limit), default_concurrency_limit());
+        self.push_log_to_all("Scan and FFmpeg concurrency updated");
+    }
+
     pub fn start_sync(&mut self, slot_index: usize, total_files: usize) -> Result<(), String> {
         self.validate_slot_index(slot_index)?;
         self.task_controllers[slot_index] = TaskController::running(total_files);
 
         let slot = &mut self.state.slots[slot_index];
         slot.status = DesktopStatus::Running;
+        slot.active_concurrency_limit = Some(self.state.concurrency_limit);
         slot.progress_total = total_files;
         slot.progress_completed = 0;
         slot.new_tracks = total_files;

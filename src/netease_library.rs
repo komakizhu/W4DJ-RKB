@@ -5,12 +5,54 @@ use crate::library_catalog::{
     LibraryCatalog, LocalStatus,
 };
 use crate::media_probe::probe_local_audio;
-use crate::netease::{NeteaseRecord, choose_record, database_candidates, load_records_from_db};
-use std::collections::{HashMap, HashSet};
+use crate::netease::{
+    NeteaseDatabaseSummary, NeteaseRecord, choose_record, database_candidates,
+    load_records_from_db, load_records_from_db_observed, probe_netease_database,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogBuildError {
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for CatalogBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("歌曲库刷新已取消"),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CatalogBuildError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogBuildProgress {
+    pub stage: &'static str,
+    pub processed: usize,
+    pub total: Option<usize>,
+    pub current_item: String,
+}
+
+/// Progress emitted while locating a local NetEase library.  Discovery is
+/// deliberately a small, typed value so the desktop layer can expose it
+/// without leaking absolute paths to the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NeteaseDiscoveryProgress {
+    pub stage: &'static str,
+    pub processed: usize,
+    pub total: Option<usize>,
+    pub current_item: String,
+    pub message: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,17 +64,103 @@ pub struct NeteaseDiscovery {
 }
 
 pub fn discover_netease_library() -> NeteaseDiscovery {
-    let mut best: Option<(PathBuf, usize, Vec<NeteaseRecord>)> = None;
-    for path in database_candidates() {
-        let Ok(records) = load_records_from_db(&path) else {
-            continue;
-        };
-        if records.len() > best.as_ref().map_or(0, |(_, count, _)| *count) {
-            best = Some((path, records.len(), records));
+    discover_netease_library_with_local_count(true)
+}
+
+pub fn discover_netease_library_for_refresh() -> NeteaseDiscovery {
+    discover_netease_library_with_local_count(false)
+}
+
+fn discover_netease_library_with_local_count(include_local_file_count: bool) -> NeteaseDiscovery {
+    discover_netease_library_observed(include_local_file_count, |_| {})
+}
+
+fn load_records_for_summary_observed<Observe>(
+    summary: &NeteaseDatabaseSummary,
+    mut observe: Observe,
+) -> Result<Vec<NeteaseRecord>, String>
+where
+    Observe: FnMut(NeteaseDiscoveryProgress),
+{
+    load_records_from_db_observed(&summary.path, 2, |table, processed, total| {
+        observe(NeteaseDiscoveryProgress {
+            stage: "readingRecords",
+            processed,
+            total: Some(total),
+            current_item: table.to_string(),
+            message: "正在读取网易云数据库".to_string(),
+        });
+    })
+    .map_err(|error| format!("无法只读打开网易云数据库：{error}"))
+}
+
+fn probe_database_candidates(candidates: &[PathBuf]) -> Vec<NeteaseDatabaseSummary> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let worker_count = 2usize.min(candidates.len()).max(1);
+    let queue = Arc::new(Mutex::new(
+        candidates.iter().cloned().collect::<VecDeque<_>>(),
+    ));
+    let (sender, receiver) = mpsc::channel();
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let sender = sender.clone();
+        workers.push(thread::spawn(move || {
+            loop {
+                let path = queue.lock().ok().and_then(|mut queue| queue.pop_front());
+                let Some(path) = path else {
+                    break;
+                };
+                if let Ok(summary) = probe_netease_database(&path) {
+                    let _ = sender.send(summary);
+                }
+            }
+        }));
+    }
+    drop(sender);
+    let summaries = receiver.into_iter().collect::<Vec<_>>();
+    for worker in workers {
+        let _ = worker.join();
+    }
+    summaries
+}
+
+pub fn discover_netease_library_observed<Observe>(
+    include_local_file_count: bool,
+    mut observe: Observe,
+) -> NeteaseDiscovery
+where
+    Observe: FnMut(NeteaseDiscoveryProgress),
+{
+    let candidates = database_candidates();
+    let mut best: Option<NeteaseDatabaseSummary> = None;
+    observe(NeteaseDiscoveryProgress {
+        stage: "locatingDatabase",
+        processed: 0,
+        total: Some(candidates.len()),
+        current_item: String::new(),
+        message: "正在查找网易云数据库".to_string(),
+    });
+    for (index, _path) in candidates.iter().enumerate() {
+        observe(NeteaseDiscoveryProgress {
+            stage: "locatingDatabase",
+            processed: index + 1,
+            total: Some(candidates.len()),
+            current_item: "网易云数据库候选".to_string(),
+            message: "正在查找网易云数据库".to_string(),
+        });
+    }
+    for summary in probe_database_candidates(&candidates) {
+        if summary.supported
+            && summary.record_count > best.as_ref().map_or(0, |item| item.record_count)
+        {
+            best = Some(summary);
         }
     }
 
-    let Some((database_path, record_count, best_records)) = best else {
+    let Some(summary) = best else {
         return NeteaseDiscovery {
             database_path: None,
             music_folder: None,
@@ -41,17 +169,129 @@ pub fn discover_netease_library() -> NeteaseDiscovery {
         };
     };
 
-    let music_folder = candidate_music_folder(&database_path, &best_records);
-    let local_file_count = music_folder
-        .as_deref()
-        .map(count_audio_files)
-        .unwrap_or_default();
+    let records = load_records_for_summary_observed(&summary, &mut observe).unwrap_or_default();
+    let music_folder = candidate_music_folder(&summary.path, &records);
+    let local_file_count = if include_local_file_count {
+        observe(NeteaseDiscoveryProgress {
+            stage: "checkingMusicFolder",
+            processed: 0,
+            total: None,
+            current_item: String::new(),
+            message: "正在查找音乐目录".to_string(),
+        });
+        let count = music_folder
+            .as_deref()
+            .map(|folder| {
+                count_audio_files_observed(folder, |processed, path| {
+                    observe(NeteaseDiscoveryProgress {
+                        stage: "checkingMusicFolder",
+                        processed,
+                        total: None,
+                        current_item: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        message: "正在查找音乐目录".to_string(),
+                    });
+                })
+            })
+            .unwrap_or_default();
+        observe(NeteaseDiscoveryProgress {
+            stage: "checkingMusicFolder",
+            processed: count,
+            total: Some(count),
+            current_item: String::new(),
+            message: "音乐目录查找完成".to_string(),
+        });
+        count
+    } else {
+        0
+    };
     NeteaseDiscovery {
-        database_path: Some(database_path),
+        database_path: Some(summary.path),
         music_folder,
-        record_count,
+        record_count: summary.record_count,
         local_file_count,
     }
+}
+
+pub fn discover_netease_library_from_database(
+    database_path: &Path,
+) -> Result<NeteaseDiscovery, String> {
+    discover_netease_library_from_database_with_local_count(database_path, true)
+}
+
+pub fn discover_netease_library_from_database_for_refresh(
+    database_path: &Path,
+) -> Result<NeteaseDiscovery, String> {
+    discover_netease_library_from_database_with_local_count(database_path, false)
+}
+
+fn discover_netease_library_from_database_with_local_count(
+    database_path: &Path,
+    include_local_file_count: bool,
+) -> Result<NeteaseDiscovery, String> {
+    discover_netease_library_from_database_observed(database_path, include_local_file_count, |_| {})
+}
+
+pub fn discover_netease_library_from_database_observed<Observe>(
+    database_path: &Path,
+    include_local_file_count: bool,
+    mut observe: Observe,
+) -> Result<NeteaseDiscovery, String>
+where
+    Observe: FnMut(NeteaseDiscoveryProgress),
+{
+    let summary = probe_netease_database(database_path)
+        .map_err(|error| format!("无法读取所选 SQLite 文件结构：{error}"))?;
+    if !summary.supported {
+        return Err("所选 SQLite 文件不包含可识别的网易云数据表".to_string());
+    }
+    let records = load_records_for_summary_observed(&summary, &mut observe)?;
+    let music_folder = candidate_music_folder(database_path, &records);
+    let local_file_count = if include_local_file_count {
+        observe(NeteaseDiscoveryProgress {
+            stage: "checkingMusicFolder",
+            processed: 0,
+            total: None,
+            current_item: String::new(),
+            message: "正在查找音乐目录".to_string(),
+        });
+        music_folder
+            .as_deref()
+            .map(|folder| {
+                count_audio_files_observed(folder, |processed, path| {
+                    observe(NeteaseDiscoveryProgress {
+                        stage: "checkingMusicFolder",
+                        processed,
+                        total: None,
+                        current_item: path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        message: "正在查找音乐目录".to_string(),
+                    });
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        0
+    };
+    if include_local_file_count {
+        observe(NeteaseDiscoveryProgress {
+            stage: "checkingMusicFolder",
+            processed: local_file_count,
+            total: Some(local_file_count),
+            current_item: String::new(),
+            message: "音乐目录查找完成".to_string(),
+        });
+    }
+    Ok(NeteaseDiscovery {
+        database_path: Some(database_path.to_path_buf()),
+        music_folder,
+        record_count: summary.record_count,
+        local_file_count,
+    })
 }
 
 pub fn build_catalog_snapshot(
@@ -66,15 +306,71 @@ pub fn build_catalog_snapshot_incremental(
     music_folder: Option<&Path>,
     catalog: Option<&LibraryCatalog>,
 ) -> Result<CatalogSnapshot, String> {
+    build_catalog_snapshot_incremental_observed(
+        database_path,
+        music_folder,
+        catalog,
+        || false,
+        |_| {},
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub fn build_catalog_snapshot_incremental_observed<Cancel, Observe>(
+    database_path: &Path,
+    music_folder: Option<&Path>,
+    catalog: Option<&LibraryCatalog>,
+    mut is_cancelled: Cancel,
+    mut observe: Observe,
+) -> Result<CatalogSnapshot, CatalogBuildError>
+where
+    Cancel: FnMut() -> bool,
+    Observe: FnMut(CatalogBuildProgress),
+{
+    observe(CatalogBuildProgress {
+        stage: "readingRecords",
+        processed: 0,
+        total: None,
+        current_item: String::new(),
+    });
+    if is_cancelled() {
+        return Err(CatalogBuildError::Cancelled);
+    }
     let records = load_records_from_db(database_path)
-        .map_err(|error| format!("无法只读打开网易云数据库：{error}"))?;
-    let local_paths = music_folder
-        .filter(|path| path.is_dir())
-        .map(collect_audio_files)
-        .unwrap_or_default();
+        .map_err(|error| CatalogBuildError::Failed(format!("无法只读打开网易云数据库：{error}")))?;
+    let total_records = records.len();
+    for (index, record) in records.iter().enumerate() {
+        if is_cancelled() {
+            return Err(CatalogBuildError::Cancelled);
+        }
+        observe(CatalogBuildProgress {
+            stage: "readingRecords",
+            processed: index + 1,
+            total: Some(total_records),
+            current_item: record.title.clone(),
+        });
+    }
+    let local_paths = if let Some(path) = music_folder.filter(|path| path.is_dir()) {
+        collect_audio_files_observed(path, &mut is_cancelled, &mut observe)?
+    } else {
+        Vec::new()
+    };
 
     let mut matched_paths: HashMap<String, PathBuf> = HashMap::new();
-    for path in &local_paths {
+    let total_local_paths = local_paths.len();
+    for (index, path) in local_paths.iter().enumerate() {
+        if is_cancelled() {
+            return Err(CatalogBuildError::Cancelled);
+        }
+        observe(CatalogBuildProgress {
+            stage: "checkingLocalFiles",
+            processed: index + 1,
+            total: Some(total_local_paths),
+            current_item: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        });
         if let Some(record) = choose_record(path, &records) {
             matched_paths
                 .entry(record_key(record))
@@ -82,15 +378,38 @@ pub fn build_catalog_snapshot_incremental(
         }
     }
 
-    let local_files = local_paths
-        .iter()
-        .filter_map(|path| local_file_for_path_cached(path, &records, catalog))
-        .collect::<Vec<_>>();
+    let mut local_files = Vec::with_capacity(local_paths.len());
+    for (index, path) in local_paths.iter().enumerate() {
+        if is_cancelled() {
+            return Err(CatalogBuildError::Cancelled);
+        }
+        observe(CatalogBuildProgress {
+            stage: "probingLocalFiles",
+            processed: index + 1,
+            total: Some(total_local_paths),
+            current_item: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        });
+        if let Some(file) = local_file_for_path_cached(path, &records, catalog) {
+            local_files.push(file);
+        }
+    }
 
     let mut tracks = Vec::new();
     let mut source_records = Vec::new();
     let mut seen = HashSet::new();
-    for record in &records {
+    for (index, record) in records.iter().enumerate() {
+        if is_cancelled() {
+            return Err(CatalogBuildError::Cancelled);
+        }
+        observe(CatalogBuildProgress {
+            stage: "readingRecords",
+            processed: index + 1,
+            total: Some(total_records),
+            current_item: record.title.clone(),
+        });
         let key = record_key(record);
         if !seen.insert(key.clone()) {
             continue;
@@ -100,7 +419,19 @@ pub fn build_catalog_snapshot_incremental(
         source_records.push(source_record_from_record(record, &key));
     }
 
-    for path in &local_paths {
+    for (index, path) in local_paths.iter().enumerate() {
+        if is_cancelled() {
+            return Err(CatalogBuildError::Cancelled);
+        }
+        observe(CatalogBuildProgress {
+            stage: "checkingLocalFiles",
+            processed: index + 1,
+            total: Some(total_local_paths),
+            current_item: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        });
         if records
             .iter()
             .any(|record| choose_record(path, std::slice::from_ref(record)).is_some())
@@ -115,8 +446,12 @@ pub fn build_catalog_snapshot_incremental(
 
     attach_local_measurements(&mut tracks, &local_files);
 
-    let metadata = fs::metadata(database_path)
-        .map_err(|error| format!("无法读取网易云数据库文件信息：{error}"))?;
+    if is_cancelled() {
+        return Err(CatalogBuildError::Cancelled);
+    }
+    let metadata = fs::metadata(database_path).map_err(|error| {
+        CatalogBuildError::Failed(format!("无法读取网易云数据库文件信息：{error}"))
+    })?;
     let modified_at_ms = metadata
         .modified()
         .ok()
@@ -176,8 +511,27 @@ fn candidate_music_folder(database_path: &Path, records: &[NeteaseRecord]) -> Op
         })
 }
 
-fn count_audio_files(root: &Path) -> usize {
+pub fn count_audio_files(root: &Path) -> usize {
     collect_audio_files(root).len()
+}
+
+pub fn count_audio_files_observed<Observe>(root: &Path, mut observe: Observe) -> usize
+where
+    Observe: FnMut(usize, &Path),
+{
+    let mut count = 0;
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() || !is_audio_file(entry.path()) {
+            continue;
+        }
+        count += 1;
+        observe(count, entry.path());
+    }
+    count
 }
 
 fn collect_audio_files(root: &Path) -> Vec<PathBuf> {
@@ -189,6 +543,37 @@ fn collect_audio_files(root: &Path) -> Vec<PathBuf> {
         .map(|entry| entry.into_path())
         .filter(|path| is_audio_file(path))
         .collect()
+}
+
+fn collect_audio_files_observed<Cancel, Observe>(
+    root: &Path,
+    is_cancelled: &mut Cancel,
+    observe: &mut Observe,
+) -> Result<Vec<PathBuf>, CatalogBuildError>
+where
+    Cancel: FnMut() -> bool,
+    Observe: FnMut(CatalogBuildProgress),
+{
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        if is_cancelled() {
+            return Err(CatalogBuildError::Cancelled);
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_file() || !is_audio_file(entry.path()) {
+            continue;
+        }
+        paths.push(entry.path().to_path_buf());
+        observe(CatalogBuildProgress {
+            stage: "checkingLocalFiles",
+            processed: paths.len(),
+            total: None,
+            current_item: entry.file_name().to_string_lossy().into_owned(),
+        });
+    }
+    Ok(paths)
 }
 
 fn is_audio_file(path: &Path) -> bool {

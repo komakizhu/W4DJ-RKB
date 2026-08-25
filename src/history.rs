@@ -3,6 +3,7 @@ use crate::config::{
 };
 use crate::sync::MetadataDiagnostic;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -101,11 +102,13 @@ pub struct PendingFile {
     pub destination_path: String,
     pub source_size_bytes: u64,
     pub estimated_output_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_destination_path: Option<String>,
     #[serde(default)]
     pub operation: CandidateOperation,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistoryEntry {
     pub id: String,
     pub batch_id: String,
@@ -142,9 +145,14 @@ pub struct HistoryEntry {
     pub report_path: Option<String>,
     #[serde(default)]
     pub analysis_reports: Vec<AnalysisReport>,
+    /// Absolute path of the runtime-session directory created for this
+    /// conversion. Older history entries omit it and are resolved by batch
+    /// id when exported or displayed.
+    #[serde(default)]
+    pub runtime_session_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnalysisReport {
     pub source_path: String,
     pub destination_path: String,
@@ -159,6 +167,26 @@ pub struct AnalysisReport {
     pub model_status: Option<String>,
     #[serde(default)]
     pub model_details: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+    /// Distinguishes basic Essentia output from the strict whole-song
+    /// completion state. All fields are optional for old history.json files.
+    #[serde(default)]
+    pub basic_status: Option<String>,
+    #[serde(default)]
+    pub basic_danceability: Option<f64>,
+    #[serde(default)]
+    pub discogs_danceability_status: Option<String>,
+    #[serde(default)]
+    pub discogs_danceability: Option<f64>,
+    #[serde(default)]
+    pub discogs_completed_heads: Option<usize>,
+    #[serde(default)]
+    pub discogs_total_heads: Option<usize>,
+    #[serde(default)]
+    pub cached: Option<bool>,
 }
 
 pub fn load_history(path: impl AsRef<Path>) -> io::Result<Vec<HistoryEntry>> {
@@ -254,6 +282,13 @@ fn write_history(path: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
 }
 
 pub fn format_error_report(entry: &HistoryEntry) -> String {
+    format_error_report_with_runtime(entry, None)
+}
+
+pub fn format_error_report_with_runtime(
+    entry: &HistoryEntry,
+    runtime_session: Option<&serde_json::Value>,
+) -> String {
     let mut report = String::new();
     report.push_str("W4DJ RKB 转换报告\n");
     report.push_str("报告格式版本：2\n\n");
@@ -320,8 +355,8 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
 
     report.push_str("[报告文件]\n");
     report.push_str(&format!(
-        "自动保存位置：{}\n\n",
-        entry.report_path.as_deref().unwrap_or("未自动保存")
+        "导出保存位置：{}\n\n",
+        entry.report_path.as_deref().unwrap_or("尚未手动导出")
     ));
 
     report.push_str("[统计]\n");
@@ -331,7 +366,176 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     report.push_str(&format!("错误文件：{}\n", entry.error_count));
     report.push_str(&format!("完成文件：{}\n", entry.completed_count));
     report.push_str(&format!("失败文件：{}\n", entry.failed_count));
-    report.push_str(&format!("待处理文件：{}\n\n", entry.pending_files.len()));
+    report.push_str(&format!(
+        "待处理文件：{}\n转换待处理文件：{}\n\n",
+        entry.pending_files.len(),
+        entry.pending_files.len()
+    ));
+
+    report.push_str("[转换状态]\n");
+    report.push_str(&format!(
+        "转换：{}/{}\n转换失败：{}\n转换待处理：{}\n\n",
+        entry.completed_count,
+        entry.new_count,
+        entry.failed_count,
+        entry.pending_files.len()
+    ));
+
+    let analysis_completed = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| analysis.status == "completed")
+        .count();
+    let analysis_timed_out = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| analysis.status == "timeout")
+        .count();
+    let analysis_failed = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| analysis.status == "failed")
+        .count();
+    let analysis_cancelled = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| analysis.status == "cancelled")
+        .count();
+    let analysis_pending = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| analysis.status == "pending" || analysis.status == "running")
+        .count();
+    let basic_danceability_count = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| analysis.basic_danceability.is_some())
+        .count();
+    let discogs_danceability_completed = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| analysis.discogs_danceability_status.as_deref() == Some("completed"))
+        .count();
+    let discogs_danceability_failed = entry
+        .analysis_reports
+        .iter()
+        .filter(|analysis| {
+            matches!(
+                analysis.discogs_danceability_status.as_deref(),
+                Some("failed" | "model_missing" | "timeout" | "cancelled")
+            )
+        })
+        .count();
+    report.push_str("[增强分析总览]\n");
+    report.push_str(&format!(
+        "完整分析完成：{}\n失败：{}\n超时：{}\n取消：{}\n待处理/运行中：{}\n已记录逐曲结果：{}\n基础 Danceability 有值：{}\nDiscogs Danceability completed：{}\nDiscogs Danceability failed/missing/timeout/cancelled：{}\n\n",
+        analysis_completed,
+        analysis_failed,
+        analysis_timed_out,
+        analysis_cancelled,
+        analysis_pending,
+        entry.analysis_reports.len(),
+        basic_danceability_count,
+        discogs_danceability_completed,
+        discogs_danceability_failed,
+    ));
+    if let Some(runtime_tracks) = runtime_analysis_tracks(runtime_session) {
+        let runtime_completed = runtime_tracks
+            .iter()
+            .filter(|track| track.status == "completed")
+            .count();
+        let runtime_failed = runtime_tracks
+            .iter()
+            .filter(|track| track.status == "failed")
+            .count();
+        let runtime_timeout = runtime_tracks
+            .iter()
+            .filter(|track| track.status == "timeout")
+            .count();
+        let runtime_pending = runtime_tracks
+            .iter()
+            .filter(|track| track.status == "pending" || track.status == "running")
+            .count();
+        report.push_str(&format!(
+            "运行会话逐曲总览：完成 {runtime_completed}/{}，失败 {runtime_failed}，超时 {runtime_timeout}，待处理 {runtime_pending}\n\n",
+            runtime_tracks.len()
+        ));
+    }
+    if let Some(runtime_state) = runtime_session
+        .and_then(|value| value.get("runtimeSession"))
+        .and_then(|value| value.get("files"))
+        .and_then(|value| value.get("analysis-state.json"))
+    {
+        report.push_str("[增强分析状态快照]\n");
+        for (label, key) in [
+            ("状态", "status"),
+            ("请求时间", "requestedAt"),
+            ("开始时间", "startedAt"),
+            ("结束时间", "finishedAt"),
+            ("最后心跳", "lastHeartbeatAt"),
+            ("当前歌曲", "currentItem"),
+            ("当前阶段", "currentStage"),
+            ("Worker", "workerJobId"),
+            ("终止原因", "terminationReason"),
+        ] {
+            let value = runtime_state
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("无");
+            report.push_str(&format!("{label}：{value}\n"));
+        }
+        if let Some(stage_processed) = runtime_state.get("stageProcessed") {
+            report.push_str(&format!("当前阶段进度：{}", stage_processed));
+            if let Some(stage_total) = runtime_state.get("stageTotal") {
+                report.push_str(&format!("/{}", stage_total));
+            }
+            report.push('\n');
+        }
+        report.push('\n');
+    }
+
+    report.push_str("[增强分析逐曲状态]\n");
+    if entry.analysis_reports.is_empty() {
+        report.push_str("未记录\n\n");
+    }
+    for (index, analysis) in entry.analysis_reports.iter().enumerate() {
+        report.push_str(&format!(
+            "{}. 状态：{}\n源文件：{}\n目标文件：{}\n阶段：{}\n耗时：{}\n原因：{}\n\n",
+            index + 1,
+            analysis.status,
+            analysis.source_path,
+            analysis.destination_path,
+            analysis.stage.as_deref().unwrap_or("无"),
+            analysis
+                .elapsed_ms
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "无".to_string()),
+            analysis.message.as_deref().unwrap_or("无"),
+        ));
+    }
+    if let Some(runtime_tracks) = runtime_analysis_tracks(runtime_session) {
+        report.push_str("\n运行会话逐曲状态（包含未开始歌曲）：\n");
+        for (index, track) in runtime_tracks.iter().enumerate() {
+            report.push_str(&format!(
+                "{}. 歌曲：{}\n状态：{}\n源文件：{}\n目标文件：{}\n开始时间：{}\n结束时间：{}\n阶段：{}\nWorker：{}\n耗时：{}\n缓存复用：{}\n终止原因：{}\n\n",
+                index + 1,
+                track.name,
+                track.status,
+                track.source_path,
+                track.destination_path,
+                if track.started_at.is_empty() { "无" } else { &track.started_at },
+                if track.finished_at.is_empty() { "无" } else { &track.finished_at },
+                track.stage,
+                track.worker_job_id,
+                track.elapsed_ms,
+                track
+                    .cached
+                    .map(|value| if value { "是" } else { "否" })
+                    .unwrap_or("未记录"),
+                track.termination_reason,
+            ));
+        }
+    }
 
     report.push_str("[失败文件详情]\n");
     if entry.failed_files.is_empty() {
@@ -373,6 +577,132 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     report.push_str("[逐曲元数据诊断]\n");
     if entry.metadata_diagnostics.is_empty() {
         report.push_str("未记录（旧版任务或尚未处理歌曲）\n\n");
+    } else {
+        let database_path = entry
+            .metadata_diagnostics
+            .iter()
+            .filter_map(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.database_path.as_deref())
+            })
+            .next()
+            .unwrap_or("未加载");
+        let database_loaded = entry.metadata_diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .netease_recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.database_loaded)
+        });
+        let record_count = entry
+            .metadata_diagnostics
+            .iter()
+            .filter_map(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .map(|recovery| recovery.database_record_count)
+            })
+            .max()
+            .unwrap_or_default();
+        let matched = entry
+            .metadata_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.matched)
+            })
+            .count();
+        let ambiguous = entry
+            .metadata_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.match_method)
+                    == Some(crate::netease::NeteaseRecordMatchMethod::Ambiguous)
+            })
+            .count();
+        let no_match = entry
+            .metadata_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .and_then(|recovery| recovery.match_method)
+                    == Some(crate::netease::NeteaseRecordMatchMethod::NoMatch)
+            })
+            .count();
+        let local_cover = entry
+            .metadata_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| {
+                        matches!(
+                            recovery.cover_source,
+                            Some(
+                                crate::netease::NeteaseCoverSource::Embedded
+                                    | crate::netease::NeteaseCoverSource::DatabaseBlob
+                                    | crate::netease::NeteaseCoverSource::ExplicitLocalPath
+                                    | crate::netease::NeteaseCoverSource::LocalCache
+                            )
+                        )
+                    })
+            })
+            .count();
+        let remote_only = entry
+            .metadata_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| {
+                        recovery.cover_source
+                            == Some(crate::netease::NeteaseCoverSource::RemoteOnly)
+                    })
+            })
+            .count();
+        let missing_or_invalid = entry
+            .metadata_diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic
+                    .netease_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| {
+                        matches!(
+                            recovery.cover_source,
+                            Some(
+                                crate::netease::NeteaseCoverSource::Missing
+                                    | crate::netease::NeteaseCoverSource::Invalid
+                            )
+                        )
+                    })
+            })
+            .count();
+        report.push_str("[网易云数据库与封面恢复]\n");
+        report.push_str(&format!(
+            "有效数据库路径：{}\n数据库已加载：{}\n加载记录数：{}\n已匹配：{}\n歧义：{}\n无匹配：{}\n本地封面成功：{}\n远程仅有 URL：{}\n缺失/无效：{}\n选择来源：{}\n\n",
+            database_path,
+            if database_loaded { "是" } else { "否" },
+            record_count,
+            matched,
+            ambiguous,
+            no_match,
+            local_cover,
+            remote_only,
+            missing_or_invalid,
+            if database_loaded { "自动定位或手动偏好" } else { "无有效数据库" },
+        ));
     }
 
     report.push_str("[增强分析报告]\n");
@@ -381,21 +711,134 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
     }
     for (index, analysis) in entry.analysis_reports.iter().enumerate() {
         report.push_str(&format!(
-            "{}. 源文件：{}\n目标文件：{}\n状态：{}\n原因：{}\nDrop 状态：{}\nDrop LUFS：{}\n模型状态：{}\n模型详情：{}\n\n",
+            "{}. 源文件：{}\n目标文件：{}\n整首最终状态：{}\n基础分析状态：{}\n基础 Danceability：{}\nDiscogs Danceability 状态：{}\nDiscogs Danceability：{}\nDiscogs head 完成：{}/{}\n阶段：{}\n耗时：{}\n原因：{}\nDrop 状态：{}\nDrop LUFS：{}\n模型状态：{}\n模型详情：{}\n缓存复用：{}\n\n",
             index + 1,
             analysis.source_path,
             analysis.destination_path,
             analysis.status,
+            analysis.basic_status.as_deref().unwrap_or("旧版未记录"),
+            analysis
+                .basic_danceability
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "无".to_string()),
+            analysis
+                .discogs_danceability_status
+                .as_deref()
+                .unwrap_or("旧版未记录"),
+            analysis
+                .discogs_danceability
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "无".to_string()),
+            analysis
+                .discogs_completed_heads
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            analysis
+                .discogs_total_heads
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "?".to_string()),
+            analysis.stage.as_deref().unwrap_or("无"),
+            analysis
+                .elapsed_ms
+                .map(|value| format!("{value} ms"))
+                .unwrap_or_else(|| "无".to_string()),
             analysis.message.as_deref().unwrap_or("无"),
             analysis.drop_status.as_deref().unwrap_or("无"),
             analysis.drop_loudness_lufs.as_deref().unwrap_or("无"),
             analysis.model_status.as_deref().unwrap_or("无"),
             analysis.model_details.as_deref().unwrap_or("无"),
+            analysis
+                .cached
+                .map(|value| if value { "是" } else { "否" })
+                .unwrap_or("旧版未记录"),
         ));
     }
+
+    report.push_str("[Discogs-EffNet 逐 head 状态]\n");
+    let mut discogs_head_count = 0usize;
+    for analysis in &entry.analysis_reports {
+        let Some(details) = analysis
+            .model_details
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        else {
+            continue;
+        };
+        let Some(heads) = details
+            .get("discogsEffnet")
+            .and_then(|value| value.get("heads"))
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (head_id, head) in heads {
+            discogs_head_count += 1;
+            let labels = head
+                .get("labels")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| {
+                            let label = value.get("label")?.as_str()?;
+                            let confidence = value
+                                .get("confidence")
+                                .and_then(serde_json::Value::as_f64)
+                                .map(|value| format!(" {:.1}%", value * 100.0))
+                                .unwrap_or_default();
+                            Some(format!("{label}{confidence}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    head.get("selectedClass")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("无")
+                        .to_string()
+                });
+            let selected_confidence = head
+                .get("selectedConfidence")
+                .and_then(serde_json::Value::as_f64)
+                .map(|value| format!("{:.1}%", value * 100.0))
+                .unwrap_or_else(|| "无".to_string());
+            let _ = writeln!(
+                report,
+                "{}. 歌曲：{}\nHead：{}\n状态：{}\n版本：{}\n标签/类别：{}\n选中置信度：{}\n帧数：{}\n原因：{}\n耗时：{}\n",
+                discogs_head_count,
+                analysis.destination_path,
+                head_id,
+                head.get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                head.get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("无"),
+                labels,
+                selected_confidence,
+                head.get("frameCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "无".to_string()),
+                head.get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("无"),
+                analysis
+                    .elapsed_ms
+                    .map(|value| format!("{value} ms"))
+                    .unwrap_or_else(|| "无".to_string()),
+            );
+        }
+    }
+    if discogs_head_count == 0 {
+        report.push_str("未记录（该任务没有 Discogs-EffNet head 结果）\n");
+    }
+    report.push('\n');
+
     for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
         report.push_str(&format!(
-            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n源封面：{}\n输出封面：{}\n最终校验：{}\n\n",
+            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n校验依据：{}\n输出标签实际匹配：{}\n源封面：{}\n输出封面：{}\n网易云匹配方式：{}\n网易云封面来源：{}\n网易云曲目 ID：{}\n网易云专辑 ID：{}\n网易云终止原因：{}\n最终校验：{}\n\n",
             index + 1,
             diagnostic.source_path,
             diagnostic.destination_path,
@@ -411,8 +854,40 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
             diagnostic.output_album.as_deref().unwrap_or("无"),
             diagnostic.detected_filename_layout,
             diagnostic.decision,
+            diagnostic.validation_basis.as_deref().unwrap_or("旧版未记录"),
+            diagnostic
+                .output_tags_match
+                .map(|value| if value { "是" } else { "否" })
+                .unwrap_or("无法读取"),
             if diagnostic.source_artwork { "有（有效图片）" } else { "无或无效" },
             match diagnostic.output_artwork { Some(true) => "有（有效图片）", Some(false) => "无或无效", None => "无法读取" },
+            diagnostic
+                .netease_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.match_method.map(|method| serde_enum_label(&method)))
+                .as_deref()
+                .unwrap_or("未记录"),
+            diagnostic
+                .netease_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.cover_source.map(|source| serde_enum_label(&source)))
+                .as_deref()
+                .unwrap_or("未记录"),
+            diagnostic
+                .netease_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.track_id.as_deref())
+                .unwrap_or("无"),
+            diagnostic
+                .netease_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.album_id.as_deref())
+                .unwrap_or("无"),
+            diagnostic
+                .netease_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.message.as_deref())
+                .unwrap_or("无"),
             diagnostic.metadata_validation,
         ));
     }
@@ -428,7 +903,402 @@ pub fn format_error_report(entry: &HistoryEntry) -> String {
         }
     }
 
+    if let Some(runtime_session) = runtime_session {
+        report.push_str("\n[运行会话]\n");
+        if let Some(summary) = runtime_session.get("readableSummary") {
+            report.push_str(&format!("摘要：{}\n", summary));
+        }
+        if let Some(state) = runtime_session
+            .get("runtimeSession")
+            .and_then(|session| session.get("files"))
+            .and_then(|files| files.get("analysis-state.json"))
+        {
+            report.push_str("[增强分析状态快照]\n");
+            for key in [
+                "status",
+                "total",
+                "completed",
+                "failed",
+                "timedOut",
+                "pending",
+                "currentItem",
+                "currentStage",
+                "workerJobId",
+                "lastHeartbeatAt",
+                "terminationReason",
+            ] {
+                if let Some(value) = state.get(key) {
+                    report.push_str(&format!("{}：{}\n", key, value));
+                }
+            }
+            report.push('\n');
+        }
+        if let Some(events) = runtime_session
+            .get("runtimeSession")
+            .and_then(|session| session.get("files"))
+            .and_then(|files| files.get("events.jsonl"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for event in events {
+                report.push_str("- ");
+                report.push_str(&event.to_string());
+                report.push('\n');
+            }
+        } else {
+            report.push_str("未找到运行会话事件\n");
+        }
+    }
+
     report
+}
+
+#[derive(Debug, Default)]
+struct RuntimeAnalysisTrack {
+    name: String,
+    source_path: String,
+    destination_path: String,
+    status: String,
+    stage: String,
+    worker_job_id: String,
+    started_at: String,
+    finished_at: String,
+    elapsed_ms: String,
+    termination_reason: String,
+    cached: Option<bool>,
+}
+
+fn runtime_analysis_tracks(
+    runtime_session: Option<&serde_json::Value>,
+) -> Option<Vec<RuntimeAnalysisTrack>> {
+    let files = runtime_session?
+        .get("runtimeSession")
+        .and_then(|session| session.get("files"))?;
+    let mut tracks = std::collections::BTreeMap::<String, RuntimeAnalysisTrack>::new();
+    if let Some(slots) = files
+        .get("candidates.json")
+        .and_then(serde_json::Value::as_array)
+    {
+        for slot in slots {
+            let Some(candidates) = slot
+                .get("preview")
+                .and_then(|preview| preview.get("candidates"))
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for candidate in candidates {
+                let Some(source_path) = candidate
+                    .get("source_path")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                tracks.insert(
+                    source_path.to_string(),
+                    RuntimeAnalysisTrack {
+                        name: candidate
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(source_path)
+                            .to_string(),
+                        source_path: source_path.to_string(),
+                        destination_path: candidate
+                            .get("destination_path")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        status: String::from("pending"),
+                        stage: String::from("pending"),
+                        ..RuntimeAnalysisTrack::default()
+                    },
+                );
+            }
+        }
+    }
+    if let Some(reports) = files
+        .get("analysis-reports.json")
+        .and_then(serde_json::Value::as_array)
+    {
+        for report in reports {
+            let Some(source_path) = report
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let track =
+                tracks
+                    .entry(source_path.to_string())
+                    .or_insert_with(|| RuntimeAnalysisTrack {
+                        source_path: source_path.to_string(),
+                        ..RuntimeAnalysisTrack::default()
+                    });
+            track.status = report
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("failed")
+                .to_string();
+            if let Some(stage) = report.get("stage").and_then(serde_json::Value::as_str) {
+                track.stage = stage.to_string();
+            }
+            if let Some(elapsed_ms) = report.get("elapsed_ms") {
+                track.elapsed_ms = elapsed_ms.to_string();
+            }
+            if let Some(message) = report.get("message").and_then(serde_json::Value::as_str) {
+                track.termination_reason = message.to_string();
+            }
+        }
+    }
+    let analysis_state = files.get("analysis-state.json");
+    let state_interrupted = analysis_state
+        .and_then(|state| state.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status == "interrupted")
+        || analysis_state
+            .and_then(|state| state.get("lastHeartbeatEpochMs"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|heartbeat| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or_default();
+                now.saturating_sub(heartbeat) > 15_000
+                    && analysis_state
+                        .and_then(|state| state.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("running")
+            });
+    if let Some(state_tracks) = analysis_state
+        .and_then(|state| state.get("tracks"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for (source_path, state_track) in state_tracks {
+            let track = tracks
+                .entry(source_path.clone())
+                .or_insert_with(|| RuntimeAnalysisTrack {
+                    source_path: source_path.clone(),
+                    ..RuntimeAnalysisTrack::default()
+                });
+            if let Some(name) = state_track.get("name").and_then(serde_json::Value::as_str) {
+                track.name = name.to_string();
+            }
+            if let Some(destination_path) = state_track
+                .get("destinationPath")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.destination_path = destination_path.to_string();
+            }
+            if let Some(status) = state_track
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.status = status.to_string();
+            }
+            if let Some(stage) = state_track.get("stage").and_then(serde_json::Value::as_str) {
+                track.stage = stage.to_string();
+            }
+            if let Some(worker_job_id) = state_track
+                .get("workerJobId")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.worker_job_id = worker_job_id.to_string();
+            }
+            if let Some(started_at) = state_track
+                .get("startedAt")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.started_at = started_at.to_string();
+            }
+            if let Some(finished_at) = state_track
+                .get("finishedAt")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.finished_at = finished_at.to_string();
+            }
+            if let Some(elapsed_ms) = state_track.get("elapsedMs") {
+                track.elapsed_ms = elapsed_ms.to_string();
+            }
+            if let Some(reason) = state_track
+                .get("terminationReason")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.termination_reason = reason.to_string();
+            }
+        }
+    }
+    if let Some(events) = files
+        .get("events.jsonl")
+        .and_then(serde_json::Value::as_array)
+    {
+        let mut cancelled = false;
+        let mut failed = false;
+        let mut terminal_reason = String::new();
+        for event in events {
+            let Some(event_name) = event.get("event").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let details = event.get("details").unwrap_or(&serde_json::Value::Null);
+            if event_name == "analysis_cancelled" {
+                cancelled = true;
+                let cancelled_at = event
+                    .get("at")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                for track in tracks.values_mut() {
+                    if track.status == "pending" || track.status == "running" {
+                        track.finished_at = cancelled_at.clone();
+                    }
+                }
+                continue;
+            }
+            if event_name == "analysis_error" {
+                failed = true;
+                let failed_at = event
+                    .get("at")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                terminal_reason = details
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("分析任务错误")
+                    .to_string();
+                for track in tracks.values_mut() {
+                    if track.status == "pending" || track.status == "running" {
+                        track.finished_at = failed_at.clone();
+                    }
+                }
+                continue;
+            }
+            let Some(source_path) = details
+                .get("source_path")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let track =
+                tracks
+                    .entry(source_path.to_string())
+                    .or_insert_with(|| RuntimeAnalysisTrack {
+                        source_path: source_path.to_string(),
+                        ..RuntimeAnalysisTrack::default()
+                    });
+            if let Some(name) = details.get("name").and_then(serde_json::Value::as_str) {
+                track.name = name.to_string();
+            }
+            if let Some(destination_path) = details
+                .get("destination_path")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.destination_path = destination_path.to_string();
+            }
+            if let Some(worker_job_id) = details
+                .get("worker_job_id")
+                .and_then(serde_json::Value::as_str)
+            {
+                track.worker_job_id = worker_job_id.to_string();
+            }
+            match event_name {
+                "analysis_candidate_started" => {
+                    track.status = String::from("running");
+                    track.stage = String::from("preparing");
+                    track.started_at = event
+                        .get("at")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                }
+                "analysis_candidate_progress" => {
+                    track.status = String::from("running");
+                    if track.started_at.is_empty() {
+                        track.started_at = event
+                            .get("at")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                    if let Some(stage) = details.get("stage").and_then(serde_json::Value::as_str) {
+                        track.stage = stage.to_string();
+                    }
+                }
+                "analysis_candidate_finished" => {
+                    track.finished_at = event
+                        .get("at")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(status) = details.get("status").and_then(serde_json::Value::as_str)
+                    {
+                        track.status = status.to_string();
+                    }
+                    if let Some(stage) = details.get("stage").and_then(serde_json::Value::as_str) {
+                        track.stage = stage.to_string();
+                    }
+                    if let Some(elapsed_ms) = details.get("elapsed_ms") {
+                        track.elapsed_ms = elapsed_ms.to_string();
+                    }
+                    if let Some(error) = details.get("error").and_then(serde_json::Value::as_str) {
+                        track.termination_reason = error.to_string();
+                    }
+                    if let Some(cached) = details.get("cached").and_then(serde_json::Value::as_bool)
+                    {
+                        track.cached = Some(cached);
+                    }
+                }
+                "analysis_candidate_persisted" => {
+                    track.status = details
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("completed")
+                        .to_string();
+                    if track.finished_at.is_empty() {
+                        track.finished_at = event
+                            .get("at")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if cancelled {
+            for track in tracks.values_mut() {
+                if track.status == "pending" || track.status == "running" {
+                    track.status = String::from("cancelled");
+                    track.stage = String::from("cancelled");
+                }
+            }
+        }
+        if failed {
+            for track in tracks.values_mut() {
+                if track.status == "pending" || track.status == "running" {
+                    track.status = String::from("failed");
+                    track.stage = String::from("error");
+                    track.termination_reason = terminal_reason.clone();
+                }
+            }
+        }
+    }
+    if state_interrupted {
+        for track in tracks.values_mut() {
+            if track.status == "pending" || track.status == "running" {
+                track.status = String::from("interrupted");
+                if track.stage == "pending" || track.stage.is_empty() {
+                    track.stage = String::from("interrupted");
+                }
+                if track.termination_reason.is_empty() {
+                    track.termination_reason = String::from("运行会话心跳已过期");
+                }
+            }
+        }
+    }
+    if tracks.is_empty() {
+        None
+    } else {
+        Some(tracks.into_values().collect())
+    }
 }
 
 fn history_status_label(status: &HistoryStatus) -> &'static str {
@@ -479,6 +1349,13 @@ fn candidate_operation_label(operation: CandidateOperation) -> &'static str {
     }
 }
 
+fn serde_enum_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| String::from("未记录"))
+        .trim_matches('"')
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +1390,7 @@ mod tests {
             netease_filename_format: NeteaseFilenameFormat::default(),
             report_path: None,
             analysis_reports: Vec::new(),
+            runtime_session_dir: None,
         }
     }
 
