@@ -78,127 +78,6 @@ pub struct AnalysisLabel {
     pub confidence: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum EmotionHeadStatus {
-    #[serde(rename = "completed")]
-    Completed,
-    #[serde(rename = "model_missing")]
-    ModelMissing,
-    #[serde(rename = "failed")]
-    Failed,
-    #[serde(rename = "cancelled")]
-    Cancelled,
-    #[serde(rename = "timeout")]
-    Timeout,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscogsEffnetHeadResult {
-    pub model: String,
-    pub status: String,
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub labels: Vec<AnalysisLabel>,
-    #[serde(default)]
-    pub scores: std::collections::BTreeMap<String, f64>,
-    #[serde(default)]
-    pub frame_count: usize,
-    #[serde(default)]
-    pub threshold: Option<f64>,
-    #[serde(default)]
-    pub selected_class: Option<String>,
-    #[serde(default)]
-    pub selected_confidence: Option<f64>,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscogsEffnetAnalysis {
-    pub embedding_model: String,
-    pub embedding_dimensions: usize,
-    pub input_shape: Vec<usize>,
-    #[serde(default)]
-    pub heads: std::collections::BTreeMap<String, DiscogsEffnetHeadResult>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ContinuousEmotionResult {
-    pub model: String,
-    pub status: EmotionHeadStatus,
-    #[serde(default)]
-    pub valence: Option<f64>,
-    #[serde(default)]
-    pub arousal: Option<f64>,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ContinuousEmotionResultWire {
-    model: String,
-    status: EmotionHeadStatus,
-    #[serde(default)]
-    valence: Option<f64>,
-    #[serde(default)]
-    arousal: Option<f64>,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for ContinuousEmotionResult {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = ContinuousEmotionResultWire::deserialize(deserializer)?;
-        let valid_coordinate = |coordinate: Option<f64>| {
-            coordinate.is_some_and(|value| value.is_finite() && (1.0..=9.0).contains(&value))
-        };
-        match value.status {
-            EmotionHeadStatus::Completed => {
-                if !valid_coordinate(value.valence) || !valid_coordinate(value.arousal) {
-                    return Err(serde::de::Error::custom(
-                        "completed 情绪模型结果必须包含有限的 1–9 valence/arousal",
-                    ));
-                }
-            }
-            EmotionHeadStatus::ModelMissing
-            | EmotionHeadStatus::Failed
-            | EmotionHeadStatus::Cancelled
-            | EmotionHeadStatus::Timeout => {
-                if value.valence.is_some() || value.arousal.is_some() {
-                    return Err(serde::de::Error::custom(
-                        "非 completed 情绪模型结果的 valence/arousal 必须为 null",
-                    ));
-                }
-            }
-        }
-        Ok(Self {
-            model: value.model,
-            status: value.status,
-            valence: value.valence,
-            arousal: value.arousal,
-            reason: value.reason,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct EmotionCandidates {
-    #[serde(default)]
-    pub emomusic: Option<ContinuousEmotionResult>,
-    #[serde(default)]
-    pub muse: Option<ContinuousEmotionResult>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HighLevelAnalysis {
@@ -210,105 +89,19 @@ pub struct HighLevelAnalysis {
     #[serde(default)]
     pub genre: Vec<AnalysisLabel>,
     #[serde(default)]
-    pub style: Vec<AnalysisLabel>,
-    #[serde(default)]
     pub mood: Vec<AnalysisLabel>,
     #[serde(default)]
     pub instrument: Vec<AnalysisLabel>,
     #[serde(default)]
-    pub emotion_candidates: Option<EmotionCandidates>,
-    #[serde(default)]
-    pub mood_cluster: Vec<AnalysisLabel>,
-    #[serde(default)]
-    pub mood_cluster_status: Option<EmotionHeadStatus>,
-    #[serde(default)]
-    pub mood_cluster_reason: Option<String>,
-    #[serde(default)]
     pub filtered: Vec<FilteredAnalysisLabel>,
-    #[serde(default)]
-    pub discogs_effnet: Option<DiscogsEffnetAnalysis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct FilteredAnalysisLabel {
     pub label: String,
-    /// JavaScript JSON.stringify converts an unavailable NaN score to null.
-    /// Keep that diagnostic value optional instead of rejecting the entire
-    /// track analysis during Tauri command deserialization.
-    pub confidence: Option<f64>,
+    pub confidence: f64,
     pub reason: String,
-}
-
-pub const REQUIRED_DISCOGS_HEAD_IDS: [&str; 5] = [
-    "moodTheme",
-    "approachability",
-    "instrumentation",
-    "timbre",
-    "danceability",
-];
-
-/// The single Rust-side completion contract used by the W4DJ projection and
-/// report writer. Missing legacy fields deliberately fail closed so an old
-/// partial cache can never be presented as a completed enhanced analysis.
-pub fn is_basic_analysis_complete(entry: &TrackAnalysis) -> bool {
-    [
-        entry.duration_seconds,
-        entry.bpm,
-        entry.integrated_loudness_lufs,
-        entry.energy,
-        entry.danceability,
-    ]
-    .into_iter()
-    .all(|value| value.is_some_and(f64::is_finite))
-        && entry
-            .key
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
-}
-
-pub fn is_complete_analysis(entry: &TrackAnalysis) -> bool {
-    if !is_basic_analysis_complete(entry) {
-        return false;
-    }
-    let Some(drop) = entry.drop_analysis.as_ref() else {
-        return false;
-    };
-    if drop.status == "failed" {
-        return false;
-    }
-    let Some(high_level) = entry.high_level.as_ref() else {
-        return false;
-    };
-    if high_level.status != "completed" {
-        return false;
-    }
-    let Some(discogs) = high_level.discogs_effnet.as_ref() else {
-        return false;
-    };
-    if REQUIRED_DISCOGS_HEAD_IDS.iter().any(|id| {
-        discogs
-            .heads
-            .get(*id)
-            .is_none_or(|head| head.status != "completed")
-    }) {
-        return false;
-    }
-    let Some(emotions) = high_level.emotion_candidates.as_ref() else {
-        return false;
-    };
-    if !emotions
-        .emomusic
-        .as_ref()
-        .is_some_and(|value| value.status == EmotionHeadStatus::Completed)
-        || !emotions
-            .muse
-            .as_ref()
-            .is_some_and(|value| value.status == EmotionHeadStatus::Completed)
-    {
-        return false;
-    }
-    high_level.mood_cluster_status == Some(EmotionHeadStatus::Completed)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -675,7 +468,6 @@ pub fn analysis_file_path(history_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn sample() -> TrackAnalysis {
         TrackAnalysis {
@@ -704,95 +496,6 @@ mod tests {
             drop_analysis: None,
             high_level: None,
         }
-    }
-
-    fn complete_enhanced_sample() -> TrackAnalysis {
-        let mut entry = sample();
-        entry.drop_analysis = Some(DropAnalysisDetails {
-            status: String::from("completed"),
-            reason: None,
-            beat_start_index: None,
-            beat_end_index: None,
-            beat_count: None,
-            segment_start_seconds: None,
-            segment_end_seconds: None,
-            selected_average_beat_loudness: None,
-        });
-        let heads = REQUIRED_DISCOGS_HEAD_IDS
-            .iter()
-            .map(|id| {
-                (
-                    (*id).to_string(),
-                    DiscogsEffnetHeadResult {
-                        model: (*id).to_string(),
-                        status: String::from("completed"),
-                        version: String::from("test"),
-                        labels: Vec::new(),
-                        scores: BTreeMap::new(),
-                        frame_count: 1,
-                        threshold: None,
-                        selected_class: None,
-                        selected_confidence: None,
-                        reason: None,
-                    },
-                )
-            })
-            .collect();
-        let emotion = |model: &str| ContinuousEmotionResult {
-            model: model.to_string(),
-            status: EmotionHeadStatus::Completed,
-            valence: Some(5.0),
-            arousal: Some(5.0),
-            reason: None,
-        };
-        entry.high_level = Some(HighLevelAnalysis {
-            status: String::from("completed"),
-            model_version: Some(String::from("test")),
-            reason: None,
-            genre: Vec::new(),
-            style: Vec::new(),
-            mood: Vec::new(),
-            instrument: Vec::new(),
-            emotion_candidates: Some(EmotionCandidates {
-                emomusic: Some(emotion("emomusic")),
-                muse: Some(emotion("muse")),
-            }),
-            mood_cluster: Vec::new(),
-            mood_cluster_status: Some(EmotionHeadStatus::Completed),
-            mood_cluster_reason: None,
-            filtered: Vec::new(),
-            discogs_effnet: Some(DiscogsEffnetAnalysis {
-                embedding_model: String::from("discogs-effnet-bs64-1"),
-                embedding_dimensions: 1280,
-                input_shape: vec![64, 128, 96],
-                heads,
-            }),
-        });
-        entry
-    }
-
-    #[test]
-    fn enhanced_completion_requires_every_configured_head() {
-        let complete = complete_enhanced_sample();
-        assert!(is_basic_analysis_complete(&complete));
-        assert!(is_complete_analysis(&complete));
-
-        let mut missing_head = complete.clone();
-        missing_head
-            .high_level
-            .as_mut()
-            .unwrap()
-            .discogs_effnet
-            .as_mut()
-            .unwrap()
-            .heads
-            .remove("danceability");
-        assert!(!is_complete_analysis(&missing_head));
-
-        let mut missing_loudness = complete;
-        missing_loudness.integrated_loudness_lufs = None;
-        assert!(!is_basic_analysis_complete(&missing_loudness));
-        assert!(!is_complete_analysis(&missing_loudness));
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use crate::concurrency::{DEFAULT_CONCURRENCY_LIMIT, MAX_CONCURRENCY_LIMIT, MIN_CONCURRENCY_LIMIT};
 use crate::config::{
     ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
 };
@@ -9,36 +8,6 @@ use std::io;
 use std::path::Path;
 
 pub const SYNC_SLOT_COUNT: usize = 2;
-
-pub fn default_concurrency_limit() -> u8 {
-    DEFAULT_CONCURRENCY_LIMIT as u8
-}
-
-pub fn normalize_concurrency_limit(value: f64, fallback: u8) -> u8 {
-    let fallback = fallback.clamp(MIN_CONCURRENCY_LIMIT as u8, MAX_CONCURRENCY_LIMIT as u8);
-    if !value.is_finite() {
-        return fallback;
-    }
-    value
-        .round()
-        .clamp(MIN_CONCURRENCY_LIMIT as f64, MAX_CONCURRENCY_LIMIT as f64) as u8
-}
-
-fn deserialize_concurrency_limit<'de, D>(deserializer: D) -> Result<u8, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let parsed = match value {
-        serde_json::Value::Number(number) => number.as_f64(),
-        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
-        _ => None,
-    };
-    Ok(normalize_concurrency_limit(
-        parsed.unwrap_or(f64::NAN),
-        default_concurrency_limit(),
-    ))
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncSlotPreferences {
@@ -73,13 +42,6 @@ pub struct AppPreferences {
     pub filename_rule: FilenameRule,
     #[serde(default)]
     pub netease_filename_format: NeteaseFilenameFormat,
-    #[serde(default)]
-    pub netease_database_path: Option<String>,
-    #[serde(
-        default = "default_concurrency_limit",
-        deserialize_with = "deserialize_concurrency_limit"
-    )]
-    pub concurrency_limit: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,8 +66,6 @@ impl Default for AppPreferences {
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
             netease_filename_format: NeteaseFilenameFormat::default(),
-            netease_database_path: None,
-            concurrency_limit: default_concurrency_limit(),
         }
     }
 }
@@ -127,8 +87,6 @@ impl AppPreferences {
             conflict_strategy: ConflictStrategy::default(),
             filename_rule: FilenameRule::default(),
             netease_filename_format: NeteaseFilenameFormat::default(),
-            netease_database_path: None,
-            concurrency_limit: default_concurrency_limit(),
         }
     }
 }
@@ -164,8 +122,6 @@ fn parse_preferences(contents: &str) -> io::Result<AppPreferences> {
         conflict_strategy: ConflictStrategy::default(),
         filename_rule: FilenameRule::default(),
         netease_filename_format: NeteaseFilenameFormat::default(),
-        netease_database_path: None,
-        concurrency_limit: default_concurrency_limit(),
     })
 }
 

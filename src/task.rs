@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +20,6 @@ pub struct TaskSnapshot {
 #[derive(Debug, Clone)]
 pub struct TaskController {
     state: Arc<Mutex<TaskState>>,
-    cancel_signal: Arc<AtomicBool>,
 }
 
 impl TaskState {
@@ -67,7 +65,6 @@ impl TaskController {
     pub fn running(total: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(TaskState::running(total))),
-            cancel_signal: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -76,12 +73,7 @@ impl TaskController {
     }
 
     pub fn request_cancel(&self) {
-        self.cancel_signal.store(true, Ordering::SeqCst);
         self.with_state(|state| state.cancelled = true);
-    }
-
-    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel_signal)
     }
 
     pub fn set_total(&self, total: usize) {

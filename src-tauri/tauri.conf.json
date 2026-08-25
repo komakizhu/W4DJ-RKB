@@ -1,8 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "W4DJ RKB",
-  "mainBinaryName": "w4dj-desktop",
-  "version": "3.2.0-beta.3",
+  "version": "3.2.0",
   "identifier": "com.slipstream.w4dj",
   "build": {
     "beforeDevCommand": "",
@@ -11,7 +10,22 @@
     "frontendDist": "../app/dist"
   },
   "app": {
-    "macOSPrivateApi": true
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "W4DJ RKB",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 560,
+        "center": true,
+        "visible": true,
+        "dragDropEnabled": true,
+        "resizable": true,
+        "fullscreen": false,
+        "transparent": false
+      }
+    ]
   },
   "bundle": {
     "active": true,
@@ -25,9 +39,6 @@
     ],
     "externalBin": [
       "binaries/ffmpeg"
-    ],
-    "resources": {
-      "resources/essentia-models/**/*": "essentia-models"
-    }
+    ]
   }
 }

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11,83 +11,43 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
+use flate2::read::DeflateDecoder;
 use ncmdump::Ncmdump;
-use tauri::utils::config::BackgroundThrottlingPolicy;
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::Manager;
 use w4dj::analysis::{
-    REQUIRED_DISCOGS_HEAD_IDS, TrackAnalysis, TrackMetadata, analysis_file_path,
-    build_rekordbox_xml, clear_analysis_file, is_basic_analysis_complete,
-    is_complete_analysis, load_analysis_file,
-    merge_analysis_entries, read_track_metadata, save_analysis_file,
+    TrackAnalysis, TrackMetadata, analysis_file_path, build_rekordbox_xml, clear_analysis_file,
+    load_analysis_file, merge_analysis_entries, read_track_metadata, save_analysis_file,
 };
 use w4dj::config::{
-    ConflictStrategy, ConversionMode, FilenameNormalizationPolicy, FilenameRule, LosslessFormat,
-    Mode, NeteaseFilenameFormat,
-};
-use w4dj::concurrency::GlobalConcurrencyBudget;
-use w4dj::dj_playlist::{
-    ImportedDjPlaylist, ImportedDjPlaylistSummary, parse_w4dj_playlist, serialize_w4dj_playlist,
-};
-use w4dj::dj_playlist_match::DjPlaylistMatchReport;
-use w4dj::m3u8::{
-    M3u8ExportSummary, ResolvedDjPlaylistTrack, build_relative_m3u8_with_summary,
-    write_relative_m3u8_atomic,
+    ConflictStrategy, ConversionMode, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
 };
 use w4dj::desktop::{DesktopController, DesktopState};
 use w4dj::history::{
     AnalysisReport, FailedFile, HistoryEntry, HistoryStatus, PendingFile, append_analysis_reports,
-    classify_error, clear_history, delete_history_entry, format_error_report_with_runtime,
+    classify_error, clear_history, delete_history_entry, format_error_report,
     load_history as load_history_file, upsert_history,
 };
-use w4dj::library_catalog::{CatalogLocalFile, CatalogSourceRecord, LibraryCatalog};
+use w4dj::library_catalog::{CatalogSourceRecord, LibraryCatalog};
 use w4dj::library_query::{LibraryPage, LibraryQuery};
-use w4dj::w4dj_library::{
-    EmotionEvaluationManifest, W4djLibrary, write_emotion_evaluation_manifest,
-};
 use w4dj::netease_library::{
-    CatalogBuildError, NeteaseDiscovery,
-    build_catalog_snapshot_incremental_observed, discover_netease_library,
-    discover_netease_library_for_refresh, discover_netease_library_from_database,
-    discover_netease_library_from_database_for_refresh, count_audio_files,
-    discover_netease_library_from_database_observed, discover_netease_library_observed,
-    count_audio_files_observed,
+    NeteaseDiscovery, build_catalog_snapshot_incremental, discover_netease_library,
 };
-use w4dj::netease::{
-    NeteaseMetadataResolver, database_fingerprint_view,
-    load_locators_from_db_observed, locate_supported_database,
-};
-use w4dj::netease_cache::{self, CacheState};
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
     PreviewCandidate, PreviewIssue, PreviewOperation, SlotPreview, SyncPreview,
-    attach_netease_identities,
-    build_retry_preview,
-    build_sync_preview_with_settings_and_netease_observed_with_policy_and_resolver,
-    build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy_and_resolver,
-    is_recovered_single_source,
+    build_retry_preview, build_sync_preview_with_settings_and_netease,
+    build_sync_preview_with_settings_and_netease_observed_with_cache,
+    is_recovered_single_source, resolve_missing_single_source_path,
 };
 use w4dj::scan_cache::{ScanCache, clear_scan_cache as clear_scan_cache_file, load_scan_cache, save_scan_cache_atomic};
 use w4dj::sync::{
-    apply_track_analysis_metadata_with_context,
-    cleanup_temporary_outputs, compare_music_dicts,
-    EmbeddedAnalysis, inspect_metadata_diagnostic_with_resolver,
-    is_ignored_music_file,
-    is_supported_source_file,
-    get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy,
-    sync_music_library_transactional_with_observer_and_budget_and_context_with_policy,
-    ConversionMetadataContext, update_analysis_metadata_transactionally,
-    update_existing_metadata_transactionally_with_context_and_policy,
-    remove_replaced_output,
-    validate_track_analysis_metadata,
-    ScanEnumerationError, ScanPhase, enumerate_music_files_observed,
+    apply_track_analysis_metadata, cleanup_temporary_outputs, compare_music_dicts,
+    count_music_files_with_cancel,
+    EmbeddedAnalysis, inspect_metadata_diagnostic,
+    get_destination_music_dict, get_music_dict_with_scan_issues, is_supported_source_file,
+    sync_music_library_transactional_with_observer, sync_music_library_with_observer,
+    update_existing_metadata_transactionally, ScanPhase,
 };
-
-mod essentia_model_import;
-
-// Enhanced analysis remains implemented and callable for later debugging,
-// but every normal app launch starts with it disabled. The frontend uses the
-// matching single visibility switch before exposing its controls again.
-const ENHANCED_ANALYSIS_DEFAULT_ENABLED: bool = false;
 
 #[cfg(target_os = "macos")]
 use objc2::MainThreadMarker;
@@ -103,96 +63,20 @@ struct AppState {
     preferences_path: Arc<Mutex<PathBuf>>,
     history_path: Arc<Mutex<PathBuf>>,
     models_path: Arc<Mutex<PathBuf>>,
-    bundled_models_path: Arc<Mutex<PathBuf>>,
     scan_cache_path: Arc<Mutex<PathBuf>>,
-    library: Arc<LibraryState>,
+    library_catalog_path: Arc<Mutex<PathBuf>>,
     history_write_lock: Arc<Mutex<()>>,
-    models_write_lock: Arc<Mutex<()>>,
     destination_coordinator: DestinationCoordinator,
     scan_progress: Arc<Mutex<ScanProgress>>,
     scan_cancel: Arc<AtomicBool>,
     scan_result: Arc<Mutex<Option<Vec<SlotPreview>>>>,
     test_monitor_path: Arc<Mutex<PathBuf>>,
     test_monitors: Arc<Mutex<HashMap<String, Arc<TestMonitor>>>>,
-    concurrency_budget: Arc<Mutex<Arc<GlobalConcurrencyBudget>>>,
-    ffmpeg_registry: Arc<w4dj::sync::ActiveFfmpegRegistry>,
-    headless_config: Option<HeadlessAcceptanceConfig>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HeadlessAcceptanceConfig {
-    scenario: String,
-    exercise_cancel_resume: bool,
-    input_path: Option<String>,
-    output_path: Option<String>,
-    database_path: Option<String>,
-    report_path: String,
-}
-
-struct LibraryState {
-    catalog_path: Mutex<PathBuf>,
-    manual_database_path: Mutex<Option<PathBuf>>,
-    metadata_cache: Mutex<NeteaseMetadataCacheProgress>,
-    metadata_cache_cancel: AtomicBool,
-    metadata_cache_build_lock: Mutex<()>,
-    metadata_cache_worker: Mutex<Option<thread::JoinHandle<()>>>,
-    refresh: Mutex<LibraryRefreshProgress>,
-    cancel: AtomicBool,
-    worker: Mutex<Option<thread::JoinHandle<()>>>,
-    invalid_scan: Mutex<InvalidScanProgress>,
-    invalid_scan_cancel: AtomicBool,
-    invalid_scan_worker: Mutex<Option<thread::JoinHandle<()>>>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NeteaseMetadataCacheProgress {
-    status: String,
-    stage: String,
-    processed: usize,
-    total: Option<usize>,
-    current_item: String,
-    message: String,
-    error: Option<String>,
-    database_path: Option<String>,
-    cached_record_count: usize,
-}
-
-impl Default for NeteaseMetadataCacheProgress {
-    fn default() -> Self {
-        Self {
-            status: CacheState::Idle.as_str().to_string(),
-            stage: "idle".to_string(),
-            processed: 0,
-            total: None,
-            current_item: String::new(),
-            message: String::new(),
-            error: None,
-            database_path: None,
-            cached_record_count: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NeteaseDiscoveryProgressEvent {
-    status: String,
-    stage: String,
-    processed: usize,
-    total: Option<usize>,
-    current_item: String,
-    message: String,
-    suggestion: Option<NeteaseDiscovery>,
-    error: Option<String>,
-}
-
-// Runtime session recording is intentionally local-only. It gives the user a
-// complete, exportable account of a conversion without sending diagnostics
-// anywhere or blocking the conversion path.
-const RUNTIME_SESSION_RECORDING_ENABLED: bool = true;
-const RUNTIME_SESSION_DIRECTORY: &str = "W4DJ-runtime-sessions";
+// Debug-only delivery switch. Remove this block before creating a formal release build.
+const DEBUG_TEST_MONITOR_ENABLED: bool = true;
+const TEST_MONITOR_DIRECTORY: &str = "W4DJ-test-monitor";
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct TestMonitorSession {
@@ -215,10 +99,8 @@ struct TestMonitor {
     session_dir: PathBuf,
     session_path: PathBuf,
     events_path: PathBuf,
-    analysis_state_path: PathBuf,
     lock: Arc<Mutex<()>>,
     session: Arc<Mutex<TestMonitorSession>>,
-    analysis_reports: Arc<Mutex<Vec<AnalysisReport>>>,
     remaining_jobs: Arc<AtomicUsize>,
 }
 
@@ -243,7 +125,7 @@ impl TestMonitor {
         let now = timestamp_string();
         let session = TestMonitorSession {
             schema_version: 1,
-            monitor: "W4DJ runtime session recorder",
+            monitor: "W4DJ local debug test monitor",
             app_version: env!("CARGO_PKG_VERSION"),
             session_id: session_id.clone(),
             batch_id: batch_id.to_string(),
@@ -259,47 +141,12 @@ impl TestMonitor {
         let monitor = Self {
             session_path: session_dir.join("session.json"),
             events_path: session_dir.join("events.jsonl"),
-            analysis_state_path: session_dir.join("analysis-state.json"),
             session_dir,
             lock: Arc::new(Mutex::new(())),
             session: Arc::new(Mutex::new(session)),
-            analysis_reports: Arc::new(Mutex::new(Vec::new())),
             remaining_jobs: Arc::new(AtomicUsize::new(job_count)),
         };
         monitor.write_session_file()?;
-        let total = previews
-            .iter()
-            .map(|preview| preview.preview.candidates.len())
-            .sum::<usize>();
-        let mut tracks = serde_json::Map::new();
-        for preview in previews {
-            for candidate in &preview.preview.candidates {
-                tracks.insert(
-                    candidate.source_path.clone(),
-                    serde_json::json!({
-                        "name": candidate.name,
-                        "sourcePath": candidate.source_path,
-                        "destinationPath": candidate.destination_path,
-                        "status": "pending",
-                        "stage": "pending",
-                    }),
-                );
-            }
-        }
-        write_json_file(
-            &monitor.analysis_state_path,
-            &serde_json::json!({
-                "schemaVersion": 1,
-                "batchId": batch_id,
-                "status": "notRequested",
-                "total": total,
-                "completed": 0,
-                "failed": 0,
-                "timedOut": 0,
-                "pending": total,
-                "tracks": tracks,
-            }),
-        )?;
         fs::write(
             monitor.session_dir.join("candidates.json"),
             serde_json::to_string_pretty(previews).map_err(|error| {
@@ -308,55 +155,13 @@ impl TestMonitor {
         )?;
         fs::write(
             monitor.session_dir.join("README.md"),
-            "# W4DJ 运行会话记录\n\n此目录由应用自动生成，仅保存在本机下载目录，不会上传。它用于保留本次任务的内部运行轨迹，不会自动导出错误报告。\n\n- `candidates.json`：本次任务的输入与计划输出。\n- `events.jsonl`：按时间追加的预检、转换、分析和回写事件。\n- `summary-slot-*.json`：每个任务结束后的完整转换历史、错误和元数据诊断。\n- `analysis-reports.json`：增强分析和分析元数据回写结果。\n- `session.json`：本次运行的设置、状态和任务汇总。\n\n需要报告时，请在转换历史中手动点击“导出错误报告”，选择保存位置后生成 UTF-8 文本文件。路径和元数据诊断可能包含本机文件信息，请分享给开发者前自行确认。\n",
+            "# W4DJ 本地调试测试记录\n\n此目录由当前调试版自动生成，仅保存在本机下载目录，不会上传。\n\n- `candidates.json`：本次任务的输入与计划输出。\n- `events.jsonl`：按时间追加的任务和单曲结果。\n- `summary-slot-*.json`：每个任务结束后的完整转换历史、错误和元数据诊断。\n- `analysis-reports.json`：增强分析和分析元数据回写结果（增强模式生成）。\n- `session.json`：本次测试的设置、状态和任务汇总。\n\n路径和元数据诊断可能包含本机文件信息，请分享给开发者前自行确认。\n",
         )?;
         monitor.record_event("session_started", serde_json::json!({
             "session_directory": monitor.session_dir.display().to_string(),
             "candidate_count": previews.iter().map(|preview| preview.preview.candidates.len()).sum::<usize>(),
         }));
         Ok(monitor)
-    }
-
-    /// Re-open a session created by a previous application process.  The
-    /// durable event/state files are the source of truth after a WebView or
-    /// backend restart; the in-memory conversion session is intentionally not
-    /// reconstructed because conversion jobs have already finished.
-    fn from_existing(session_dir: PathBuf) -> io::Result<Self> {
-        if !session_dir.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "运行会话目录不存在",
-            ));
-        }
-        let session_id = session_dir
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("recovered-session")
-            .to_string();
-        let now = timestamp_string();
-        Ok(Self {
-            session_path: session_dir.join("session.json"),
-            events_path: session_dir.join("events.jsonl"),
-            analysis_state_path: session_dir.join("analysis-state.json"),
-            session_dir,
-            lock: Arc::new(Mutex::new(())),
-            session: Arc::new(Mutex::new(TestMonitorSession {
-                schema_version: 1,
-                monitor: "W4DJ runtime session recorder",
-                app_version: env!("CARGO_PKG_VERSION"),
-                session_id,
-                batch_id: String::new(),
-                started_at: now.clone(),
-                updated_at: now,
-                finished_at: None,
-                status: "running".to_string(),
-                settings: serde_json::Value::Null,
-                tasks: serde_json::Value::Array(Vec::new()),
-                task_results: Vec::new(),
-            })),
-            analysis_reports: Arc::new(Mutex::new(Vec::new())),
-            remaining_jobs: Arc::new(AtomicUsize::new(0)),
-        })
     }
 
     fn record_event(&self, event: &str, details: serde_json::Value) {
@@ -368,7 +173,7 @@ impl TestMonitor {
             "event": event,
             "details": details,
         });
-            if let Ok(line) = serde_json::to_string(&record)
+        if let Ok(line) = serde_json::to_string(&record)
             && let Ok(mut file) = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -376,188 +181,6 @@ impl TestMonitor {
             {
                 let _ = writeln!(file, "{line}");
             }
-        self.update_analysis_state(&record);
-    }
-
-    /// Keep a small, atomically replaced state snapshot alongside the append
-    /// only event log. This is deliberately derived from events so a crash or
-    /// force quit still leaves the latest known song/stage available on the
-    /// next launch.
-    fn update_analysis_state(&self, record: &serde_json::Value) {
-        let Ok(mut state) = fs::read_to_string(&self.analysis_state_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-            .or_else(|| Some(serde_json::json!({
-                "schemaVersion": 1,
-                "status": "notRequested",
-                "total": 0,
-                "completed": 0,
-                "failed": 0,
-                "timedOut": 0,
-                "pending": 0,
-                "tracks": {},
-            })))
-            .ok_or(()) else {
-            return;
-        };
-        let Some(object) = state.as_object_mut() else {
-            return;
-        };
-        let event = record.get("event").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let details = record.get("details").unwrap_or(&serde_json::Value::Null);
-        let at = record.get("at").cloned().unwrap_or(serde_json::Value::Null);
-        let mut track_map = object
-            .remove("tracks")
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        let source_path = details.get("source_path").and_then(serde_json::Value::as_str);
-        if let Some(path) = source_path {
-            let track = track_map
-                .entry(path.to_string())
-                .or_insert_with(|| serde_json::json!({"sourcePath": path}));
-            if let Some(track_object) = track.as_object_mut() {
-                if let Some(value) = details.get("name") {
-                    track_object.insert("name".into(), value.clone());
-                }
-                if let Some(value) = details.get("destination_path") {
-                    track_object.insert("destinationPath".into(), value.clone());
-                }
-                if let Some(value) = details.get("worker_job_id") {
-                    track_object.insert("workerJobId".into(), value.clone());
-                }
-                if let Some(value) = details.get("stage") {
-                    track_object.insert("stage".into(), value.clone());
-                }
-                if let Some(value) = details.get("elapsed_ms") {
-                    track_object.insert("elapsedMs".into(), value.clone());
-                }
-                if let Some(value) = details.get("processed") {
-                    track_object.insert("processed".into(), value.clone());
-                }
-                if let Some(value) = details.get("total") {
-                    track_object.insert("total".into(), value.clone());
-                }
-                if let Some(value) = details.get("stage_started_at") {
-                    track_object.insert("stageStartedAt".into(), value.clone());
-                }
-                if let Some(value) = details.get("backend") {
-                    track_object.insert("backend".into(), value.clone());
-                }
-                if let Some(value) = details.get("patch_count") {
-                    track_object.insert("patchCount".into(), value.clone());
-                }
-                if let Some(value) = details.get("tf_memory") {
-                    track_object.insert("tfMemory".into(), value.clone());
-                }
-                match event {
-                    "analysis_candidate_started" | "analysis_candidate_progress" => {
-                        track_object.insert("status".into(), serde_json::json!("running"));
-                        if event == "analysis_candidate_started" {
-                            track_object.insert("startedAt".into(), at.clone());
-                        }
-                    }
-                    "analysis_candidate_finished" | "analysis_candidate_persisted" => {
-                        if let Some(value) = details.get("status") {
-                            track_object.insert("status".into(), value.clone());
-                        } else {
-                            track_object.insert("status".into(), serde_json::json!("completed"));
-                        }
-                        track_object.insert("finishedAt".into(), at.clone());
-                        if let Some(value) = details.get("error").or_else(|| details.get("message")) {
-                            track_object.insert("terminationReason".into(), value.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        match event {
-            "analysis_requested" => {
-                object.insert("status".into(), serde_json::json!("pending"));
-                object.insert("requestedAt".into(), at.clone());
-                if let Some(value) = details.get("attempt_id") {
-                    object.insert("attemptId".into(), value.clone());
-                }
-                if let Some(value) = details.get("candidate_count") {
-                    object.insert("total".into(), value.clone());
-                }
-            }
-            "analysis_started" => {
-                object.insert("status".into(), serde_json::json!("running"));
-                object.insert("startedAt".into(), at.clone());
-                if let Some(value) = details.get("attempt_id") {
-                    object.insert("attemptId".into(), value.clone());
-                }
-            }
-            "analysis_candidate_progress" => {
-                object.insert("status".into(), serde_json::json!("running"));
-                object.insert("lastHeartbeatAt".into(), at.clone());
-                for (key, field) in [("name", "currentItem"), ("stage", "currentStage"), ("worker_job_id", "workerJobId")] {
-                    if let Some(value) = details.get(key) {
-                        object.insert(field.into(), value.clone());
-                    }
-                }
-                for (key, field) in [("processed", "stageProcessed"), ("total", "stageTotal")] {
-                    if let Some(value) = details.get(key) {
-                        object.insert(field.into(), value.clone());
-                    }
-                }
-            }
-            "analysis_cancelled" | "analysis_error" => {
-                object.insert("status".into(), serde_json::json!(if event == "analysis_cancelled" { "cancelled" } else { "error" }));
-                object.insert("finishedAt".into(), at.clone());
-                if let Some(value) = details.get("reason").or_else(|| details.get("message")) {
-                    object.insert("terminationReason".into(), value.clone());
-                }
-                for track in track_map.values_mut() {
-                    if let Some(track_object) = track.as_object_mut()
-                        && matches!(track_object.get("status").and_then(serde_json::Value::as_str), Some("pending" | "running"))
-                    {
-                        track_object.insert("status".into(), serde_json::json!(if event == "analysis_cancelled" { "cancelled" } else { "failed" }));
-                        track_object.insert("finishedAt".into(), at.clone());
-                    }
-                }
-            }
-            "analysis_completed" => {
-                object.insert("finishedAt".into(), at.clone());
-            }
-            _ => {}
-        }
-
-        object.insert("lastHeartbeatAt".into(), at);
-        object.insert("lastHeartbeatEpochMs".into(), serde_json::json!(unix_timestamp_ms()));
-
-        let mut completed = 0usize;
-        let mut failed = 0usize;
-        let mut timed_out = 0usize;
-        let mut terminal = 0usize;
-        for track in track_map.values() {
-            match track.get("status").and_then(serde_json::Value::as_str) {
-                Some("completed") => { completed += 1; terminal += 1; }
-                Some("failed") => { failed += 1; terminal += 1; }
-                Some("timeout") => { timed_out += 1; terminal += 1; }
-                Some("cancelled") => { terminal += 1; }
-                _ => {}
-            }
-        }
-        let total = object.get("total").and_then(serde_json::Value::as_u64).unwrap_or(track_map.len() as u64) as usize;
-        object.insert("completed".into(), serde_json::json!(completed));
-        object.insert("failed".into(), serde_json::json!(failed));
-        object.insert("timedOut".into(), serde_json::json!(timed_out));
-        object.insert("pending".into(), serde_json::json!(total.saturating_sub(terminal)));
-        if event == "analysis_completed" {
-            object.insert(
-                "status".into(),
-                serde_json::json!(if failed > 0 || timed_out > 0 || terminal < total {
-                    "partial"
-                } else {
-                    "completed"
-                }),
-            );
-        }
-        object.insert("tracks".into(), serde_json::Value::Object(track_map));
-        let _ = write_json_file(&self.analysis_state_path, &state);
     }
 
     fn record_task_started(&self, slot_index: usize, source: &str, destination: &str, count: usize) {
@@ -608,7 +231,7 @@ impl TestMonitor {
         if let Ok(contents) = serde_json::to_string_pretty(entry)
             && let Err(error) = fs::write(summary_path, contents)
         {
-            eprintln!("Failed to save runtime session summary: {error}");
+            eprintln!("Failed to save local test monitor summary: {error}");
         }
 
         let Ok(_guard) = self.lock.lock() else {
@@ -625,28 +248,7 @@ impl TestMonitor {
                 "report_path": entry.report_path,
             }));
             if self.remaining_jobs.fetch_sub(1, Ordering::SeqCst) == 1 {
-                session.status = if session
-                    .task_results
-                    .iter()
-                    .all(|result| result.get("status").and_then(serde_json::Value::as_str) == Some("completed"))
-                {
-                    "completed"
-                } else if session
-                    .task_results
-                    .iter()
-                    .any(|result| result.get("status").and_then(serde_json::Value::as_str) == Some("cancelled"))
-                {
-                    "cancelled"
-                } else if session
-                    .task_results
-                    .iter()
-                    .any(|result| result.get("status").and_then(serde_json::Value::as_str) == Some("error"))
-                {
-                    "error"
-                } else {
-                    "partial"
-                }
-                .to_string();
+                session.status = "completed".to_string();
                 session.finished_at = Some(timestamp_string());
             }
             let _ = write_json_file(&self.session_path, &*session);
@@ -666,27 +268,17 @@ impl TestMonitor {
     }
 
     fn record_analysis_reports(&self, reports: &[AnalysisReport]) {
-        let snapshot = {
-            let Ok(mut all_reports) = self.analysis_reports.lock() else {
-                return;
-            };
-            for report in reports {
-                all_reports.retain(|existing| existing.source_path != report.source_path);
-                all_reports.push(report.clone());
-            }
-            all_reports.clone()
-        };
         let path = self.session_dir.join("analysis-reports.json");
-        if let Ok(contents) = serde_json::to_string_pretty(&snapshot)
+        if let Ok(contents) = serde_json::to_string_pretty(reports)
             && let Err(error) = fs::write(path, contents)
         {
-            eprintln!("Failed to save runtime session analysis reports: {error}");
+            eprintln!("Failed to save local test monitor analysis reports: {error}");
         }
         self.record_event(
             "analysis_reports_updated",
             serde_json::json!({
-                "report_count": snapshot.len(),
-                "reports": snapshot,
+                "report_count": reports.len(),
+                "reports": reports,
             }),
         );
     }
@@ -698,58 +290,12 @@ impl TestMonitor {
             .map_err(|_| io::Error::other("test monitor session lock poisoned"))?;
         write_json_file(&self.session_path, &*session)
     }
-
-    fn claim_analysis_run(&self, attempt_id: &str) -> Result<(), String> {
-        if attempt_id.trim().is_empty() {
-            return Err("增强分析缺少 attemptId".to_string());
-        }
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| "运行会话锁损坏".to_string())?;
-        let mut state = fs::read_to_string(&self.analysis_state_path)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-            .unwrap_or_else(|| serde_json::json!({"schemaVersion": 1, "status": "notRequested"}));
-        let object = state
-            .as_object_mut()
-            .ok_or_else(|| "分析状态文件格式无效".to_string())?;
-        let now_ms = unix_timestamp_ms();
-        if object.get("status").and_then(serde_json::Value::as_str) == Some("running") {
-            let current_attempt = object
-                .get("attemptId")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let heartbeat = object
-                .get("lastHeartbeatEpochMs")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if current_attempt != attempt_id && now_ms.saturating_sub(heartbeat) <= 15_000 {
-                return Err("该批次增强分析已有运行中的尝试".to_string());
-            }
-            if current_attempt != attempt_id {
-                object.insert("status".into(), serde_json::json!("interrupted"));
-                object.insert("interruptionReason".into(), serde_json::json!("超过 15 秒未收到心跳，已允许接管"));
-            }
-        }
-        object.insert("attemptId".into(), serde_json::json!(attempt_id));
-        object.insert("status".into(), serde_json::json!("running"));
-        object.insert("startedAt".into(), serde_json::json!(timestamp_string()));
-        object.insert("lastHeartbeatEpochMs".into(), serde_json::json!(now_ms));
-        write_json_file(&self.analysis_state_path, &state)
-            .map_err(|error| format!("保存增强分析状态失败：{error}"))
-    }
 }
 
 fn write_json_file<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let contents = serde_json::to_vec_pretty(value)
         .map_err(|error| io::Error::other(format!("serialize json: {error}")))?;
-    let temporary_path = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|extension| extension.to_str()).unwrap_or("json")
-    ));
-    fs::write(&temporary_path, contents)?;
-    fs::rename(temporary_path, path)
+    fs::write(path, contents)
 }
 
 fn monitor_safe_component(value: &str) -> String {
@@ -768,13 +314,6 @@ fn monitor_safe_component(value: &str) -> String {
     } else {
         sanitized
     }
-}
-
-fn unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn monitor_file_snapshot(path: &Path) -> serde_json::Value {
@@ -809,7 +348,6 @@ fn default_download_directory() -> PathBuf {
 enum ScanStatus {
     Idle,
     Running,
-    Cancelling,
     Completed,
     Cancelled,
     Error,
@@ -821,7 +359,6 @@ enum ScanProgressPhase {
     Preparing,
     ScanningSource,
     ScanningDestination,
-    MatchingMetadata,
     Checking,
     Completed,
     Cancelled,
@@ -846,12 +383,6 @@ struct ScanTaskProgress {
     phase: ScanProgressPhase,
     processed: usize,
     total: usize,
-    source_processed: usize,
-    source_total: Option<usize>,
-    destination_processed: usize,
-    destination_total: Option<usize>,
-    metadata_processed: usize,
-    metadata_total: Option<usize>,
     current_file: String,
 }
 
@@ -885,20 +416,12 @@ struct ConfirmedSyncJob {
     preview: SyncPreview,
     retry_of: Option<String>,
     test_monitor: Option<Arc<TestMonitor>>,
-    w4dj_path: PathBuf,
-    metadata_context: Arc<ConversionMetadataContext>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct AnalysisFailure {
     path: String,
     message: String,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    stage: Option<String>,
-    #[serde(rename = "elapsedMs", default)]
-    elapsed_ms: Option<u64>,
 }
 
 struct ScanJob {
@@ -909,8 +432,6 @@ struct ScanJob {
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
     scan_cache_path: PathBuf,
-    concurrency_budget: Arc<GlobalConcurrencyBudget>,
-    metadata_resolver: Arc<NeteaseMetadataResolver>,
     tasks: Vec<(usize, String, String)>,
 }
 
@@ -921,110 +442,12 @@ struct AppInfo {
     project_url: &'static str,
 }
 
-#[derive(Debug, Clone, serde::Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct AnalysisSessionSummary {
-    status: String,
-    total: usize,
-    completed: usize,
-    failed: usize,
-    timed_out: usize,
-    pending: usize,
-    current_item: Option<String>,
-    current_stage: Option<String>,
-    worker_job_id: Option<String>,
-    requested_at: Option<String>,
-    started_at: Option<String>,
-    finished_at: Option<String>,
-    termination_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct HistoryEntryView {
-    #[serde(flatten)]
-    entry: HistoryEntry,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    analysis: Option<AnalysisSessionSummary>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IncompleteAnalysisRun {
-    batch_id: String,
-    previews: Vec<SlotPreview>,
-    analysis: AnalysisSessionSummary,
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LibraryStatus {
     catalog_path: String,
     track_count: u64,
-    analyzed_track_count: u64,
-    /// Empty compatibility data for Task 1 discovery; Dashboard queries the
-    /// W4DJ analysis projection instead of this field.
     netease: NeteaseDiscovery,
-    manual_database_path: Option<String>,
-    refresh: LibraryRefreshProgress,
-    database_warning: Option<String>,
-    total_track_count: u64,
-    available_track_count: u64,
-    invalid_track_count: u64,
-    not_analyzed_count: u64,
-    analysis_failed_count: u64,
-    analysis_completed_count: u64,
-    invalid_scan: InvalidScanProgress,
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-enum NeteaseMetadataDatabaseSource {
-    Manual,
-    Automatic,
-    Unavailable,
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct NeteaseMetadataDatabaseStatus {
-    manual_path: Option<String>,
-    effective_path: Option<String>,
-    source: NeteaseMetadataDatabaseSource,
-    loaded: bool,
-    record_count: usize,
-    warning: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cached_record_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    database_changed: Option<bool>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InvalidScanProgress {
-    scan_id: String,
-    status: String,
-    processed: usize,
-    total: usize,
-    current_item: String,
-    message: String,
-    error: Option<String>,
-}
-
-impl Default for InvalidScanProgress {
-    fn default() -> Self {
-        Self {
-            scan_id: String::new(),
-            status: "idle".to_string(),
-            processed: 0,
-            total: 0,
-            current_item: String::new(),
-            message: String::new(),
-            error: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1038,79 +461,7 @@ struct LibraryRefreshSummary {
     music_folder: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-enum LibraryRefreshStatus {
-    Idle,
-    Running,
-    Cancelling,
-    Completed,
-    Cancelled,
-    Error,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-enum LibraryRefreshStage {
-    LocatingDatabase,
-    ReadingRecords,
-    CheckingLocalFiles,
-    ProbingLocalFiles,
-    ImportingAnalysis,
-    Committing,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LibraryRefreshProgress {
-    refresh_id: String,
-    status: LibraryRefreshStatus,
-    stage: LibraryRefreshStage,
-    processed: usize,
-    total: Option<usize>,
-    current_item: String,
-    message: String,
-    summary: Option<LibraryRefreshSummary>,
-    error: Option<String>,
-}
-
-impl Default for LibraryRefreshProgress {
-    fn default() -> Self {
-        Self {
-            refresh_id: String::new(),
-            status: LibraryRefreshStatus::Idle,
-            stage: LibraryRefreshStage::LocatingDatabase,
-            processed: 0,
-            total: None,
-            current_item: String::new(),
-            message: String::new(),
-            summary: None,
-            error: None,
-        }
-    }
-}
-
-impl LibraryState {
-    fn new() -> Self {
-        Self {
-            catalog_path: Mutex::new(PathBuf::new()),
-            manual_database_path: Mutex::new(None),
-            metadata_cache: Mutex::new(NeteaseMetadataCacheProgress::default()),
-            metadata_cache_cancel: AtomicBool::new(false),
-            metadata_cache_build_lock: Mutex::new(()),
-            metadata_cache_worker: Mutex::new(None),
-            refresh: Mutex::new(LibraryRefreshProgress::default()),
-            cancel: AtomicBool::new(false),
-            worker: Mutex::new(None),
-            invalid_scan: Mutex::new(InvalidScanProgress::default()),
-            invalid_scan_cancel: AtomicBool::new(false),
-            invalid_scan_worker: Mutex::new(None),
-        }
-    }
-}
-
 const ESSENTIA_MODEL_VERSION: &str = "essentia-musicnn-2022-v2";
-const ESSENTIA_MODELS_URL: &str = "https://essentia.upf.edu/models/";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1120,218 +471,75 @@ struct EssentiaModelStatus {
     genre: bool,
     mood: bool,
     instrument: bool,
-    installing: bool,
-    emotion_continuous: bool,
-    emotion_cluster: bool,
-    discogs_effnet: Option<DiscogsEffnetModelStatus>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DiscogsEffnetModelStatus {
-    embedding: bool,
-    mood_theme: bool,
-    approachability: bool,
-    instrumentation: bool,
-    timbre: bool,
-    danceability: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EssentiaModelImportIssueDto {
-    file_name: String,
-    reason: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EssentiaModelImportResult {
-    installed_ids: Vec<String>,
-    issues: Vec<EssentiaModelImportIssueDto>,
-    missing_ids: Vec<String>,
-    status: EssentiaModelStatus,
-    message: String,
+    downloading: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct EssentiaModelSpec {
     id: &'static str,
     kind: &'static str,
+    model_url: &'static str,
+    weights_url: Option<&'static str>,
     classes: &'static [&'static str],
-    output_units: Option<u64>,
-    output_name: &'static str,
-    embedding_family: Option<&'static str>,
-    input_shape: Option<&'static [u64]>,
-    input_width: Option<u64>,
 }
-
-const DISCOGS_EFFNET_INPUT_SHAPE: &[u64] = &[64, 128, 96];
-const DISCOGS_MOOD_THEME_CLASSES: &[&str] = &[
-    "action", "adventure", "advertising", "background", "ballad", "calm", "children",
-    "christmas", "commercial", "cool", "corporate", "dark", "deep", "documentary",
-    "drama", "dramatic", "dream", "emotional", "energetic", "epic", "fast", "film", "fun",
-    "funny", "game", "groovy", "happy", "heavy", "holiday", "hopeful", "inspiring", "love",
-    "meditative", "melancholic", "melodic", "motivational", "movie", "nature", "party",
-    "positive", "powerful", "relaxing", "retro", "romantic", "sad", "sexy", "slow", "soft",
-    "soundscape", "space", "sport", "summer", "trailer", "travel", "upbeat", "uplifting",
-];
-const DISCOGS_INSTRUMENTATION_CLASSES: &[&str] = &[
-    "accordion", "acousticbassguitar", "acousticguitar", "bass", "beat", "bell", "bongo",
-    "brass", "cello", "clarinet", "classicalguitar", "computer", "doublebass", "drummachine",
-    "drums", "electricguitar", "electricpiano", "flute", "guitar", "harmonica", "harp", "horn",
-    "keyboard", "oboe", "orchestra", "organ", "pad", "percussion", "piano", "pipeorgan", "rhodes",
-    "sampler", "saxophone", "strings", "synthesizer", "trombone", "trumpet", "viola", "violin", "voice",
-];
-const DISCOGS_APPROACHABILITY_CLASSES: &[&str] = &["not approachable", "approachable"];
-const DISCOGS_TIMBRE_CLASSES: &[&str] = &["bright", "dark"];
-const DISCOGS_DANCEABILITY_CLASSES: &[&str] = &["danceable", "not_danceable"];
 
 fn essentia_model_specs() -> Vec<EssentiaModelSpec> {
     vec![
         EssentiaModelSpec {
             id: "musicnn_embedding",
             kind: "embedding",
+            model_url: "https://essentia.upf.edu/models/feature-extractors/musicnn/msd-musicnn-1-tfjs.zip",
+            weights_url: None,
             classes: &[],
-            output_units: None,
-            output_name: "model/dense/Relu",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: None,
+        },
+        EssentiaModelSpec {
+            id: "genre_rosamerica",
+            kind: "genre",
+            model_url: "https://essentia.upf.edu/models/classification-heads/genre_rosamerica/genre_rosamerica-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/genre_rosamerica/genre_rosamerica-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
+            classes: &["cla", "dan", "hip", "jaz", "pop", "rhy", "roc", "spe"],
         },
         EssentiaModelSpec {
             id: "mood_aggressive",
             kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_aggressive/mood_aggressive-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_aggressive/mood_aggressive-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
             classes: &["aggressive", "non_aggressive"],
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
         },
         EssentiaModelSpec {
             id: "mood_happy",
             kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_happy/mood_happy-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_happy/mood_happy-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
             classes: &["happy", "non_happy"],
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
         },
         EssentiaModelSpec {
             id: "mood_relaxed",
             kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_relaxed/mood_relaxed-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_relaxed/mood_relaxed-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
             classes: &["relaxed", "non_relaxed"],
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
         },
         EssentiaModelSpec {
             id: "mood_party",
             kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_party/mood_party-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_party/mood_party-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
             classes: &["party", "non_party"],
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
         },
         EssentiaModelSpec {
             id: "mood_sad",
             kind: "mood",
+            model_url: "https://essentia.upf.edu/models/classification-heads/mood_sad/mood_sad-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/mood_sad/mood_sad-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
             classes: &["sad", "non_sad"],
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
         },
         EssentiaModelSpec {
             id: "voice_instrumental",
             kind: "instrument",
+            model_url: "https://essentia.upf.edu/models/classification-heads/voice_instrumental/voice_instrumental-msd-musicnn-1-tfjs/model.json",
+            weights_url: Some("https://essentia.upf.edu/models/classification-heads/voice_instrumental/voice_instrumental-msd-musicnn-1-tfjs/group1-shard1of1.bin"),
             classes: &["instrumental", "voice"],
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
-        },
-        EssentiaModelSpec {
-            id: "emomusic",
-            kind: "emotionContinuous",
-            classes: &["valence", "arousal"],
-            output_units: Some(2),
-            output_name: "model/Identity",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
-        },
-        EssentiaModelSpec {
-            id: "muse",
-            kind: "emotionContinuous",
-            classes: &["valence", "arousal"],
-            output_units: Some(2),
-            output_name: "model/Identity",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
-        },
-        EssentiaModelSpec {
-            id: "mirex",
-            kind: "emotionCluster",
-            classes: &["passionate", "rollicking", "literate", "humorous", "aggressive"],
-            output_units: Some(5),
-            output_name: "PartitionedCall",
-            embedding_family: Some("musicnn"), input_shape: None, input_width: Some(200),
-        },
-        EssentiaModelSpec {
-            id: "discogs_effnet",
-            kind: "genreEmbedding",
-            classes: &[],
-            output_units: Some(1280),
-            output_name: "discogs_embedding",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: Some(DISCOGS_EFFNET_INPUT_SHAPE), input_width: None,
-        },
-        EssentiaModelSpec {
-            id: "discogs_effnet_embedding",
-            kind: "discogsEffnetEmbedding",
-            classes: &[],
-            output_units: Some(1280),
-            output_name: "discogs_embedding",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: Some(DISCOGS_EFFNET_INPUT_SHAPE), input_width: None,
-        },
-        EssentiaModelSpec {
-            id: "genre_discogs400",
-            kind: "genre",
-            classes: &[],
-            output_units: Some(400),
-            output_name: "discogs_genre",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: None, input_width: Some(1280),
-        },
-        EssentiaModelSpec {
-            id: "discogs_mood_theme",
-            kind: "discogsEffnetHead",
-            classes: DISCOGS_MOOD_THEME_CLASSES,
-            output_units: Some(56),
-            output_name: "model/Sigmoid",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: None, input_width: Some(1280),
-        },
-        EssentiaModelSpec {
-            id: "discogs_approachability",
-            kind: "discogsEffnetHead",
-            classes: DISCOGS_APPROACHABILITY_CLASSES,
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: None, input_width: Some(1280),
-        },
-        EssentiaModelSpec {
-            id: "discogs_instrumentation",
-            kind: "discogsEffnetHead",
-            classes: DISCOGS_INSTRUMENTATION_CLASSES,
-            output_units: Some(40),
-            output_name: "model/Sigmoid",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: None, input_width: Some(1280),
-        },
-        EssentiaModelSpec {
-            id: "discogs_timbre",
-            kind: "discogsEffnetHead",
-            classes: DISCOGS_TIMBRE_CLASSES,
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: None, input_width: Some(1280),
-        },
-        EssentiaModelSpec {
-            id: "discogs_danceability",
-            kind: "discogsEffnetHead",
-            classes: DISCOGS_DANCEABILITY_CLASSES,
-            output_units: Some(2),
-            output_name: "model/Softmax",
-            embedding_family: Some("discogs-effnet-bs64-1"), input_shape: None, input_width: Some(1280),
         },
     ]
 }
@@ -1349,41 +557,50 @@ fn essentia_model_file_path(models_path: &Path, id: &str, extension: &str) -> Pa
 }
 
 fn essentia_model_is_installed(models_path: &Path, spec: EssentiaModelSpec) -> bool {
-    essentia_model_import::installed_model_pair_is_valid(models_path, spec.id)
+    let json_path = essentia_model_file_path(models_path, spec.id, "json");
+    let weights_path = essentia_model_file_path(models_path, spec.id, "bin");
+    if !json_path.is_file() || !weights_path.is_file() {
+        return false;
+    }
+    let Ok(model_json) = fs::read_to_string(json_path) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&model_json) else {
+        return false;
+    };
+    parsed.get("modelTopology").is_some()
+        && parsed
+            .get("weightsManifest")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|manifests| !manifests.is_empty())
+        && fs::metadata(weights_path)
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
 }
 
 fn essentia_embedding_is_installed(models_path: &Path) -> bool {
-    essentia_model_specs()
-        .into_iter()
-        .find(|spec| spec.id == "musicnn_embedding")
-        .is_some_and(|spec| essentia_model_is_installed(models_path, spec))
+    essentia_model_is_installed(
+        models_path,
+        EssentiaModelSpec {
+            id: "musicnn_embedding",
+            kind: "embedding",
+            model_url: "",
+            weights_url: None,
+            classes: &[],
+        },
+    )
 }
 
 fn essentia_model_status_for_path(models_path: &Path) -> EssentiaModelStatus {
     let specs = essentia_model_specs();
     let embedding = essentia_embedding_is_installed(models_path);
-    let genre_embedding = specs
-        .iter()
-        .find(|spec| spec.id == "discogs_effnet_embedding")
-        .is_some_and(|spec| essentia_model_is_installed(models_path, *spec))
-        || specs
-            .iter()
-            .find(|spec| spec.id == "discogs_effnet")
-            .is_some_and(|spec| essentia_model_is_installed(models_path, *spec));
-    let genre_head = specs
-        .iter()
-        .find(|spec| spec.id == "genre_discogs400")
-        .is_some_and(|spec| essentia_model_is_installed(models_path, *spec));
-    let discogs_status = |id: &str| {
-        specs
-            .iter()
-            .find(|spec| spec.id == id)
-            .is_some_and(|spec| essentia_model_is_installed(models_path, *spec))
-    };
     EssentiaModelStatus {
         version: ESSENTIA_MODEL_VERSION,
         embedding,
-        genre: embedding && genre_embedding && genre_head,
+        genre: specs
+            .iter()
+            .any(|spec| spec.kind == "genre" && essentia_model_is_installed(models_path, *spec))
+            && embedding,
         mood: specs
             .iter()
             .filter(|spec| spec.kind == "mood")
@@ -1393,29 +610,134 @@ fn essentia_model_status_for_path(models_path: &Path) -> EssentiaModelStatus {
             .iter()
             .any(|spec| spec.kind == "instrument" && essentia_model_is_installed(models_path, *spec))
             && embedding,
-        installing: false,
-        emotion_continuous: specs
-            .iter()
-            .filter(|spec| spec.kind == "emotionContinuous")
-            .all(|spec| essentia_model_is_installed(models_path, *spec))
-            && embedding,
-        emotion_cluster: specs
-            .iter()
-            .any(|spec| spec.kind == "emotionCluster" && essentia_model_is_installed(models_path, *spec))
-            && embedding,
-        discogs_effnet: Some(DiscogsEffnetModelStatus {
-            embedding: specs
-                .iter()
-                .find(|spec| spec.id == "discogs_effnet_embedding")
-                .is_some_and(|spec| essentia_model_is_installed(models_path, *spec))
-                || genre_embedding,
-            mood_theme: discogs_status("discogs_mood_theme"),
-            approachability: discogs_status("discogs_approachability"),
-            instrumentation: discogs_status("discogs_instrumentation"),
-            timbre: discogs_status("discogs_timbre"),
-            danceability: discogs_status("discogs_danceability"),
-        }),
+        downloading: false,
     }
+}
+
+fn download_essentia_model_file(url: &str, destination: &Path) -> Result<(), String> {
+    let response = ureq::get(url)
+        .set("User-Agent", "W4DJ-RKB")
+        .call()
+        .map_err(|error| format!("下载 Essentia 模型失败：{error}"))?;
+    if response.status() != 200 {
+        return Err(format!("下载 Essentia 模型失败：HTTP {}", response.status()));
+    }
+    let temporary = destination.with_extension(format!(
+        "{}.part",
+        destination.extension().and_then(|value| value.to_str()).unwrap_or("bin")
+    ));
+    let mut reader = response.into_reader();
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("读取 Essentia 模型失败：{error}"))?;
+    if bytes.is_empty() {
+        return Err("下载的 Essentia 模型为空".to_string());
+    }
+    fs::write(&temporary, bytes).map_err(|error| format!("保存 Essentia 模型失败：{error}"))?;
+    fs::rename(&temporary, destination)
+        .map_err(|error| format!("安装 Essentia 模型失败：{error}"))
+}
+
+fn download_essentia_embedding_model(url: &str, models_path: &Path) -> Result<(), String> {
+    let response = ureq::get(url)
+        .set("User-Agent", "W4DJ-RKB")
+        .call()
+        .map_err(|error| format!("下载 Essentia MusiCNN 模型失败：{error}"))?;
+    if response.status() != 200 {
+        return Err(format!("下载 Essentia MusiCNN 模型失败：HTTP {}", response.status()));
+    }
+    let mut archive_bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut archive_bytes)
+        .map_err(|error| format!("读取 Essentia MusiCNN 模型失败：{error}"))?;
+    let entries = extract_malformed_essentia_zip_entries(&archive_bytes)?;
+    let model_json = entries
+        .first()
+        .cloned()
+        .ok_or_else(|| "Essentia MusiCNN 模型包缺少 model.json".to_string())?;
+    let weight_data = entries
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "Essentia MusiCNN 模型包缺少权重".to_string())?;
+    if model_json.is_empty() || weight_data.is_empty() {
+        return Err("Essentia MusiCNN 模型包缺少 model.json 或权重".to_string());
+    }
+    let json_path = essentia_model_file_path(models_path, "musicnn_embedding", "json");
+    let bin_path = essentia_model_file_path(models_path, "musicnn_embedding", "bin");
+    let json_temp = json_path.with_extension("json.part");
+    let bin_temp = bin_path.with_extension("bin.part");
+    fs::write(&json_temp, model_json).map_err(|error| format!("保存 Essentia 模型结构失败：{error}"))?;
+    fs::write(&bin_temp, weight_data).map_err(|error| format!("保存 Essentia 模型权重失败：{error}"))?;
+    fs::rename(&json_temp, &json_path).map_err(|error| format!("安装 Essentia 模型结构失败：{error}"))?;
+    fs::rename(&bin_temp, &bin_path).map_err(|error| format!("安装 Essentia 模型权重失败：{error}"))
+}
+
+/// The official Essentia MusiCNN archive currently contains a malformed local
+/// extra-field length. Its central directory is therefore rejected by the
+/// standard ZIP reader even though both deflate streams are intact. Read the
+/// two local entries defensively and locate each stream by validating its
+/// expected decompressed size. This keeps the downloader limited to the
+/// official archive format without accepting arbitrary filesystem paths.
+fn extract_malformed_essentia_zip_entries(archive: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = archive[cursor..]
+        .windows(4)
+        .position(|window| window == b"PK\x03\x04")
+    {
+        let offset = cursor + relative;
+        if offset + 30 > archive.len() {
+            break;
+        }
+        let compression = u16::from_le_bytes([archive[offset + 8], archive[offset + 9]]);
+        let compressed_size = u32::from_le_bytes([
+            archive[offset + 18],
+            archive[offset + 19],
+            archive[offset + 20],
+            archive[offset + 21],
+        ]) as usize;
+        let uncompressed_size = u32::from_le_bytes([
+            archive[offset + 22],
+            archive[offset + 23],
+            archive[offset + 24],
+            archive[offset + 25],
+        ]) as usize;
+        let name_length = u16::from_le_bytes([archive[offset + 26], archive[offset + 27]]) as usize;
+        let extra_length = u16::from_le_bytes([archive[offset + 28], archive[offset + 29]]) as usize;
+        let data_floor = offset
+            .checked_add(30)
+            .and_then(|value| value.checked_add(name_length))
+            .and_then(|value| value.checked_add(extra_length))
+            .ok_or_else(|| "Essentia 模型包的条目头损坏".to_string())?;
+        if compression != 8 || compressed_size == 0 || uncompressed_size == 0 {
+            cursor = offset + 30 + name_length;
+            continue;
+        }
+
+        let mut decoded = None;
+        let search_end = data_floor
+            .saturating_add(64)
+            .min(archive.len().saturating_sub(compressed_size));
+        for data_start in data_floor..=search_end {
+            let data_end = data_start + compressed_size;
+            let mut decoder = DeflateDecoder::new(&archive[data_start..data_end]);
+            let mut output = Vec::with_capacity(uncompressed_size);
+            if decoder.read_to_end(&mut output).is_ok() && output.len() == uncompressed_size {
+                decoded = Some(output);
+                break;
+            }
+        }
+        if let Some(output) = decoded {
+            entries.push(output);
+            if entries.len() == 2 {
+                return Ok(entries);
+            }
+        }
+        cursor = data_floor.saturating_add(compressed_size).min(archive.len());
+    }
+    Err("Essentia MusiCNN 模型包缺少可读取的 model.json 或权重".to_string())
 }
 
 #[tauri::command]
@@ -1427,123 +749,33 @@ fn get_essentia_model_status(state: tauri::State<'_, AppState>) -> Result<Essent
     Ok(essentia_model_status_for_path(&path))
 }
 
-/// Validate and install the bundled model files on demand.
-///
-/// Model files are deliberately not touched during application startup. The
-/// first enhanced-analysis request calls this command, so ordinary conversion
-/// and the initial Dashboard render do not pay the model verification/copy
-/// cost. The write lock keeps this operation safe if two analysis entry points
-/// race to initialize the model directory.
 #[tauri::command]
-fn ensure_essentia_models(state: tauri::State<'_, AppState>) -> Result<EssentiaModelStatus, String> {
-    let _models_write_guard = state
-        .models_write_lock
-        .lock()
-        .expect("Essentia model write lock poisoned");
-    let models_path = essentia_models_path(&state);
-    if models_path.as_os_str().is_empty() {
+fn download_essentia_models(state: tauri::State<'_, AppState>) -> Result<EssentiaModelStatus, String> {
+    let path = essentia_models_path(&state);
+    if path.as_os_str().is_empty() {
         return Err("Essentia 模型目录尚未准备好".to_string());
     }
-    let bundled_models_path = state
-        .bundled_models_path
-        .lock()
-        .expect("bundled models path lock poisoned")
-        .clone();
-    if bundled_models_path.as_os_str().is_empty() {
-        return Err("内置 Essentia 模型目录尚未准备好".to_string());
-    }
-    essentia_model_import::install_bundled_model_set(
-        &bundled_models_path,
-        &models_path,
-        false,
-    )?;
-    Ok(essentia_model_status_for_path(&models_path))
-}
-
-#[tauri::command]
-fn import_essentia_models(
-    paths: Vec<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<EssentiaModelImportResult, String> {
-    let _models_write_guard = state
-        .models_write_lock
-        .lock()
-        .expect("Essentia model write lock poisoned");
-    let models_path = essentia_models_path(&state);
-    if models_path.as_os_str().is_empty() {
-        return Err("Essentia 模型目录尚未准备好".to_string());
-    }
-    let input_paths = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
-    let report = essentia_model_import::import_model_paths(&input_paths, &models_path)?;
-    let status = essentia_model_status_for_path(&models_path);
-    let importable_ids = essentia_model_import::known_import_model_ids();
-    let mut missing_ids = essentia_model_specs()
-        .into_iter()
-        .filter(|spec| importable_ids.contains(&spec.id))
-        .filter(|spec| !essentia_model_is_installed(&models_path, *spec))
-        .map(|spec| spec.id.to_string())
-        .collect::<Vec<_>>();
-    missing_ids.sort();
-    missing_ids.dedup();
-    let installed_count = report.installed_ids.len();
-    let issue_count = report.issues.len();
-    let message = if missing_ids.is_empty() && issue_count == 0 {
-        format!("已导入 {installed_count} 个 Essentia 模型。")
-    } else if installed_count > 0 {
-        format!(
-            "已导入 {installed_count} 个模型，仍缺少 {} 个模型{}。",
-            missing_ids.len(),
-            if issue_count > 0 {
-                format!("；{issue_count} 个文件未导入")
-            } else {
-                String::new()
+    fs::create_dir_all(&path).map_err(|error| format!("创建 Essentia 模型目录失败：{error}"))?;
+    for spec in essentia_model_specs() {
+        let model_path = essentia_model_file_path(&path, spec.id, "json");
+        let weights_path = essentia_model_file_path(&path, spec.id, "bin");
+        if spec.kind == "embedding" {
+            if !essentia_model_is_installed(&path, spec) {
+                download_essentia_embedding_model(spec.model_url, &path)?;
             }
-        )
-    } else {
-        "没有可安装的 Essentia 模型；请检查文件格式和官方模型目录。".to_string()
-    };
-    Ok(EssentiaModelImportResult {
-        installed_ids: report.installed_ids,
-        issues: report
-            .issues
-            .into_iter()
-            .map(|issue| EssentiaModelImportIssueDto {
-                file_name: issue.file_name,
-                reason: issue.reason,
-            })
-            .collect(),
-        missing_ids,
-        status,
-        message,
-    })
-}
-
-#[tauri::command]
-fn restore_bundled_essentia_models(
-    state: tauri::State<'_, AppState>,
-) -> Result<EssentiaModelStatus, String> {
-    let _models_write_guard = state
-        .models_write_lock
-        .lock()
-        .expect("Essentia model write lock poisoned");
-    let models_path = essentia_models_path(&state);
-    if models_path.as_os_str().is_empty() {
-        return Err("Essentia 模型目录尚未准备好".to_string());
+            continue;
+        }
+        if !model_path.is_file() {
+            download_essentia_model_file(spec.model_url, &model_path)?;
+        }
+        if !weights_path.is_file() {
+            download_essentia_model_file(
+                spec.weights_url.ok_or_else(|| "Essentia 模型缺少权重地址".to_string())?,
+                &weights_path,
+            )?;
+        }
     }
-    let bundled_models_path = state
-        .bundled_models_path
-        .lock()
-        .expect("bundled models path lock poisoned")
-        .clone();
-    if bundled_models_path.as_os_str().is_empty() {
-        return Err("内置 Essentia 模型目录尚未准备好".to_string());
-    }
-    essentia_model_import::install_bundled_model_set(
-        &bundled_models_path,
-        &models_path,
-        true,
-    )?;
-    Ok(essentia_model_status_for_path(&models_path))
+    Ok(essentia_model_status_for_path(&path))
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1551,19 +783,9 @@ fn restore_bundled_essentia_models(
 struct EssentiaModelFile {
     id: String,
     model_json: String,
-    /// Sending model weights as a JSON `Vec<u8>` makes WebKit materialize one
-    /// JavaScript number for every byte before the promise can resolve.  The
-    /// largest bundled model is ~18 MB, so that representation can block the
-    /// UI thread for minutes.  Keep the command payload compact and decode it
-    /// to a Uint8Array in the frontend before transferring it to the Worker.
-    weight_data_base64: String,
+    weight_data: Vec<u8>,
     classes: Vec<String>,
     kind: String,
-    output_name: String,
-    output_units: Option<u64>,
-    embedding_family: Option<&'static str>,
-    input_shape: Option<Vec<u64>>,
-    input_width: Option<u64>,
     version: &'static str,
 }
 
@@ -1580,29 +802,18 @@ fn load_essentia_model(
     let model_path = essentia_model_file_path(&path, spec.id, "json");
     let weights_path = essentia_model_file_path(&path, spec.id, "bin");
     if !essentia_model_is_installed(&path, spec) {
-        return Err("Essentia 模型尚未安装或已损坏".to_string());
+        return Err("Essentia 模型尚未下载".to_string());
     }
     let model_json = fs::read_to_string(model_path)
         .map_err(|error| format!("读取 Essentia 模型结构失败：{error}"))?;
     let weight_data = fs::read(weights_path)
         .map_err(|error| format!("读取 Essentia 模型权重失败：{error}"))?;
-    let classes = if spec.id == "genre_discogs400" {
-        serde_json::from_str::<Vec<String>>(include_str!("../resources/essentia-models/genre_discogs400.labels.json"))
-            .map_err(|error| format!("读取 Discogs Genre 标签失败：{error}"))?
-    } else {
-        spec.classes.iter().map(|value| (*value).to_string()).collect()
-    };
     Ok(EssentiaModelFile {
         id: spec.id.to_string(),
         model_json,
-        weight_data_base64: base64::engine::general_purpose::STANDARD.encode(weight_data),
-        classes,
+        weight_data,
+        classes: spec.classes.iter().map(|value| (*value).to_string()).collect(),
         kind: spec.kind.to_string(),
-        output_name: spec.output_name.to_string(),
-        output_units: spec.output_units,
-        embedding_family: spec.embedding_family,
-        input_shape: spec.input_shape.map(|shape| shape.to_vec()),
-        input_width: spec.input_width,
         version: ESSENTIA_MODEL_VERSION,
     })
 }
@@ -1704,14 +915,6 @@ fn load_desktop_state(state: tauri::State<'_, AppState>) -> DesktopState {
         .lock()
         .expect("desktop lock poisoned")
         .state()
-        .clone()
-}
-
-fn concurrency_budget_snapshot(state: &AppState) -> Arc<GlobalConcurrencyBudget> {
-    state
-        .concurrency_budget
-        .lock()
-        .expect("concurrency budget lock poisoned")
         .clone()
 }
 
@@ -1959,14 +1162,9 @@ fn save_track_analyses(
         .lock()
         .expect("history write lock poisoned");
     let existing = load_analysis_file(&path)?;
-    let merged = merge_analysis_entries(existing.clone(), entries);
+    let merged = merge_analysis_entries(existing, entries);
     let count = merged.len();
     save_analysis_file(&path, &merged)?;
-    // This command persists the reusable analysis cache only. The output
-    // owned W4DJ projection is updated by apply_track_analysis_results after
-    // the destination file has received and passed a metadata read-back
-    // check. Marking it completed here would make a cache-only result appear
-    // as if the current MP3 had already been updated after a reload/cancel.
     Ok(count)
 }
 
@@ -1977,21 +1175,7 @@ fn clear_track_analyses(state: tauri::State<'_, AppState>) -> Result<(), String>
         .history_write_lock
         .lock()
         .expect("history write lock poisoned");
-    let existing = load_analysis_file(&path)?;
-    clear_analysis_file(&path)?;
-    let catalog_path = library_catalog_path(&state);
-    let (mut catalog, _) = match open_w4dj_library(&catalog_path) {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = save_analysis_file(&path, &existing);
-            return Err(format!("打开 W4DJ 分析歌曲库失败：{error}"));
-        }
-    };
-    if let Err(error) = catalog.clear_analyses() {
-        let _ = save_analysis_file(&path, &existing);
-        return Err(format!("清除 W4DJ 分析歌曲库失败：{error}"));
-    }
-    Ok(())
+    clear_analysis_file(&path)
 }
 
 #[tauri::command]
@@ -2111,52 +1295,12 @@ fn choose_netease_filename_format(
 }
 
 #[tauri::command]
-fn choose_concurrency_limit(
-    value: String,
-    state: tauri::State<'_, AppState>,
-) -> DesktopState {
-    let fallback = {
-        state
-            .controller
-            .lock()
-            .expect("desktop lock poisoned")
-            .state()
-            .concurrency_limit
-    };
-    let parsed = value.trim().parse::<f64>().unwrap_or(f64::NAN);
-    let normalized = w4dj::preferences::normalize_concurrency_limit(parsed, fallback);
-    let snapshot = {
-        let mut controller = state.controller.lock().expect("desktop lock poisoned");
-        controller.choose_concurrency_limit(normalized);
-        controller.state().clone()
-    };
-    // The budget is swapped only for the next task.  Existing tasks retain
-    // their Arc snapshot and therefore their original worker limit.
-    *state
-        .concurrency_budget
-        .lock()
-        .expect("concurrency budget lock poisoned") =
-        Arc::new(GlobalConcurrencyBudget::new(normalized as usize));
-    persist_preferences(&state);
-    snapshot
-}
-
-#[tauri::command]
 fn start_sync(
     slot_index: usize,
     state: tauri::State<'_, AppState>,
 ) -> Result<DesktopState, String> {
     let controller = Arc::clone(&state.controller);
     let destination_coordinator = state.destination_coordinator.clone();
-    let concurrency_budget = concurrency_budget_snapshot(&state);
-    let ffmpeg_registry = Arc::clone(&state.ffmpeg_registry);
-    let metadata_context = conversion_metadata_context(&state);
-    let w4dj_path = state
-        .library
-        .catalog_path
-        .lock()
-        .expect("library catalog path lock poisoned")
-        .clone();
     {
         let mut controller = controller.lock().expect("desktop lock poisoned");
         if controller.is_running(slot_index)? {
@@ -2167,17 +1311,7 @@ fn start_sync(
         controller.push_log(slot_index, "Scanning input source")?;
     }
 
-    thread::spawn(move || {
-        run_sync_task(
-            controller,
-            destination_coordinator,
-            w4dj_path,
-            slot_index,
-            concurrency_budget,
-            ffmpeg_registry,
-            metadata_context,
-        )
-    });
+    thread::spawn(move || run_sync_task(controller, destination_coordinator, slot_index));
 
     Ok(state
         .controller
@@ -2211,15 +1345,6 @@ fn cancel_sync(
 fn start_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
     let controller = Arc::clone(&state.controller);
     let destination_coordinator = state.destination_coordinator.clone();
-    let concurrency_budget = concurrency_budget_snapshot(&state);
-    let ffmpeg_registry = Arc::clone(&state.ffmpeg_registry);
-    let metadata_context = conversion_metadata_context(&state);
-    let w4dj_path = state
-        .library
-        .catalog_path
-        .lock()
-        .expect("library catalog path lock poisoned")
-        .clone();
     let slot_indexes = {
         let mut controller = controller.lock().expect("desktop lock poisoned");
         let slot_indexes = controller.startable_slot_indexes();
@@ -2245,21 +1370,7 @@ fn start_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, Str
     for slot_index in slot_indexes {
         let controller = Arc::clone(&controller);
         let destination_coordinator = destination_coordinator.clone();
-        let w4dj_path = w4dj_path.clone();
-        let concurrency_budget = concurrency_budget.clone();
-        let ffmpeg_registry = ffmpeg_registry.clone();
-        let metadata_context = metadata_context.clone();
-        thread::spawn(move || {
-            run_sync_task(
-                controller,
-                destination_coordinator,
-                w4dj_path,
-                slot_index,
-                concurrency_budget,
-                ffmpeg_registry,
-                metadata_context,
-            )
-        });
+        thread::spawn(move || run_sync_task(controller, destination_coordinator, slot_index));
     }
 
     Ok(state
@@ -2320,11 +1431,10 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
         return Err(String::from("请至少选择一个歌曲文件夹或单曲"));
     }
 
-    let metadata_context = conversion_metadata_context(state.inner());
     let mut previews = slots
         .into_iter()
         .map(|(slot_index, source, destination)| {
-            let mut preview = build_sync_preview_with_settings_and_netease_observed_with_policy_and_resolver(
+            let preview = build_sync_preview_with_settings_and_netease(
                 &source,
                 &destination,
                 mode,
@@ -2332,18 +1442,8 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
                 conflict_strategy,
                 filename_rule,
                 netease_filename_format,
-                filename_normalization_policy_for_slot(slot_index),
-                None,
-                metadata_context.netease.as_ref(),
             )
-            .map_err(|error| format!("预检失败：{error}"))?
-            .ok_or_else(|| "预检被取消".to_string())?;
-        if matches!(
-            filename_normalization_policy_for_slot(slot_index),
-            FilenameNormalizationPolicy::PreserveSource
-        ) {
-            attach_netease_identities(&mut preview, metadata_context.netease.as_ref());
-        }
+            .map_err(|error| format!("预检失败：{error}"))?;
             Ok(SlotPreview {
                 slot_index,
                 mode,
@@ -2358,14 +1458,6 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
         .collect::<Result<Vec<_>, String>>()?;
     deduplicate_cross_slot_candidates(&mut previews);
     Ok(previews)
-}
-
-fn filename_normalization_policy_for_slot(slot_index: usize) -> FilenameNormalizationPolicy {
-    if slot_index == 0 {
-        FilenameNormalizationPolicy::PreserveSource
-    } else {
-        FilenameNormalizationPolicy::SoundCloud
-    }
 }
 
 fn scan_progress_snapshot(progress: &Arc<Mutex<ScanProgress>>) -> ScanProgress {
@@ -2401,12 +1493,6 @@ fn load_scan_result(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
 #[tauri::command]
 fn cancel_scan(state: tauri::State<'_, AppState>) -> ScanProgress {
     state.scan_cancel.store(true, Ordering::SeqCst);
-    update_scan_progress(&state.scan_progress, |progress| {
-        if matches!(progress.status, ScanStatus::Running | ScanStatus::Cancelling) {
-            progress.status = ScanStatus::Cancelling;
-            progress.message = "正在取消扫描".to_string();
-        }
-    });
     scan_progress_snapshot(&state.scan_progress)
 }
 
@@ -2427,7 +1513,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
             .scan_progress
             .lock()
             .expect("scan progress lock poisoned");
-        if matches!(progress.status, ScanStatus::Running | ScanStatus::Cancelling) {
+        if matches!(progress.status, ScanStatus::Running) {
             return Ok(progress.clone());
         }
     }
@@ -2475,8 +1561,6 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
             tasks,
         )
     };
-    let concurrency_budget = concurrency_budget_snapshot(&state);
-    let metadata_resolver = Arc::clone(&conversion_metadata_context(state.inner()).netease);
 
     state.scan_cancel.store(false, Ordering::SeqCst);
     {
@@ -2498,12 +1582,6 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
                     phase: ScanProgressPhase::Preparing,
                     processed: 0,
                     total: 0,
-                    source_processed: 0,
-                    source_total: None,
-                    destination_processed: 0,
-                    destination_total: None,
-                    metadata_processed: 0,
-                    metadata_total: None,
                     current_file: String::new(),
                 })
                 .collect(),
@@ -2521,8 +1599,6 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         filename_rule,
         netease_filename_format,
         scan_cache_path,
-        concurrency_budget,
-        metadata_resolver,
         tasks,
     };
     thread::spawn(move || run_scan_task(progress, scan_cancel, scan_result, job));
@@ -2544,19 +1620,48 @@ fn run_scan_task(
         filename_rule,
         netease_filename_format,
         scan_cache_path,
-        concurrency_budget,
-        metadata_resolver,
         tasks,
     } = job;
     let mut scan_cache = load_scan_cache(&scan_cache_path).unwrap_or_else(|_| ScanCache::empty());
-    if scan_cancel.load(Ordering::SeqCst) {
-        finish_scan_cancelled(&progress, &scan_result);
-        return;
+    let mut total = 0;
+    let mut task_totals = HashMap::<usize, usize>::new();
+    for (_, source, destination) in &tasks {
+        let scan_source = resolve_missing_single_source_path(Path::new(source))
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.clone());
+        let (source_count, cancelled) = count_music_files_with_cancel(
+            &scan_source,
+            w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
+            || scan_cancel.load(Ordering::SeqCst),
+        );
+        let mut task_total = source_count;
+        if cancelled {
+            finish_scan_cancelled(&progress, &scan_result);
+            return;
+        }
+        let (destination_count, cancelled) = count_music_files_with_cancel(
+            destination,
+            &["mp3", "wav", "aiff"],
+            || scan_cancel.load(Ordering::SeqCst),
+        );
+        task_total += destination_count;
+        total += task_total;
+        if let Some((slot_index, _, _)) = tasks.iter().find(|(_, task_source, task_destination)| {
+            task_source == source && task_destination == destination
+        }) {
+            task_totals.insert(*slot_index, task_total);
+        }
+        if cancelled {
+            finish_scan_cancelled(&progress, &scan_result);
+            return;
+        }
     }
     update_scan_progress(&progress, |state| {
-        state.total = 0;
-        state.processed = 0;
-        state.message = "正在枚举输入和输出文件".to_string();
+        state.total = total;
+        state.message = "正在准备扫描".to_string();
+        for task in &mut state.tasks {
+            task.total = task_totals.get(&task.slot_index).copied().unwrap_or(0);
+        }
     });
     let mut previews = Vec::with_capacity(tasks.len());
     for (slot_index, source, destination) in tasks {
@@ -2564,48 +1669,6 @@ fn run_scan_task(
             finish_scan_cancelled(&progress, &scan_result);
             return;
         }
-
-        // Establish denominators before worker processing starts. The walk
-        // checks the shared cancellation flag on every entry, so this
-        // preflight remains interruptible while the UI can render `x/total`
-        // from the first processed file.
-        let source_total = match count_scan_files(
-            &source,
-            w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
-            &scan_cancel,
-        ) {
-            Ok(total) => Some(total),
-            Err(ScanEnumerationError::Cancelled) => {
-                finish_scan_cancelled(&progress, &scan_result);
-                return;
-            }
-            Err(ScanEnumerationError::Failed(_)) => None,
-        };
-        let destination_total = if destination.trim().is_empty() {
-            Some(0)
-        } else {
-            match count_scan_files(&destination, &["mp3", "wav", "aiff"], &scan_cancel) {
-                Ok(total) => Some(total),
-                Err(ScanEnumerationError::Cancelled) => {
-                    finish_scan_cancelled(&progress, &scan_result);
-                    return;
-                }
-                Err(ScanEnumerationError::Failed(_)) => None,
-            }
-        };
-        update_scan_progress(&progress, |state| {
-            if let Some(task) = state
-                .tasks
-                .iter_mut()
-                .find(|task| task.slot_index == slot_index)
-            {
-                task.source_total = source_total;
-                task.destination_total = destination_total;
-                task.total = source_total
-                    .unwrap_or(0)
-                    .saturating_add(destination_total.unwrap_or(0));
-            }
-        });
 
         let mut observer = |phase: ScanPhase, path: &Path| {
             if scan_cancel.load(Ordering::SeqCst) {
@@ -2615,17 +1678,12 @@ fn run_scan_task(
                 state.phase = match phase {
                     ScanPhase::Source => ScanProgressPhase::ScanningSource,
                     ScanPhase::Destination => ScanProgressPhase::ScanningDestination,
-                    ScanPhase::Metadata => ScanProgressPhase::MatchingMetadata,
                 };
                 state.processed = state.processed.saturating_add(1);
-                state.current_file = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
+                state.current_file = path.display().to_string();
                 state.message = match phase {
                     ScanPhase::Source => "正在扫描输入目录".to_string(),
                     ScanPhase::Destination => "正在扫描输出目录".to_string(),
-                    ScanPhase::Metadata => "正在匹配网易云元数据".to_string(),
                 };
                 if let Some(task) = state
                     .tasks
@@ -2633,39 +1691,13 @@ fn run_scan_task(
                     .find(|task| task.slot_index == slot_index)
                 {
                     task.phase = state.phase.clone();
-                    match phase {
-                        ScanPhase::Source => {
-                            task.source_processed = task.source_processed.saturating_add(1);
-                        }
-                        ScanPhase::Destination => {
-                            task.destination_processed =
-                                task.destination_processed.saturating_add(1);
-                        }
-                        ScanPhase::Metadata => {
-                            if task.metadata_total.is_none() {
-                                task.metadata_total = Some(task.source_processed);
-                                task.source_total = Some(task.source_processed);
-                            }
-                            task.metadata_processed = task.metadata_processed.saturating_add(1);
-                        }
-                    }
-                    task.processed = task
-                        .source_processed
-                        .saturating_add(task.destination_processed);
-                    task.current_file = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.display().to_string());
+                    task.processed = task.processed.saturating_add(1);
+                    task.current_file = path.display().to_string();
                 }
-                state.total = state
-                    .tasks
-                    .iter()
-                    .map(|task| task.processed)
-                    .sum::<usize>();
             });
             !scan_cancel.load(Ordering::SeqCst)
         };
-        let preview = match build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy_and_resolver(
+        let preview = match build_sync_preview_with_settings_and_netease_observed_with_cache(
             &source,
             &destination,
             mode,
@@ -2673,12 +1705,8 @@ fn run_scan_task(
             conflict_strategy,
             filename_rule,
             netease_filename_format,
-            filename_normalization_policy_for_slot(slot_index),
             Some(&mut observer),
             &mut scan_cache,
-            Arc::clone(&concurrency_budget),
-            Arc::clone(&scan_cancel),
-            metadata_resolver.as_ref(),
         ) {
             Ok(Some(preview)) => preview,
             Ok(None) => {
@@ -2701,25 +1729,11 @@ fn run_scan_task(
             retry_of: None,
         });
         update_scan_progress(&progress, |state| {
-            let discovered_total = state
-                .tasks
-                .iter()
-                .map(|task| task.processed)
-                .sum::<usize>();
-            state.total = discovered_total;
             if let Some(task) = state
                 .tasks
                 .iter_mut()
                 .find(|task| task.slot_index == slot_index)
             {
-                task.source_total = Some(task.source_processed);
-                task.destination_total = Some(task.destination_processed);
-                task.metadata_total = Some(task.metadata_processed);
-                task.total = task
-                    .source_total
-                    .unwrap_or(0)
-                    .saturating_add(task.destination_total.unwrap_or(0))
-                    .saturating_add(task.metadata_total.unwrap_or(0));
                 task.phase = ScanProgressPhase::Completed;
                 task.current_file.clear();
             }
@@ -2763,15 +1777,6 @@ fn run_scan_task(
         state.current_file.clear();
         state.message = "扫描完成".to_string();
     });
-}
-
-fn count_scan_files(
-    folder: &str,
-    allowed_extensions: &[&str],
-    cancel: &AtomicBool,
-) -> Result<usize, ScanEnumerationError> {
-    enumerate_music_files_observed(folder, allowed_extensions, cancel, |_, _, _| {})
-        .map(|result| result.paths.len())
 }
 
 fn validate_scan_previews(previews: &[SlotPreview]) -> Result<(), String> {
@@ -2947,15 +1952,8 @@ fn start_confirmed_sync(
         .clone();
     let history_write_lock = Arc::clone(&state.history_write_lock);
     let destination_coordinator = state.destination_coordinator.clone();
-    let w4dj_path = state
-        .library
-        .catalog_path
-        .lock()
-        .expect("library catalog path lock poisoned")
-        .clone();
     let requested_analyses = analyses.unwrap_or_default();
     let requested_analysis_failures = analysis_failures.unwrap_or_default();
-    let metadata_context = conversion_metadata_context(&state);
     let mut jobs = Vec::with_capacity(previews.len());
     let mut seen_slots = Vec::with_capacity(previews.len());
     let monitor_previews;
@@ -2975,17 +1973,7 @@ fn start_confirmed_sync(
         let mut validated_previews = Vec::with_capacity(previews.len());
 
         for slot_preview in previews {
-            let mut slot_preview = slot_preview;
             let slot_index = slot_preview.slot_index;
-            if matches!(
-                filename_normalization_policy_for_slot(slot_index),
-                FilenameNormalizationPolicy::PreserveSource
-            ) {
-                attach_netease_identities(
-                    &mut slot_preview.preview,
-                    metadata_context.netease.as_ref(),
-                );
-            }
             if seen_slots.contains(&slot_index) {
                 return Err(format!("重复的同步任务槽位：{slot_index}"));
             }
@@ -3096,8 +2084,6 @@ fn start_confirmed_sync(
                 preview: slot_preview.preview,
                 retry_of: retry_of.clone().or(slot_preview.retry_of),
                 test_monitor: None,
-                w4dj_path: w4dj_path.clone(),
-                metadata_context: metadata_context.clone(),
             });
         }
 
@@ -3135,7 +2121,7 @@ fn start_confirmed_sync(
         persist_preferences(&state);
     }
 
-    let test_monitor = if RUNTIME_SESSION_RECORDING_ENABLED && !jobs.is_empty() {
+    let test_monitor = if DEBUG_TEST_MONITOR_ENABLED && !jobs.is_empty() {
         let root = state
             .test_monitor_path
             .lock()
@@ -3150,7 +2136,7 @@ fn start_confirmed_sync(
         ) {
             Ok(monitor) => Some(Arc::new(monitor)),
             Err(error) => {
-                eprintln!("Failed to initialize runtime session recorder: {error}");
+                eprintln!("Failed to initialize local test monitor: {error}");
                 None
             }
         }
@@ -3158,10 +2144,7 @@ fn start_confirmed_sync(
         None
     };
 
-    if RUNTIME_SESSION_RECORDING_ENABLED
-        && monitor_needs_analysis
-        && let Some(monitor) = test_monitor.as_ref()
-    {
+    if monitor_needs_analysis && let Some(monitor) = test_monitor.as_ref() {
         state
             .test_monitors
             .lock()
@@ -3169,16 +2152,12 @@ fn start_confirmed_sync(
             .insert(batch_id.clone(), Arc::clone(monitor));
     }
 
-    let task_concurrency_budget = concurrency_budget_snapshot(&state);
-    let task_ffmpeg_registry = Arc::clone(&state.ffmpeg_registry);
     for mut job in jobs {
         job.test_monitor = test_monitor.clone();
         let controller = Arc::clone(&state.controller);
         let destination_coordinator = destination_coordinator.clone();
         let history_path = history_path.clone();
         let history_write_lock = Arc::clone(&history_write_lock);
-        let concurrency_budget = Arc::clone(&task_concurrency_budget);
-        let ffmpeg_registry = Arc::clone(&task_ffmpeg_registry);
         thread::spawn(move || {
             run_confirmed_sync_task(
                 controller,
@@ -3186,8 +2165,6 @@ fn start_confirmed_sync(
                 history_path,
                 history_write_lock,
                 job,
-                concurrency_budget,
-                ffmpeg_registry,
             )
         });
     }
@@ -3212,34 +2189,15 @@ fn apply_track_analysis_results(
         return Err(String::from("增强分析缺少批次 ID"));
     }
 
-    // Analysis writeback is a separate operation from conversion, but it
-    // must use the same read-only database snapshot for every candidate in
-    // this batch.  Resolve it once before entering the per-track loop.
-    let metadata_context = conversion_metadata_context(state.inner());
-
-    let track_analysis_lookup = analyses
+    let analysis_lookup = analyses
         .iter()
-        .map(|analysis| (analysis.path.clone(), analysis))
+        .map(|analysis| (analysis.path.clone(), embedded_analysis_from_track(analysis)))
         .collect::<HashMap<_, _>>();
     let failure_lookup = analysis_failures
         .iter()
-        .map(|failure| (failure.path.clone(), failure))
+        .map(|failure| (failure.path.clone(), failure.message.clone()))
         .collect::<HashMap<_, _>>();
     let mut reports = Vec::new();
-    let w4dj_path = state
-        .library
-        .catalog_path
-        .lock()
-        .expect("library catalog path lock poisoned")
-        .clone();
-    let mut w4dj_library = match W4djLibrary::open(&w4dj_path) {
-        Ok(library) => Some(library),
-        Err(error) => {
-            eprintln!("W4DJ analysis library unavailable: {error}");
-            None
-        }
-    };
-    let mut w4dj_projection_count = 0usize;
 
     for slot_preview in &previews {
         for candidate in &slot_preview.preview.candidates {
@@ -3253,57 +2211,25 @@ fn apply_track_analysis_results(
                 drop_loudness_lufs: None,
                 model_status: None,
                 model_details: None,
-                stage: None,
-                elapsed_ms: None,
-                basic_status: None,
-                basic_danceability: None,
-                discogs_danceability_status: None,
-                discogs_danceability: None,
-                discogs_completed_heads: None,
-                discogs_total_heads: None,
-                cached: None,
             };
 
-            let Some(analysis) = track_analysis_lookup.get(&candidate.source_path) else {
+            if let Some(message) = failure_lookup.get(&candidate.source_path) {
                 let mut report = base_report();
-                if let Some(failure) = failure_lookup.get(&candidate.source_path) {
-                    report.status = failure
-                        .status
-                        .clone()
-                        .unwrap_or_else(|| String::from("failed"));
-                    report.message = Some(failure.message.clone());
-                    report.stage = failure.stage.clone();
-                    report.elapsed_ms = failure.elapsed_ms;
-                } else {
-                    report.status = String::from("failed");
-                    report.stage = Some(String::from("pending"));
-                    report.message = Some(String::from("未收到该歌曲的 Essentia 分析结果"));
-                }
-                if let Some(library) = w4dj_library.as_mut() {
-                    let _ = library.mark_analysis_failed_for_destination(
-                        destination_path,
-                        report.message.as_deref().unwrap_or("未收到分析结果"),
-                    );
-                }
+                report.status = String::from("failed");
+                report.message = Some(message.clone());
+                reports.push(report);
+                continue;
+            }
+
+            let Some(analysis) = analysis_lookup.get(&candidate.source_path) else {
+                let mut report = base_report();
+                report.status = String::from("failed");
+                report.message = Some(String::from("未收到该歌曲的 Essentia 分析结果"));
                 reports.push(report);
                 continue;
             };
 
             let mut report = base_report();
-            let complete = is_complete_analysis(analysis);
-            report.status = if complete {
-                String::from("completed")
-            } else {
-                String::from("failed")
-            };
-            report.basic_status = Some(if is_basic_analysis_complete(analysis) {
-                String::from("completed")
-            } else {
-                String::from("failed")
-            });
-            report.basic_danceability = analysis
-                .danceability
-                .filter(|value| value.is_finite());
             report.drop_status = analysis
                 .drop_analysis
                 .as_ref()
@@ -3317,39 +2243,6 @@ fn apply_track_analysis_results(
                 .high_level
                 .as_ref()
                 .and_then(|value| serde_json::to_string(value).ok());
-            if let Some(discogs) = analysis
-                .high_level
-                .as_ref()
-                .and_then(|value| value.discogs_effnet.as_ref())
-            {
-                report.discogs_total_heads = Some(REQUIRED_DISCOGS_HEAD_IDS.len());
-                report.discogs_completed_heads = Some(
-                    REQUIRED_DISCOGS_HEAD_IDS
-                        .iter()
-                        .filter(|id| {
-                            discogs
-                                .heads
-                                .get(**id)
-                                .is_some_and(|head| head.status == "completed")
-                        })
-                        .count(),
-                );
-                if let Some(head) = discogs.heads.get("danceability") {
-                    report.discogs_danceability_status = Some(head.status.clone());
-                    report.discogs_danceability = head
-                        .selected_confidence
-                        .filter(|value| value.is_finite());
-                }
-            }
-            if let Some(failure) = failure_lookup.get(&candidate.source_path) {
-                report.status = failure
-                    .status
-                    .clone()
-                    .unwrap_or_else(|| String::from("failed"));
-                report.message = Some(failure.message.clone());
-                report.stage = failure.stage.clone();
-                report.elapsed_ms = failure.elapsed_ms;
-            }
 
             if !destination_path.is_file() {
                 report.status = String::from("failed");
@@ -3358,52 +2251,15 @@ fn apply_track_analysis_results(
                 continue;
             }
 
-            let embedded_analysis = embedded_analysis_from_track(analysis);
-            let result = update_analysis_metadata_transactionally(
+            let result = update_existing_metadata_transactionally(
+                Path::new(&candidate.source_path),
                 destination_path,
-                |temporary_output| {
-                    apply_track_analysis_metadata_with_context(
-                        temporary_output,
-                        &embedded_analysis,
-                        metadata_context.as_ref(),
-                    )
-                },
+                slot_preview.netease_filename_format,
+                |temporary_output| apply_track_analysis_metadata(temporary_output, analysis),
             );
             if let Err(error) = result {
                 report.status = String::from("failed");
                 report.message = Some(format!("分析元数据回写失败：{error}"));
-                if let Some(library) = w4dj_library.as_mut() {
-                    let _ = library.mark_analysis_failed_for_destination(
-                        destination_path,
-                        report.message.as_deref().unwrap_or("分析元数据回写失败"),
-                    );
-                }
-            } else if let Err(error) = validate_track_analysis_metadata(destination_path, &embedded_analysis) {
-                report.status = String::from("failed");
-                report.message = Some(format!("分析元数据回读校验失败：{error}"));
-                if let Some(library) = w4dj_library.as_mut() {
-                    let _ = library.mark_analysis_failed_for_destination(
-                        destination_path,
-                        report.message.as_deref().unwrap_or("分析元数据回读校验失败"),
-                    );
-                }
-            } else if let Some(library) = w4dj_library.as_mut() {
-                match library.apply_analysis_for_destination(destination_path, analysis) {
-                    Ok(true) => {
-                        w4dj_projection_count += 1;
-                    }
-                    Ok(false) => {
-                        report.status = String::from("failed");
-                        report.message = Some(String::from("W4DJ 分析库未找到对应输出记录"));
-                    }
-                    Err(error) => {
-                        report.status = String::from("failed");
-                        report.message = Some(format!("写入 W4DJ 分析库失败：{error}"));
-                    }
-                }
-            } else {
-                report.status = String::from("failed");
-                report.message = Some(String::from("W4DJ 分析库不可用，未完成最终投影"));
             }
             reports.push(report);
         }
@@ -3421,19 +2277,35 @@ fn apply_track_analysis_results(
     append_analysis_reports(&history_path, &batch_id, reports.clone())
         .map_err(|error| format!("保存增强分析报告失败：{error}"))?;
 
-    let monitor = runtime_monitor_for_batch(&state, &batch_id);
+    let monitor = if DEBUG_TEST_MONITOR_ENABLED {
+        state
+            .test_monitors
+            .lock()
+            .expect("test monitor map lock poisoned")
+            .get(&batch_id)
+            .cloned()
+    } else {
+        None
+    };
     if let Some(monitor) = monitor {
-        monitor.record_event(
-            "analysis_persisted",
-            serde_json::json!({
-                "report_count": reports.len(),
-                "completed_count": reports.iter().filter(|report| report.status == "completed").count(),
-                "failed_count": reports.iter().filter(|report| report.status == "failed").count(),
-                "metadata_writeback_count": reports.iter().filter(|report| report.status == "completed").count(),
-                "w4dj_library_projection_count": w4dj_projection_count,
-            }),
-        );
         monitor.record_analysis_reports(&reports);
+        state
+            .test_monitors
+            .lock()
+            .expect("test monitor map lock poisoned")
+            .remove(&batch_id);
+    }
+
+    if !reports.is_empty()
+        && let Ok(entries) = load_history_file(&history_path)
+    {
+        for entry in entries.iter().filter(|entry| entry.batch_id == batch_id) {
+                if let Some(report_path) = entry.report_path.as_deref()
+                    && let Err(error) = fs::write(report_path, format_error_report(entry))
+                {
+                    eprintln!("Failed to update enhanced analysis report: {error}");
+                }
+            }
     }
 
     Ok(state
@@ -3445,7 +2317,7 @@ fn apply_track_analysis_results(
 }
 
 #[tauri::command]
-fn load_history(state: tauri::State<'_, AppState>) -> Result<Vec<HistoryEntryView>, String> {
+fn load_history(state: tauri::State<'_, AppState>) -> Result<Vec<HistoryEntry>, String> {
     let history_path = state
         .history_path
         .lock()
@@ -3455,86 +2327,7 @@ fn load_history(state: tauri::State<'_, AppState>) -> Result<Vec<HistoryEntryVie
         .history_write_lock
         .lock()
         .expect("history write lock poisoned");
-    let entries = load_history_file(history_path).map_err(|error| format!("读取转换历史失败：{error}"))?;
-    let monitor_root = state
-        .test_monitor_path
-        .lock()
-        .expect("runtime session path lock poisoned")
-        .clone();
-    Ok(entries
-        .into_iter()
-        .map(|entry| {
-            let session_dir = resolve_runtime_session_dir(&monitor_root, &entry);
-            let analysis = runtime_session_analysis_summary(session_dir.as_deref());
-            HistoryEntryView { entry, analysis }
-        })
-        .collect())
-}
-
-#[tauri::command]
-fn load_incomplete_analysis_run(
-    state: tauri::State<'_, AppState>,
-) -> Result<Option<IncompleteAnalysisRun>, String> {
-    let root = state
-        .test_monitor_path
-        .lock()
-        .expect("runtime session path lock poisoned")
-        .clone();
-    let Ok(mut candidates) = fs::read_dir(&root) else {
-        return Ok(None);
-    };
-    let mut best: Option<(SystemTime, IncompleteAnalysisRun)> = None;
-    while let Some(Ok(entry)) = candidates.next() {
-        let session_dir = entry.path();
-        if !session_dir.is_dir() {
-            continue;
-        }
-        let Some(state_value) = fs::read_to_string(session_dir.join("analysis-state.json"))
-            .ok()
-            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        else {
-            continue;
-        };
-        let status = state_value
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("notRequested");
-        if !matches!(status, "pending" | "running" | "partial" | "error" | "interrupted") {
-            continue;
-        }
-        let Some(batch_id) = state_value
-            .get("batchId")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                fs::read_to_string(session_dir.join("session.json"))
-                    .ok()
-                    .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-                    .and_then(|session| session.get("batch_id").and_then(serde_json::Value::as_str).map(str::to_owned))
-            })
-        else {
-            continue;
-        };
-        let Some(previews) = fs::read_to_string(session_dir.join("candidates.json"))
-            .ok()
-            .and_then(|contents| serde_json::from_str::<Vec<SlotPreview>>(&contents).ok())
-        else {
-            continue;
-        };
-        let analysis = runtime_session_analysis_summary(Some(&session_dir)).unwrap_or_default();
-        let modified = fs::metadata(session_dir.join("analysis-state.json"))
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(UNIX_EPOCH);
-        let run = IncompleteAnalysisRun { batch_id, previews, analysis };
-        if best
-            .as_ref()
-            .map(|(current, _)| modified > *current)
-            .unwrap_or(true)
-        {
-            best = Some((modified, run));
-        }
-    }
-    Ok(best.map(|(_, run)| run))
+    load_history_file(history_path).map_err(|error| format!("读取转换历史失败：{error}"))
 }
 
 #[tauri::command]
@@ -3648,7 +2441,8 @@ fn check_for_updates() -> Result<UpdateCheckResult, String> {
 
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
-    if !external_url_is_allowed(&url) {
+    const PROJECT_URL: &str = "https://github.com/komakizhu/W4DJ-RKB";
+    if url != PROJECT_URL && !url.starts_with("https://github.com/komakizhu/W4DJ-RKB/releases/") {
         return Err("不允许打开此外部地址".to_string());
     }
 
@@ -3672,1145 +2466,83 @@ fn open_external_url(url: String) -> Result<(), String> {
         })
 }
 
-fn external_url_is_allowed(url: &str) -> bool {
-    const PROJECT_URL: &str = "https://github.com/komakizhu/W4DJ-RKB";
-    url == PROJECT_URL
-        || url.starts_with("https://github.com/komakizhu/W4DJ-RKB/releases/")
-        || url == ESSENTIA_MODELS_URL
-}
-
 fn library_catalog_path(state: &tauri::State<'_, AppState>) -> PathBuf {
     state
-        .library
-        .catalog_path
+        .library_catalog_path
         .lock()
         .expect("library catalog path lock poisoned")
         .clone()
-}
-
-/// The old catalog remains a metadata staging area for the compatibility
-/// NetEase refresh commands.  It must never share the output-owned W4DJ
-/// database used by Dashboard queries.
-fn legacy_library_catalog_path(state: &tauri::State<'_, AppState>) -> PathBuf {
-    library_catalog_path(state).with_file_name("library-dashboard.sqlite3")
-}
-
-fn validated_w4dj_import_path(path: &str) -> Result<PathBuf, String> {
-    let input = PathBuf::from(path);
-    if !input.is_absolute() {
-        return Err("DJ 歌单路径必须是绝对路径".to_string());
-    }
-    if input
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("w4dj"))
-    {
-        return Err("请选择 .w4dj 歌单文件".to_string());
-    }
-    let metadata = fs::symlink_metadata(&input).map_err(|error| format!("无法读取 DJ 歌单：{error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("DJ 歌单必须是普通文件，不能是目录或符号链接".to_string());
-    }
-    fs::canonicalize(&input).map_err(|error| format!("无法定位 DJ 歌单：{error}"))
-}
-
-#[tauri::command]
-fn import_w4dj_playlist(path: String, state: tauri::State<'_, AppState>) -> Result<ImportedDjPlaylist, String> {
-    let canonical = validated_w4dj_import_path(&path)?;
-    let metadata = fs::metadata(&canonical).map_err(|error| format!("无法读取 DJ 歌单：{error}"))?;
-    if metadata.len() > w4dj::dj_playlist::W4DJ_PLAYLIST_MAX_BYTES as u64 {
-        return Err(format!("DJ 歌单文件超过 {} MiB 上限", w4dj::dj_playlist::W4DJ_PLAYLIST_MAX_BYTES / (1024 * 1024)));
-    }
-    let bytes = fs::read(&canonical).map_err(|error| format!("无法读取 DJ 歌单：{error}"))?;
-    let playlist = parse_w4dj_playlist(&bytes, Some(&canonical)).map_err(|error| error.to_string())?;
-    let path = library_catalog_path(&state);
-    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
-    library
-        .upsert_imported_dj_playlist(&playlist)
-        .map_err(|error| error.to_string())?;
-    library
-        .get_imported_dj_playlist(&playlist.playlist_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "导入后的 DJ 歌单无法重新读取".to_string())
-}
-
-#[tauri::command]
-fn list_imported_dj_playlists(state: tauri::State<'_, AppState>) -> Result<Vec<ImportedDjPlaylistSummary>, String> {
-    let path = library_catalog_path(&state);
-    W4djLibrary::open(&path)
-        .and_then(|library| library.list_imported_dj_playlists())
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn load_imported_dj_playlist(
-    playlist_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<ImportedDjPlaylist, String> {
-    if playlist_id.trim().is_empty() {
-        return Err("DJ 歌单 ID 不能为空".to_string());
-    }
-    let path = library_catalog_path(&state);
-    W4djLibrary::open(&path)
-        .and_then(|library| library.get_imported_dj_playlist(&playlist_id))
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "找不到指定的 DJ 歌单".to_string())
-}
-
-#[tauri::command]
-fn export_imported_dj_playlist_w4dj(
-    playlist_id: String,
-    path: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    if playlist_id.trim().is_empty() {
-        return Err("DJ 歌单 ID 不能为空".to_string());
-    }
-    let output = PathBuf::from(path);
-    if !output.is_absolute() {
-        return Err("W4DJ 导出路径必须是绝对路径".to_string());
-    }
-    if output
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("w4dj"))
-    {
-        return Err("W4DJ 导出路径必须使用 .w4dj 扩展名".to_string());
-    }
-    if output.parent().is_none_or(|parent| !parent.is_dir()) {
-        return Err("W4DJ 导出目录不存在".to_string());
-    }
-    let library_path = library_catalog_path(&state);
-    let library = W4djLibrary::open(&library_path).map_err(|error| error.to_string())?;
-    let playlist = library
-        .get_imported_dj_playlist(&playlist_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "找不到指定的 DJ 歌单".to_string())?;
-    let bytes = serialize_w4dj_playlist(&playlist).map_err(|error| error.to_string())?;
-    fs::write(&output, bytes).map_err(|error| format!("写入 W4DJ 歌单失败：{error}"))
-}
-
-#[tauri::command]
-fn export_netease_playlist_text(path: String, text: String) -> Result<(), String> {
-    let output = PathBuf::from(path);
-    if !output.is_absolute() {
-        return Err("TXT 导出路径必须是绝对路径".to_string());
-    }
-    if output.extension().and_then(|extension| extension.to_str()).is_none_or(|extension| !extension.eq_ignore_ascii_case("txt")) {
-        return Err("TXT 导出路径必须使用 .txt 扩展名".to_string());
-    }
-    if let Some(parent) = output.parent()
-        && !parent.is_dir()
-    {
-        return Err("TXT 导出目录不存在".to_string());
-    }
-    fs::write(&output, text.as_bytes()).map_err(|error| format!("写入 TXT 失败：{error}"))
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DjPlaylistM3u8ExportResult {
-    path: String,
-    matched_count: usize,
-    total: usize,
-    omitted: Vec<w4dj::m3u8::M3u8OmittedTrack>,
-}
-
-#[tauri::command]
-fn match_imported_dj_playlist(
-    playlist_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<DjPlaylistMatchReport, String> {
-    if playlist_id.trim().is_empty() {
-        return Err("DJ 歌单 ID 不能为空".to_string());
-    }
-    let path = library_catalog_path(&state);
-    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
-    let report = library
-        .compute_imported_dj_playlist_matches(&playlist_id)
-        .map_err(|error| error.to_string())?;
-    library
-        .replace_imported_dj_playlist_matches(&playlist_id, &report)
-        .map_err(|error| error.to_string())?;
-    library
-        .get_imported_dj_playlist_match_report(&playlist_id)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn load_imported_dj_playlist_matches(
-    playlist_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<DjPlaylistMatchReport, String> {
-    if playlist_id.trim().is_empty() {
-        return Err("DJ 歌单 ID 不能为空".to_string());
-    }
-    let path = library_catalog_path(&state);
-    W4djLibrary::open(&path)
-        .and_then(|library| library.get_imported_dj_playlist_match_report(&playlist_id))
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn set_imported_dj_playlist_match(
-    playlist_id: String,
-    position: u64,
-    track_key: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<DjPlaylistMatchReport, String> {
-    if playlist_id.trim().is_empty() || track_key.trim().is_empty() {
-        return Err("DJ 歌单 ID 和输出 trackKey 不能为空".to_string());
-    }
-    let path = library_catalog_path(&state);
-    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
-    library
-        .set_imported_dj_playlist_match(&playlist_id, position, &track_key)
-        .map_err(|error| error.to_string())?;
-    library
-        .get_imported_dj_playlist_match_report(&playlist_id)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn clear_imported_dj_playlist_match(
-    playlist_id: String,
-    position: u64,
-    state: tauri::State<'_, AppState>,
-) -> Result<DjPlaylistMatchReport, String> {
-    if playlist_id.trim().is_empty() {
-        return Err("DJ 歌单 ID 不能为空".to_string());
-    }
-    let path = library_catalog_path(&state);
-    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
-    library
-        .clear_imported_dj_playlist_match(&playlist_id, position)
-        .map_err(|error| error.to_string())?;
-    library
-        .get_imported_dj_playlist_match_report(&playlist_id)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn export_imported_dj_playlist_m3u8(
-    playlist_id: String,
-    path: String,
-    allow_partial: bool,
-    state: tauri::State<'_, AppState>,
-) -> Result<DjPlaylistM3u8ExportResult, String> {
-    if playlist_id.trim().is_empty() {
-        return Err("DJ 歌单 ID 不能为空".to_string());
-    }
-    let output = PathBuf::from(path);
-    if !output.is_absolute() {
-        return Err("M3U8 导出路径必须是绝对路径".to_string());
-    }
-    if output
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("m3u8"))
-    {
-        return Err("M3U8 导出路径必须使用 .m3u8 扩展名".to_string());
-    }
-    let library_path = library_catalog_path(&state);
-    let library = W4djLibrary::open(&library_path).map_err(|error| error.to_string())?;
-    let playlist = library
-        .get_imported_dj_playlist(&playlist_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "找不到指定的 DJ 歌单".to_string())?;
-    let report = library
-        .get_imported_dj_playlist_match_report(&playlist_id)
-        .map_err(|error| error.to_string())?;
-    let candidates = library
-        .available_dj_output_candidates()
-        .map_err(|error| error.to_string())?;
-    let resolved = report
-        .matches
-        .iter()
-        .filter_map(|row| {
-            let track_key = row.track_key.as_deref()?;
-            let candidate = candidates.iter().find(|candidate| candidate.track_key == track_key)?;
-            Some(ResolvedDjPlaylistTrack {
-                position: row.position,
-                title: row.title.clone(),
-                artist_display: row.artist_display.clone(),
-                duration_seconds: candidate.duration_seconds,
-                destination_path: candidate.destination_path.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let (contents, summary): (String, M3u8ExportSummary) =
-        build_relative_m3u8_with_summary(&playlist, &resolved, &output, allow_partial)
-            .map_err(|error| error.to_string())?;
-    write_relative_m3u8_atomic(&output, &contents).map_err(|error| error.to_string())?;
-    Ok(DjPlaylistM3u8ExportResult {
-        path: output.to_string_lossy().into_owned(),
-        matched_count: summary.matched_count,
-        total: summary.total,
-        omitted: summary.omitted,
-    })
 }
 
 fn open_library_catalog(path: &Path) -> Result<(LibraryCatalog, Option<PathBuf>), String> {
     LibraryCatalog::open_or_recover(path).map_err(|error| error.to_string())
 }
 
-fn open_w4dj_library(path: &Path) -> Result<(W4djLibrary, Option<PathBuf>), String> {
-    let (mut library, backup) = W4djLibrary::open_or_recover(path).map_err(|error| error.to_string())?;
-    library
-        .remove_internal_temp_records()
-        .map_err(|error| error.to_string())?;
-    Ok((library, backup))
-}
-
-fn manual_netease_database_path(state: &AppState) -> Option<PathBuf> {
-    state
-        .library
-        .manual_database_path
-        .lock()
-        .expect("manual database path lock poisoned")
-        .clone()
-}
-
-fn netease_metadata_cache_path(state: &AppState) -> PathBuf {
-    state
-        .library
-        .catalog_path
-        .lock()
-        .expect("library catalog path lock poisoned")
-        .with_file_name("library-dashboard.sqlite3")
-}
-
-fn emit_netease_metadata_cache_progress(
-    app: &tauri::AppHandle,
-    progress: &NeteaseMetadataCacheProgress,
-) {
-    let _ = app.emit("netease-metadata-cache-progress", progress.clone());
-}
-
-fn metadata_cache_snapshot(state: &AppState) -> NeteaseMetadataCacheProgress {
-    state
-        .library
-        .metadata_cache
-        .lock()
-        .expect("metadata cache progress lock poisoned")
-        .clone()
-}
-
-fn update_metadata_cache_progress<F>(state: &LibraryState, update: F) -> NeteaseMetadataCacheProgress
-where
-    F: FnOnce(&mut NeteaseMetadataCacheProgress),
-{
-    let mut progress = state
-        .metadata_cache
-        .lock()
-        .expect("metadata cache progress lock poisoned");
-    update(&mut progress);
-    progress.clone()
-}
-
-fn build_metadata_cache_blocking(
-    library: &LibraryState,
-    cache_path: &Path,
-    database_path: &Path,
-) -> Result<usize, String> {
-    let _build_guard = library
-        .metadata_cache_build_lock
-        .lock()
-        .map_err(|_| "metadata cache build lock poisoned".to_string())?;
-    let fingerprint = database_fingerprint_view(database_path);
-    netease_cache::mark_state(cache_path, CacheState::Building, None)
-        .map_err(|error| format!("初始化网易云轻量索引失败：{error}"))?;
-    let locators = load_locators_from_db_observed(database_path, |table, processed, total| {
-        if library.metadata_cache_cancel.load(Ordering::SeqCst) {
-            return false;
-        }
-        let _ = update_metadata_cache_progress(library, |progress| {
-            progress.status = CacheState::Building.as_str().to_string();
-            progress.stage = "readingLocators".to_string();
-            progress.processed = processed;
-            progress.total = Some(total);
-            progress.current_item = table.to_string();
-            progress.message = "正在建立网易云轻量索引".to_string();
-        });
-        true
-    })
-    .map_err(|error| format!("读取网易云轻量索引失败：{error}"))?;
-    if library.metadata_cache_cancel.load(Ordering::SeqCst) {
-        let _ = netease_cache::mark_state(cache_path, CacheState::Cancelled, None);
-        return Err("cancelled".to_string());
-    }
-    let after = database_fingerprint_view(database_path);
-    if after != fingerprint {
-        let _ = netease_cache::mark_state(cache_path, CacheState::Stale, Some("源数据库在建立索引期间发生变化"));
-        return Err("网易云数据库在建立索引期间发生变化，请重试".to_string());
-    }
-    netease_cache::replace_locators(cache_path, database_path, &fingerprint, &locators)
-        .map_err(|error| format!("提交网易云轻量索引失败：{error}"))?;
-    Ok(locators.len())
-}
-
-fn ensure_metadata_cache_ready(state: &AppState) -> Result<(), String> {
-    let Some(database_path) = locate_supported_database(manual_netease_database_path(state).as_deref()) else {
-        return Ok(());
-    };
-    let cache_path = netease_metadata_cache_path(state);
-    let fingerprint = database_fingerprint_view(&database_path);
-    let summary = netease_cache::read_summary(&cache_path, Some(&database_path), Some(&fingerprint))
-        .map_err(|error| format!("读取网易云轻量索引状态失败：{error}"))?;
-    if summary.state == CacheState::Ready {
-        return Ok(());
-    }
-    let count = build_metadata_cache_blocking(&state.library, &cache_path, &database_path)?;
-    let _ = update_metadata_cache_progress(&state.library, |progress| {
-        progress.status = CacheState::Ready.as_str().to_string();
-        progress.stage = "completed".to_string();
-        progress.processed = count;
-        progress.total = Some(count);
-        progress.current_item.clear();
-        progress.message = "网易云轻量索引已就绪".to_string();
-        progress.database_path = Some(database_path.to_string_lossy().into_owned());
-        progress.cached_record_count = count;
-        progress.error = None;
-    });
-    Ok(())
-}
-
-fn resolve_netease_metadata_database_status(
-    manual_path: Option<&Path>,
-    cache_path: &Path,
-) -> Result<(NeteaseMetadataDatabaseStatus, NeteaseMetadataResolver), String> {
-    let mut warning = None;
-    if let Some(manual) = manual_path
-        && (!manual.is_file()
-            || !w4dj::netease::probe_netease_database(manual)
-                .map(|summary| summary.supported)
-                .unwrap_or(false))
-    {
-        warning = Some(format!(
-            "保存的网易云数据库不可用或 schema 不受支持：{}，已尝试自动定位",
-            manual.display()
-        ));
-    }
-    let effective_path = locate_supported_database(manual_path);
-    let cache_summary = if let Some(path) = effective_path.as_deref() {
-        let fingerprint = database_fingerprint_view(path);
-        netease_cache::read_summary(cache_path, Some(path), Some(&fingerprint))
-            .map_err(|error| format!("网易云轻量索引状态读取失败：{error}"))?
-    } else {
-        netease_cache::CacheSummary::default()
-    };
-    let (resolver, cache_status, cached_record_count, database_changed) =
-        if let Some(path) = effective_path.as_deref()
-            && cache_summary.state == CacheState::Ready
-        {
-            let locators = netease_cache::read_locators(cache_path)
-                .map_err(|error| format!("网易云轻量索引读取失败：{error}"))?;
-            (
-                NeteaseMetadataResolver::from_locators(path, locators, warning.clone()),
-                Some(CacheState::Ready.as_str().to_string()),
-                Some(cache_summary.record_count),
-                Some(false),
-            )
-        } else {
-            (
-                NeteaseMetadataResolver::default(),
-                Some(cache_summary.state.as_str().to_string()),
-                Some(cache_summary.record_count),
-                Some(cache_summary.state == CacheState::Stale),
-            )
-        };
-    let source = if manual_path.is_some()
-        && effective_path.as_deref() == manual_path
-    {
-        NeteaseMetadataDatabaseSource::Manual
-    } else if effective_path.is_some() {
-        NeteaseMetadataDatabaseSource::Automatic
-    } else {
-        NeteaseMetadataDatabaseSource::Unavailable
-    };
-    let status = NeteaseMetadataDatabaseStatus {
-        manual_path: manual_path.map(|path| path.display().to_string()),
-        effective_path: effective_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        source,
-        loaded: effective_path.is_some() && cache_summary.state == CacheState::Ready,
-        record_count: if let Some(path) = effective_path.as_deref() {
-            w4dj::netease::probe_netease_database(path)
-                .map(|summary| summary.record_count)
-                .unwrap_or_default()
-        } else {
-            0
-        },
-        warning: warning.or_else(|| {
-            (effective_path.is_some() && cache_summary.state != CacheState::Ready)
-                .then(|| "网易云轻量索引未就绪，转换前会按需准备".to_string())
-        }),
-        cache_status,
-        cached_record_count,
-        database_changed,
-    };
-    Ok((status, resolver))
-}
-
-fn persist_preferences_checked(state: &AppState) -> Result<(), String> {
-    let mut preferences = {
-        let controller = state.controller.lock().map_err(|_| "desktop lock poisoned".to_string())?;
-        controller.state().preferences()
-    };
-    preferences.netease_database_path = state
-        .library
-        .manual_database_path
-        .lock()
-        .map_err(|_| "manual database path lock poisoned".to_string())?
-        .as_ref()
-        .map(|path| path.to_string_lossy().into_owned());
-
-    let preferences_path = state
-        .preferences_path
-        .lock()
-        .map_err(|_| "preferences path lock poisoned".to_string())?
-        .clone();
-    if preferences_path.as_os_str().is_empty() {
-        return Ok(());
-    }
-    save_preferences(&preferences_path, &preferences)
-        .map_err(|error| format!("保存偏好失败：{error}"))
-}
-
-fn set_manual_netease_database_path(
-    state: &AppState,
-    path: Option<PathBuf>,
-) -> Result<(), String> {
-    let previous = {
-        let mut manual = state
-            .library
-            .manual_database_path
-            .lock()
-            .map_err(|_| "manual database path lock poisoned".to_string())?;
-        let previous = manual.clone();
-        *manual = path;
-        previous
-    };
-    if let Err(error) = persist_preferences_checked(state) {
-        *state
-            .library
-            .manual_database_path
-            .lock()
-            .map_err(|_| "manual database path lock poisoned".to_string())? = previous;
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn ensure_netease_database_not_busy(state: &AppState) -> Result<(), String> {
-    if matches!(
-        library_progress_snapshot(state).status,
-        LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling
-    ) {
-        return Err("歌曲库正在更新，暂时不能更换数据库".to_string());
-    }
-    Ok(())
-}
-
-fn conversion_metadata_context(state: &AppState) -> Arc<ConversionMetadataContext> {
-    let preferred = manual_netease_database_path(state);
-    // This is the first conversion/scan boundary, not app startup. Prepare
-    // the small locator snapshot here if the user has not explicitly done so;
-    // complete source rows are still fetched one song at a time by recover().
-    if let Err(error) = ensure_metadata_cache_ready(state)
-        && error != "cancelled"
-    {
-        eprintln!("Netease metadata cache warning: {error}");
-    }
-    let cache_path = netease_metadata_cache_path(state);
-    let (resolver, warning) = NeteaseMetadataResolver::load_lazy_with_warning(
-        preferred.as_deref(),
-        &cache_path,
-    )
-        .unwrap_or_else(|error| {
-            (
-                NeteaseMetadataResolver::default(),
-                Some(format!("网易云数据库加载失败：{error}")),
-            )
-        });
-    if let Some(warning) = warning {
-        eprintln!("Netease metadata resolver warning: {warning}");
-    }
-    Arc::new(ConversionMetadataContext {
-        netease: Arc::new(resolver),
-    })
-}
-
-fn task_one_music_directory(state: &AppState) -> Option<PathBuf> {
-    state
-        .controller
-        .lock()
-        .ok()
-        .and_then(|controller| controller.state().slots.first().cloned())
-        .map(|slot| PathBuf::from(slot.source_directory))
-        .filter(|path| path.is_dir())
-}
-
-fn resolve_netease_library_inputs(
-    manual_path: Option<&Path>,
-    task_one_source: Option<&Path>,
-    for_refresh: bool,
-) -> (NeteaseDiscovery, Option<String>) {
-    let mut warning = None;
-    let mut discovery = manual_path
-        .and_then(|path| match if for_refresh {
-            discover_netease_library_from_database_for_refresh(path)
-        } else {
-            discover_netease_library_from_database(path)
-        } {
-            Ok(discovery) => Some(discovery),
-            Err(error) => {
-                warning = Some(format!("保存的网易云数据库不可用：{error}，已尝试自动定位"));
-                None
-            }
-        })
-        .unwrap_or_else(|| {
-            if for_refresh {
-                discover_netease_library_for_refresh()
-            } else {
-                discover_netease_library()
-            }
-        });
-
-    if task_one_source.is_some() {
-        discovery.music_folder = task_one_source.map(Path::to_path_buf);
-        if !for_refresh {
-            discovery.local_file_count = discovery
-                .music_folder
-                .as_deref()
-                .map(count_audio_files)
-                .unwrap_or_default();
-        }
-    }
-    (discovery, warning)
-}
-
-fn library_progress_snapshot(state: &AppState) -> LibraryRefreshProgress {
-    state
-        .library
-        .refresh
-        .lock()
-        .expect("library refresh lock poisoned")
-        .clone()
-}
-
-fn invalid_scan_is_active(state: &AppState) -> bool {
-    matches!(
-        state
-            .library
-            .invalid_scan
-            .lock()
-            .expect("invalid scan lock poisoned")
-            .status
-            .as_str(),
-        "running" | "cancelling"
-    )
-}
-
-fn update_library_progress(
-    state: &LibraryState,
-    update: impl FnOnce(&mut LibraryRefreshProgress),
-) -> LibraryRefreshProgress {
-    let mut progress = state
-        .refresh
-        .lock()
-        .expect("library refresh lock poisoned");
-    update(&mut progress);
-    progress.clone()
-}
-
-fn emit_library_progress(app: &tauri::AppHandle, progress: &LibraryRefreshProgress) {
-    let _ = app.emit("library-refresh-progress", progress);
-}
-
-fn set_library_stage(
-    app: &tauri::AppHandle,
-    state: &LibraryState,
-    stage: LibraryRefreshStage,
-    message: impl Into<String>,
-) {
-    let progress = update_library_progress(state, |progress| {
-        progress.stage = stage;
-        progress.message = message.into();
-        progress.processed = 0;
-        progress.total = None;
-        progress.current_item.clear();
-    });
-    emit_library_progress(app, &progress);
-}
-
-fn finish_library_refresh(
-    app: &tauri::AppHandle,
-    state: &LibraryState,
-    status: LibraryRefreshStatus,
-    stage: Option<LibraryRefreshStage>,
-    message: impl Into<String>,
-    summary: Option<LibraryRefreshSummary>,
-    error: Option<String>,
-) {
-    let message = message.into();
-    let progress = update_library_progress(state, |progress| {
-        apply_library_refresh_terminal(progress, status, stage, message, summary, error);
-    });
-    emit_library_progress(app, &progress);
-}
-
-fn apply_library_refresh_terminal(
-    progress: &mut LibraryRefreshProgress,
-    status: LibraryRefreshStatus,
-    stage: Option<LibraryRefreshStage>,
-    message: String,
-    summary: Option<LibraryRefreshSummary>,
-    error: Option<String>,
-) {
-    progress.status = status;
-    if let Some(stage) = stage {
-        progress.stage = stage;
-    }
-    progress.message = message;
-    progress.error = error;
-    progress.current_item.clear();
-    if matches!(progress.status, LibraryRefreshStatus::Completed)
-        && let Some(summary) = summary.as_ref()
-    {
-        let track_count = usize::try_from(summary.track_count).unwrap_or(usize::MAX);
-        progress.processed = track_count;
-        progress.total = Some(track_count);
-    }
-    progress.summary = summary;
-    if progress.total.is_none() {
-        progress.total = Some(progress.processed);
-    }
-}
-
-#[derive(Debug)]
-enum LibraryRefreshRunError {
-    Cancelled,
-    Failed(String),
-}
-
-fn run_library_refresh(
-    app: &tauri::AppHandle,
-    state: &LibraryState,
-    catalog_path: &Path,
-    manual_database_path: Option<&Path>,
-    task_one_source: Option<&Path>,
-    analysis_path: &Path,
-) -> Result<LibraryRefreshSummary, LibraryRefreshRunError> {
-    set_library_stage(app, state, LibraryRefreshStage::LocatingDatabase, "正在定位网易云数据库");
-    if state.cancel.load(Ordering::SeqCst) {
-        return Err(LibraryRefreshRunError::Cancelled);
-    }
-
-    let (discovery, warning) =
-        resolve_netease_library_inputs(manual_database_path, task_one_source, true);
-    if let Some(warning) = warning {
-        let progress = update_library_progress(state, |progress| {
-            progress.message = warning;
-        });
-        emit_library_progress(app, &progress);
-    }
-    if state.cancel.load(Ordering::SeqCst) {
-        return Err(LibraryRefreshRunError::Cancelled);
-    }
-    let database_path = discovery
-        .database_path
-        .as_deref()
-        .ok_or_else(|| {
-            LibraryRefreshRunError::Failed(
-                "未找到网易云音乐本地数据库，请手动选择歌曲来源".to_string(),
-            )
-        })?;
-    let music_folder = discovery.music_folder.as_deref();
-
-    let (old_catalog, _) = open_library_catalog(catalog_path)
-        .map_err(LibraryRefreshRunError::Failed)?;
-    let mut last_snapshot_emit = Instant::now() - Duration::from_millis(100);
-    let mut last_snapshot_stage = "";
-    let snapshot = build_catalog_snapshot_incremental_observed(
-        database_path,
-        music_folder,
-        Some(&old_catalog),
-        || state.cancel.load(Ordering::SeqCst),
-        |update| {
-            let stage = match update.stage {
-                "readingRecords" => LibraryRefreshStage::ReadingRecords,
-                "checkingLocalFiles" => LibraryRefreshStage::CheckingLocalFiles,
-                "probingLocalFiles" => LibraryRefreshStage::ProbingLocalFiles,
-                _ => LibraryRefreshStage::ReadingRecords,
-            };
-            let progress = update_library_progress(state, |progress| {
-                progress.stage = stage;
-                progress.processed = update.processed;
-                progress.total = update.total;
-                progress.current_item = update.current_item;
-                progress.message = "正在建立歌曲库快照".to_string();
-            });
-            let should_emit = last_snapshot_stage != update.stage
-                || last_snapshot_emit.elapsed() >= Duration::from_millis(100)
-                || update.total == Some(update.processed);
-            if should_emit {
-                last_snapshot_stage = update.stage;
-                last_snapshot_emit = Instant::now();
-                emit_library_progress(app, &progress);
-            }
-        },
-    )
-    .map_err(|error| match error {
-        CatalogBuildError::Cancelled => LibraryRefreshRunError::Cancelled,
-        CatalogBuildError::Failed(message) => LibraryRefreshRunError::Failed(message),
-    })?;
-
-    if state.cancel.load(Ordering::SeqCst) {
-        return Err(LibraryRefreshRunError::Cancelled);
-    }
-    set_library_stage(app, state, LibraryRefreshStage::ImportingAnalysis, "正在导入已有分析结果");
-    let analysis_entries = load_analysis_file(analysis_path)
-        .map_err(|error| LibraryRefreshRunError::Failed(format!("无法读取分析缓存：{error}")))?;
-    let local_file_count = snapshot.local_files.len();
-    let readable_file_count = snapshot.local_files.iter().filter(|file| file.readable).count();
-    let reused_file_count = snapshot
-        .local_files
-        .iter()
-        .filter(|file| old_catalog.local_file_by_path(Path::new(&file.path)).ok().flatten().is_some())
-        .count();
-
-    set_library_stage(app, state, LibraryRefreshStage::Committing, "正在提交歌曲库更新");
-    let mut catalog = open_library_catalog(catalog_path)
-        .map_err(LibraryRefreshRunError::Failed)?
-        .0;
-    let mut last_commit_emit = Instant::now() - Duration::from_millis(100);
-    catalog
-        .upsert_snapshot_with_analysis(
-            &snapshot,
-            &analysis_entries,
-            || state.cancel.load(Ordering::SeqCst),
-            |processed, total, item| {
-                let progress = update_library_progress(state, |progress| {
-                    progress.stage = LibraryRefreshStage::Committing;
-                    progress.processed = processed;
-                    progress.total = Some(total);
-                    progress.current_item = Path::new(item)
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| item.to_string());
-                });
-                if last_commit_emit.elapsed() >= Duration::from_millis(100) || processed == total {
-                    last_commit_emit = Instant::now();
-                    emit_library_progress(app, &progress);
-                }
-            },
-        )
-        .map_err(|error| {
-            if error.to_string().contains("刷新已取消") {
-                LibraryRefreshRunError::Cancelled
-            } else {
-                LibraryRefreshRunError::Failed(error.to_string())
-            }
-        })?;
-    let track_count = catalog
-        .count_tracks()
-        .map_err(|error| LibraryRefreshRunError::Failed(error.to_string()))?
-        .max(0) as u64;
-    Ok(LibraryRefreshSummary {
-        track_count,
-        local_file_count,
-        readable_file_count,
-        reused_file_count,
-        database_path: database_path.display().to_string(),
-        music_folder: music_folder.map(|path| path.display().to_string()),
-    })
-}
-
 #[tauri::command]
 fn load_library_status(state: tauri::State<'_, AppState>) -> Result<LibraryStatus, String> {
     let path = library_catalog_path(&state);
-    let (catalog, _) = open_w4dj_library(&path)?;
-    let stats = catalog.stats().map_err(|error| error.to_string())?;
-    let manual_path = manual_netease_database_path(&state);
-    let database_warning = manual_path.as_deref().and_then(|path| {
-        (!path.is_file()).then(|| {
-            format!(
-                "保存的网易云数据库不可用：{}；兼容刷新时将尝试自动定位",
-                path.display()
-            )
-        })
-    });
+    let (catalog, _) = open_library_catalog(&path)?;
+    let netease = discover_netease_library();
+    let track_count = catalog
+        .count_tracks()
+        .map_err(|error| error.to_string())?
+        .max(0) as u64;
     Ok(LibraryStatus {
         catalog_path: path.display().to_string(),
-        track_count: stats.total,
-        analyzed_track_count: stats.analysis_completed,
-        // Loading Dashboard state must never probe or open the NetEase DB.
-        netease: NeteaseDiscovery {
-            database_path: None,
-            music_folder: None,
-            record_count: 0,
-            local_file_count: 0,
-        },
-        manual_database_path: manual_path.map(|path| path.display().to_string()),
-        refresh: library_progress_snapshot(&state),
-        database_warning,
-        total_track_count: stats.total,
-        available_track_count: stats.available,
-        invalid_track_count: stats.invalid,
-        not_analyzed_count: stats.not_analyzed,
-        analysis_failed_count: stats.analysis_failed,
-        analysis_completed_count: stats.analysis_completed,
-        invalid_scan: state
-            .library
-            .invalid_scan
-            .lock()
-            .expect("invalid scan lock poisoned")
-            .clone(),
+        track_count,
+        netease,
     })
 }
 
 #[tauri::command]
-fn export_emotion_evaluation_manifest(
-    output_path: String,
-    count: Option<usize>,
-    seed: Option<u64>,
-    state: tauri::State<'_, AppState>,
-) -> Result<EmotionEvaluationManifest, String> {
-    let output_path = output_path.trim();
-    if output_path.is_empty() {
-        return Err("情绪验收 manifest 缺少输出路径".to_string());
-    }
-    let path = library_catalog_path(&state);
-    let library = open_w4dj_library(&path)?.0;
-    let manifest = library
-        .emotion_evaluation_manifest(count.unwrap_or(100), seed.unwrap_or(1))
-        .map_err(|error| error.to_string())?;
-    write_emotion_evaluation_manifest(Path::new(output_path), &manifest)
-        .map_err(|error| error.to_string())?;
-    Ok(manifest)
-}
-
-#[tauri::command]
-fn locate_netease_library(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    force: Option<bool>,
-) -> NeteaseDiscovery {
-    let force = force.unwrap_or(false);
-    let emit = |event: NeteaseDiscoveryProgressEvent| {
-        let _ = app.emit("netease-discovery-progress", event);
-    };
-    emit(NeteaseDiscoveryProgressEvent {
-        status: "running".to_string(),
-        stage: "locatingDatabase".to_string(),
-        processed: 0,
-        total: None,
-        current_item: String::new(),
-        message: "正在查找网易云数据库".to_string(),
-        suggestion: None,
-        error: None,
-    });
-    let manual_path = manual_netease_database_path(&state);
-    let task_one_source = (!force)
-        .then(|| task_one_music_directory(&state))
-        .flatten();
-    let (mut discovery, warning) = if let Some(path) = manual_path.as_deref() {
-        match discover_netease_library_from_database_observed(path, false, |progress| {
-            emit(NeteaseDiscoveryProgressEvent {
-                status: "running".to_string(),
-                stage: progress.stage.to_string(),
-                processed: progress.processed,
-                total: progress.total,
-                current_item: progress.current_item,
-                message: progress.message,
-                suggestion: None,
-                error: None,
-            });
-        }) {
-            Ok(discovery) => (discovery, None),
-            Err(error) => (
-                discover_netease_library_observed(false, |progress| {
-                    emit(NeteaseDiscoveryProgressEvent {
-                        status: "running".to_string(),
-                        stage: progress.stage.to_string(),
-                        processed: progress.processed,
-                        total: progress.total,
-                        current_item: progress.current_item,
-                        message: progress.message,
-                        suggestion: None,
-                        error: None,
-                    });
-                }),
-                Some(format!("保存的网易云数据库不可用：{error}，已尝试自动定位")),
-            ),
-        }
-    } else {
-        (
-            discover_netease_library_observed(false, |progress| {
-                emit(NeteaseDiscoveryProgressEvent {
-                    status: "running".to_string(),
-                    stage: progress.stage.to_string(),
-                    processed: progress.processed,
-                    total: progress.total,
-                    current_item: progress.current_item,
-                    message: progress.message,
-                    suggestion: None,
-                    error: None,
-                });
-            }),
-            None,
-        )
-    };
-    if let Some(task_one_source) = task_one_source.clone() {
-        discovery.music_folder = Some(task_one_source);
-    }
-    let discovery_ok = discovery.database_path.is_some();
-    if !discovery_ok {
-        emit(NeteaseDiscoveryProgressEvent {
-            status: "error".to_string(),
-            stage: "checkingMusicFolder".to_string(),
-            processed: 0,
-            total: None,
-            current_item: String::new(),
-            message: warning.clone().unwrap_or_else(|| {
-                "未找到网易云本地数据库，请选择来源或在歌曲库中手动选择数据库".to_string()
-            }),
-            suggestion: Some(discovery.clone()),
-            error: Some(warning.unwrap_or_else(|| "未找到网易云本地数据库".to_string())),
-        });
-        return discovery;
-    }
-
-    let should_count = discovery.music_folder.as_deref().is_some_and(|folder| {
-        if let Some(current) = task_one_source.as_deref() {
-            w4dj::scan_cache::normalize_path(folder) != w4dj::scan_cache::normalize_path(current)
-        } else {
-            true
-        }
-    });
-
-    if !should_count {
-        emit(NeteaseDiscoveryProgressEvent {
-            status: "completed".to_string(),
-            stage: "checkingMusicFolder".to_string(),
-            processed: 0,
-            total: Some(0),
-            current_item: String::new(),
-            message: warning.unwrap_or_else(|| "网易云库发现完成".to_string()),
-            suggestion: Some(discovery.clone()),
-            error: None,
-        });
-        return discovery;
-    }
-
-    emit(NeteaseDiscoveryProgressEvent {
-        status: "running".to_string(),
-        stage: "checkingMusicFolder".to_string(),
-        processed: 0,
-        total: None,
-        current_item: String::new(),
-        message: "正在检查音乐目录".to_string(),
-        suggestion: Some(discovery.clone()),
-        error: None,
-    });
-    if let Some(folder) = discovery.music_folder.clone() {
-        let app = app.clone();
-        let warning = warning.clone();
-        let suggestion = discovery.clone();
-        thread::spawn(move || {
-            let count = count_audio_files_observed(&folder, |processed, path| {
-                let _ = app.emit(
-                    "netease-discovery-progress",
-                    NeteaseDiscoveryProgressEvent {
-                        status: "running".to_string(),
-                        stage: "checkingMusicFolder".to_string(),
-                        processed,
-                        total: None,
-                        current_item: path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        message: "正在检查音乐目录".to_string(),
-                        suggestion: None,
-                        error: None,
-                    },
-                );
-            });
-            let mut completed = suggestion;
-            completed.local_file_count = count;
-            let _ = app.emit(
-                "netease-discovery-progress",
-                NeteaseDiscoveryProgressEvent {
-                    status: "completed".to_string(),
-                    stage: "checkingMusicFolder".to_string(),
-                    processed: count,
-                    total: Some(count),
-                    current_item: String::new(),
-                    message: warning.unwrap_or_else(|| "网易云库发现完成".to_string()),
-                    suggestion: Some(completed),
-                    error: None,
-                },
-            );
-        });
-    }
-    discovery
-}
-
-fn try_start_library_refresh(
-    state: &LibraryState,
-    refresh_id: String,
-) -> Result<LibraryRefreshProgress, String> {
-    let mut progress = state
-        .refresh
-        .lock()
-        .expect("library refresh lock poisoned");
-    if matches!(
-        progress.status,
-        LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling
-    ) {
-        return Err("歌曲库正在更新".to_string());
-    }
-    state.cancel.store(false, Ordering::SeqCst);
-    *progress = LibraryRefreshProgress {
-        refresh_id,
-        status: LibraryRefreshStatus::Running,
-        stage: LibraryRefreshStage::LocatingDatabase,
-        processed: 0,
-        total: None,
-        current_item: String::new(),
-        message: "正在定位网易云数据库".to_string(),
-        summary: None,
-        error: None,
-    };
-    Ok(progress.clone())
-}
-
-fn request_library_refresh_cancel(state: &LibraryState) -> LibraryRefreshProgress {
-    let mut progress = state
-        .refresh
-        .lock()
-        .expect("library refresh lock poisoned");
-    if matches!(progress.status, LibraryRefreshStatus::Running) {
-        state.cancel.store(true, Ordering::SeqCst);
-        progress.status = LibraryRefreshStatus::Cancelling;
-        progress.message = "正在取消歌曲库更新".to_string();
-    }
-    progress.clone()
+fn locate_netease_library() -> NeteaseDiscovery {
+    discover_netease_library()
 }
 
 #[tauri::command]
 fn refresh_library_catalog(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<LibraryRefreshProgress, String> {
-    if invalid_scan_is_active(&state) {
-        return Err("失效歌曲正在扫描，暂时不能刷新歌曲库".to_string());
-    }
-    let path = legacy_library_catalog_path(&state);
-    let manual_database_path = manual_netease_database_path(&state);
-    let task_one_source = task_one_music_directory(&state);
+) -> Result<LibraryRefreshSummary, String> {
+    let discovery = discover_netease_library();
+    let database_path = discovery
+        .database_path
+        .as_deref()
+        .ok_or_else(|| "未找到网易云音乐本地数据库，请手动选择歌曲来源".to_string())?;
+    let path = library_catalog_path(&state);
+    let (mut catalog, _) = open_library_catalog(&path)?;
+    let previous_files = discovery
+        .music_folder
+        .as_deref()
+        .map(|folder| {
+            let mut files = Vec::new();
+            let _ = collect_analyzable_audio_files(folder, &mut files);
+            files
+                .iter()
+                .filter_map(|file| {
+                    catalog
+                        .local_file_by_path(Path::new(file))
+                        .ok()
+                        .flatten()
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    let snapshot = build_catalog_snapshot_incremental(
+        database_path,
+        discovery.music_folder.as_deref(),
+        Some(&catalog),
+    )
+    .map_err(|error| error.to_string())?;
+    let local_file_count = snapshot.local_files.len();
+    let readable_file_count = snapshot
+        .local_files
+        .iter()
+        .filter(|file| file.readable)
+        .count();
+    catalog
+        .upsert_snapshot(&snapshot)
+        .map_err(|error| error.to_string())?;
+
     let analysis_path = {
         let history_path = state
             .history_path
@@ -4819,283 +2551,26 @@ fn refresh_library_catalog(
             .clone();
         analysis_file_path(&history_path)
     };
-    let refresh_id = format!("library-{}", unique_timestamp());
-    let initial = try_start_library_refresh(&state.library, refresh_id.clone())?;
-    emit_library_progress(&app, &initial);
-    if let Some(worker) = state
-        .library
-        .worker
-        .lock()
-        .expect("library worker lock poisoned")
-        .take()
-    {
-        let _ = worker.join();
+    if let Ok(entries) = load_analysis_file(&analysis_path) {
+        catalog
+            .apply_analysis_entries(&entries)
+            .map_err(|error| error.to_string())?;
     }
-    let library = Arc::clone(&state.library);
-    let worker_app = app.clone();
-    let worker = thread::Builder::new()
-        .name("library-refresh".to_string())
-        .spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_library_refresh(
-                &worker_app,
-                &library,
-                &path,
-                manual_database_path.as_deref(),
-                task_one_source.as_deref(),
-                &analysis_path,
-            )
-        }));
-        match result {
-            Ok(Ok(summary)) => finish_library_refresh(
-                &worker_app,
-                &library,
-                LibraryRefreshStatus::Completed,
-                Some(LibraryRefreshStage::Committing),
-                "歌曲库更新完成",
-                Some(summary),
-                None,
-            ),
-            Ok(Err(LibraryRefreshRunError::Cancelled)) => finish_library_refresh(
-                &worker_app,
-                &library,
-                LibraryRefreshStatus::Cancelled,
-                None,
-                "歌曲库更新已取消",
-                None,
-                None,
-            ),
-            Ok(Err(LibraryRefreshRunError::Failed(error))) => finish_library_refresh(
-                &worker_app,
-                &library,
-                LibraryRefreshStatus::Error,
-                None,
-                "歌曲库更新失败",
-                None,
-                Some(error),
-            ),
-            Err(_) => finish_library_refresh(
-                &worker_app,
-                &library,
-                LibraryRefreshStatus::Error,
-                None,
-                "歌曲库更新失败",
-                None,
-                Some("歌曲库后台任务异常退出".to_string()),
-            ),
-        }
-        })
-        .map_err(|error| {
-            finish_library_refresh(
-                &app,
-                &state.library,
-                LibraryRefreshStatus::Error,
-                None,
-                "歌曲库更新失败",
-                None,
-                Some(format!("无法启动歌曲库后台任务：{error}")),
-            );
-            error.to_string()
-        })?;
-    *state.library.worker.lock().expect("library worker lock poisoned") = Some(worker);
-    Ok(initial)
-}
-
-#[tauri::command]
-fn cancel_library_refresh(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> LibraryRefreshProgress {
-    let snapshot = request_library_refresh_cancel(&state.library);
-    emit_library_progress(&app, &snapshot);
-    snapshot
-}
-
-#[tauri::command]
-fn select_netease_database_fallback(
-    path: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<LibraryStatus, String> {
-    ensure_netease_database_not_busy(state.inner())?;
-    let database_path = PathBuf::from(path.trim());
-    NeteaseMetadataResolver::load_exact(&database_path)
-        .map_err(|error| format!("所选网易云数据库无效：{error}"))?;
-    set_manual_netease_database_path(state.inner(), Some(database_path))?;
-    load_library_status(state)
-}
-
-#[tauri::command]
-fn clear_netease_database_fallback(
-    state: tauri::State<'_, AppState>,
-) -> Result<LibraryStatus, String> {
-    ensure_netease_database_not_busy(state.inner())?;
-    set_manual_netease_database_path(state.inner(), None)?;
-    load_library_status(state)
-}
-
-#[tauri::command]
-fn load_netease_metadata_database_status(
-    state: tauri::State<'_, AppState>,
-) -> Result<NeteaseMetadataDatabaseStatus, String> {
-    let manual_path = manual_netease_database_path(state.inner());
-    let cache_path = netease_metadata_cache_path(state.inner());
-    resolve_netease_metadata_database_status(manual_path.as_deref(), &cache_path)
-        .map(|(status, _)| status)
-}
-
-#[tauri::command]
-fn select_netease_metadata_database(
-    path: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<NeteaseMetadataDatabaseStatus, String> {
-    ensure_netease_database_not_busy(state.inner())?;
-    let database_path = PathBuf::from(path.trim());
-    let supported = database_path.is_file()
-        && w4dj::netease::probe_netease_database(&database_path)
-            .map(|summary| summary.supported)
-            .unwrap_or(false);
-    if !supported {
-        return Err("所选网易云数据库无效：schema 不受支持".to_string());
-    }
-    set_manual_netease_database_path(state.inner(), Some(database_path))?;
-    load_netease_metadata_database_status(state)
-}
-
-#[tauri::command]
-fn clear_netease_metadata_database(
-    state: tauri::State<'_, AppState>,
-) -> Result<NeteaseMetadataDatabaseStatus, String> {
-    ensure_netease_database_not_busy(state.inner())?;
-    set_manual_netease_database_path(state.inner(), None)?;
-    load_netease_metadata_database_status(state)
-}
-
-#[tauri::command]
-fn load_netease_metadata_cache_status(
-    state: tauri::State<'_, AppState>,
-) -> NeteaseMetadataCacheProgress {
-    metadata_cache_snapshot(state.inner())
-}
-
-#[tauri::command]
-fn cancel_netease_metadata_cache(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> NeteaseMetadataCacheProgress {
-    state
-        .library
-        .metadata_cache_cancel
-        .store(true, Ordering::SeqCst);
-    let progress = update_metadata_cache_progress(&state.library, |progress| {
-        if progress.status == CacheState::Building.as_str() {
-            progress.status = CacheState::Cancelling.as_str().to_string();
-            progress.message = "正在取消网易云轻量索引".to_string();
-        }
-    });
-    emit_netease_metadata_cache_progress(&app, &progress);
-    progress
-}
-
-#[tauri::command]
-fn prepare_netease_metadata_cache(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<NeteaseMetadataCacheProgress, String> {
-    {
-        let progress = state
-            .library
-            .metadata_cache
-            .lock()
-            .map_err(|_| "metadata cache progress lock poisoned".to_string())?;
-        if progress.status == CacheState::Building.as_str()
-            || progress.status == CacheState::Cancelling.as_str()
-        {
-            return Ok(progress.clone());
-        }
-    }
-    let database_path = locate_supported_database(manual_netease_database_path(state.inner()).as_deref())
-        .ok_or_else(|| "未找到可用的网易云数据库".to_string())?;
-    let cache_path = netease_metadata_cache_path(state.inner());
-    let fingerprint = database_fingerprint_view(&database_path);
-    let summary = netease_cache::read_summary(&cache_path, Some(&database_path), Some(&fingerprint))
-        .map_err(|error| format!("读取网易云轻量索引状态失败：{error}"))?;
-    if summary.state == CacheState::Ready {
-        let progress = update_metadata_cache_progress(&state.library, |progress| {
-            progress.status = CacheState::Ready.as_str().to_string();
-            progress.stage = "completed".to_string();
-            progress.processed = summary.record_count;
-            progress.total = Some(summary.record_count);
-            progress.database_path = Some(database_path.to_string_lossy().into_owned());
-            progress.cached_record_count = summary.record_count;
-            progress.message = "网易云轻量索引已就绪".to_string();
-            progress.error = None;
-        });
-        emit_netease_metadata_cache_progress(&app, &progress);
-        return Ok(progress);
-    }
-    state
-        .library
-        .metadata_cache_cancel
-        .store(false, Ordering::SeqCst);
-    let initial = update_metadata_cache_progress(&state.library, |progress| {
-        progress.status = CacheState::Building.as_str().to_string();
-        progress.stage = "readingLocators".to_string();
-        progress.processed = 0;
-        progress.total = None;
-        progress.current_item.clear();
-        progress.database_path = Some(database_path.to_string_lossy().into_owned());
-        progress.cached_record_count = summary.record_count;
-        progress.message = "正在建立网易云轻量索引".to_string();
-        progress.error = None;
-    });
-    emit_netease_metadata_cache_progress(&app, &initial);
-    if let Some(worker) = state
-        .library
-        .metadata_cache_worker
-        .lock()
-        .map_err(|_| "metadata cache worker lock poisoned".to_string())?
-        .take()
-    {
-        let _ = worker.join();
-    }
-    let library = Arc::clone(&state.library);
-    let worker_app = app.clone();
-    let worker = thread::Builder::new()
-        .name("netease-metadata-cache".to_string())
-        .spawn(move || {
-            let result = build_metadata_cache_blocking(&library, &cache_path, &database_path);
-            let progress = match result {
-                Ok(count) => update_metadata_cache_progress(&library, |progress| {
-                    progress.status = CacheState::Ready.as_str().to_string();
-                    progress.stage = "completed".to_string();
-                    progress.processed = count;
-                    progress.total = Some(count);
-                    progress.current_item.clear();
-                    progress.cached_record_count = count;
-                    progress.message = "网易云轻量索引已就绪".to_string();
-                    progress.error = None;
-                }),
-                Err(error) if error == "cancelled" => update_metadata_cache_progress(&library, |progress| {
-                    progress.status = CacheState::Cancelled.as_str().to_string();
-                    progress.stage = "cancelled".to_string();
-                    progress.message = "网易云轻量索引已取消".to_string();
-                }),
-                Err(error) => update_metadata_cache_progress(&library, |progress| {
-                    progress.status = CacheState::Error.as_str().to_string();
-                    progress.stage = "error".to_string();
-                    progress.error = Some(error.clone());
-                    progress.message = "网易云轻量索引失败".to_string();
-                }),
-            };
-            emit_netease_metadata_cache_progress(&worker_app, &progress);
-        })
-        .map_err(|error| format!("启动网易云轻量索引失败：{error}"))?;
-    *state
-        .library
-        .metadata_cache_worker
-        .lock()
-        .map_err(|_| "metadata cache worker lock poisoned".to_string())? = Some(worker);
-    Ok(initial)
+    let track_count = catalog
+        .count_tracks()
+        .map_err(|error| error.to_string())?
+        .max(0) as u64;
+    Ok(LibraryRefreshSummary {
+        track_count,
+        local_file_count,
+        readable_file_count,
+        reused_file_count: previous_files,
+        database_path: database_path.display().to_string(),
+        music_folder: discovery
+            .music_folder
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    })
 }
 
 #[tauri::command]
@@ -5104,7 +2579,7 @@ fn query_library_catalog(
     state: tauri::State<'_, AppState>,
 ) -> Result<LibraryPage, String> {
     let path = library_catalog_path(&state);
-    let (catalog, _) = open_w4dj_library(&path)?;
+    let (catalog, _) = open_library_catalog(&path)?;
     catalog.query(&query).map_err(|error| error.to_string())
 }
 
@@ -5114,234 +2589,10 @@ fn get_library_track_detail(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<w4dj::library_catalog::CatalogTrack>, String> {
     let path = library_catalog_path(&state);
-    let (catalog, _) = open_w4dj_library(&path)?;
+    let (catalog, _) = open_library_catalog(&path)?;
     catalog
         .track_detail(&track_key)
         .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn relocate_library_track(
-    track_key: String,
-    path: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    if matches!(
-        library_progress_snapshot(&state).status,
-        LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling
-    ) {
-        return Err("歌曲库正在更新，暂时不能重新定位文件".to_string());
-    }
-    if invalid_scan_is_active(&state) {
-        return Err("失效歌曲正在扫描，暂时不能重新定位文件".to_string());
-    }
-    let catalog_path = library_catalog_path(&state);
-    let replacement_path = Path::new(path.trim());
-    if !is_analyzable_audio_file(replacement_path) {
-        return Err("所选文件不是支持的音频文件".to_string());
-    }
-    let (mut catalog, _) = open_w4dj_library(&catalog_path)?;
-    catalog
-        .relocate_analyzed_track(&track_key, replacement_path)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn remove_library_track(
-    track_key: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
-    if matches!(
-        library_progress_snapshot(&state).status,
-        LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling
-    ) {
-        return Err("歌曲库正在更新，暂时不能移除记录".to_string());
-    }
-    if invalid_scan_is_active(&state) {
-        return Err("失效歌曲正在扫描，暂时不能移除记录".to_string());
-    }
-    let catalog_path = library_catalog_path(&state);
-    let (mut catalog, _) = open_w4dj_library(&catalog_path)?;
-    catalog
-        .remove_analyzed_track(&track_key)
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn clear_invalid_library_tracks(state: tauri::State<'_, AppState>) -> Result<u64, String> {
-    if matches!(
-        library_progress_snapshot(&state).status,
-        LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling
-    ) {
-        return Err("歌曲库正在更新，暂时不能清除失效文件".to_string());
-    }
-    if invalid_scan_is_active(&state) {
-        return Err("失效歌曲正在扫描，暂时不能清除失效文件".to_string());
-    }
-    let catalog_path = library_catalog_path(&state);
-    let (mut catalog, _) = open_w4dj_library(&catalog_path)?;
-    catalog.remove_invalid().map_err(|error| error.to_string())
-}
-
-fn invalid_scan_snapshot(state: &AppState) -> InvalidScanProgress {
-    state
-        .library
-        .invalid_scan
-        .lock()
-        .expect("invalid scan lock poisoned")
-        .clone()
-}
-
-fn update_invalid_scan(
-    state: &LibraryState,
-    update: impl FnOnce(&mut InvalidScanProgress),
-) -> InvalidScanProgress {
-    let mut progress = state
-        .invalid_scan
-        .lock()
-        .expect("invalid scan lock poisoned");
-    update(&mut progress);
-    progress.clone()
-}
-
-fn emit_invalid_scan_progress(app: &tauri::AppHandle, progress: &InvalidScanProgress) {
-    let _ = app.emit("library-invalid-scan-progress", progress);
-}
-
-#[tauri::command]
-fn find_invalid_library_tracks(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<InvalidScanProgress, String> {
-    if matches!(
-        library_progress_snapshot(&state).status,
-        LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling
-    ) {
-        return Err("歌曲库正在更新，暂时不能扫描失效歌曲".to_string());
-    }
-    {
-        let mut progress = state
-            .library
-            .invalid_scan
-            .lock()
-            .expect("invalid scan lock poisoned");
-        if matches!(progress.status.as_str(), "running" | "cancelling") {
-            return Err("失效歌曲正在扫描".to_string());
-        }
-        state.library.invalid_scan_cancel.store(false, Ordering::SeqCst);
-        progress.scan_id = format!("invalid-{}", unique_timestamp());
-        progress.status = "running".to_string();
-        progress.processed = 0;
-        progress.total = 0;
-        progress.current_item.clear();
-        progress.message = "正在检查已登记歌曲".to_string();
-        progress.error = None;
-    }
-    let initial = invalid_scan_snapshot(&state);
-    emit_invalid_scan_progress(&app, &initial);
-    if let Some(worker) = state
-        .library
-        .invalid_scan_worker
-        .lock()
-        .expect("invalid scan worker lock poisoned")
-        .take()
-    {
-        let _ = worker.join();
-    }
-    let library = Arc::clone(&state.library);
-    let path = library_catalog_path(&state);
-    let worker_app = app.clone();
-    let worker = thread::Builder::new()
-        .name("library-invalid-scan".to_string())
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let (mut database, _) = open_w4dj_library(&path)
-                    .map_err(|error| error.to_string())?;
-                let mut last_emit = Instant::now() - Duration::from_millis(100);
-                database
-                    .scan_invalid(
-                        || library.invalid_scan_cancel.load(Ordering::SeqCst),
-                        |processed, total, current_item| {
-                            let progress = update_invalid_scan(&library, |value| {
-                                value.processed = processed;
-                                value.total = total;
-                                value.current_item = current_item.to_string();
-                                value.message = "正在检查已登记歌曲".to_string();
-                            });
-                            if last_emit.elapsed() >= Duration::from_millis(100)
-                                || processed == total
-                            {
-                                last_emit = Instant::now();
-                                emit_invalid_scan_progress(&worker_app, &progress);
-                            }
-                        },
-                    )
-                    .map_err(|error| error.to_string())
-            }));
-            let (status, message, error) = match result {
-                Ok(Ok(stats)) => (
-                    "completed",
-                    format!(
-                        "失效歌曲扫描完成：{} 首可用，{} 首失效",
-                        stats.available, stats.invalid
-                    ),
-                    None,
-                ),
-                Ok(Err(error)) if error.contains("已取消") => {
-                    ("cancelled", "失效歌曲扫描已取消".to_string(), None)
-                }
-                Ok(Err(error)) => ("error", "失效歌曲扫描失败".to_string(), Some(error)),
-                Err(_) => (
-                    "error",
-                    "失效歌曲扫描失败".to_string(),
-                    Some("后台扫描任务异常退出".to_string()),
-                ),
-            };
-            let progress = update_invalid_scan(&library, |value| {
-                value.status = status.to_string();
-                value.message = message;
-                value.error = error;
-                value.current_item.clear();
-                if value.total == 0 {
-                    value.total = value.processed;
-                }
-            });
-            emit_invalid_scan_progress(&worker_app, &progress);
-        })
-        .map_err(|error| {
-            let progress = update_invalid_scan(&state.library, |value| {
-                value.status = "error".to_string();
-                value.message = "失效歌曲扫描无法启动".to_string();
-                value.error = Some(error.to_string());
-            });
-            emit_invalid_scan_progress(&app, &progress);
-            error.to_string()
-        })?;
-    *state
-        .library
-        .invalid_scan_worker
-        .lock()
-        .expect("invalid scan worker lock poisoned") = Some(worker);
-    Ok(initial)
-}
-
-#[tauri::command]
-fn cancel_invalid_library_scan(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> InvalidScanProgress {
-    let progress = update_invalid_scan(&state.library, |value| {
-        if value.status == "running" {
-            state
-                .library
-                .invalid_scan_cancel
-                .store(true, Ordering::SeqCst);
-            value.status = "cancelling".to_string();
-            value.message = "正在取消失效歌曲扫描".to_string();
-        }
-    });
-    emit_invalid_scan_progress(&app, &progress);
-    progress
 }
 
 #[tauri::command]
@@ -5350,7 +2601,7 @@ fn get_library_track_source_records(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<CatalogSourceRecord>, String> {
     let path = library_catalog_path(&state);
-    let (catalog, _) = open_w4dj_library(&path)?;
+    let (catalog, _) = open_library_catalog(&path)?;
     catalog
         .source_records_for_track(&track_key)
         .map_err(|error| error.to_string())
@@ -5362,7 +2613,7 @@ fn get_library_track_cover(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let path = library_catalog_path(&state);
-    let (catalog, _) = open_w4dj_library(&path)?;
+    let (catalog, _) = open_library_catalog(&path)?;
     let Some(track) = catalog
         .track_detail(&track_key)
         .map_err(|error| error.to_string())?
@@ -5399,80 +2650,6 @@ fn get_library_track_cover(
     )))
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LibraryAnalysisCandidate {
-    path: String,
-    name: String,
-    size_bytes: u64,
-    slot_index: Option<usize>,
-}
-
-fn is_supported_library_analysis_file(path: &Path) -> bool {
-    !is_ignored_music_file(path)
-        && path
-            .extension()
-            .and_then(|value| value.to_str())
-            .is_some_and(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "mp3" | "flac" | "wav" | "aif" | "aiff"
-                )
-            })
-}
-
-fn build_library_analysis_candidates(
-    files: Vec<CatalogLocalFile>,
-    output_roots: &[PathBuf],
-) -> Vec<LibraryAnalysisCandidate> {
-    files
-        .into_iter()
-        .filter(|file| is_supported_library_analysis_file(&file.path))
-        .map(|file| {
-            let slot_index = output_roots
-                .iter()
-                .position(|root| file.path.starts_with(root));
-            LibraryAnalysisCandidate {
-                name: file
-                    .path
-                    .file_name()
-                    .map(|value| value.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| file.path.to_string_lossy().into_owned()),
-                path: file.path.to_string_lossy().into_owned(),
-                size_bytes: file.size_bytes.max(0) as u64,
-                slot_index,
-            }
-        })
-        .collect()
-}
-
-#[tauri::command]
-fn list_library_analysis_candidates(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<LibraryAnalysisCandidate>, String> {
-    let path = library_catalog_path(&state);
-    let (catalog, _) = open_w4dj_library(&path)?;
-    let output_roots = state
-        .controller
-        .lock()
-        .ok()
-        .map(|controller| {
-            controller
-                .state()
-                .slots
-                .iter()
-                .map(|slot| PathBuf::from(&slot.destination_directory))
-                .filter(|root| !root.as_os_str().is_empty())
-                .map(|root| fs::canonicalize(&root).unwrap_or(root))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    catalog
-        .readable_local_files()
-        .map(|files| build_library_analysis_candidates(files, &output_roots))
-        .map_err(|error| error.to_string())
-}
-
 fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         Some("image/jpeg")
@@ -5495,12 +2672,6 @@ fn is_image_bytes(bytes: &[u8]) -> bool {
 
 #[tauri::command]
 fn clear_library_catalog_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if matches!(library_progress_snapshot(&state).status, LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling) {
-        return Err("歌曲库正在更新，暂时不能清除索引".to_string());
-    }
-    if invalid_scan_is_active(&state) {
-        return Err("失效歌曲正在扫描，暂时不能清除索引".to_string());
-    }
     let path = library_catalog_path(&state);
     if path.as_os_str().is_empty() {
         return Ok(());
@@ -5517,530 +2688,6 @@ fn clear_library_catalog_cache(state: tauri::State<'_, AppState>) -> Result<(), 
         }
     }
     Ok(())
-}
-
-fn find_runtime_session_dir(root: &Path, batch_id: &str) -> Option<PathBuf> {
-    let mut matches = fs::read_dir(root)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let session_path = path.join("session.json");
-            let contents = fs::read_to_string(&session_path).ok()?;
-            let session = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
-            (session.get("batch_id").and_then(serde_json::Value::as_str) == Some(batch_id))
-                .then(|| {
-                    let modified = fs::metadata(&session_path)
-                        .and_then(|metadata| metadata.modified())
-                        .unwrap_or(UNIX_EPOCH);
-                    (modified, path)
-                })
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|(modified, _)| *modified);
-    matches.pop().map(|(_, path)| path)
-}
-
-/// Resolve a history entry to the exact runtime session that was created for
-/// it. New entries carry this path explicitly; the batch-id scan remains only
-/// as a backwards-compatible fallback for history written before the field
-/// existed. Paths are accepted only below the configured runtime-session root.
-fn resolve_runtime_session_dir(root: &Path, entry: &HistoryEntry) -> Option<PathBuf> {
-    if let Some(saved) = entry.runtime_session_dir.as_deref() {
-        let candidate = PathBuf::from(saved);
-        if candidate.starts_with(root)
-            && candidate.is_dir()
-            && fs::read_to_string(candidate.join("session.json"))
-                .ok()
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-                .and_then(|session| session.get("batch_id").and_then(serde_json::Value::as_str).map(|batch| batch == entry.batch_id))
-                .unwrap_or(false)
-        {
-            return Some(candidate);
-        }
-    }
-    find_runtime_session_dir(root, &entry.batch_id)
-}
-
-fn runtime_event_string(details: &serde_json::Value, key: &str) -> Option<String> {
-    details.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
-}
-
-fn runtime_session_analysis_summary(session_dir: Option<&Path>) -> Option<AnalysisSessionSummary> {
-    let session_dir = session_dir?;
-    let candidates = fs::read_to_string(session_dir.join("candidates.json"))
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
-    let total_from_candidates = candidates
-        .as_ref()
-        .and_then(serde_json::Value::as_array)
-        .map(|slots| {
-            slots
-                .iter()
-                .filter_map(|slot| slot.get("preview"))
-                .filter_map(|preview| preview.get("candidates"))
-                .filter_map(serde_json::Value::as_array)
-                .map(Vec::len)
-                .sum::<usize>()
-        })
-        .unwrap_or(0);
-    let events = fs::read_to_string(session_dir.join("events.jsonl"))
-        .ok()
-        .map(|contents| {
-            contents
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let analysis_reports = fs::read_to_string(session_dir.join("analysis-reports.json"))
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    let analysis_state = fs::read_to_string(session_dir.join("analysis-state.json"))
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
-    if events.is_empty()
-        && total_from_candidates == 0
-        && analysis_reports.is_empty()
-        && analysis_state.is_none()
-    {
-        return None;
-    }
-
-    let mut statuses = std::collections::HashMap::<String, String>::new();
-    let mut names = std::collections::HashMap::<String, String>::new();
-    let mut current_item = None;
-    let mut current_stage = None;
-    let mut worker_job_id = None;
-    let mut requested_at = None;
-    let mut started_at = None;
-    let mut finished_at = None;
-    let mut termination_reason = None;
-    let mut requested = !analysis_reports.is_empty();
-    let mut terminal_status = None;
-
-    let mut stale_running_state = false;
-    if let Some(state) = analysis_state.as_ref() {
-        let state_status = state
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("notRequested");
-        requested |= state_status != "notRequested";
-        if let Some(tracks) = state.get("tracks").and_then(serde_json::Value::as_object) {
-            for (path, track) in tracks {
-                statuses.insert(
-                    path.clone(),
-                    track
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("pending")
-                        .to_string(),
-                );
-                if let Some(name) = track.get("name").and_then(serde_json::Value::as_str) {
-                    names.insert(path.clone(), name.to_string());
-                }
-            }
-        }
-        current_item = state
-            .get("currentItem")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        current_stage = state
-            .get("currentStage")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        worker_job_id = state
-            .get("workerJobId")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        requested_at = state
-            .get("requestedAt")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        started_at = state
-            .get("startedAt")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        finished_at = state
-            .get("finishedAt")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        termination_reason = state
-            .get("terminationReason")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        terminal_status = match state_status {
-            "cancelled" | "error" | "completed" | "partial" | "interrupted" => Some(state_status.to_string()),
-            _ => None,
-        };
-        let heartbeat = state
-            .get("lastHeartbeatEpochMs")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        if state_status == "running"
-            && heartbeat > 0
-            && unix_timestamp_ms().saturating_sub(heartbeat) > 15_000
-        {
-            stale_running_state = true;
-            terminal_status = Some(String::from("interrupted"));
-            for status in statuses.values_mut() {
-                if status == "running" {
-                    *status = String::from("interrupted");
-                }
-            }
-        }
-    }
-
-    for report in &analysis_reports {
-        let Some(path) = report.get("source_path").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        statuses.insert(
-            path.to_string(),
-            report
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("failed")
-                .to_string(),
-        );
-    }
-
-    for event in &events {
-        let event_name = event.get("event").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let at = event.get("at").and_then(serde_json::Value::as_str).map(str::to_owned);
-        let details = event.get("details").unwrap_or(&serde_json::Value::Null);
-        match event_name {
-            "analysis_requested" => {
-                requested = true;
-                requested_at = at;
-            }
-            "analysis_started" => {
-                requested = true;
-                if requested_at.is_none() {
-                    requested_at = at.clone();
-                }
-                started_at = at;
-            }
-            "analysis_candidate_started" => {
-                if let Some(path) = runtime_event_string(details, "source_path") {
-                    statuses.insert(path.clone(), String::from("running"));
-                    if let Some(name) = runtime_event_string(details, "name") {
-                        names.insert(path.clone(), name);
-                    }
-                    current_item = names.get(&path).cloned();
-                }
-                worker_job_id = runtime_event_string(details, "worker_job_id").or(worker_job_id);
-                current_stage = Some(String::from("preparing"));
-            }
-            "analysis_candidate_progress" => {
-                if let Some(path) = runtime_event_string(details, "source_path") {
-                    statuses.entry(path.clone()).or_insert_with(|| String::from("running"));
-                    current_item = runtime_event_string(details, "name").or_else(|| names.get(&path).cloned());
-                }
-                current_stage = runtime_event_string(details, "stage").or(current_stage);
-                worker_job_id = runtime_event_string(details, "worker_job_id").or(worker_job_id);
-            }
-            "analysis_candidate_finished" => {
-                if let Some(path) = runtime_event_string(details, "source_path") {
-                    statuses.insert(
-                        path,
-                        runtime_event_string(details, "status").unwrap_or_else(|| String::from("failed")),
-                    );
-                }
-                current_stage = runtime_event_string(details, "stage").or(current_stage);
-                worker_job_id = runtime_event_string(details, "worker_job_id").or(worker_job_id);
-            }
-            "analysis_candidate_persisted" => {
-                if let Some(path) = runtime_event_string(details, "source_path") {
-                    statuses.entry(path).or_insert_with(|| String::from("completed"));
-                }
-            }
-            "analysis_cancelled" => {
-                terminal_status = Some(String::from("cancelled"));
-                termination_reason = runtime_event_string(details, "reason")
-                    .or_else(|| runtime_event_string(details, "message"));
-                finished_at = at;
-            }
-            "analysis_error" => {
-                terminal_status = Some(String::from("error"));
-                termination_reason = runtime_event_string(details, "message");
-                finished_at = at;
-            }
-            "analysis_completed" => {
-                terminal_status = Some(String::from("completed"));
-                finished_at = at;
-            }
-            _ => {}
-        }
-    }
-    // Events are append-only and can predate the final durable heartbeat
-    // snapshot. Replaying them above is useful for names/stages, but a stale
-    // heartbeat must still win over old running events for per-track status.
-    if stale_running_state {
-        for status in statuses.values_mut() {
-            if status == "running" {
-                *status = String::from("interrupted");
-            }
-        }
-        terminal_status = Some(String::from("interrupted"));
-    }
-    if !requested {
-        return Some(AnalysisSessionSummary {
-            status: String::from("notRequested"),
-            total: total_from_candidates,
-            ..AnalysisSessionSummary::default()
-        });
-    }
-    let total = total_from_candidates.max(statuses.len());
-    let completed = statuses.values().filter(|status| status.as_str() == "completed").count();
-    let timed_out = statuses.values().filter(|status| status.as_str() == "timeout").count();
-    let failed = statuses.values().filter(|status| status.as_str() == "failed").count();
-    let pending = total.saturating_sub(completed + timed_out + failed);
-    let status = match terminal_status.as_deref() {
-        Some("cancelled") => String::from("cancelled"),
-        Some("interrupted") => String::from("interrupted"),
-        Some("error") => String::from("error"),
-        Some("completed") if failed > 0 || timed_out > 0 || pending > 0 => {
-            String::from("partial")
-        }
-        Some(value) => value.to_string(),
-        None if pending > 0 => String::from("running"),
-        None if failed > 0 || timed_out > 0 => String::from("partial"),
-        None => String::from("completed"),
-    };
-    Some(AnalysisSessionSummary {
-        status,
-        total,
-        completed,
-        failed,
-        timed_out,
-        pending,
-        current_item,
-        current_stage,
-        worker_job_id,
-        requested_at,
-        started_at,
-        finished_at,
-        termination_reason,
-    })
-}
-
-fn read_runtime_session_artifacts(session_dir: &Path) -> serde_json::Value {
-    let mut artifacts = serde_json::Map::new();
-    let Ok(entries) = fs::read_dir(session_dir) else {
-        return serde_json::json!({
-            "available": false,
-            "error": "运行会话目录不存在或无法读取",
-        });
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = fs::metadata(&path) else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let known_artifact = matches!(
-            name,
-            "session.json"
-                | "candidates.json"
-                | "events.jsonl"
-                | "analysis-reports.json"
-                | "analysis-state.json"
-                | "README.md"
-        ) || name.starts_with("summary-slot-");
-        if !known_artifact {
-            continue;
-        }
-        let Ok(contents) = fs::read_to_string(&path) else {
-            artifacts.insert(
-                name.to_string(),
-                serde_json::json!({"error": "文件无法读取"}),
-            );
-            continue;
-        };
-        let value = if name.ends_with(".json") {
-            serde_json::from_str(&contents)
-                .unwrap_or_else(|_| serde_json::json!({"raw": contents}))
-        } else if name.ends_with(".jsonl") {
-            let events = contents
-                .lines()
-                .map(|line| {
-                    serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
-                        serde_json::json!({
-                            "raw": line,
-                            "parseError": error.to_string(),
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-            serde_json::Value::Array(events)
-        } else {
-            serde_json::Value::String(contents)
-        };
-        artifacts.insert(name.to_string(), value);
-    }
-
-    serde_json::json!({
-        "available": true,
-        "directory": session_dir.display().to_string(),
-        "files": artifacts,
-    })
-}
-
-fn build_runtime_session_export(
-    entry: &HistoryEntry,
-    session_dir: Option<&Path>,
-) -> serde_json::Value {
-    let runtime_session = session_dir
-        .map(read_runtime_session_artifacts)
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "available": false,
-                "error": "找不到该任务的运行会话记录（可能是旧版本任务）",
-            })
-        });
-    let readable_summary = format_error_report_with_runtime(
-        entry,
-        Some(&serde_json::json!({"runtimeSession": runtime_session.clone()})),
-    );
-    serde_json::json!({
-        "schemaVersion": 1,
-        "exportedAt": timestamp_string(),
-        "appVersion": env!("CARGO_PKG_VERSION"),
-        "privacy": "包含本地路径、文件元数据、运行日志和分析状态；仅在确认后分享。",
-        "history": entry,
-        "readableSummary": readable_summary,
-        "runtimeSession": runtime_session,
-    })
-}
-
-/// Return the in-memory monitor for a batch, reopening its durable session
-/// after an application restart when necessary. Keeping the recovered monitor
-/// in the map also serializes concurrent event appends and state snapshots.
-fn runtime_monitor_for_batch(
-    state: &AppState,
-    batch_id: &str,
-) -> Option<Arc<TestMonitor>> {
-    if !RUNTIME_SESSION_RECORDING_ENABLED || batch_id.trim().is_empty() {
-        return None;
-    }
-    let mut monitors = state
-        .test_monitors
-        .lock()
-        .expect("runtime session map lock poisoned");
-    if let Some(monitor) = monitors.get(batch_id).cloned() {
-        return Some(monitor);
-    }
-    let root = state
-        .test_monitor_path
-        .lock()
-        .expect("runtime session path lock poisoned")
-        .clone();
-    let monitor = find_runtime_session_dir(&root, batch_id)
-        .and_then(|directory| TestMonitor::from_existing(directory).ok())
-        .map(Arc::new);
-    if let Some(monitor) = monitor.as_ref() {
-        monitors.insert(batch_id.to_string(), Arc::clone(monitor));
-    }
-    monitor
-}
-
-#[tauri::command]
-fn record_runtime_session_event(
-    batch_id: String,
-    event: String,
-    details: serde_json::Value,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    if batch_id.trim().is_empty() || event.trim().is_empty() {
-        return Ok(());
-    }
-    let monitor = runtime_monitor_for_batch(&state, &batch_id);
-    if let Some(monitor) = monitor {
-        monitor.record_event(&event, details);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn claim_analysis_run(
-    batch_id: String,
-    attempt_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
-    let monitor = runtime_monitor_for_batch(&state, &batch_id);
-    match monitor {
-        Some(monitor) => monitor.claim_analysis_run(&attempt_id).map(|()| true),
-        // Library-only analysis has no conversion monitor. It still uses the
-        // same per-song Worker lifecycle, but there is no shared run to claim.
-        None => Ok(true),
-    }
-}
-
-#[tauri::command]
-fn finalize_analysis_session(
-    batch_id: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    if batch_id.trim().is_empty() {
-        return Ok(());
-    }
-    state
-        .test_monitors
-        .lock()
-        .expect("runtime session map lock poisoned")
-        .remove(&batch_id);
-    Ok(())
-}
-
-#[tauri::command]
-fn export_runtime_session(
-    id: String,
-    path: String,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    if path.trim().is_empty() {
-        return Err(String::from("请指定运行会话记录保存位置"));
-    }
-
-    let history_path = state
-        .history_path
-        .lock()
-        .expect("history path lock poisoned")
-        .clone();
-    let entries = {
-        let _history_guard = state
-            .history_write_lock
-            .lock()
-            .expect("history write lock poisoned");
-        load_history_file(&history_path)
-            .map_err(|error| format!("无法读取转换历史：{error}"))?
-    };
-    let entry = entries
-        .into_iter()
-        .find(|entry| entry.id == id)
-        .ok_or_else(|| String::from("找不到对应的转换历史"))?;
-    let monitor_root = state
-        .test_monitor_path
-        .lock()
-        .expect("runtime session path lock poisoned")
-        .clone();
-    let session_dir = resolve_runtime_session_dir(&monitor_root, &entry);
-    let payload = build_runtime_session_export(&entry, session_dir.as_deref());
-    let contents = serde_json::to_vec_pretty(&payload)
-        .map_err(|error| format!("运行会话记录序列化失败：{error}"))?;
-    fs::write(path, contents).map_err(|error| format!("运行会话记录保存失败：{error}"))
 }
 
 #[tauri::command]
@@ -6062,194 +2709,17 @@ fn export_history_error_report(
         .history_write_lock
         .lock()
         .expect("history write lock poisoned");
-    let monitor_root = state
-        .test_monitor_path
-        .lock()
-        .expect("runtime session path lock poisoned")
-        .clone();
-    let entry = load_history_file(&history_path)
+    let entry = load_history_file(history_path)
         .map_err(|error| format!("无法读取转换历史：{error}"))?
         .into_iter()
         .find(|entry| entry.id == id)
         .ok_or_else(|| String::from("找不到对应的转换历史"))?;
-    let session_dir = resolve_runtime_session_dir(&monitor_root, &entry);
-    export_history_error_report_to_path_with_runtime(
-        &history_path,
-        &id,
-        Path::new(&path),
-        session_dir.as_deref(),
-    )
-}
 
-#[allow(dead_code)]
-fn export_history_error_report_to_path(
-    history_path: &Path,
-    id: &str,
-    output_path: &Path,
-) -> Result<(), String> {
-    export_history_error_report_to_path_with_runtime(history_path, id, output_path, None)
-}
-
-fn export_history_error_report_to_path_with_runtime(
-    history_path: &Path,
-    id: &str,
-    output_path: &Path,
-    session_dir: Option<&Path>,
-) -> Result<(), String> {
-    let mut entries = load_history_file(history_path)
-        .map_err(|error| format!("无法读取转换历史：{error}"))?;
-    let entry = entries
-        .iter_mut()
-        .find(|entry| entry.id == id)
-        .ok_or_else(|| String::from("找不到对应的转换历史"))?;
-    entry.report_path = Some(output_path.display().to_string());
-    let runtime = session_dir.map(|path| {
-        serde_json::json!({
-            "runtimeSession": read_runtime_session_artifacts(path),
-        })
-    });
-    let report = format_error_report_with_runtime(entry, runtime.as_ref());
-
-    fs::write(output_path, report).map_err(|error| format!("错误报告保存失败：{error}"))?;
-    upsert_history(history_path, entry.clone())
-        .map_err(|error| format!("错误报告已保存，但历史记录更新失败：{error}"))
-}
-
-const HEADLESS_ACCEPTANCE_SCENARIOS: &[&str] = &[
-    "libraryAnalysis",
-    "neteaseMetadata",
-    "flacCoverRecovery",
-    "energyDashboard",
-    "emotionManifest",
-    "externalFormats",
-    "bundleSmoke",
-];
-
-fn parse_headless_acceptance_args(args: &[String]) -> Result<Option<HeadlessAcceptanceConfig>, String> {
-    let mut scenario = None;
-    let mut report_path = None;
-    let mut exercise_cancel_resume = false;
-    let mut input_path = None;
-    let mut output_path = None;
-    let mut database_path = None;
-    let mut index = 0;
-
-    while index < args.len() {
-        let argument = args[index].as_str();
-        let next_value = |index: &mut usize, flag: &str| -> Result<String, String> {
-            *index += 1;
-            args.get(*index)
-                .cloned()
-                .filter(|value| !value.starts_with('-'))
-                .ok_or_else(|| format!("{flag} 缺少参数"))
-        };
-        match argument {
-            "--headless-acceptance" => scenario = Some(next_value(&mut index, argument)?),
-            "--acceptance-report" => report_path = Some(next_value(&mut index, argument)?),
-            "--exercise-cancel-resume" => exercise_cancel_resume = true,
-            "--input" => input_path = Some(next_value(&mut index, argument)?),
-            "--output" => output_path = Some(next_value(&mut index, argument)?),
-            "--database" => database_path = Some(next_value(&mut index, argument)?),
-            value if value.starts_with("--") => {
-                return Err(format!("未知验收参数：{value}"));
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-
-    let Some(scenario) = scenario else {
-        return Ok(None);
-    };
-    if !HEADLESS_ACCEPTANCE_SCENARIOS.contains(&scenario.as_str()) {
-        return Err(format!("未知验收场景：{scenario}"));
-    }
-    let report_path = report_path.ok_or_else(|| String::from("--acceptance-report 必须提供绝对路径"))?;
-    if !Path::new(&report_path).is_absolute() {
-        return Err(String::from("--acceptance-report 必须是绝对路径"));
-    }
-    for (flag, value) in [
-        ("--input", input_path.as_deref()),
-        ("--output", output_path.as_deref()),
-        ("--database", database_path.as_deref()),
-    ] {
-        if let Some(value) = value
-            && !Path::new(value).is_absolute()
-        {
-            return Err(format!("{flag} 必须是绝对路径"));
-        }
-    }
-
-    Ok(Some(HeadlessAcceptanceConfig {
-        scenario,
-        exercise_cancel_resume,
-        input_path,
-        output_path,
-        database_path,
-        report_path,
-    }))
-}
-
-#[tauri::command]
-fn load_headless_acceptance_config(
-    state: tauri::State<'_, AppState>,
-) -> Result<HeadlessAcceptanceConfig, String> {
-    state
-        .headless_config
-        .clone()
-        .ok_or_else(|| String::from("当前不是隐藏验收运行时"))
-}
-
-#[tauri::command]
-fn write_headless_acceptance_event(
-    report_path: String,
-    event: serde_json::Value,
-) -> Result<(), String> {
-    let path = PathBuf::from(report_path.trim());
-    if !path.is_absolute() {
-        return Err(String::from("验收报告路径必须是绝对路径"));
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("创建验收报告目录失败：{error}"))?;
-    }
-    let line = serde_json::to_string(&event).map_err(|error| format!("序列化验收事件失败：{error}"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| format!("打开验收报告失败：{error}"))?;
-    writeln!(file, "{line}").map_err(|error| format!("写入验收报告失败：{error}"))
-}
-
-#[tauri::command]
-fn finish_headless_acceptance(
-    _app: tauri::AppHandle,
-    code: i32,
-) -> Result<(), String> {
-    if !matches!(code, 0 | 2 | 3 | 4) {
-        return Err(String::from("无效的验收退出码"));
-    }
-    // `AppHandle::exit` requests a Tauri run-loop exit, but the generated
-    // desktop entry point would otherwise return success after the loop
-    // stops.  The explicit delayed exit preserves the documented CLI exit
-    // codes while allowing the IPC response and final JSONL write to flush.
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        std::process::exit(code);
-    });
-    Ok(())
+    fs::write(path, format_error_report(&entry))
+        .map_err(|error| format!("错误报告保存失败：{error}"))
 }
 
 fn main() {
-    let command_line_args = std::env::args().skip(1).collect::<Vec<_>>();
-    let headless_config = match parse_headless_acceptance_args(&command_line_args) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("Headless acceptance argument error: {error}");
-            std::process::exit(4);
-        }
-    };
-    let headless_mode = headless_config.is_some();
     let Some(_instance_lock) = acquire_single_instance_lock()
         .unwrap_or_else(|error| panic!("failed to acquire single-instance lock: {}", error))
     else {
@@ -6265,22 +2735,15 @@ fn main() {
             preferences_path: Arc::new(Mutex::new(PathBuf::new())),
             history_path: Arc::new(Mutex::new(PathBuf::new())),
             models_path: Arc::new(Mutex::new(PathBuf::new())),
-            bundled_models_path: Arc::new(Mutex::new(PathBuf::new())),
             scan_cache_path: Arc::new(Mutex::new(PathBuf::new())),
-            library: Arc::new(LibraryState::new()),
+            library_catalog_path: Arc::new(Mutex::new(PathBuf::new())),
             history_write_lock: Arc::new(Mutex::new(())),
-            models_write_lock: Arc::new(Mutex::new(())),
             destination_coordinator: DestinationCoordinator::default(),
             scan_progress: Arc::new(Mutex::new(ScanProgress::default())),
             scan_cancel: Arc::new(AtomicBool::new(false)),
             scan_result: Arc::new(Mutex::new(None)),
             test_monitor_path: Arc::new(Mutex::new(PathBuf::new())),
             test_monitors: Arc::new(Mutex::new(HashMap::new())),
-            concurrency_budget: Arc::new(Mutex::new(Arc::new(
-                GlobalConcurrencyBudget::new(w4dj::concurrency::DEFAULT_CONCURRENCY_LIMIT),
-            ))),
-            ffmpeg_registry: Arc::new(w4dj::sync::ActiveFfmpegRegistry::new()),
-            headless_config: headless_config.clone(),
         })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -6295,7 +2758,6 @@ fn main() {
             choose_conflict_strategy,
             choose_filename_rule,
             choose_netease_filename_format,
-            choose_concurrency_limit,
             start_sync,
             pause_sync,
             cancel_sync,
@@ -6311,12 +2773,7 @@ fn main() {
             start_confirmed_sync,
             apply_track_analysis_results,
             load_history,
-            load_incomplete_analysis_run,
             retry_history_failures,
-            record_runtime_session_event,
-            claim_analysis_run,
-            finalize_analysis_session,
-            export_runtime_session,
             export_history_error_report,
             delete_history_entry_command,
             clear_history_command,
@@ -6333,70 +2790,19 @@ fn main() {
             save_track_analyses,
             clear_track_analyses,
             get_essentia_model_status,
-            ensure_essentia_models,
-            restore_bundled_essentia_models,
-            import_essentia_models,
+            download_essentia_models,
             load_essentia_model,
             export_rekordbox_xml,
             load_library_status,
             locate_netease_library,
             refresh_library_catalog,
-            cancel_library_refresh,
-            select_netease_database_fallback,
-            clear_netease_database_fallback,
-            load_netease_metadata_database_status,
-            select_netease_metadata_database,
-            clear_netease_metadata_database,
-            prepare_netease_metadata_cache,
-            cancel_netease_metadata_cache,
-            load_netease_metadata_cache_status,
             query_library_catalog,
             get_library_track_detail,
-            relocate_library_track,
-            remove_library_track,
-            clear_invalid_library_tracks,
-            find_invalid_library_tracks,
-            cancel_invalid_library_scan,
-            export_emotion_evaluation_manifest,
             get_library_track_source_records,
             get_library_track_cover,
-            list_library_analysis_candidates,
-            clear_library_catalog_cache,
-            import_w4dj_playlist,
-            list_imported_dj_playlists,
-            load_imported_dj_playlist,
-            export_imported_dj_playlist_w4dj,
-            export_netease_playlist_text,
-            match_imported_dj_playlist,
-            load_imported_dj_playlist_matches,
-            set_imported_dj_playlist_match,
-            clear_imported_dj_playlist_match,
-            export_imported_dj_playlist_m3u8,
-            load_headless_acceptance_config,
-            write_headless_acceptance_event,
-            finish_headless_acceptance
+            clear_library_catalog_cache
         ])
-        .setup(move |app| {
-            let headless_url = if headless_mode {
-                WebviewUrl::App("headless.html".into())
-            } else {
-                WebviewUrl::App("index.html".into())
-            };
-            let mut window_builder = WebviewWindowBuilder::new(app, "main", headless_url)
-                .title("W4DJ RKB")
-                .inner_size(1120.0, 760.0)
-                .min_inner_size(760.0, 560.0)
-                .resizable(true)
-                .visible(!headless_mode);
-            if headless_mode {
-                // macOS otherwise suspends hidden WebViews after they are
-                // detached from the foreground.  That would pause Web
-                // Audio, WASM and Worker execution while the CLI run is
-                // still alive, producing a false analysis stall.
-                window_builder = window_builder
-                    .background_throttling(BackgroundThrottlingPolicy::Disabled);
-            }
-            let window = window_builder.build()?;
+        .setup(|app| {
             let preferences_path = app
                 .path()
                 .app_config_dir()
@@ -6410,24 +2816,19 @@ fn main() {
                 .parent()
                 .expect("preferences path should have a parent")
                 .join("essentia-models");
-            let bundled_models_path = app
-                .path()
-                .resource_dir()
-                .expect("failed to resolve bundled resource directory")
-                .join("essentia-models");
             let scan_cache_path = preferences_path
                 .parent()
                 .expect("preferences path should have a parent")
                 .join("scan-cache.json");
-            let w4dj_library_path = preferences_path
+            let library_catalog_path = preferences_path
                 .parent()
                 .expect("preferences path should have a parent")
-                .join("w4dj.sqlite3");
+                .join("library-dashboard.sqlite3");
             let test_monitor_path = app
                 .path()
                 .download_dir()
                 .unwrap_or_else(|_| default_download_directory())
-                .join(RUNTIME_SESSION_DIRECTORY);
+                .join(TEST_MONITOR_DIRECTORY);
 
             {
                 let state = app.state::<AppState>();
@@ -6444,7 +2845,7 @@ fn main() {
                     .history_path
                     .lock()
                     .expect("history path lock poisoned");
-                *path_guard = history_path.clone();
+                *path_guard = history_path;
             }
 
             {
@@ -6453,16 +2854,7 @@ fn main() {
                     .models_path
                     .lock()
                     .expect("models path lock poisoned");
-                *path_guard = models_path.clone();
-            }
-
-            {
-                let state = app.state::<AppState>();
-                let mut path_guard = state
-                    .bundled_models_path
-                    .lock()
-                    .expect("bundled models path lock poisoned");
-                *path_guard = bundled_models_path.clone();
+                *path_guard = models_path;
             }
 
             {
@@ -6477,11 +2869,10 @@ fn main() {
             {
                 let state = app.state::<AppState>();
                 let mut path_guard = state
-                    .library
-                    .catalog_path
+                    .library_catalog_path
                     .lock()
                     .expect("library catalog path lock poisoned");
-                *path_guard = w4dj_library_path;
+                *path_guard = library_catalog_path;
             }
 
             {
@@ -6494,61 +2885,38 @@ fn main() {
             }
 
             {
-                let mut preferences = load_preferences(&preferences_path)
+                let preferences = load_preferences(&preferences_path)
                     .unwrap_or_else(|_| AppPreferences::default());
-                preferences.enhanced_mode = ENHANCED_ANALYSIS_DEFAULT_ENABLED;
                 let state = app.state::<AppState>();
-                *state
-                    .library
-                    .manual_database_path
-                    .lock()
-                    .expect("manual database path lock poisoned") = preferences
-                    .netease_database_path
-                    .clone()
-                    .map(PathBuf::from);
                 let mut controller = state.controller.lock().expect("desktop lock poisoned");
                 controller.apply_preferences(preferences);
-                let limit = controller.state().concurrency_limit as usize;
-                *state
-                    .concurrency_budget
-                    .lock()
-                    .expect("concurrency budget lock poisoned") =
-                    Arc::new(GlobalConcurrencyBudget::new(limit));
             }
 
+            #[cfg(target_os = "macos")]
             {
-                let state = app.state::<AppState>();
-                let w4dj_path = state
-                    .library
-                    .catalog_path
-                    .lock()
-                    .expect("library catalog path lock poisoned")
-                    .clone();
-                let analysis_path = analysis_file_path(&history_path);
-                match W4djLibrary::open(&w4dj_path).and_then(|mut library| {
-                    library.import_initial_history(&history_path, &analysis_path)
-                }) {
-                    Ok(imported) if imported > 0 => {
-                        eprintln!("Imported {imported} committed output(s) into W4DJ library");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        eprintln!("Failed to initialize W4DJ output library: {error}");
-                    }
-                }
+                let window = app
+                    .get_webview_window("main")
+                    .expect("main window should exist");
+
+                apply_vibrancy(
+                    &window,
+                    NSVisualEffectMaterial::HudWindow,
+                    Some(NSVisualEffectState::Active),
+                    Some(18.0),
+                )
+                .expect("failed to apply macOS vibrancy");
+
+                window.center().expect("failed to center main window");
+                window.show().expect("failed to show main window");
+                window.set_focus().expect("failed to focus main window");
             }
 
-            if !headless_mode {
-                #[cfg(target_os = "macos")]
-                {
-                    apply_vibrancy(
-                        &window,
-                        NSVisualEffectMaterial::HudWindow,
-                        Some(NSVisualEffectState::Active),
-                        Some(18.0),
-                    )
-                    .expect("failed to apply macOS vibrancy");
-                }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let window = app
+                    .get_webview_window("main")
+                    .expect("main window should exist");
+
                 window.center().expect("failed to center main window");
                 window.show().expect("failed to show main window");
                 window.set_focus().expect("failed to focus main window");
@@ -6561,8 +2929,23 @@ fn main() {
 }
 
 fn persist_preferences(state: &tauri::State<'_, AppState>) {
-    if let Err(error) = persist_preferences_checked(state.inner()) {
-        eprintln!("Failed to save preferences: {error}");
+    let preferences = {
+        let controller = state.controller.lock().expect("desktop lock poisoned");
+        controller.state().preferences()
+    };
+
+    let preferences_path = state
+        .preferences_path
+        .lock()
+        .expect("preferences path lock poisoned")
+        .clone();
+
+    if preferences_path.as_os_str().is_empty() {
+        return;
+    }
+
+    if let Err(error) = save_preferences(&preferences_path, &preferences) {
+        eprintln!("Failed to save preferences: {}", error);
     }
 }
 
@@ -6570,121 +2953,11 @@ fn apply_analysis_for_candidate_to_path(
     candidate: &PreviewCandidate,
     output_path: &Path,
     analyses: &HashMap<String, EmbeddedAnalysis>,
-    metadata_context: &ConversionMetadataContext,
 ) -> io::Result<()> {
     let Some(analysis) = analyses.get(&candidate.source_path) else {
         return Ok(());
     };
-    apply_track_analysis_metadata_with_context(output_path, analysis, metadata_context)?;
-    validate_track_analysis_metadata(output_path, analysis)
-}
-
-fn register_committed_output(
-    library: &mut Option<W4djLibrary>,
-    slot_index: usize,
-    destination_root: &Path,
-    candidate: &PreviewCandidate,
-    analyses: &HashMap<String, EmbeddedAnalysis>,
-) -> Option<String> {
-    let Some(library) = library else {
-        return None;
-    };
-    if let Err(error) = library.upsert_output_file(
-        slot_index,
-        destination_root,
-        Some(Path::new(&candidate.source_path)),
-        Path::new(&candidate.destination_path),
-    ) {
-        eprintln!(
-            "W4DJ output registration warning for {}: {}",
-            candidate.destination_path, error
-        );
-        return Some(format!(
-            "歌曲库登记警告：{}（音频已保留，可稍后重新扫描歌曲库修复）",
-            error
-        ));
-    }
-    if (candidate.netease_track_id.is_some() || candidate.netease_album_id.is_some())
-        && let Err(error) = library.set_output_identity(
-            Path::new(&candidate.destination_path),
-            candidate.netease_track_id.as_deref(),
-            candidate.netease_album_id.as_deref(),
-        )
-    {
-        return Some(format!(
-            "歌曲库身份登记警告：{}（音频已保留，可稍后重新扫描歌曲库修复）",
-            error
-        ));
-    }
-    // A normal conversion may replace the bytes behind an existing output
-    // path. Keep the output row, but invalidate analysis that belonged to the
-    // previous file. Inline analysis supplied for a retry is already written
-    // before registration and must remain attached to the new output.
-    if !analyses.contains_key(&candidate.source_path)
-        && let Err(error) = library.invalidate_analysis_for_destination(
-            Path::new(&candidate.destination_path),
-        )
-    {
-        return Some(format!(
-            "歌曲库分析状态重置警告：{}（音频已保留，可稍后重新分析）",
-            error
-        ));
-    }
-    None
-}
-
-fn register_output_directory(path: &Path, slot_index: usize, output_root: &Path) -> Vec<String> {
-    let Ok(mut library) = W4djLibrary::open(path) else {
-        return vec![String::from(
-            "歌曲库登记警告：无法打开 W4DJ 数据库（音频已保留，可稍后重新扫描歌曲库修复）",
-        )];
-    };
-    let mut warnings = Vec::new();
-    let mut directories = vec![output_root.to_path_buf()];
-    while let Some(directory) = directories.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            warnings.push(format!(
-                "歌曲库登记警告：无法读取输出目录 {}（音频已保留）",
-                directory.display()
-            ));
-            continue;
-        };
-        for entry in entries.flatten() {
-            let destination = entry.path();
-            if destination.is_dir() {
-                directories.push(destination);
-                continue;
-            }
-            if is_ignored_music_file(&destination) {
-                continue;
-            }
-            if destination.is_file()
-            && destination
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| {
-                    matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "mp3" | "flac" | "wav" | "aif" | "aiff"
-                    )
-                })
-            && let Err(error) =
-                library.upsert_output_file(slot_index, output_root, None, &destination)
-        {
-            let warning = format!(
-                "歌曲库登记警告：{}（音频已保留，可稍后重新扫描歌曲库修复）",
-                error
-            );
-            eprintln!(
-                "W4DJ output registration warning for {}: {}",
-                destination.display(),
-                error
-            );
-            warnings.push(warning);
-        }
-        }
-    }
-    warnings
+    apply_track_analysis_metadata(output_path, analysis)
 }
 
 fn embedded_analysis_from_track(analysis: &TrackAnalysis) -> EmbeddedAnalysis {
@@ -6717,8 +2990,6 @@ fn run_confirmed_sync_task(
     history_path: PathBuf,
     history_write_lock: Arc<Mutex<()>>,
     job: ConfirmedSyncJob,
-    concurrency_budget: Arc<GlobalConcurrencyBudget>,
-    ffmpeg_registry: Arc<w4dj::sync::ActiveFfmpegRegistry>,
 ) {
     let started_at = timestamp_string();
     let started = Instant::now();
@@ -6729,16 +3000,6 @@ fn run_confirmed_sync_task(
             &job.source,
             &job.destination,
             job.candidates.len(),
-        );
-        let resolver = job.metadata_context.netease.as_ref();
-        monitor.record_event(
-            "netease_resolver",
-            serde_json::json!({
-                "database_path": resolver.database_path().map(|path| path.display().to_string()),
-                "database_loaded": resolver.database_loaded(),
-                "record_count": resolver.record_count(),
-                "warning": resolver.warning(),
-            }),
         );
         monitor.record_event(
             "task_candidates",
@@ -6791,40 +3052,10 @@ fn run_confirmed_sync_task(
         netease_filename_format: job.netease_filename_format,
         report_path: None,
         analysis_reports: Vec::new(),
-        runtime_session_dir: job
-            .test_monitor
-            .as_ref()
-            .map(|monitor| monitor.session_dir.display().to_string()),
     }));
-    {
-        let resolver = job.metadata_context.netease.as_ref();
-        let database = resolver
-            .database_path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| String::from("未加载"));
-        let mut entry = recovery_entry.lock().expect("recovery history lock poisoned");
-        entry.logs.push(format!(
-            "网易云元数据解析器：数据库={}，已加载={}，记录数={}{}",
-            database,
-            if resolver.database_loaded() { "是" } else { "否" },
-            resolver.record_count(),
-            resolver
-                .warning()
-                .map(|warning| format!("，警告={warning}"))
-                .unwrap_or_default(),
-        ));
-    }
     persist_recovery_entry(&history_path, &history_write_lock, &recovery_entry);
 
     let mut setup_error: Option<String> = None;
-    // Keep the conversion outcome separate from the UI terminal state.  The
-    // history entry is the durable record of a completed conversion, so it
-    // must be written before the slot is exposed as completed/error to the
-    // frontend.  Otherwise the frontend can observe the terminal state and
-    // reload history during the small window in which the worker has not yet
-    // persisted the entry.
-    let mut task_result: Result<w4dj::task::TaskSnapshot, String> =
-        Ok(task_controller.snapshot());
     if let Err(error) = validate_source_input(&job.source) {
         setup_error = Some(error);
     } else if let Err(error) = fs::create_dir_all(&job.destination) {
@@ -6833,24 +3064,13 @@ fn run_confirmed_sync_task(
 
     if setup_error.is_none() {
         let destination_lock = destination_coordinator.lock_for(Path::new(&job.destination));
-        let cleanup_result = {
-            let _destination_guard = destination_lock
-                .lock()
-                .expect("destination sync lock poisoned");
-            cleanup_temporary_outputs(&job.destination)
-        };
-        let mut w4dj_library = match W4djLibrary::open(&job.w4dj_path) {
-            Ok(library) => Some(library),
-            Err(error) => {
-                eprintln!("W4DJ output library unavailable; conversion will continue: {error}");
-                None
-            }
-        };
+        let _destination_guard = destination_lock
+            .lock()
+            .expect("destination sync lock poisoned");
 
-        if let Err(error) = cleanup_result {
+        if let Err(error) = cleanup_temporary_outputs(&job.destination) {
             setup_error = Some(format!("无法清理临时文件：{error}"));
-        }
-        if setup_error.is_none() {
+        } else {
             let mut candidate_lookup = HashMap::new();
             let analysis_lookup = job
                 .analyses
@@ -6911,7 +3131,7 @@ fn run_confirmed_sync_task(
                     break;
                 }
 
-                let result = update_existing_metadata_transactionally_with_context_and_policy(
+                let result = update_existing_metadata_transactionally(
                     Path::new(&candidate.source_path),
                     Path::new(&candidate.destination_path),
                     job.netease_filename_format,
@@ -6920,31 +3140,10 @@ fn run_confirmed_sync_task(
                             candidate,
                             temporary_output,
                             &analysis_lookup,
-                            job.metadata_context.as_ref(),
                         )
                     },
-                    job.metadata_context.as_ref(),
-                    filename_normalization_policy_for_slot(job.slot_index),
                 );
-                let registration_warning = if result.is_ok()
-                    && let Some(candidate) = candidate_lookup.get(&candidate.name)
-                {
-                    register_committed_output(
-                        &mut w4dj_library,
-                        job.slot_index,
-                        Path::new(&job.destination),
-                        candidate,
-                        &analysis_lookup,
-                    )
-                } else {
-                    None
-                };
                 let mut controller_guard = controller.lock().expect("desktop lock poisoned");
-                if let Some(warning) = registration_warning {
-                    controller_guard
-                        .push_log(job.slot_index, warning)
-                        .expect("confirmed slot index should be valid");
-                }
                 let failed_file = match result {
                     Ok(()) => {
                         task_controller.complete_current_file();
@@ -6985,11 +3184,7 @@ fn run_confirmed_sync_task(
                         failed_file.as_ref().map(|file| file.message.as_str()),
                     );
                 }
-                record_metadata_diagnostic(
-                    &recovery_entry,
-                    candidate,
-                    job.metadata_context.as_ref(),
-                );
+                record_metadata_diagnostic(&recovery_entry, candidate);
                 mark_recovery_processed(
                     &history_path,
                     &history_write_lock,
@@ -7004,76 +3199,25 @@ fn run_confirmed_sync_task(
             let sync_result = if queued_files.is_empty() {
                 Ok(task_controller.snapshot())
             } else {
-                let finalize_candidates = Arc::new(candidate_lookup.clone());
-                let finalize_analyses = Arc::new(analysis_lookup.clone());
-                let finalize_metadata_context = Arc::clone(&job.metadata_context);
-                sync_music_library_transactional_with_observer_and_budget_and_context_with_policy(
+                sync_music_library_transactional_with_observer(
                     &queued_files,
                     &job.destination,
                     &job.mode,
                     job.lossless_format,
                     job.netease_filename_format,
-                    filename_normalization_policy_for_slot(job.slot_index),
                     &task_controller,
-                    {
-                        let candidates = Arc::clone(&finalize_candidates);
-                        let analyses = Arc::clone(&finalize_analyses);
-                        let metadata_context = Arc::clone(&finalize_metadata_context);
-                        move |name: &str, temporary_output: &Path| {
-                        let Some(candidate) = candidates.get(name) else {
+                    |name, temporary_output| {
+                        let Some(candidate) = candidate_lookup.get(name) else {
                             return Ok(());
                         };
                         apply_analysis_for_candidate_to_path(
                             candidate,
                             temporary_output,
-                            &analyses,
-                            metadata_context.as_ref(),
+                            &analysis_lookup,
                         )
-                        }
                     },
                     |name, task, error| {
-                        if error.is_some_and(|error| {
-                            error.kind() == io::ErrorKind::Interrupted && task.is_cancelled()
-                        }) {
-                            return;
-                        }
                         let candidate = candidate_lookup.get(name);
-                        let replacement_warning = if error.is_none()
-                            && matches!(job.conflict_strategy, ConflictStrategy::Overwrite)
-                        {
-                            candidate
-                                .and_then(|candidate| candidate.previous_destination_path.as_deref())
-                                .and_then(|previous_path| {
-                                    candidate.and_then(|candidate| {
-                                        match remove_replaced_output(
-                                            Path::new(previous_path),
-                                            Path::new(&candidate.destination_path),
-                                            Path::new(&candidate.source_path),
-                                        ) {
-                                            Ok(true) | Ok(false) => None,
-                                            Err(error) => Some(format!(
-                                                "覆盖已生成新文件，但旧输出未能删除 {}：{}",
-                                                previous_path, error
-                                            )),
-                                        }
-                                    })
-                                })
-                        } else {
-                            None
-                        };
-                        let registration_warning = if error.is_none() {
-                            candidate.and_then(|candidate| {
-                                register_committed_output(
-                                    &mut w4dj_library,
-                                    job.slot_index,
-                                    Path::new(&job.destination),
-                                    candidate,
-                                    &analysis_lookup,
-                                )
-                            })
-                        } else {
-                            None
-                        };
                         let failed_file = if let Some(error) = error {
                             let failed_file = FailedFile {
                                 name: name.to_string(),
@@ -7099,16 +3243,6 @@ fn run_confirmed_sync_task(
                         } else {
                             let mut controller_guard =
                                 controller.lock().expect("desktop lock poisoned");
-                            if let Some(warning) = replacement_warning {
-                                controller_guard
-                                    .push_log(job.slot_index, warning)
-                                    .expect("confirmed slot index should be valid");
-                            }
-                            if let Some(warning) = registration_warning {
-                                controller_guard
-                                    .push_log(job.slot_index, warning)
-                                    .expect("confirmed slot index should be valid");
-                            }
                             controller_guard
                                 .record_file_result(job.slot_index, name, task.snapshot(), None)
                                 .expect("confirmed slot index should be valid");
@@ -7126,11 +3260,7 @@ fn run_confirmed_sync_task(
                                     failed_file.as_ref().map(|file| file.message.as_str()),
                                 );
                             }
-                            record_metadata_diagnostic(
-                                &recovery_entry,
-                                candidate,
-                                job.metadata_context.as_ref(),
-                            );
+                            record_metadata_diagnostic(&recovery_entry, candidate);
                         }
                         mark_recovery_processed(
                             &history_path,
@@ -7141,13 +3271,18 @@ fn run_confirmed_sync_task(
                             failed_file,
                         );
                     },
-                    Arc::clone(&concurrency_budget),
-                    Arc::clone(&ffmpeg_registry),
-                    job.metadata_context.as_ref(),
                 )
             };
 
-            task_result = sync_result.map_err(|error| format!("导出失败：{error}"));
+            let mut controller_guard = controller.lock().expect("desktop lock poisoned");
+            match sync_result {
+                Ok(snapshot) => controller_guard
+                    .finish_sync(job.slot_index, snapshot)
+                    .expect("confirmed slot index should be valid"),
+                Err(error) => controller_guard
+                    .fail_sync(job.slot_index, format!("导出失败：{error}"))
+                    .expect("confirmed slot index should be valid"),
+            }
         }
     }
 
@@ -7164,7 +3299,7 @@ fn run_confirmed_sync_task(
                 &error,
             );
         }
-        task_result = Err(error);
+        fail_sync(&controller, job.slot_index, error);
     }
 
     let finished_at = timestamp_string();
@@ -7187,7 +3322,7 @@ fn run_confirmed_sync_task(
     } else {
         Vec::new()
     };
-    let history_entry = HistoryEntry {
+    let mut history_entry = HistoryEntry {
         id: format!("{}-slot{}", job.batch_id, job.slot_index + 1),
         batch_id: job.batch_id,
         slot_index: job.slot_index,
@@ -7219,78 +3354,41 @@ fn run_confirmed_sync_task(
         netease_filename_format: job.netease_filename_format,
         report_path: None,
         analysis_reports: Vec::new(),
-        runtime_session_dir: job
-            .test_monitor
-            .as_ref()
-            .map(|monitor| monitor.session_dir.display().to_string()),
     };
+
+    let report_path = automatic_report_path(&history_path, &history_entry);
+    history_entry.report_path = Some(report_path.display().to_string());
+    if let Err(error) = fs::create_dir_all(
+        report_path
+            .parent()
+            .expect("automatic report path should have a parent"),
+    ) {
+        history_entry.report_path = None;
+        eprintln!("Failed to create automatic report directory: {error}");
+    } else if let Err(error) = fs::write(&report_path, format_error_report(&history_entry)) {
+        history_entry.report_path = None;
+        eprintln!("Failed to save automatic conversion report: {error}");
+    }
 
     if let Some(monitor) = job.test_monitor.as_ref() {
         monitor.record_task_finished(&history_entry);
     }
 
-    if let Err(error) = persist_history_before_terminal_state(
-        &history_path,
-        &history_write_lock,
-        &controller,
-        job.slot_index,
-        history_entry,
-        task_result,
-    ) {
-        eprintln!("Failed to save conversion history: {error}");
+    let _history_guard = history_write_lock
+        .lock()
+        .expect("history write lock poisoned");
+    if let Err(error) = upsert_history(history_path, history_entry) {
+        eprintln!("Failed to save conversion history: {}", error);
     }
-}
-
-/// Persist the final conversion record before publishing the slot's terminal
-/// state.  The frontend polls that state and reloads history when it changes;
-/// keeping this order makes a completed conversion and its history record one
-/// observable transition instead of a race between two independent writes.
-fn persist_history_before_terminal_state(
-    history_path: &Path,
-    history_write_lock: &Arc<Mutex<()>>,
-    controller: &Arc<Mutex<DesktopController>>,
-    slot_index: usize,
-    history_entry: HistoryEntry,
-    task_result: Result<w4dj::task::TaskSnapshot, String>,
-) -> Result<(), String> {
-    let history_result = {
-        let _history_guard = history_write_lock
-            .lock()
-            .map_err(|_| String::from("history write lock poisoned"))?;
-        upsert_history(history_path, history_entry)
-            .map_err(|error| format!("保存转换历史失败：{error}"))
-    };
-
-    let mut controller_guard = controller.lock().expect("desktop lock poisoned");
-    if let Err(error) = &history_result {
-        controller_guard
-            .push_log(
-                slot_index,
-                format!("转换完成，但保存转换历史失败：{error}"),
-            )
-            .expect("confirmed slot index should be valid");
-    }
-    match task_result {
-        Ok(snapshot) => controller_guard
-            .finish_sync(slot_index, snapshot)
-            .expect("confirmed slot index should be valid"),
-        Err(error) => controller_guard
-            .fail_sync(slot_index, error)
-            .expect("confirmed slot index should be valid"),
-    }
-
-    history_result
 }
 
 fn record_metadata_diagnostic(
     recovery_entry: &Arc<Mutex<HistoryEntry>>,
     candidate: &PreviewCandidate,
-    metadata_context: &ConversionMetadataContext,
 ) {
-    let diagnostic = inspect_metadata_diagnostic_with_resolver(
+    let diagnostic = inspect_metadata_diagnostic(
         Path::new(&candidate.source_path),
         Path::new(&candidate.destination_path),
-        metadata_context.netease.as_ref(),
     );
     let mut entry = recovery_entry.lock().expect("recovery history lock poisoned");
     if entry
@@ -7302,6 +3400,28 @@ fn record_metadata_diagnostic(
     }
 }
 
+fn automatic_report_path(history_path: &Path, entry: &HistoryEntry) -> PathBuf {
+    let report_directory = history_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("conversion-reports");
+    let safe_id: String = entry
+        .id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    report_directory.join(format!(
+        "W4DJ-RKB-{safe_id}-task-{}.txt",
+        entry.slot_index + 1
+    ))
+}
+
 fn pending_file_from_candidate(candidate: &PreviewCandidate) -> PendingFile {
     PendingFile {
         name: candidate.name.clone(),
@@ -7309,7 +3429,6 @@ fn pending_file_from_candidate(candidate: &PreviewCandidate) -> PendingFile {
         destination_path: candidate.destination_path.clone(),
         source_size_bytes: candidate.source_size_bytes,
         estimated_output_bytes: candidate.estimated_output_bytes,
-        previous_destination_path: candidate.previous_destination_path.clone(),
         operation: candidate.operation,
     }
 }
@@ -7504,22 +3623,9 @@ fn format_unix_timestamp(seconds: u64) -> String {
 fn run_sync_task(
     controller: Arc<Mutex<DesktopController>>,
     destination_coordinator: DestinationCoordinator,
-    w4dj_path: PathBuf,
     slot_index: usize,
-    concurrency_budget: Arc<GlobalConcurrencyBudget>,
-    ffmpeg_registry: Arc<w4dj::sync::ActiveFfmpegRegistry>,
-    metadata_context: Arc<ConversionMetadataContext>,
 ) {
-    let (
-        source,
-        destination,
-        using_fallback,
-        mode,
-        lossless_format,
-        filename_rule,
-        netease_filename_format,
-        task_controller,
-    ) = {
+    let (source, destination, using_fallback, mode, lossless_format, task_controller) = {
         let controller = controller.lock().expect("desktop lock poisoned");
         let state = controller.state();
         let slot = &state.slots[slot_index];
@@ -7535,8 +3641,6 @@ fn run_sync_task(
                 && !destination.trim().is_empty(),
             state.mode,
             state.lossless_format,
-            state.filename_rule,
-            state.netease_filename_format,
             controller
                 .task_controller(slot_index)
                 .expect("sync slot index validated before worker start"),
@@ -7563,13 +3667,11 @@ fn run_sync_task(
     }
 
     let destination_lock = destination_coordinator.lock_for(Path::new(&destination));
-    let cleanup_result = {
-        let _destination_guard = destination_lock
-            .lock()
-            .expect("destination sync lock poisoned");
-        cleanup_temporary_outputs(&destination)
-    };
-    if let Err(error) = cleanup_result {
+    let _destination_guard = destination_lock
+        .lock()
+        .expect("destination sync lock poisoned");
+
+    if let Err(error) = cleanup_temporary_outputs(&destination) {
         fail_sync(
             &controller,
             slot_index,
@@ -7592,38 +3694,7 @@ fn run_sync_task(
             .push_log(slot_index, format!("Scanning source: {}", source))
             .expect("sync slot index validated before worker start");
     }
-    let cancel_signal = task_controller.cancellation_flag();
-    let mut source_observer = |_: ScanPhase, path: &Path| {
-        if cancel_signal.load(Ordering::SeqCst) {
-            return false;
-        }
-        let mut guard = controller.lock().expect("desktop lock poisoned");
-        let _ = guard.record_file_started(
-            slot_index,
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default(),
-        );
-        true
-    };
-    let (mut source_files, scan_issues, scan_cancelled) =
-        get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy(
-            &source,
-            w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
-            filename_rule,
-            netease_filename_format,
-            filename_normalization_policy_for_slot(slot_index),
-            Arc::clone(&concurrency_budget),
-            Arc::clone(&cancel_signal),
-            ScanPhase::Source,
-            &mut source_observer,
-        );
-    if scan_cancelled || task_controller.is_cancelled() {
-        let mut guard = controller.lock().expect("desktop lock poisoned");
-        let _ = guard.push_log(slot_index, "扫描已取消");
-        let _ = guard.finish_sync(slot_index, task_controller.snapshot());
-        return;
-    }
+    let (mut source_files, scan_issues) = get_music_dict_with_scan_issues(&source);
     let missing_sources = source_files
         .iter()
         .filter(|(_, (_, path))| !path.exists())
@@ -7662,37 +3733,7 @@ fn run_sync_task(
             .push_log(slot_index, format!("Scanning destination: {}", destination))
             .expect("sync slot index validated before worker start");
     }
-    let mut destination_observer = |_: ScanPhase, path: &Path| {
-        if cancel_signal.load(Ordering::SeqCst) {
-            return false;
-        }
-        let mut guard = controller.lock().expect("desktop lock poisoned");
-        let _ = guard.record_file_started(
-            slot_index,
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default(),
-        );
-        true
-    };
-    let (destination_files, _destination_issues, destination_cancelled) =
-        get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy(
-            &destination,
-            &["mp3", "wav", "aiff"],
-            filename_rule,
-            netease_filename_format,
-            filename_normalization_policy_for_slot(slot_index),
-            Arc::clone(&concurrency_budget),
-            Arc::clone(&cancel_signal),
-            ScanPhase::Destination,
-            &mut destination_observer,
-        );
-    if destination_cancelled || task_controller.is_cancelled() {
-        let mut guard = controller.lock().expect("desktop lock poisoned");
-        let _ = guard.push_log(slot_index, "扫描已取消");
-        let _ = guard.finish_sync(slot_index, task_controller.snapshot());
-        return;
-    }
+    let destination_files = get_destination_music_dict(&destination);
     let queued_files =
         compare_music_dicts(&source_files, &destination_files, &mode, lossless_format);
     let existing_files = source_files.len().saturating_sub(queued_files.len());
@@ -7728,21 +3769,13 @@ fn run_sync_task(
     }
 
     let mut failed_files = 0usize;
-    let result = sync_music_library_transactional_with_observer_and_budget_and_context_with_policy(
+    let result = sync_music_library_with_observer(
         &queued_files,
         &destination,
         &mode,
         lossless_format,
-        netease_filename_format,
-        filename_normalization_policy_for_slot(slot_index),
         &task_controller,
-        |_, _| Ok(()),
         |name, task, error| {
-            if error.is_some_and(|error| {
-                error.kind() == io::ErrorKind::Interrupted && task.is_cancelled()
-            }) {
-                return;
-            }
             if error.is_some() {
                 failed_files += 1;
             }
@@ -7757,32 +3790,15 @@ fn run_sync_task(
                 )
                 .expect("sync slot index validated before worker start");
         },
-        Arc::clone(&concurrency_budget),
-        Arc::clone(&ffmpeg_registry),
-        metadata_context.as_ref(),
     );
 
+    let mut controller = controller.lock().expect("desktop lock poisoned");
     if failed_files > 0 {
-        let mut controller = controller.lock().expect("desktop lock poisoned");
         controller
             .push_log(
                 slot_index,
                 format!("Failed {} file(s) during sync", failed_files),
             )
-            .expect("sync slot index validated before worker start");
-    }
-    let registration_warnings = if result.is_ok() {
-        // Register outputs after the converter's safe-commit callback has
-        // returned, and before taking the UI controller lock.  SQLite/media
-        // work must not block keyboard/button state updates.
-        register_output_directory(&w4dj_path, slot_index, Path::new(&destination))
-    } else {
-        Vec::new()
-    };
-    let mut controller = controller.lock().expect("desktop lock poisoned");
-    for warning in registration_warnings {
-        controller
-            .push_log(slot_index, warning)
             .expect("sync slot index validated before worker start");
     }
     match result {
@@ -7890,410 +3906,25 @@ fn fail_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_headless_acceptance_args, HeadlessAcceptanceConfig};
-    use super::essentia_model_import::known_import_model_ids;
-    use super::essentia_model_specs;
-    use super::LibraryRefreshProgress;
-    use super::LibraryRefreshSummary;
-    use super::LibraryRefreshStage;
-    use super::LibraryRefreshStatus;
-    use super::LibraryState;
-    use super::InvalidScanProgress;
-    use super::ScanProgress;
-    use super::ScanProgressPhase;
-    use super::ScanStatus;
-    use super::ScanTaskProgress;
-    use super::NeteaseMetadataDatabaseSource;
-    use super::NeteaseMetadataDatabaseStatus;
-    use super::NeteaseMetadataCacheProgress;
     use super::TestMonitor;
     use super::DestinationCoordinator;
-    use super::CatalogLocalFile;
     use super::apply_preflight_summary;
     use super::collect_processable_previews;
     use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
-    use super::persist_history_before_terminal_state;
     use super::validate_destination_directory;
     use super::validate_scan_previews;
     use super::validate_source_input;
     use super::validate_unique_planned_outputs;
-    use super::{
-        apply_library_refresh_terminal, request_library_refresh_cancel,
-        try_start_library_refresh,
-    };
     use std::fs;
-    use std::collections::BTreeSet;
     use std::path::Path;
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use w4dj::config::Mode;
     use w4dj::desktop::{DesktopController, DesktopState};
-    use w4dj::history::{AnalysisReport, FailedFile, HistoryEntry, HistoryStatus};
+    use w4dj::history::{FailedFile, HistoryStatus};
     use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
     use w4dj::preview::{PreviewCandidate, PreviewIssue, SlotPreview, SyncPreview};
     use w4dj::task::TaskController;
-
-    #[test]
-    fn headless_acceptance_requires_absolute_report_path() {
-        let args = vec![
-            "--headless-acceptance".into(),
-            "libraryAnalysis".into(),
-            "--acceptance-report".into(),
-            "relative.jsonl".into(),
-        ];
-        assert!(parse_headless_acceptance_args(&args).is_err());
-    }
-
-    #[test]
-    fn headless_acceptance_parses_known_scenario_and_optional_paths() {
-        let args = vec![
-            "--headless-acceptance".into(),
-            "libraryAnalysis".into(),
-            "--exercise-cancel-resume".into(),
-            "--acceptance-report".into(),
-            "/private/tmp/w4dj-headless.jsonl".into(),
-            "--input".into(),
-            "/tmp/input".into(),
-        ];
-        let config = parse_headless_acceptance_args(&args)
-            .expect("arguments should parse")
-            .expect("headless mode should be enabled");
-        assert_eq!(config.scenario, "libraryAnalysis");
-        assert!(config.exercise_cancel_resume);
-        assert_eq!(config.input_path.as_deref(), Some("/tmp/input"));
-        assert_eq!(config.report_path, "/private/tmp/w4dj-headless.jsonl");
-    }
-
-    #[test]
-    fn normal_arguments_do_not_enable_headless_mode() {
-        let args: Vec<String> = Vec::new();
-        assert!(parse_headless_acceptance_args(&args)
-            .expect("normal arguments should parse")
-            .is_none());
-    }
-
-    #[test]
-    fn headless_config_uses_camel_case_wire_fields() {
-        let config = HeadlessAcceptanceConfig {
-            scenario: "libraryAnalysis".into(),
-            exercise_cancel_resume: true,
-            input_path: None,
-            output_path: None,
-            database_path: None,
-            report_path: "/tmp/report.jsonl".into(),
-        };
-        let value = serde_json::to_value(config).expect("config should serialize");
-        assert_eq!(value["exerciseCancelResume"], true);
-        assert_eq!(value["reportPath"], "/tmp/report.jsonl");
-    }
-
-    #[test]
-    fn library_analysis_candidates_include_available_files_outside_configured_roots() {
-        let candidates = super::build_library_analysis_candidates(
-            vec![
-                CatalogLocalFile {
-                    id: None,
-                    track_key: "track:test-root".into(),
-                    path: PathBuf::from("/music/test/inside.mp3"),
-                    size_bytes: 11,
-                    modified_at_ms: None,
-                    measured_format: Some("mp3".into()),
-                    measured_bitrate_bps: None,
-                    measured_duration_seconds: None,
-                    sample_rate_hz: None,
-                    channels: None,
-                    readable: true,
-                    probe_error: None,
-                },
-                CatalogLocalFile {
-                    id: None,
-                    track_key: "track:other-root".into(),
-                    path: PathBuf::from("/music/testtttt/outside.flac"),
-                    size_bytes: 22,
-                    modified_at_ms: None,
-                    measured_format: Some("flac".into()),
-                    measured_bitrate_bps: None,
-                    measured_duration_seconds: None,
-                    sample_rate_hz: None,
-                    channels: None,
-                    readable: true,
-                    probe_error: None,
-                },
-                CatalogLocalFile {
-                    id: None,
-                    track_key: "track:ignored".into(),
-                    path: PathBuf::from("/music/test/.DS_Store"),
-                    size_bytes: 1,
-                    modified_at_ms: None,
-                    measured_format: None,
-                    measured_bitrate_bps: None,
-                    measured_duration_seconds: None,
-                    sample_rate_hz: None,
-                    channels: None,
-                    readable: true,
-                    probe_error: None,
-                },
-            ],
-            &[PathBuf::from("/music/test")],
-        );
-
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].name, "inside.mp3");
-        assert_eq!(candidates[0].slot_index, Some(0));
-        assert_eq!(candidates[1].name, "outside.flac");
-        assert_eq!(candidates[1].slot_index, None);
-    }
-
-    #[test]
-    fn library_refresh_progress_uses_camel_case_payloads() {
-        let progress = LibraryRefreshProgress {
-            refresh_id: "library-1".into(),
-            status: LibraryRefreshStatus::Running,
-            stage: LibraryRefreshStage::ProbingLocalFiles,
-            processed: 2,
-            total: Some(3),
-            current_item: "Song.mp3".into(),
-            message: "正在探测本地文件".into(),
-            summary: None,
-            error: None,
-        };
-        let value = serde_json::to_value(progress).unwrap();
-        assert_eq!(value["refreshId"], "library-1");
-        assert_eq!(value["currentItem"], "Song.mp3");
-        assert_eq!(value["status"], "running");
-        assert_eq!(value["stage"], "probingLocalFiles");
-    }
-
-    #[test]
-    fn scan_progress_serializes_metadata_phase_and_cancelling_status() {
-        let progress = ScanProgress {
-            status: ScanStatus::Cancelling,
-            phase: ScanProgressPhase::MatchingMetadata,
-            processed: 7,
-            total: 1088,
-            current_file: "Song.mp3".into(),
-            message: "正在取消扫描".into(),
-            tasks: vec![ScanTaskProgress {
-                slot_index: 0,
-                phase: ScanProgressPhase::MatchingMetadata,
-                processed: 1088,
-                total: 1088,
-                source_processed: 1088,
-                source_total: Some(1088),
-                destination_processed: 0,
-                destination_total: None,
-                metadata_processed: 7,
-                metadata_total: Some(1088),
-                current_file: "Song.mp3".into(),
-            }],
-        };
-
-        let value = serde_json::to_value(progress).unwrap();
-        assert_eq!(value["status"], "cancelling");
-        assert_eq!(value["phase"], "matching_metadata");
-        assert_eq!(value["tasks"][0]["metadata_processed"], 7);
-        assert_eq!(value["tasks"][0]["metadata_total"], 1088);
-    }
-
-    #[test]
-    fn netease_metadata_database_status_uses_camel_case() {
-        let value = serde_json::to_value(NeteaseMetadataDatabaseStatus {
-            manual_path: Some("/music/db.sqlite3".into()),
-            effective_path: Some("/music/db.sqlite3".into()),
-            source: NeteaseMetadataDatabaseSource::Manual,
-            loaded: true,
-            record_count: 42,
-            warning: None,
-            cache_status: Some("ready".into()),
-            cached_record_count: Some(42),
-            database_changed: Some(false),
-        })
-        .unwrap();
-        assert_eq!(value["source"], "manual");
-        assert_eq!(value["recordCount"], 42);
-        assert!(value.get("manual_path").is_none());
-    }
-
-    #[test]
-    fn netease_metadata_database_status_reports_invalid_manual_path_as_fallback() {
-        let missing = Path::new("/definitely/missing/sqlite_storage.sqlite3");
-        let (status, resolver) =
-            super::resolve_netease_metadata_database_status(
-                Some(missing),
-                Path::new("/definitely/missing/library-dashboard.sqlite3"),
-            )
-            .unwrap();
-        assert_ne!(status.source, NeteaseMetadataDatabaseSource::Manual);
-        assert!(status.warning.is_some());
-        assert_eq!(
-            status.manual_path.as_deref(),
-            Some("/definitely/missing/sqlite_storage.sqlite3")
-        );
-        assert_eq!(status.loaded, resolver.database_loaded());
-    }
-
-    #[test]
-    fn external_url_allowlist_includes_only_project_and_official_essentia_pages() {
-        assert!(super::external_url_is_allowed("https://essentia.upf.edu/models/"));
-        assert!(!super::external_url_is_allowed(
-            "https://essentia.upf.edu.evil.example/models/"
-        ));
-        assert!(!super::external_url_is_allowed("http://essentia.upf.edu/models/"));
-    }
-
-    #[test]
-    fn essentia_import_result_uses_camel_case() {
-        let value = serde_json::to_value(super::EssentiaModelImportResult {
-            installed_ids: vec!["musicnn_embedding".into()],
-            issues: vec![super::EssentiaModelImportIssueDto {
-                file_name: "model.json".into(),
-                reason: "缺少权重".into(),
-            }],
-            missing_ids: vec!["mood_happy".into()],
-            status: super::EssentiaModelStatus {
-                version: super::ESSENTIA_MODEL_VERSION,
-                embedding: true,
-                genre: true,
-                mood: false,
-                instrument: false,
-                installing: false,
-                emotion_continuous: false,
-                emotion_cluster: false,
-                discogs_effnet: None,
-            },
-            message: "部分导入完成".into(),
-        })
-        .unwrap();
-        assert!(value.get("installedIds").is_some());
-        assert!(value.get("missingIds").is_some());
-        assert!(value["status"].get("emotionContinuous").is_some());
-        assert!(value["status"].get("emotionCluster").is_some());
-        assert_eq!(value["issues"][0]["fileName"], "model.json");
-    }
-
-    #[test]
-    fn importer_identity_table_matches_runtime_model_specs() {
-        let runtime = essentia_model_specs()
-            .into_iter()
-            .map(|spec| spec.id)
-            .collect::<BTreeSet<_>>();
-        let importable = known_import_model_ids().iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(runtime, importable);
-    }
-
-    #[test]
-    fn checked_in_musicnn_classifier_outputs_match_runtime_specs() {
-        let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("essentia-models");
-        let specs = essentia_model_specs();
-        for id in [
-            "mood_aggressive",
-            "mood_happy",
-            "mood_relaxed",
-            "mood_party",
-            "mood_sad",
-            "voice_instrumental",
-        ] {
-            let spec = specs
-                .iter()
-                .find(|candidate| candidate.id == id)
-                .expect("runtime model spec is registered");
-            let value: serde_json::Value = serde_json::from_slice(
-                &fs::read(resources.join(format!("{id}.json"))).expect("bundled model exists"),
-            )
-            .expect("bundled model JSON is valid");
-            let nodes = value
-                .pointer("/modelTopology/node")
-                .and_then(serde_json::Value::as_array)
-                .expect("bundled model has graph nodes");
-            assert!(
-                nodes.iter().any(|node| {
-                    node.get("name").and_then(serde_json::Value::as_str)
-                        == Some(spec.output_name)
-                }),
-                "{id} runtime output {} is absent from the checked-in graph",
-                spec.output_name,
-            );
-        }
-    }
-
-    #[test]
-    fn completed_library_refresh_reports_unique_track_count() {
-        let mut progress = LibraryRefreshProgress {
-            refresh_id: "library-1".into(),
-            status: LibraryRefreshStatus::Running,
-            stage: LibraryRefreshStage::Committing,
-            processed: 68,
-            total: Some(68),
-            current_item: "metadata-row".into(),
-            message: "正在提交歌曲库更新".into(),
-            summary: None,
-            error: None,
-        };
-        let summary = LibraryRefreshSummary {
-            track_count: 24,
-            local_file_count: 24,
-            readable_file_count: 24,
-            reused_file_count: 0,
-            database_path: "/music/library.db".into(),
-            music_folder: Some("/music/netease".into()),
-        };
-
-        apply_library_refresh_terminal(
-            &mut progress,
-            LibraryRefreshStatus::Completed,
-            Some(LibraryRefreshStage::Committing),
-            "歌曲库更新完成".into(),
-            Some(summary),
-            None,
-        );
-
-        assert_eq!(progress.processed, 24);
-        assert_eq!(progress.total, Some(24));
-        assert_eq!(progress.summary.as_ref().map(|summary| summary.track_count), Some(24));
-    }
-
-    #[test]
-    fn library_refresh_is_singleton_and_cancel_is_idempotent() {
-        let state = LibraryState {
-            catalog_path: Mutex::new(PathBuf::new()),
-            manual_database_path: Mutex::new(None),
-            metadata_cache: Mutex::new(NeteaseMetadataCacheProgress::default()),
-            metadata_cache_cancel: AtomicBool::new(false),
-            metadata_cache_build_lock: Mutex::new(()),
-            metadata_cache_worker: Mutex::new(None),
-            refresh: Mutex::new(LibraryRefreshProgress {
-                refresh_id: String::new(),
-                status: LibraryRefreshStatus::Idle,
-                stage: LibraryRefreshStage::LocatingDatabase,
-                processed: 0,
-                total: None,
-                current_item: String::new(),
-                message: String::new(),
-                summary: None,
-                error: None,
-            }),
-            cancel: AtomicBool::new(false),
-            worker: Mutex::new(None),
-            invalid_scan: Mutex::new(InvalidScanProgress::default()),
-            invalid_scan_cancel: AtomicBool::new(false),
-            invalid_scan_worker: Mutex::new(None),
-        };
-
-        let initial = try_start_library_refresh(&state, "library-test".to_string()).unwrap();
-        assert!(matches!(initial.status, LibraryRefreshStatus::Running));
-        assert!(try_start_library_refresh(&state, "library-test-2".to_string()).is_err());
-
-        let cancelling = request_library_refresh_cancel(&state);
-        assert!(matches!(cancelling.status, LibraryRefreshStatus::Cancelling));
-        assert!(state.cancel.load(std::sync::atomic::Ordering::SeqCst));
-        let repeated = request_library_refresh_cancel(&state);
-        assert!(matches!(repeated.status, LibraryRefreshStatus::Cancelling));
-        assert_eq!(repeated.refresh_id, "library-test");
-    }
 
     fn sample_preview(slot_index: usize, has_candidate: bool) -> SlotPreview {
         SlotPreview {
@@ -8319,14 +3950,7 @@ mod tests {
                         destination_path: "/music/out/song.mp3".into(),
                         source_size_bytes: 1024,
                         estimated_output_bytes: Some(1024),
-                        previous_destination_path: None,
                         operation: Default::default(),
-                        netease_track_id: None,
-                        netease_album_id: None,
-                        album: None,
-                        netease_title: None,
-                        netease_artist: None,
-                        disambiguation_reason: None,
                     }]
                 } else {
                     Vec::new()
@@ -8367,307 +3991,10 @@ mod tests {
         assert!(monitor.session_dir.join("candidates.json").is_file());
         assert!(monitor.session_dir.join("events.jsonl").is_file());
         assert!(monitor.session_dir.join("README.md").is_file());
-        assert!(monitor.session_dir.join("analysis-state.json").is_file());
 
         let event_text = fs::read_to_string(monitor.session_dir.join("events.jsonl")).unwrap();
         assert!(event_text.contains("candidate_result"));
         assert!(event_text.contains("/music/in/song.mp3"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn analysis_run_claim_rejects_a_live_attempt_and_allows_stale_takeover() {
-        let root = std::env::temp_dir().join(format!(
-            "w4dj-analysis-claim-{}",
-            super::unique_timestamp()
-        ));
-        let preview = sample_preview(0, true);
-        let monitor = TestMonitor::new(
-            &root,
-            "batch/claim",
-            serde_json::json!({"enhanced_mode": true}),
-            std::slice::from_ref(&preview),
-            1,
-        )
-        .unwrap();
-        monitor.claim_analysis_run("attempt-a").unwrap();
-        assert!(monitor.claim_analysis_run("attempt-b").is_err());
-        let state_path = monitor.session_dir.join("analysis-state.json");
-        let mut state = serde_json::from_slice::<serde_json::Value>(&fs::read(&state_path).unwrap()).unwrap();
-        state["lastHeartbeatEpochMs"] = serde_json::json!(0);
-        fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
-        monitor.claim_analysis_run("attempt-b").unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&fs::read(&state_path).unwrap()).unwrap()["attemptId"],
-            "attempt-b"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn recovered_test_monitor_continues_persisting_analysis_events() {
-        let root = std::env::temp_dir().join(format!(
-            "w4dj-analysis-recovered-monitor-{}",
-            super::unique_timestamp()
-        ));
-        let preview = sample_preview(0, true);
-        let monitor = TestMonitor::new(
-            &root,
-            "batch/recovered",
-            serde_json::json!({"enhanced_mode": true}),
-            std::slice::from_ref(&preview),
-            1,
-        )
-        .unwrap();
-        monitor.claim_analysis_run("attempt-before-restart").unwrap();
-        let recovered = TestMonitor::from_existing(monitor.session_dir.clone()).unwrap();
-        recovered.record_event(
-            "analysis_candidate_started",
-            serde_json::json!({
-                "source_path": "/music/in/song.mp3",
-                "destination_path": "/music/out/song.mp3",
-                "name": "song.mp3",
-                "worker_job_id": "worker-after-restart",
-            }),
-        );
-        let state = serde_json::from_slice::<serde_json::Value>(
-            &fs::read(monitor.session_dir.join("analysis-state.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(state["tracks"]["/music/in/song.mp3"]["status"], "running");
-        assert_eq!(state["tracks"]["/music/in/song.mp3"]["workerJobId"], "worker-after-restart");
-        assert!(fs::read_to_string(monitor.session_dir.join("events.jsonl"))
-            .unwrap()
-            .contains("worker-after-restart"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn local_test_monitor_accumulates_incremental_analysis_reports() {
-        let root = std::env::temp_dir().join(format!(
-            "w4dj-test-monitor-analysis-{}",
-            super::unique_timestamp()
-        ));
-        let preview = sample_preview(0, true);
-        let monitor = TestMonitor::new(
-            &root,
-            "batch/analysis",
-            serde_json::json!({"enhanced_mode": true}),
-            std::slice::from_ref(&preview),
-            1,
-        )
-        .unwrap();
-        let report = |source_path: &str| AnalysisReport {
-            source_path: source_path.into(),
-            destination_path: format!("/music/out/{}", source_path.rsplit('/').next().unwrap()),
-            status: "completed".into(),
-            message: None,
-            drop_status: Some("completed".into()),
-            drop_loudness_lufs: None,
-            model_status: Some("completed".into()),
-            model_details: None,
-            stage: None,
-            elapsed_ms: None,
-            basic_status: None,
-            basic_danceability: None,
-            discogs_danceability_status: None,
-            discogs_danceability: None,
-            discogs_completed_heads: None,
-            discogs_total_heads: None,
-            cached: None,
-        };
-
-        monitor.record_analysis_reports(&[report("/music/in/one.mp3")]);
-        monitor.record_analysis_reports(&[report("/music/in/two.mp3")]);
-
-        let reports = serde_json::from_slice::<Vec<AnalysisReport>>(
-            &fs::read(monitor.session_dir.join("analysis-reports.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].source_path, "/music/in/one.mp3");
-        assert_eq!(reports[1].source_path, "/music/in/two.mp3");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_session_export_contains_history_and_local_artifacts() {
-        let root = std::env::temp_dir().join(format!(
-            "w4dj-runtime-session-export-{}",
-            super::unique_timestamp()
-        ));
-        let preview = sample_preview(0, true);
-        let monitor = TestMonitor::new(
-            &root,
-            "batch/export",
-            serde_json::json!({"enhanced_mode": true}),
-            std::slice::from_ref(&preview),
-            1,
-        )
-        .unwrap();
-        monitor.record_event(
-            "analysis_completed",
-            serde_json::json!({"result_count": 1}),
-        );
-        let entry = HistoryEntry {
-            id: "history-export".into(),
-            batch_id: "batch/export".into(),
-            slot_index: 0,
-            started_at: "2026-08-20 00:00:00 UTC".into(),
-            finished_at: "2026-08-20 00:00:01 UTC".into(),
-            duration_seconds: 1,
-            source_directory: "/music/in-0".into(),
-            destination_directory: "/music/out-0".into(),
-            mode: Mode::Compat,
-            lossless_format: None,
-            new_count: 1,
-            existing_count: 0,
-            skipped_count: 0,
-            error_count: 0,
-            completed_count: 1,
-            failed_count: 0,
-            failed_files: Vec::new(),
-            pending_files: Vec::new(),
-            metadata_diagnostics: Vec::new(),
-            logs: vec!["conversion complete".into()],
-            status: HistoryStatus::Completed,
-            retry_of: None,
-            conflict_strategy: Default::default(),
-            filename_rule: Default::default(),
-            netease_filename_format: Default::default(),
-            report_path: None,
-            analysis_reports: Vec::new(),
-            runtime_session_dir: None,
-        };
-
-        let payload = super::build_runtime_session_export(&entry, Some(&monitor.session_dir));
-        assert_eq!(payload["schemaVersion"], 1);
-        assert_eq!(payload["history"]["id"], "history-export");
-        let mut slot_entry = entry.clone();
-        slot_entry.id = "batch-export-slot2".into();
-        assert_eq!(
-            super::resolve_runtime_session_dir(&root, &slot_entry),
-            Some(monitor.session_dir.clone())
-        );
-        assert_eq!(payload["runtimeSession"]["available"], true);
-        assert!(payload["runtimeSession"]["files"]["session.json"].is_object());
-        assert!(payload["runtimeSession"]["files"]["events.jsonl"]
-            .as_array()
-            .is_some_and(|events| events.iter().any(|event| event["event"] == "analysis_completed")));
-        assert!(payload["readableSummary"].as_str().is_some());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_analysis_summary_distinguishes_timeout_and_pending_tracks() {
-        let root = std::env::temp_dir().join(format!(
-            "w4dj-runtime-analysis-summary-{}",
-            super::unique_timestamp()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let candidates = serde_json::json!([
-            { "preview": { "candidates": [
-                { "name": "completed.mp3", "source_path": "/music/in/completed.mp3", "destination_path": "/music/out/completed.mp3" },
-                { "name": "timeout.mp3", "source_path": "/music/in/timeout.mp3", "destination_path": "/music/out/timeout.mp3" },
-                { "name": "pending.mp3", "source_path": "/music/in/pending.mp3", "destination_path": "/music/out/pending.mp3" }
-            ] } }
-        ]);
-        fs::write(
-            root.join("candidates.json"),
-            serde_json::to_vec(&candidates).unwrap(),
-        )
-        .unwrap();
-        let events = [
-            serde_json::json!({ "event": "analysis_requested", "at": "2026-08-22 00:00:00 UTC", "details": {} }),
-            serde_json::json!({ "event": "analysis_started", "at": "2026-08-22 00:00:01 UTC", "details": {} }),
-            serde_json::json!({ "event": "analysis_candidate_finished", "at": "2026-08-22 00:01:00 UTC", "details": {
-                "source_path": "/music/in/completed.mp3", "name": "completed.mp3", "status": "completed", "worker_job_id": "worker-1"
-            } }),
-            serde_json::json!({ "event": "analysis_candidate_finished", "at": "2026-08-22 00:02:00 UTC", "details": {
-                "source_path": "/music/in/timeout.mp3", "name": "timeout.mp3", "status": "timeout", "stage": "analyzingHighLevel", "worker_job_id": "worker-2", "elapsed_ms": 300000
-            } }),
-            serde_json::json!({ "event": "analysis_completed", "at": "2026-08-22 00:03:00 UTC", "details": {} }),
-        ];
-        let contents = events
-            .iter()
-            .map(|event| serde_json::to_string(event).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(root.join("events.jsonl"), contents).unwrap();
-
-        let summary = super::runtime_session_analysis_summary(Some(&root)).unwrap();
-        assert_eq!(summary.status, "partial");
-        assert_eq!(summary.total, 3);
-        assert_eq!(summary.completed, 1);
-        assert_eq!(summary.timed_out, 1);
-        assert_eq!(summary.failed, 0);
-        assert_eq!(summary.pending, 1);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn manual_error_report_export_writes_file_and_records_path() {
-        let root = std::env::temp_dir().join(format!(
-            "w4dj-error-report-export-{}",
-            super::unique_timestamp()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let history_path = root.join("history.json");
-        let output_path = root.join("manual-report.txt");
-        let entry = HistoryEntry {
-            id: "history-manual-report".into(),
-            batch_id: "batch-manual-report".into(),
-            slot_index: 0,
-            started_at: "2026-08-20 00:00:00 UTC".into(),
-            finished_at: "2026-08-20 00:00:01 UTC".into(),
-            duration_seconds: 1,
-            source_directory: "/music/in".into(),
-            destination_directory: "/music/out".into(),
-            mode: Mode::Compat,
-            lossless_format: None,
-            new_count: 1,
-            existing_count: 0,
-            skipped_count: 0,
-            error_count: 1,
-            completed_count: 0,
-            failed_count: 1,
-            failed_files: vec![FailedFile {
-                name: "broken.mp3".into(),
-                source_path: "/music/in/broken.mp3".into(),
-                destination_path: "/music/out/broken.mp3".into(),
-                message: "conversion failed".into(),
-                category: Default::default(),
-            }],
-            pending_files: Vec::new(),
-            metadata_diagnostics: Vec::new(),
-            logs: vec!["conversion failed".into()],
-            status: HistoryStatus::Error,
-            retry_of: None,
-            conflict_strategy: Default::default(),
-            filename_rule: Default::default(),
-            netease_filename_format: Default::default(),
-            report_path: None,
-            analysis_reports: Vec::new(),
-            runtime_session_dir: None,
-        };
-        w4dj::history::upsert_history(&history_path, entry).unwrap();
-
-        super::export_history_error_report_to_path(
-            &history_path,
-            "history-manual-report",
-            &output_path,
-        )
-        .unwrap();
-
-        let report = fs::read_to_string(&output_path).unwrap();
-        assert!(report.contains("任务 ID：history-manual-report"));
-        assert!(report.contains("导出保存位置："));
-        let entries = w4dj::history::load_history(&history_path).unwrap();
-        assert_eq!(entries[0].report_path.as_deref(), Some(output_path.to_str().unwrap()));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -8871,84 +4198,5 @@ mod tests {
             history_status_for(&task.snapshot(), &[failed_file]),
             HistoryStatus::Partial
         );
-    }
-
-    #[test]
-    fn confirmed_sync_persists_history_before_publishing_terminal_state() {
-        let directory = std::env::temp_dir().join(format!(
-            "w4dj-history-order-{}-{}",
-            std::process::id(),
-            super::unique_timestamp()
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        let history_path = directory.join("history.json");
-        let controller = Arc::new(Mutex::new(DesktopController::new(
-            DesktopState::from_preferences(AppPreferences {
-                slots: [
-                    SyncSlotPreferences::new("/music/in", "/music/out"),
-                    SyncSlotPreferences::new("", ""),
-                ],
-                mode: Mode::Compat,
-                lossless_format: None,
-                ..AppPreferences::default()
-            }),
-        )));
-        let task_controller = {
-            let mut guard = controller.lock().expect("desktop lock should not be poisoned");
-            guard.start_confirmed_sync(0, 1).unwrap();
-            guard.task_controller(0).unwrap()
-        };
-        task_controller.complete_current_file();
-
-        let entry = HistoryEntry {
-            id: "batch-history-order-slot1".into(),
-            batch_id: "batch-history-order".into(),
-            slot_index: 0,
-            started_at: "2026-08-20 06:00:00 UTC".into(),
-            finished_at: "2026-08-20 06:00:01 UTC".into(),
-            duration_seconds: 1,
-            source_directory: "/music/in".into(),
-            destination_directory: "/music/out".into(),
-            mode: Mode::Compat,
-            lossless_format: None,
-            new_count: 1,
-            existing_count: 0,
-            skipped_count: 0,
-            error_count: 0,
-            completed_count: 1,
-            failed_count: 0,
-            failed_files: Vec::new(),
-            pending_files: Vec::new(),
-            metadata_diagnostics: Vec::new(),
-            logs: Vec::new(),
-            status: HistoryStatus::Completed,
-            retry_of: None,
-            conflict_strategy: Default::default(),
-            filename_rule: Default::default(),
-            netease_filename_format: Default::default(),
-            report_path: None,
-            analysis_reports: Vec::new(),
-            runtime_session_dir: None,
-        };
-
-        let history_lock = Arc::new(Mutex::new(()));
-        persist_history_before_terminal_state(
-            &history_path,
-            &history_lock,
-            &controller,
-            0,
-            entry,
-            Ok(task_controller.snapshot()),
-        )
-        .expect("final history should be persisted");
-
-        let entries = w4dj::history::load_history(&history_path).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].batch_id, "batch-history-order");
-        assert_eq!(
-            controller.lock().unwrap().state().slots[0].status,
-            w4dj::desktop::DesktopStatus::Completed
-        );
-        let _ = fs::remove_dir_all(directory);
     }
 }

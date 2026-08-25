@@ -77,8 +77,6 @@ W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；�
 
 Essentia.js 已内置在“加强模式”中。打开“加强模式”后，点击确认并开始转换，W4DJ 会在后台逐首分析待处理歌曲，并把结果直接写入输出音频；关闭时不会运行分析，也不改变普通转换流程：
 
-TensorFlow.js 和约 3.5 MB 的 MusiCNN/情绪/人声预训练资源均随桌面 App 打包，首次启动会安装缺失模型，不需要连接模型服务器。高级设置中的“恢复内置模型”可覆盖修复损坏的本地副本；“官网下载”和“导入模型”继续作为手动替换入口。宽类 Genre 由 MusiCNN 的 50 个 MSD 预训练标签投影得到，情绪与人声/器乐使用独立分类头。
-
 - BPM 和节拍位置；
 - Key、大小调和 Key 置信度；
 - EBU R128 Integrated Loudness（LUFS）与响度范围；
@@ -131,9 +129,9 @@ TensorFlow.js 和约 3.5 MB 的 MusiCNN/情绪/人声预训练资源均随桌面
 
 从 Releases 下载对应架构的安装包：
 
-- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v3.2.0-beta.3.dmg`
-- Intel：`W4DJ-RKB-macOS-Intel-v3.2.0-beta.3.dmg`
-- Windows：`W4DJ-RKB-Windows-Installer-v3.2.0-beta.3-setup.exe`
+- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v3.2.0.dmg`
+- Intel：`W4DJ-RKB-macOS-Intel-v3.2.0.dmg`
+- Windows：`W4DJ-RKB-Windows-Installer-v3.2.0-setup.exe`
 
 首次打开时，如果 macOS 提示应用无法验证：
 
@@ -191,5 +189,3 @@ W4DJ-RKB/
 - [MTG/essentia.js](https://github.com/MTG/essentia.js) —— 浏览器端音频分析引擎
 
 Essentia.js 使用 AGPL-3.0 授权。发布包含该分析模块的 W4DJ 安装包时，需要同时遵守其许可证义务；如果后续要做闭源商业分发，应改用 Essentia 的商业授权或采用独立分析服务。
-
-随包预训练模型由 Universitat Pompeu Fabra 的 Music Technology Group 提供，使用 CC BY-NC-SA 4.0；商业分发前需要另行取得 MTG 的商业许可。模型归属和许可链接随 App 保存在 `Resources/essentia-models/NOTICE.md`。

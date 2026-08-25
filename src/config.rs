@@ -51,27 +51,6 @@ pub enum NeteaseFilenameFormat {
     TitleArtist,
 }
 
-/// Controls how a source identity is turned into an output filename.
-/// NetEase/NCM sources keep the source title and artist text verbatim; the
-/// SoundCloud/ordinary-folder path retains the historical filesystem-safe
-/// cleanup rules.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum FilenameNormalizationPolicy {
-    PreserveSource,
-    #[default]
-    SoundCloud,
-}
-
-impl FilenameNormalizationPolicy {
-    pub const fn cache_key(self) -> &'static str {
-        match self {
-            Self::PreserveSource => "preserve_source",
-            Self::SoundCloud => "soundcloud",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
@@ -99,7 +78,7 @@ pub struct Config {
 #[derive(clap::Parser)]
 #[command(
     name = "w4dj",
-    version = "3.2.0-beta.3",
+    version = "3.2.0",
     author = "slipstream",
     about = "网易云音乐曲库同步器"
 )]

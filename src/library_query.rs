@@ -23,11 +23,6 @@ pub enum LibraryField {
     Loudness,
     Energy,
     Danceability,
-    DiscogsMoodTheme,
-    DiscogsApproachability,
-    DiscogsInstrumentation,
-    DiscogsTimbre,
-    DiscogsDanceability,
     CoverAvailable,
     Lyrics,
     UpdatedAt,
@@ -125,10 +120,10 @@ pub(crate) fn compile_query(query: &LibraryQuery) -> Result<CompiledQuery, Libra
     let text = query.text.trim();
     if !text.is_empty() {
         predicates.push(
-            "(t.title LIKE ? ESCAPE '\\' OR t.artists LIKE ? ESCAPE '\\' OR t.album LIKE ? ESCAPE '\\' OR t.aliases_json LIKE ? ESCAPE '\\' OR t.netease_genre LIKE ? ESCAPE '\\' OR t.essentia_genre LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM local_files lf WHERE lf.track_key=t.track_key AND lf.path LIKE ? ESCAPE '\\'))".to_string(),
+            "(t.title LIKE ? ESCAPE '\\' OR t.artists LIKE ? ESCAPE '\\' OR t.album LIKE ? ESCAPE '\\' OR t.netease_genre LIKE ? ESCAPE '\\' OR t.essentia_genre LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM local_files lf WHERE lf.track_key=t.track_key AND lf.path LIKE ? ESCAPE '\\'))".to_string(),
         );
         let pattern = format!("%{}%", escape_like(text));
-        values.extend((0..7).map(|_| Value::Text(pattern.clone())));
+        values.extend((0..6).map(|_| Value::Text(pattern.clone())));
     }
 
     let joiner = match query.filter_logic {
@@ -182,19 +177,7 @@ pub(crate) struct CompiledQuery {
 }
 
 fn compile_filter(filter: &LibraryFilter, values: &mut Vec<Value>) -> Result<String, LibraryError> {
-    let confidence_filter = matches!(
-        filter.operator,
-        LibraryOperator::GreaterThan
-            | LibraryOperator::GreaterOrEqual
-            | LibraryOperator::LessThan
-            | LibraryOperator::LessOrEqual
-            | LibraryOperator::Between
-    );
-    let expression = if confidence_filter {
-        discogs_confidence_expression(&filter.field).unwrap_or(field_expression(&filter.field)?)
-    } else {
-        field_expression(&filter.field)?
-    };
+    let expression = field_expression(&filter.field)?;
     match filter.operator {
         LibraryOperator::IsEmpty => Ok(format!("({expression} IS NULL OR {expression} = '')")),
         LibraryOperator::IsNotEmpty => {
@@ -216,8 +199,7 @@ fn compile_filter(filter: &LibraryFilter, values: &mut Vec<Value>) -> Result<Str
                 .value
                 .as_deref()
                 .ok_or_else(|| LibraryError::Invalid("筛选条件缺少值".to_string()))?;
-            let numeric = is_numeric_field(&filter.field)
-                || (confidence_filter && discogs_confidence_expression(&filter.field).is_some());
+            let numeric = is_numeric_field(&filter.field);
             let value = if numeric {
                 Value::Real(parse_number(raw)?)
             } else {
@@ -263,9 +245,7 @@ fn compile_filter(filter: &LibraryFilter, values: &mut Vec<Value>) -> Result<Str
             }
         }
         LibraryOperator::Between => {
-            if !is_numeric_field(&filter.field)
-                && discogs_confidence_expression(&filter.field).is_none()
-            {
+            if !is_numeric_field(&filter.field) {
                 return Err(LibraryError::Invalid(
                     "between 只适用于数值字段".to_string(),
                 ));
@@ -305,11 +285,6 @@ fn field_expression(field: &LibraryField) -> Result<&'static str, LibraryError> 
         LibraryField::Loudness => "t.integrated_loudness_lufs",
         LibraryField::Energy => "t.energy",
         LibraryField::Danceability => "t.danceability",
-        LibraryField::DiscogsMoodTheme => "t.discogs_mood_theme_json",
-        LibraryField::DiscogsApproachability => "t.discogs_approachability_json",
-        LibraryField::DiscogsInstrumentation => "t.discogs_instrumentation_json",
-        LibraryField::DiscogsTimbre => "t.discogs_timbre_json",
-        LibraryField::DiscogsDanceability => "t.discogs_danceability_json",
         LibraryField::CoverAvailable => "t.cover_available",
         LibraryField::Lyrics => "t.lyric_plain_text",
         LibraryField::UpdatedAt => "t.updated_at_ms",
@@ -328,29 +303,6 @@ fn is_numeric_field(field: &LibraryField) -> bool {
             | LibraryField::Danceability
             | LibraryField::UpdatedAt
     )
-}
-
-fn discogs_confidence_expression(field: &LibraryField) -> Option<&'static str> {
-    Some(match field {
-        // Multi-label heads are sorted by confidence before persistence, so
-        // the first label is the strongest displayed confidence.
-        LibraryField::DiscogsMoodTheme => {
-            "json_extract(t.discogs_mood_theme_json, '$.labels[0].confidence')"
-        }
-        LibraryField::DiscogsInstrumentation => {
-            "json_extract(t.discogs_instrumentation_json, '$.labels[0].confidence')"
-        }
-        LibraryField::DiscogsApproachability => {
-            "json_extract(t.discogs_approachability_json, '$.selectedConfidence')"
-        }
-        LibraryField::DiscogsTimbre => {
-            "json_extract(t.discogs_timbre_json, '$.selectedConfidence')"
-        }
-        LibraryField::DiscogsDanceability => {
-            "json_extract(t.discogs_danceability_json, '$.selectedConfidence')"
-        }
-        _ => return None,
-    })
 }
 
 fn parse_number(value: &str) -> Result<f64, LibraryError> {
@@ -403,8 +355,7 @@ mod tests {
         };
         let compiled = compile_query(&query).unwrap();
         assert!(compiled.where_sql.contains("t.effective_bitrate_bps >= ?"));
-        assert!(compiled.where_sql.contains("t.aliases_json LIKE ?"));
-        assert_eq!(compiled.values.len(), 8);
+        assert_eq!(compiled.values.len(), 7);
         assert_eq!(compiled.limit, 500);
         assert!(compiled.order_sql.contains("t.album ASC"));
     }
@@ -421,38 +372,5 @@ mod tests {
             ..LibraryQuery::default()
         };
         assert!(compile_query(&query).is_err());
-    }
-
-    #[test]
-    fn supports_discogs_class_text_and_confidence_filters() {
-        let query = LibraryQuery {
-            filters: vec![
-                LibraryFilter {
-                    field: LibraryField::DiscogsDanceability,
-                    operator: LibraryOperator::Is,
-                    value: Some("danceable".into()),
-                    second_value: None,
-                },
-                LibraryFilter {
-                    field: LibraryField::DiscogsDanceability,
-                    operator: LibraryOperator::GreaterOrEqual,
-                    value: Some("0.8".into()),
-                    second_value: None,
-                },
-            ],
-            ..LibraryQuery::default()
-        };
-        let compiled = compile_query(&query).unwrap();
-        assert!(
-            compiled
-                .where_sql
-                .contains("t.discogs_danceability_json = ?")
-        );
-        assert!(
-            compiled
-                .where_sql
-                .contains("json_extract(t.discogs_danceability_json, '$.selectedConfidence') >= ?")
-        );
-        assert_eq!(compiled.values.len(), 2);
     }
 }

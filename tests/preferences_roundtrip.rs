@@ -20,8 +20,6 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         conflict_strategy: ConflictStrategy::Rename,
         filename_rule: FilenameRule::ArtistTitle,
         netease_filename_format: Default::default(),
-        netease_database_path: Some(String::from("/music/sqlite_storage.sqlite3")),
-        concurrency_limit: 4,
     };
 
     save_preferences(&path, &preferences).unwrap();
@@ -37,11 +35,6 @@ fn preferences_roundtrip_persists_both_sync_slots() {
     assert!(loaded.enhanced_mode);
     assert_eq!(loaded.conflict_strategy, ConflictStrategy::Rename);
     assert_eq!(loaded.filename_rule, FilenameRule::ArtistTitle);
-    assert_eq!(
-        loaded.netease_database_path.as_deref(),
-        Some("/music/sqlite_storage.sqlite3")
-    );
-    assert_eq!(loaded.concurrency_limit, 4);
 }
 
 #[test]
@@ -109,37 +102,4 @@ fn preferences_without_enhanced_mode_default_to_disabled() {
     let loaded = load_preferences(&path).unwrap();
 
     assert!(!loaded.enhanced_mode);
-}
-
-#[test]
-fn concurrency_limit_migrates_and_normalizes_legacy_values() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("preferences.json");
-    let base = r#"{
-        "slots": [
-            {"source_directory": "/music/in", "destination_directory": "/music/out"},
-            {"source_directory": "", "destination_directory": ""}
-        ],
-        "mode": "compat",
-        "lossless_format": null
-    }"#;
-
-    fs::write(
-        &path,
-        base.replace(
-            "null\n    }",
-            "null,\n        \"concurrency_limit\": 8\n    }",
-        ),
-    )
-    .unwrap();
-    assert_eq!(load_preferences(&path).unwrap().concurrency_limit, 8);
-
-    for (raw, expected) in [("0", 1), ("10.6", 10), ("-4", 1), ("\"invalid\"", 2)] {
-        let contents = base.replace(
-            "null\n    }",
-            &format!("null,\n        \"concurrency_limit\": {raw}\n    }}"),
-        );
-        fs::write(&path, contents).unwrap();
-        assert_eq!(load_preferences(&path).unwrap().concurrency_limit, expected);
-    }
 }

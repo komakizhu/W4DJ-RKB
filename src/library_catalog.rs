@@ -1,16 +1,13 @@
-//! Compatibility query/index layer used by the W4DJ output library.
+//! W4DJ's private, queryable song-library index.
 //!
-//! The NetEase database is deliberately not opened by this module. Conversion
-//! code may still build a compatibility [`CatalogSnapshot`], but the
-//! Dashboard's public projection is filtered by `w4dj_library::W4djLibrary`;
-//! this module still owns the shared track/local-file tables and the legacy
-//! metadata staging schema.
+//! The NetEase database is deliberately not opened by this module.  Importers
+//! build a [`CatalogSnapshot`] from read-only source data and commit that
+//! snapshot to this SQLite database in one transaction.
 
 use crate::analysis::TrackAnalysis;
 use crate::library_query::{LibraryPage, LibraryQuery, compile_query};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params_from_iter, types::Value};
+use rusqlite::{Connection, OptionalExtension, Row, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -81,7 +78,6 @@ impl DurationSource {
 #[serde(rename_all = "snake_case")]
 pub enum LocalStatus {
     Available,
-    OutOfScope,
     Missing,
     Unreadable,
     DatabaseOnly,
@@ -91,7 +87,6 @@ impl LocalStatus {
     fn as_str(self) -> &'static str {
         match self {
             Self::Available => "available",
-            Self::OutOfScope => "out_of_scope",
             Self::Missing => "missing",
             Self::Unreadable => "unreadable",
             Self::DatabaseOnly => "database_only",
@@ -101,7 +96,6 @@ impl LocalStatus {
     fn parse(value: String) -> Self {
         match value.as_str() {
             "available" => Self::Available,
-            "out_of_scope" => Self::OutOfScope,
             "unreadable" => Self::Unreadable,
             "database_only" => Self::DatabaseOnly,
             _ => Self::Missing,
@@ -157,12 +151,6 @@ pub struct CatalogTrack {
     pub danceability: Option<f64>,
     pub mood_json: String,
     pub instrument_json: String,
-    pub style_json: String,
-    pub discogs_mood_theme_json: String,
-    pub discogs_approachability_json: String,
-    pub discogs_instrumentation_json: String,
-    pub discogs_timbre_json: String,
-    pub discogs_danceability_json: String,
     pub drop_loudness_lufs: Option<f64>,
     pub updated_at_ms: i64,
 }
@@ -215,12 +203,6 @@ impl Default for CatalogTrack {
             danceability: None,
             mood_json: "[]".to_string(),
             instrument_json: "[]".to_string(),
-            style_json: "[]".to_string(),
-            discogs_mood_theme_json: "[]".to_string(),
-            discogs_approachability_json: "{}".to_string(),
-            discogs_instrumentation_json: "[]".to_string(),
-            discogs_timbre_json: "{}".to_string(),
-            discogs_danceability_json: "{}".to_string(),
             drop_loudness_lufs: None,
             updated_at_ms: 0,
         }
@@ -329,25 +311,6 @@ impl LibraryCatalog {
         &self.path
     }
 
-    /// Internal connection access for the output-oriented W4DJ library
-    /// facade. The legacy catalog remains the owner of the connection and
-    /// transaction lifetime; callers cannot move it out of this type.
-    pub(crate) fn connection(&self) -> &Connection {
-        &self.connection
-    }
-
-    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
-        &mut self.connection
-    }
-
-    pub(crate) fn upsert_local_file(&mut self, file: &CatalogLocalFile) -> LibraryResult<()> {
-        self.connection.execute(
-            &local_file_upsert_sql(),
-            params_from_iter(local_file_values(file)),
-        )?;
-        Ok(())
-    }
-
     pub fn migrate(&mut self) -> LibraryResult<()> {
         self.connection.execute_batch(
             r#"
@@ -401,12 +364,6 @@ impl LibraryCatalog {
                 danceability REAL,
                 mood_json TEXT NOT NULL DEFAULT '[]',
                 instrument_json TEXT NOT NULL DEFAULT '[]',
-                style_json TEXT NOT NULL DEFAULT '[]',
-                discogs_mood_theme_json TEXT NOT NULL DEFAULT '[]',
-                discogs_approachability_json TEXT NOT NULL DEFAULT '{}',
-                discogs_instrumentation_json TEXT NOT NULL DEFAULT '[]',
-                discogs_timbre_json TEXT NOT NULL DEFAULT '{}',
-                discogs_danceability_json TEXT NOT NULL DEFAULT '{}',
                 drop_loudness_lufs REAL,
                 updated_at_ms INTEGER NOT NULL
             );
@@ -456,36 +413,6 @@ impl LibraryCatalog {
             );
             "#,
         )?;
-        let style_column_exists: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tracks') WHERE name='style_json')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !style_column_exists {
-            self.connection.execute(
-                "ALTER TABLE tracks ADD COLUMN style_json TEXT NOT NULL DEFAULT '[]'",
-                [],
-            )?;
-        }
-        for (column, default_value) in [
-            ("discogs_mood_theme_json", "[]"),
-            ("discogs_approachability_json", "{}"),
-            ("discogs_instrumentation_json", "[]"),
-            ("discogs_timbre_json", "{}"),
-            ("discogs_danceability_json", "{}"),
-        ] {
-            let exists: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tracks') WHERE name=?1)",
-                [column],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                self.connection.execute(
-                    &format!("ALTER TABLE tracks ADD COLUMN {column} TEXT NOT NULL DEFAULT '{default_value}'"),
-                    [],
-                )?;
-            }
-        }
         self.connection.execute(
             "INSERT INTO catalog_meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -546,97 +473,6 @@ impl LibraryCatalog {
         Ok(())
     }
 
-    pub fn upsert_snapshot_with_analysis<Cancel, Observe>(
-        &mut self,
-        snapshot: &CatalogSnapshot,
-        entries: &[TrackAnalysis],
-        mut is_cancelled: Cancel,
-        mut observe: Observe,
-    ) -> LibraryResult<usize>
-    where
-        Cancel: FnMut() -> bool,
-        Observe: FnMut(usize, usize, &str),
-    {
-        let transaction = self.connection.transaction()?;
-        let track_sql = track_upsert_sql_preserving_analysis();
-        let local_sql = local_file_upsert_sql();
-        let source_sql = source_record_upsert_sql();
-        let catalog_source_sql = catalog_source_upsert_sql();
-        let total = snapshot.tracks.len()
-            + snapshot.local_files.len()
-            + snapshot.source_records.len()
-            + snapshot.sources.len()
-            + entries.len();
-        let mut processed = 0;
-
-        for track in &snapshot.tracks {
-            if is_cancelled() {
-                return Err(LibraryError::Invalid("歌曲库刷新已取消".to_string()));
-            }
-            transaction.execute(&track_sql, params_from_iter(track_values(track)))?;
-            processed += 1;
-            observe(processed, total, &track.title);
-        }
-        transaction.execute(
-            "UPDATE local_files SET readable = 0, probe_error = '文件未在最近扫描中发现'",
-            [],
-        )?;
-        for local_file in &snapshot.local_files {
-            if is_cancelled() {
-                return Err(LibraryError::Invalid("歌曲库刷新已取消".to_string()));
-            }
-            transaction.execute(&local_sql, params_from_iter(local_file_values(local_file)))?;
-            processed += 1;
-            observe(processed, total, &local_file.path.to_string_lossy());
-        }
-        for record in &snapshot.source_records {
-            if is_cancelled() {
-                return Err(LibraryError::Invalid("歌曲库刷新已取消".to_string()));
-            }
-            transaction.execute(&source_sql, params_from_iter(source_record_values(record)))?;
-            processed += 1;
-            observe(processed, total, &record.source_primary_key);
-        }
-        for source in &snapshot.sources {
-            if is_cancelled() {
-                return Err(LibraryError::Invalid("歌曲库刷新已取消".to_string()));
-            }
-            transaction.execute(
-                &catalog_source_sql,
-                params_from_iter(catalog_source_values(source)),
-            )?;
-            processed += 1;
-            observe(processed, total, &source.database_path.to_string_lossy());
-        }
-        transaction.execute(
-            "UPDATE tracks SET local_status = CASE
-                WHEN EXISTS (SELECT 1 FROM local_files lf WHERE lf.track_key = tracks.track_key AND lf.readable = 1)
-                    THEN 'available'
-                WHEN EXISTS (SELECT 1 FROM local_files lf WHERE lf.track_key = tracks.track_key AND lf.probe_error = '文件未在最近扫描中发现')
-                    THEN 'missing'
-                WHEN EXISTS (SELECT 1 FROM local_files lf WHERE lf.track_key = tracks.track_key)
-                    THEN 'unreadable'
-                ELSE 'database_only'
-             END",
-            [],
-        )?;
-        let updated = apply_analysis_entries_in_transaction(
-            &transaction,
-            entries,
-            &mut is_cancelled,
-            &mut |index, total_entries, item| {
-                processed += 1;
-                observe(processed, total, item);
-                let _ = (index, total_entries);
-            },
-        )?;
-        if is_cancelled() {
-            return Err(LibraryError::Invalid("歌曲库刷新已取消".to_string()));
-        }
-        transaction.commit()?;
-        Ok(updated)
-    }
-
     pub fn track_detail(&self, track_key: &str) -> LibraryResult<Option<CatalogTrack>> {
         Ok(self
             .connection
@@ -669,174 +505,6 @@ impl LibraryCatalog {
             .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get(0))?)
     }
 
-    /// Count only tracks that have a completed basic analysis projection.
-    ///
-    /// The private catalog may still contain source records imported from the
-    /// NetEase scanner, but those rows are not part of the Dashboard's
-    /// analysis library until an analysis entry supplies an Essentia duration.
-    pub fn count_analyzed_tracks(&self) -> LibraryResult<i64> {
-        Ok(self.connection.query_row(
-            "SELECT COUNT(*) FROM tracks WHERE essentia_duration_seconds IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// Rebind one completed analysis to a new local audio file without
-    /// changing any Essentia result or source metadata stored on the track.
-    /// The old local-file row is removed from the private catalog only.
-    pub fn relocate_analyzed_track(&mut self, track_key: &str, path: &Path) -> LibraryResult<()> {
-        let metadata = fs::metadata(path)
-            .map_err(|error| LibraryError::Invalid(format!("无法读取所选音频文件：{error}")))?;
-        if !metadata.is_file() {
-            return Err(LibraryError::Invalid("所选路径不是文件".to_string()));
-        }
-        if metadata.len() == 0 {
-            return Err(LibraryError::Invalid("所选音频文件为空".to_string()));
-        }
-
-        let path_string = path.to_string_lossy().into_owned();
-        let measured_format = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase());
-        let size_bytes = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-        let modified_at_ms = metadata.modified().ok().and_then(|value| {
-            value
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        });
-
-        let transaction = self.connection.transaction()?;
-        let is_analyzed = transaction
-            .query_row(
-                "SELECT essentia_duration_seconds IS NOT NULL
-                 FROM tracks WHERE track_key = ?1",
-                [track_key],
-                |row| row.get::<_, bool>(0),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !is_analyzed {
-            return Err(LibraryError::Invalid(
-                "只能重新定位已经完成分析的歌曲".to_string(),
-            ));
-        }
-
-        if let Some(existing_key) = transaction
-            .query_row(
-                "SELECT track_key FROM local_files WHERE path = ?1",
-                [&path_string],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            && existing_key != track_key
-        {
-            return Err(LibraryError::Invalid(
-                "所选文件已经关联到另一首歌曲".to_string(),
-            ));
-        }
-
-        transaction.execute("DELETE FROM local_files WHERE track_key = ?1", [track_key])?;
-        transaction.execute(
-            "INSERT INTO local_files
-                (track_key, path, size_bytes, modified_at_ms, measured_format,
-                 measured_bitrate_bps, measured_duration_seconds, sample_rate_hz,
-                 channels, readable, probe_error)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, 1, NULL)",
-            rusqlite::params![
-                track_key,
-                path_string,
-                size_bytes,
-                modified_at_ms,
-                measured_format,
-            ],
-        )?;
-        let local_file_id = transaction.last_insert_rowid();
-        transaction.execute(
-            "UPDATE tracks SET
-                local_status = 'available', preferred_local_file_id = ?1,
-                measured_format = ?2, effective_format = ?2,
-                measured_duration_seconds = NULL, measured_bitrate_bps = NULL,
-                measured_size_bytes = ?3, effective_size_bytes = ?3,
-                effective_duration_seconds = essentia_duration_seconds,
-                duration_source = CASE WHEN essentia_duration_seconds IS NOT NULL
-                    THEN 'essentia' ELSE duration_source END,
-                effective_bitrate_bps = db_bitrate_bps,
-                updated_at_ms = ?4
-             WHERE track_key = ?5",
-            rusqlite::params![
-                local_file_id,
-                measured_format,
-                size_bytes,
-                now_ms(),
-                track_key
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// Remove one analysis row from W4DJ's private catalog. Audio files,
-    /// analysis JSON and the NetEase source database are intentionally left
-    /// untouched.
-    pub fn remove_analyzed_track(&mut self, track_key: &str) -> LibraryResult<bool> {
-        let transaction = self.connection.transaction()?;
-        let removed = transaction.execute(
-            "DELETE FROM tracks
-             WHERE track_key = ?1 AND essentia_duration_seconds IS NOT NULL",
-            [track_key],
-        )?;
-        transaction.commit()?;
-        Ok(removed > 0)
-    }
-
-    /// Remove every analyzed row whose local file is missing, unreadable, or
-    /// otherwise unavailable. This only affects W4DJ's SQLite projection.
-    pub fn remove_invalid_analyzed_tracks(&mut self) -> LibraryResult<u64> {
-        let mut availability = HashMap::<String, bool>::new();
-        let mut statement = self.connection.prepare(
-            "SELECT t.track_key, lf.path, lf.readable
-             FROM tracks t
-             LEFT JOIN local_files lf ON lf.track_key = t.track_key
-             WHERE t.essentia_duration_seconds IS NOT NULL",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<bool>>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (track_key, path, readable) = row?;
-            let file_is_available = readable.unwrap_or(false)
-                && path.as_deref().is_some_and(|value| {
-                    fs::metadata(value).is_ok_and(|metadata| metadata.is_file())
-                });
-            availability
-                .entry(track_key)
-                .and_modify(|available| *available |= file_is_available)
-                .or_insert(file_is_available);
-        }
-        drop(statement);
-
-        let transaction = self.connection.transaction()?;
-        let mut removed = 0;
-        for (track_key, available) in availability {
-            if !available {
-                removed += transaction.execute(
-                    "DELETE FROM tracks
-                     WHERE track_key = ?1 AND essentia_duration_seconds IS NOT NULL",
-                    [track_key],
-                )?;
-            }
-        }
-        transaction.commit()?;
-        Ok(removed as u64)
-    }
-
     pub fn local_file_by_path(&self, path: &Path) -> LibraryResult<Option<CatalogLocalFile>> {
         Ok(self
             .connection
@@ -859,17 +527,6 @@ impl LibraryCatalog {
              FROM local_files WHERE track_key = ?1 ORDER BY readable DESC, path ASC",
         )?;
         let rows = statement.query_map([track_key], local_file_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn readable_local_files(&self) -> LibraryResult<Vec<CatalogLocalFile>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, track_key, path, size_bytes, modified_at_ms, measured_format,
-                    measured_bitrate_bps, measured_duration_seconds, sample_rate_hz,
-                    channels, readable, probe_error
-             FROM local_files WHERE readable = 1 ORDER BY path ASC",
-        )?;
-        let rows = statement.query_map([], local_file_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -904,174 +561,87 @@ impl LibraryCatalog {
 
     pub fn apply_analysis_entries(&mut self, entries: &[TrackAnalysis]) -> LibraryResult<usize> {
         let transaction = self.connection.transaction()?;
-        let updated = apply_analysis_entries_in_transaction(
-            &transaction,
-            entries,
-            &mut || false,
-            &mut |_, _, _| {},
-        )?;
-        transaction.commit()?;
-        Ok(updated)
-    }
-
-    /// Replace the analysis projection in the private W4DJ catalog.
-    ///
-    /// Entries are keyed by their local path. Existing NetEase rows are
-    /// enriched in place when the path is already known; otherwise an
-    /// analysis-only track is created with a stable `analysis:` key. The
-    /// transaction also removes stale analysis-only rows, so deleting an
-    /// analysis cache entry cannot leave a ghost song in the Dashboard.
-    pub fn replace_analysis_entries(&mut self, entries: &[TrackAnalysis]) -> LibraryResult<usize> {
-        let transaction = self.connection.transaction()?;
-        let track_sql = track_upsert_sql();
-        let local_sql = local_file_upsert_sql();
-        let mut active_keys = Vec::new();
         let mut updated = 0;
-
         for entry in entries {
-            let path = entry.path.trim();
-            if path.is_empty() {
-                continue;
-            }
-            let path_value = Path::new(path);
-            let existing_key = transaction
+            let local_path = Path::new(&entry.path).to_string_lossy();
+            let Some(track_key) = transaction
                 .query_row(
                     "SELECT track_key FROM local_files WHERE path = ?1",
-                    [path],
+                    [local_path.as_ref()],
                     |row| row.get::<_, String>(0),
                 )
-                .optional()?;
-            let is_new_track = existing_key.is_none();
-            let track_key = existing_key.unwrap_or_else(|| analysis_track_key(entry));
-
-            if is_new_track {
-                let track = catalog_track_from_analysis(entry, &track_key, path_value);
-                transaction.execute(&track_sql, params_from_iter(track_values(&track)))?;
-            } else {
-                let track = catalog_track_from_analysis(entry, &track_key, path_value);
-                transaction.execute(
-                    "UPDATE tracks SET title = ?1, artists = ?2,
-                        artist_list_json = ?3, album = ?4,
-                        measured_format = ?5, effective_format = ?6,
-                        effective_size_bytes = ?7
-                     WHERE track_key = ?8 AND netease_track_id IS NULL",
-                    rusqlite::params![
-                        track.title,
-                        track.artists,
-                        track.artist_list_json,
-                        track.album,
-                        track.measured_format,
-                        track.effective_format,
-                        track.effective_size_bytes,
-                        track_key,
-                    ],
-                )?;
-            }
-
-            let local_file = catalog_local_file_from_analysis(entry, &track_key, path_value);
-            transaction.execute(&local_sql, params_from_iter(local_file_values(&local_file)))?;
-            updated += apply_analysis_entry_to_track(&transaction, entry, &track_key)?;
-            active_keys.push(track_key);
-        }
-
-        let mut stale_keys = Vec::new();
-        {
-            let mut statement = transaction.prepare(
-                "SELECT t.track_key FROM tracks t
-                 WHERE t.netease_track_id IS NULL
-                   AND t.essentia_duration_seconds IS NOT NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM source_records sr WHERE sr.track_key = t.track_key
-                   )",
+                .optional()?
+            else {
+                continue;
+            };
+            let (duration, source) = effective_duration(
+                entry.duration_seconds,
+                transaction
+                    .query_row(
+                        "SELECT measured_duration_seconds FROM tracks WHERE track_key = ?1",
+                        [&track_key],
+                        |row| row.get::<_, Option<f64>>(0),
+                    )
+                    .optional()?
+                    .flatten(),
+                transaction
+                    .query_row(
+                        "SELECT db_duration_seconds FROM tracks WHERE track_key = ?1",
+                        [&track_key],
+                        |row| row.get::<_, Option<f64>>(0),
+                    )
+                    .optional()?
+                    .flatten(),
+            );
+            let genre = entry.genre.trim();
+            let high_level = entry.high_level.as_ref();
+            let mood = high_level
+                .map(|value| {
+                    serde_json::to_string(&value.mood).unwrap_or_else(|_| "[]".to_string())
+                })
+                .unwrap_or_else(|| "[]".to_string());
+            let instrument = high_level
+                .map(|value| {
+                    serde_json::to_string(&value.instrument).unwrap_or_else(|_| "[]".to_string())
+                })
+                .unwrap_or_else(|| "[]".to_string());
+            updated += transaction.execute(
+                "UPDATE tracks SET
+                    essentia_genre=?1, essentia_duration_seconds=?2,
+                    effective_duration_seconds=?3, duration_source=?4,
+                    bpm=?5, musical_key=?6, scale=?7,
+                    integrated_loudness_lufs=?8, loudness_range_lu=?9,
+                    energy=?10, danceability=?11, mood_json=?12,
+                    instrument_json=?13, drop_loudness_lufs=?14,
+                    updated_at_ms=?15
+                 WHERE track_key=?16",
+                rusqlite::params![
+                    genre,
+                    entry.duration_seconds,
+                    duration,
+                    source.map(DurationSource::as_str),
+                    entry.bpm,
+                    entry.key,
+                    entry.scale,
+                    entry.integrated_loudness_lufs,
+                    entry.loudness_range_lu,
+                    entry.energy,
+                    entry.danceability,
+                    mood,
+                    instrument,
+                    entry.drop_loudness_lufs,
+                    now_ms(),
+                    track_key,
+                ],
             )?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                let key = row?;
-                if !active_keys.iter().any(|active| active == &key) {
-                    stale_keys.push(key);
-                }
-            }
         }
-        for key in stale_keys {
-            transaction.execute("DELETE FROM tracks WHERE track_key = ?1", [&key])?;
-        }
-
-        transaction.execute(
-            "UPDATE tracks SET local_status = CASE
-                WHEN EXISTS (SELECT 1 FROM local_files lf WHERE lf.track_key = tracks.track_key AND lf.readable = 1)
-                    THEN 'available'
-                WHEN EXISTS (SELECT 1 FROM local_files lf WHERE lf.track_key = tracks.track_key)
-                    THEN 'missing'
-                ELSE 'database_only'
-             END
-             WHERE essentia_duration_seconds IS NOT NULL",
-            [],
-        )?;
         transaction.commit()?;
         Ok(updated)
-    }
-
-    /// Remove the analysis projection while preserving imported source rows.
-    pub fn clear_analysis_projection(&mut self) -> LibraryResult<()> {
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM tracks
-             WHERE netease_track_id IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM source_records sr WHERE sr.track_key = tracks.track_key
-               )",
-            [],
-        )?;
-        transaction.execute(
-            "UPDATE tracks SET
-                essentia_genre = '', essentia_duration_seconds = NULL,
-                effective_duration_seconds = COALESCE(measured_duration_seconds, db_duration_seconds),
-                duration_source = CASE
-                    WHEN measured_duration_seconds IS NOT NULL THEN 'measured'
-                    WHEN db_duration_seconds IS NOT NULL THEN 'netease'
-                    ELSE NULL END,
-                bpm = NULL, musical_key = NULL, scale = NULL,
-                integrated_loudness_lufs = NULL, loudness_range_lu = NULL,
-                energy = NULL, danceability = NULL, mood_json = '[]',
-                instrument_json = '[]', style_json = '[]', drop_loudness_lufs = NULL,
-                updated_at_ms = ?1
-             WHERE netease_track_id IS NOT NULL OR EXISTS (
-                 SELECT 1 FROM source_records sr WHERE sr.track_key = tracks.track_key
-             )",
-            [now_ms()],
-        )?;
-        transaction.commit()?;
-        Ok(())
     }
 
     pub fn query(&self, query: &LibraryQuery) -> LibraryResult<LibraryPage> {
-        self.query_with_predicate(query, None)
-    }
-
-    pub fn query_analyzed(&self, query: &LibraryQuery) -> LibraryResult<LibraryPage> {
-        self.query_with_predicate(query, Some("t.essentia_duration_seconds IS NOT NULL"))
-    }
-
-    pub(crate) fn query_with_extra_predicate(
-        &self,
-        query: &LibraryQuery,
-        predicate: &str,
-    ) -> LibraryResult<LibraryPage> {
-        self.query_with_predicate(query, Some(predicate))
-    }
-
-    fn query_with_predicate(
-        &self,
-        query: &LibraryQuery,
-        extra_predicate: Option<&str>,
-    ) -> LibraryResult<LibraryPage> {
         let compiled = compile_query(query)?;
-        let where_sql = match extra_predicate {
-            Some(predicate) if compiled.where_sql.is_empty() => format!(" WHERE {predicate}"),
-            Some(predicate) => format!("{} AND {predicate}", compiled.where_sql),
-            None => compiled.where_sql.clone(),
-        };
-        let count_sql = format!("SELECT COUNT(*) FROM tracks t{}", where_sql);
+        let count_sql = format!("SELECT COUNT(*) FROM tracks t{}", compiled.where_sql);
         let total: u64 = self
             .connection
             .query_row(
@@ -1082,8 +652,55 @@ impl LibraryCatalog {
             .max(0) as u64;
         let sql = format!(
             "SELECT {} FROM tracks t{}{} LIMIT ? OFFSET ?",
-            qualified_track_columns(),
-            where_sql,
+            TRACK_COLUMNS
+                .replace("track_key", "t.track_key")
+                .replace("netease_track_id", "t.netease_track_id")
+                .replace("title", "t.title")
+                .replace("artists", "t.artists")
+                .replace("artist_list_json", "t.artist_list_json")
+                .replace("album", "t.album")
+                .replace("aliases_json", "t.aliases_json")
+                .replace("copyright_text", "t.copyright_text")
+                .replace("publish_date", "t.publish_date")
+                .replace("netease_genre", "t.netease_genre")
+                .replace("essentia_genre", "t.essentia_genre")
+                .replace("lyric_plain_text", "t.lyric_plain_text")
+                .replace("lyric_translated_text", "t.lyric_translated_text")
+                .replace("lyric_romanized_text", "t.lyric_romanized_text")
+                .replace("lyric_lrc_text", "t.lyric_lrc_text")
+                .replace("lyric_language", "t.lyric_language")
+                .replace("lyric_sync_type", "t.lyric_sync_type")
+                .replace("lyric_source", "t.lyric_source")
+                .replace("cover_path", "t.cover_path")
+                .replace("cover_available", "t.cover_available")
+                .replace("local_status", "t.local_status")
+                .replace("preferred_local_file_id", "t.preferred_local_file_id")
+                .replace("db_duration_seconds", "t.db_duration_seconds")
+                .replace("measured_duration_seconds", "t.measured_duration_seconds")
+                .replace("essentia_duration_seconds", "t.essentia_duration_seconds")
+                .replace("effective_duration_seconds", "t.effective_duration_seconds")
+                .replace("duration_source", "t.duration_source")
+                .replace("db_format", "t.db_format")
+                .replace("measured_format", "t.measured_format")
+                .replace("effective_format", "t.effective_format")
+                .replace("db_bitrate_bps", "t.db_bitrate_bps")
+                .replace("measured_bitrate_bps", "t.measured_bitrate_bps")
+                .replace("effective_bitrate_bps", "t.effective_bitrate_bps")
+                .replace("db_size_bytes", "t.db_size_bytes")
+                .replace("measured_size_bytes", "t.measured_size_bytes")
+                .replace("effective_size_bytes", "t.effective_size_bytes")
+                .replace("bpm", "t.bpm")
+                .replace("musical_key", "t.musical_key")
+                .replace("scale", "t.scale")
+                .replace("integrated_loudness_lufs", "t.integrated_loudness_lufs")
+                .replace("loudness_range_lu", "t.loudness_range_lu")
+                .replace("energy", "t.energy")
+                .replace("danceability", "t.danceability")
+                .replace("mood_json", "t.mood_json")
+                .replace("instrument_json", "t.instrument_json")
+                .replace("drop_loudness_lufs", "t.drop_loudness_lufs")
+                .replace("updated_at_ms", "t.updated_at_ms"),
+            compiled.where_sql,
             compiled.order_sql
         );
         let limit = compiled.limit;
@@ -1111,15 +728,6 @@ impl LibraryCatalog {
     }
 }
 
-fn qualified_track_columns() -> String {
-    TRACK_COLUMNS
-        .split(',')
-        .map(str::trim)
-        .map(|column| format!("t.{column}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 pub fn effective_duration(
     essentia: Option<f64>,
     measured: Option<f64>,
@@ -1143,234 +751,6 @@ pub fn effective_measured_or_database<T: Clone>(
     measured.or(database)
 }
 
-fn analysis_track_key(entry: &TrackAnalysis) -> String {
-    format!("analysis:{:016x}", entry.track_id())
-}
-
-fn catalog_track_from_analysis(
-    entry: &TrackAnalysis,
-    track_key: &str,
-    path: &Path,
-) -> CatalogTrack {
-    let metadata = fs::metadata(path).ok();
-    let readable = metadata.is_some();
-    let size_bytes = entry
-        .source_size_bytes
-        .map(|value| value.min(i64::MAX as u64) as i64)
-        .or_else(|| {
-            metadata
-                .as_ref()
-                .map(|value| value.len().min(i64::MAX as u64) as i64)
-        })
-        .unwrap_or_default();
-    let format = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
-    let title = if entry.title.trim().is_empty() {
-        path.file_stem()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned())
-    } else {
-        entry.title.trim().to_string()
-    };
-    let artists = entry.artist.trim().to_string();
-    let artist_list_json = serde_json::to_string(
-        &artists
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_else(|_| "[]".to_string());
-    let (duration, duration_source) = effective_duration(entry.duration_seconds, None, None);
-    let genre = analysis_genre(entry);
-    let mood = analysis_labels_json(entry.high_level.as_ref().map(|value| &value.mood));
-    let instrument = analysis_labels_json(entry.high_level.as_ref().map(|value| &value.instrument));
-    let style = analysis_labels_json(entry.high_level.as_ref().map(|value| &value.style));
-
-    CatalogTrack {
-        track_key: track_key.to_string(),
-        title,
-        artists,
-        artist_list_json,
-        album: entry.album.trim().to_string(),
-        essentia_genre: genre,
-        local_status: if readable {
-            LocalStatus::Available
-        } else {
-            LocalStatus::Missing
-        },
-        measured_format: format.clone(),
-        effective_format: format,
-        essentia_duration_seconds: entry.duration_seconds,
-        effective_duration_seconds: duration,
-        duration_source,
-        effective_size_bytes: Some(size_bytes),
-        bpm: entry.bpm,
-        musical_key: entry.key.clone(),
-        scale: entry.scale.clone(),
-        integrated_loudness_lufs: entry.integrated_loudness_lufs,
-        loudness_range_lu: entry.loudness_range_lu,
-        energy: entry.energy,
-        danceability: entry.danceability,
-        mood_json: mood,
-        instrument_json: instrument,
-        style_json: style,
-        drop_loudness_lufs: entry.drop_loudness_lufs,
-        updated_at_ms: now_ms(),
-        ..CatalogTrack::default()
-    }
-}
-
-fn catalog_local_file_from_analysis(
-    entry: &TrackAnalysis,
-    track_key: &str,
-    path: &Path,
-) -> CatalogLocalFile {
-    let metadata = fs::metadata(path).ok();
-    let readable = metadata.is_some();
-    let size_bytes = entry
-        .source_size_bytes
-        .map(|value| value.min(i64::MAX as u64) as i64)
-        .or_else(|| {
-            metadata
-                .as_ref()
-                .map(|value| value.len().min(i64::MAX as u64) as i64)
-        })
-        .unwrap_or_default();
-    let modified_at_ms = entry
-        .source_modified_at
-        .map(|value| value.min(i64::MAX as u64) as i64);
-    let measured_format = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
-    CatalogLocalFile {
-        id: None,
-        track_key: track_key.to_string(),
-        path: path.to_path_buf(),
-        size_bytes,
-        modified_at_ms,
-        measured_format,
-        measured_bitrate_bps: None,
-        measured_duration_seconds: None,
-        sample_rate_hz: None,
-        channels: None,
-        readable,
-        probe_error: (!readable).then(|| "分析文件不存在".to_string()),
-    }
-}
-
-fn analysis_genre(entry: &TrackAnalysis) -> String {
-    entry
-        .high_level
-        .as_ref()
-        .map(|value| {
-            value
-                .genre
-                .iter()
-                .map(|label| label.label.trim())
-                .filter(|label| !label.is_empty())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| entry.genre.trim().to_string())
-}
-
-fn analysis_labels_json(labels: Option<&Vec<crate::analysis::AnalysisLabel>>) -> String {
-    labels
-        .map(|values| serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string()))
-        .unwrap_or_else(|| "[]".to_string())
-}
-
-fn apply_analysis_entry_to_track(
-    transaction: &Transaction<'_>,
-    entry: &TrackAnalysis,
-    track_key: &str,
-) -> LibraryResult<usize> {
-    let measured = transaction
-        .query_row(
-            "SELECT measured_duration_seconds FROM tracks WHERE track_key = ?1",
-            [track_key],
-            |row| row.get::<_, Option<f64>>(0),
-        )
-        .optional()?
-        .flatten();
-    let netease = transaction
-        .query_row(
-            "SELECT db_duration_seconds FROM tracks WHERE track_key = ?1",
-            [track_key],
-            |row| row.get::<_, Option<f64>>(0),
-        )
-        .optional()?
-        .flatten();
-    let (duration, source) = effective_duration(entry.duration_seconds, measured, netease);
-    let mood = analysis_labels_json(entry.high_level.as_ref().map(|value| &value.mood));
-    let instrument = analysis_labels_json(entry.high_level.as_ref().map(|value| &value.instrument));
-    let style = analysis_labels_json(entry.high_level.as_ref().map(|value| &value.style));
-    Ok(transaction.execute(
-        "UPDATE tracks SET
-            essentia_genre=?1, essentia_duration_seconds=?2,
-            effective_duration_seconds=?3, duration_source=?4,
-            bpm=?5, musical_key=?6, scale=?7,
-            integrated_loudness_lufs=?8, loudness_range_lu=?9,
-            energy=?10, danceability=?11, mood_json=?12,
-            instrument_json=?13, style_json=?14, drop_loudness_lufs=?15,
-            updated_at_ms=?16
-         WHERE track_key=?17",
-        rusqlite::params![
-            analysis_genre(entry),
-            entry.duration_seconds,
-            duration,
-            source.map(DurationSource::as_str),
-            entry.bpm,
-            entry.key,
-            entry.scale,
-            entry.integrated_loudness_lufs,
-            entry.loudness_range_lu,
-            entry.energy,
-            entry.danceability,
-            mood,
-            instrument,
-            style,
-            entry.drop_loudness_lufs,
-            now_ms(),
-            track_key,
-        ],
-    )?)
-}
-
-fn apply_analysis_entries_in_transaction(
-    transaction: &Transaction<'_>,
-    entries: &[TrackAnalysis],
-    is_cancelled: &mut dyn FnMut() -> bool,
-    observe: &mut dyn FnMut(usize, usize, &str),
-) -> LibraryResult<usize> {
-    let mut updated = 0;
-    for (index, entry) in entries.iter().enumerate() {
-        if is_cancelled() {
-            return Err(LibraryError::Invalid("歌曲库刷新已取消".to_string()));
-        }
-        let local_path = Path::new(&entry.path).to_string_lossy();
-        let Some(track_key) = transaction
-            .query_row(
-                "SELECT track_key FROM local_files WHERE path = ?1",
-                [local_path.as_ref()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        else {
-            observe(index + 1, entries.len(), &entry.path);
-            continue;
-        };
-        updated += apply_analysis_entry_to_track(transaction, entry, &track_key)?;
-        observe(index + 1, entries.len(), &entry.path);
-    }
-    Ok(updated)
-}
-
 fn valid_positive(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite() && *value > 0.0)
 }
@@ -1384,13 +764,11 @@ const TRACK_COLUMNS: &str = "track_key, netease_track_id, title, artists, artist
     measured_format, effective_format, db_bitrate_bps, measured_bitrate_bps,
     effective_bitrate_bps, db_size_bytes, measured_size_bytes, effective_size_bytes,
     bpm, musical_key, scale, integrated_loudness_lufs, loudness_range_lu, energy,
-    danceability, mood_json, instrument_json, style_json, discogs_mood_theme_json,
-    discogs_approachability_json, discogs_instrumentation_json, discogs_timbre_json,
-    discogs_danceability_json, drop_loudness_lufs, updated_at_ms";
+    danceability, mood_json, instrument_json, drop_loudness_lufs, updated_at_ms";
 
 fn track_upsert_sql() -> String {
     let columns = TRACK_COLUMNS.replace('\n', " ");
-    let placeholders = (1..=53)
+    let placeholders = (1..=47)
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -1408,7 +786,7 @@ fn track_upsert_sql() -> String {
 
 fn track_upsert_sql_preserving_analysis() -> String {
     let columns = TRACK_COLUMNS.replace('\n', " ");
-    let placeholders = (1..=53)
+    let placeholders = (1..=47)
         .map(|index| format!("?{index}"))
         .collect::<Vec<_>>()
         .join(", ");
@@ -1426,12 +804,6 @@ fn track_upsert_sql_preserving_analysis() -> String {
         "danceability",
         "mood_json",
         "instrument_json",
-        "style_json",
-        "discogs_mood_theme_json",
-        "discogs_approachability_json",
-        "discogs_instrumentation_json",
-        "discogs_timbre_json",
-        "discogs_danceability_json",
         "drop_loudness_lufs",
     ];
     let assignments = columns
@@ -1493,12 +865,6 @@ fn track_values(track: &CatalogTrack) -> Vec<Value> {
         optional_f64(track.danceability),
         text(&track.mood_json),
         text(&track.instrument_json),
-        text(&track.style_json),
-        text(&track.discogs_mood_theme_json),
-        text(&track.discogs_approachability_json),
-        text(&track.discogs_instrumentation_json),
-        text(&track.discogs_timbre_json),
-        text(&track.discogs_danceability_json),
         optional_f64(track.drop_loudness_lufs),
         Value::Integer(track.updated_at_ms),
     ]
@@ -1551,14 +917,8 @@ fn track_from_row(row: &Row<'_>) -> rusqlite::Result<CatalogTrack> {
         danceability: row.get(42)?,
         mood_json: row.get(43)?,
         instrument_json: row.get(44)?,
-        style_json: row.get(45)?,
-        discogs_mood_theme_json: row.get(46)?,
-        discogs_approachability_json: row.get(47)?,
-        discogs_instrumentation_json: row.get(48)?,
-        discogs_timbre_json: row.get(49)?,
-        discogs_danceability_json: row.get(50)?,
-        drop_loudness_lufs: row.get(51)?,
-        updated_at_ms: row.get(52)?,
+        drop_loudness_lufs: row.get(45)?,
+        updated_at_ms: row.get(46)?,
     })
 }
 

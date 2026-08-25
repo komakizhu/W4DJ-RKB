@@ -1,11 +1,10 @@
 use tempfile::tempdir;
 use w4dj::config::{CandidateOperation, Mode};
 use w4dj::history::{
-    AnalysisReport, ErrorCategory, FailedFile, HistoryEntry, HistoryStatus, PendingFile,
-    append_history, classify_error, clear_history, delete_history_entry, format_error_report,
-    format_error_report_with_runtime, load_history, upsert_history,
+    ErrorCategory, FailedFile, HistoryEntry, HistoryStatus, PendingFile, append_history,
+    classify_error, clear_history, delete_history_entry, format_error_report, load_history,
+    upsert_history,
 };
-use w4dj::netease::{NeteaseCoverSource, NeteaseRecordMatchMethod, NeteaseRecoveryDiagnostic};
 use w4dj::sync::MetadataDiagnostic;
 
 fn test_entry(index: usize) -> HistoryEntry {
@@ -37,7 +36,6 @@ fn test_entry(index: usize) -> HistoryEntry {
         netease_filename_format: Default::default(),
         report_path: None,
         analysis_reports: Vec::new(),
-        runtime_session_dir: None,
     }
 }
 
@@ -76,32 +74,6 @@ fn error_report_contains_failed_path_and_reason() {
 }
 
 #[test]
-fn runtime_report_exposes_cache_reuse_per_track() {
-    let entry = test_entry(1);
-    let runtime = serde_json::json!({
-        "runtimeSession": {
-            "files": {
-                "events.jsonl": [{
-                    "event": "analysis_candidate_finished",
-                    "at": "2026-08-23 12:00:00 UTC",
-                    "details": {
-                        "name": "Song",
-                        "source_path": "/music/in/song.mp3",
-                        "destination_path": "/music/out/song.mp3",
-                        "status": "completed",
-                        "cached": true,
-                        "elapsed_ms": 0
-                    }
-                }]
-            }
-        }
-    });
-
-    let report = format_error_report_with_runtime(&entry, Some(&runtime));
-    assert!(report.contains("缓存复用：是"));
-}
-
-#[test]
 fn conversion_report_includes_per_track_metadata_diagnostics() {
     let mut entry = test_entry(2);
     entry.metadata_diagnostics.push(MetadataDiagnostic {
@@ -122,9 +94,6 @@ fn conversion_report_includes_per_track_metadata_diagnostics() {
         detected_filename_layout: "歌手 - 标题".into(),
         decision: "最终标题：Song；最终歌手：Artist".into(),
         metadata_validation: "通过：标题、歌手和可用封面已校验".into(),
-        validation_basis: Some("source_tags".into()),
-        output_tags_match: Some(true),
-        netease_recovery: None,
     });
 
     let report = format_error_report(&entry);
@@ -134,107 +103,12 @@ fn conversion_report_includes_per_track_metadata_diagnostics() {
 }
 
 #[test]
-fn conversion_report_explains_netease_database_and_cover_recovery() {
-    let mut entry = test_entry(8);
-    entry.metadata_diagnostics = vec![MetadataDiagnostic {
-        source_path: "/music/in/Song - Artist.flac".into(),
-        destination_path: "/music/out/Song - Artist.mp3".into(),
-        source_filename: "Song - Artist".into(),
-        source_extension: "flac".into(),
-        source_size_bytes: Some(100),
-        output_size_bytes: Some(90),
-        source_title: Some("Song".into()),
-        source_artist: Some("Artist".into()),
-        source_album: Some("Album".into()),
-        output_title: Some("Song".into()),
-        output_artist: Some("Artist".into()),
-        output_album: Some("Album".into()),
-        source_artwork: false,
-        output_artwork: Some(true),
-        detected_filename_layout: "标题 - 歌手".into(),
-        decision: "最终标题：Song；最终歌手：Artist".into(),
-        metadata_validation: "通过".into(),
-        validation_basis: Some("source_tags".into()),
-        output_tags_match: Some(true),
-        netease_recovery: Some(NeteaseRecoveryDiagnostic {
-            database_path: Some("/music/sqlite_storage.sqlite3".into()),
-            database_loaded: true,
-            database_record_count: 89,
-            matched: true,
-            match_method: Some(NeteaseRecordMatchMethod::FileNameAndIdentity),
-            track_id: Some("42".into()),
-            album_id: Some("7".into()),
-            cover_source: Some(NeteaseCoverSource::LocalCache),
-            cover_bytes: Some(128),
-            message: None,
-        }),
-    }];
-
-    let report = format_error_report(&entry);
-    assert!(report.contains("[网易云数据库与封面恢复]"));
-    assert!(report.contains("加载记录数：89"));
-    assert!(report.contains("本地封面成功：1"));
-    assert!(report.contains("网易云匹配方式：fileNameAndIdentity"));
-    assert!(report.contains("网易云封面来源：localCache"));
-}
-
-#[test]
 fn conversion_report_is_generic_for_successful_tasks() {
     let report = format_error_report(&test_entry(2));
     assert!(report.starts_with("W4DJ RKB 转换报告\n"));
     assert!(report.contains("任务状态：已完成"));
     assert!(report.contains("错误文件：0"));
     assert!(report.contains("失败文件：0"));
-    assert!(report.contains("[转换状态]"));
-    assert!(report.contains("[增强分析总览]"));
-}
-
-#[test]
-fn manual_report_lists_each_discogs_head_state_separately() {
-    let mut entry = test_entry(3);
-    let heads = serde_json::json!({
-        "discogsEffnet": {"heads": {
-            "moodTheme": {"status": "completed", "version": "v1", "labels": [{"label": "dark", "confidence": 0.82}], "frameCount": 4},
-            "approachability": {"status": "model_missing", "version": "", "frameCount": 0, "reason": "missing"},
-            "instrumentation": {"status": "failed", "version": "v1", "frameCount": 2, "reason": "inference"},
-            "timbre": {"status": "timeout", "version": "v1", "frameCount": 1, "reason": "deadline"},
-            "danceability": {"status": "cancelled", "version": "v1", "frameCount": 1, "reason": "user"}
-        }}
-    });
-    entry.analysis_reports.push(AnalysisReport {
-        source_path: "/music/in/song.mp3".into(),
-        destination_path: "/music/out/song.mp3".into(),
-        status: "completed".into(),
-        message: None,
-        drop_status: None,
-        drop_loudness_lufs: None,
-        model_status: Some("completed".into()),
-        model_details: Some(serde_json::to_string(&heads).unwrap()),
-        stage: Some("completed".into()),
-        elapsed_ms: Some(1234),
-        basic_status: Some("completed".into()),
-        basic_danceability: Some(0.72),
-        discogs_danceability_status: Some("cancelled".into()),
-        discogs_danceability: None,
-        discogs_completed_heads: Some(1),
-        discogs_total_heads: Some(5),
-        cached: Some(false),
-    });
-
-    let report = format_error_report(&entry);
-    assert!(report.contains("[Discogs-EffNet 逐 head 状态]"));
-    for state in [
-        "completed",
-        "model_missing",
-        "failed",
-        "timeout",
-        "cancelled",
-    ] {
-        assert!(report.contains(state), "missing Discogs state {state}");
-    }
-    assert!(report.contains("moodTheme"));
-    assert!(report.contains("dark 82.0%"));
-    assert!(report.contains("1234 ms"));
 }
 
 #[test]
@@ -274,7 +148,6 @@ fn complete_error_report_lists_pending_files() {
         destination_path: "/music/out/pending.mp3".into(),
         source_size_bytes: 4_096,
         estimated_output_bytes: Some(2_048),
-        previous_destination_path: None,
         operation: CandidateOperation::Convert,
     });
 

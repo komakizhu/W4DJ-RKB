@@ -1,20 +1,15 @@
 use crate::analysis::{DropAnalysisDetails, HighLevelAnalysis};
-use crate::concurrency::{ConcurrencyPermit, GlobalConcurrencyBudget};
-use crate::config::{
-    FilenameNormalizationPolicy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
-};
+use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
 use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
-use crate::netease::{NeteaseMetadataResolver, NeteaseRecoveryDiagnostic, RecoveredMetadata};
-use crate::scan_cache::{
-    ScanCache, ScanCacheEntry, can_reuse_entry, can_reuse_entry_normalized, modified_at_ms,
-};
+use crate::netease::RecoveredMetadata;
+use crate::scan_cache::{ScanCache, ScanCacheEntry, can_reuse_entry, modified_at_ms};
 use crate::task::{TaskController, TaskSnapshot};
 use id3::frame::{Comment, ExtendedText, Lyrics, Picture};
 use id3::{TagLike, Version};
 use ncmdump::Ncmdump;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -22,137 +17,10 @@ use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
-use std::time::UNIX_EPOCH;
+use std::process::Command;
 
 pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "ncm", "wav", "aiff"];
-const SOURCE_ENTRY_KEY_SEPARATOR: char = '\u{1f}';
-
-/// Return the presentation name from a source-scan key. The suffix is an
-/// internal collision discriminator and must never become an output filename
-/// or metadata field.
-pub(crate) fn source_entry_name(value: &str) -> &str {
-    value
-        .split_once(SOURCE_ENTRY_KEY_SEPARATOR)
-        .map(|(name, _)| name)
-        .unwrap_or(value)
-}
-
-fn unique_source_entry_key(
-    name: &str,
-    path: &Path,
-    entries: &HashMap<String, (String, PathBuf)>,
-) -> String {
-    if !entries.contains_key(name) {
-        return name.to_string();
-    }
-    let normalized = crate::scan_cache::normalize_path(path)
-        .to_string_lossy()
-        .into_owned();
-    format!("{name}{SOURCE_ENTRY_KEY_SEPARATOR}{normalized}")
-}
-
-/// Registry of FFmpeg children owned by the current application.  Cancelling
-/// a task can kill only children started by W4DJ; unrelated user processes are
-/// never touched.
-#[derive(Debug, Default)]
-pub struct ActiveFfmpegRegistry {
-    next_id: AtomicU64,
-    children: Mutex<HashMap<u64, Child>>,
-    output_locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
-}
-
-impl ActiveFfmpegRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn active_count(&self) -> usize {
-        self.children
-            .lock()
-            .expect("FFmpeg registry lock poisoned")
-            .len()
-    }
-
-    pub fn terminate_all(&self) {
-        if let Ok(mut children) = self.children.lock() {
-            for child in children.values_mut() {
-                let _ = child.kill();
-            }
-        }
-    }
-
-    fn insert(&self, child: Child) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.children
-            .lock()
-            .expect("FFmpeg registry lock poisoned")
-            .insert(id, child);
-        id
-    }
-
-    /// Return a lock for one destination path.  The conversion coordinator
-    /// uses this instead of locking an entire destination directory, so two
-    /// different output files can be encoded concurrently while an identical
-    /// target path is still protected from a cross-slot race.
-    fn lock_for_output(&self, output_path: &Path) -> Arc<Mutex<()>> {
-        let key = fs::canonicalize(output_path).unwrap_or_else(|_| {
-            let parent = output_path
-                .parent()
-                .and_then(|parent| fs::canonicalize(parent).ok())
-                .unwrap_or_else(|| {
-                    output_path
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .to_path_buf()
-                });
-            output_path
-                .file_name()
-                .map(|name| parent.join(name))
-                .unwrap_or_else(|| output_path.to_path_buf())
-        });
-        let mut locks = self
-            .output_locks
-            .lock()
-            .expect("FFmpeg output lock map poisoned");
-        Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))))
-    }
-
-    fn wait_for(&self, id: u64, cancelled: &AtomicBool) -> io::Result<ExitStatus> {
-        loop {
-            let mut children = self
-                .children
-                .lock()
-                .map_err(|_| io::Error::other("FFmpeg registry lock poisoned"))?;
-            let Some(child) = children.get_mut(&id) else {
-                return Err(io::Error::other("FFmpeg child was not registered"));
-            };
-            if cancelled.load(Ordering::SeqCst) {
-                let _ = child.kill();
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    children.remove(&id);
-                    return Ok(status);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    children.remove(&id);
-                    return Err(error);
-                }
-            }
-            drop(children);
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-}
 
 /// Per-track metadata evidence saved in the conversion report.  It is kept
 /// deliberately textual so that users can attach it to a bug report without
@@ -177,25 +45,6 @@ pub struct MetadataDiagnostic {
     pub detected_filename_layout: String,
     pub decision: String,
     pub metadata_validation: String,
-    #[serde(default)]
-    pub validation_basis: Option<String>,
-    #[serde(default)]
-    pub output_tags_match: Option<bool>,
-    #[serde(default)]
-    pub netease_recovery: Option<NeteaseRecoveryDiagnostic>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConversionMetadataContext {
-    pub netease: Arc<NeteaseMetadataResolver>,
-}
-
-impl Default for ConversionMetadataContext {
-    fn default() -> Self {
-        Self {
-            netease: Arc::new(NeteaseMetadataResolver::load(None).unwrap_or_default()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,116 +52,9 @@ impl Default for ConversionMetadataContext {
 pub enum ScanPhase {
     Source,
     Destination,
-    Metadata,
 }
 
 pub type ScanObserver<'a> = dyn FnMut(ScanPhase, &Path) -> bool + 'a;
-
-/// The result of the directory walk used by the preview scanner.  Keeping
-/// enumeration separate from file-level work lets the coordinator reuse the
-/// exact same path list for totals and scanning instead of walking an input
-/// directory a second time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnumeratedMusicFiles {
-    pub paths: Vec<PathBuf>,
-    pub issues: Vec<MusicScanIssue>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScanEnumerationError {
-    Cancelled,
-    Failed(String),
-}
-
-impl std::fmt::Display for ScanEnumerationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Cancelled => formatter.write_str("扫描已取消"),
-            Self::Failed(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for ScanEnumerationError {}
-
-/// Enumerate supported music files once.  The total is intentionally unknown
-/// while WalkDir is active (a directory can be very large); the final
-/// callback reports the exact count after the walk completes.
-pub fn enumerate_music_files_observed<F>(
-    folder: &str,
-    allowed_extensions: &[&str],
-    cancel: &AtomicBool,
-    mut observe: F,
-) -> Result<EnumeratedMusicFiles, ScanEnumerationError>
-where
-    F: FnMut(usize, Option<usize>, &Path),
-{
-    if folder.trim().is_empty() {
-        return Ok(EnumeratedMusicFiles {
-            paths: Vec::new(),
-            issues: Vec::new(),
-        });
-    }
-    let source_path = Path::new(folder);
-    let mut paths = Vec::new();
-    let mut issues = Vec::new();
-    if source_path.is_file() {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(ScanEnumerationError::Cancelled);
-        }
-        if is_supported_source_file_with_extensions(source_path, allowed_extensions) {
-            paths.push(source_path.to_path_buf());
-            observe(1, Some(1), source_path);
-        }
-        return Ok(EnumeratedMusicFiles { paths, issues });
-    }
-    if !source_path.exists() {
-        return Err(ScanEnumerationError::Failed(format!(
-            "输入目录不存在：{}",
-            source_path.display()
-        )));
-    }
-
-    for entry_result in walkdir::WalkDir::new(folder) {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(ScanEnumerationError::Cancelled);
-        }
-        match entry_result {
-            Ok(entry) => {
-                if entry.file_type().is_file()
-                    && !is_ignored_music_file(entry.path())
-                    && has_allowed_extension(entry.path(), allowed_extensions)
-                {
-                    paths.push(entry.path().to_path_buf());
-                    observe(paths.len(), None, entry.path());
-                }
-            }
-            Err(error) => {
-                if let Some(path) = error.path().filter(|path| !is_ignored_music_file(path)) {
-                    issues.push(MusicScanIssue {
-                        path: path.to_path_buf(),
-                        message: format!("无法扫描歌曲文件：{error}"),
-                    });
-                }
-            }
-        }
-    }
-    if cancel.load(Ordering::SeqCst) {
-        return Err(ScanEnumerationError::Cancelled);
-    }
-    if let Some(last) = paths.last() {
-        observe(paths.len(), Some(paths.len()), last);
-    } else {
-        observe(0, Some(0), source_path);
-    }
-    Ok(EnumeratedMusicFiles { paths, issues })
-}
-
-fn is_supported_source_file_with_extensions(path: &Path, allowed_extensions: &[&str]) -> bool {
-    path.is_file()
-        && !is_ignored_music_file(path)
-        && has_allowed_extension(path, allowed_extensions)
-}
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
@@ -546,20 +288,6 @@ pub fn get_music_dict_with_scan_issues_with_settings(
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
-    get_music_dict_with_scan_issues_with_settings_and_policy(
-        folder,
-        filename_rule,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-    )
-}
-
-pub fn get_music_dict_with_scan_issues_with_settings_and_policy(
-    folder: &str,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let source_path = Path::new(folder);
     if source_path.is_file() && !is_supported_source_file(source_path) {
         return (HashMap::new(), Vec::new());
@@ -570,7 +298,6 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_policy(
         SUPPORTED_SOURCE_EXTENSIONS,
         filename_rule,
         netease_filename_format,
-        filename_policy,
     )
 }
 
@@ -602,26 +329,6 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_observer(
     Vec<MusicScanIssue>,
     bool,
 ) {
-    get_music_dict_with_scan_issues_with_settings_and_observer_with_policy(
-        folder,
-        filename_rule,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-        observer,
-    )
-}
-
-pub fn get_music_dict_with_scan_issues_with_settings_and_observer_with_policy(
-    folder: &str,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    observer: &mut ScanObserver<'_>,
-) -> (
-    HashMap<String, (String, PathBuf)>,
-    Vec<MusicScanIssue>,
-    bool,
-) {
     let source_path = Path::new(folder);
     if source_path.is_file() && !is_supported_source_file(source_path) {
         return (HashMap::new(), Vec::new(), false);
@@ -632,7 +339,6 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_observer_with_policy(
         SUPPORTED_SOURCE_EXTENSIONS,
         filename_rule,
         netease_filename_format,
-        filename_policy,
         Some(observer),
         ScanPhase::Source,
     )
@@ -646,30 +352,6 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer(
     folder: &str,
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
-    output_directory: &Path,
-    cache: &mut ScanCache,
-    observer: &mut ScanObserver<'_>,
-) -> (
-    HashMap<String, (String, PathBuf)>,
-    Vec<MusicScanIssue>,
-    bool,
-) {
-    get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy(
-        folder,
-        filename_rule,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-        output_directory,
-        cache,
-        observer,
-    )
-}
-
-pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy(
-    folder: &str,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
     output_directory: &Path,
     cache: &mut ScanCache,
     observer: &mut ScanObserver<'_>,
@@ -732,7 +414,6 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_pol
                     output_directory,
                     filename_rule_cache_key(filename_rule),
                     netease_filename_format_cache_key(netease_filename_format),
-                    filename_policy.cache_key(),
                     size_bytes,
                     modified_at,
                 )
@@ -740,17 +421,10 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_pol
             .cloned();
 
         let (song_name, cached_issue) = if let Some(cached) = cached {
-            (
-                cached.safe_output_stem.unwrap_or(cached.derived_name),
-                cached.scan_issue,
-            )
+            (cached.derived_name, cached.scan_issue)
         } else {
-            let song_name = derive_song_name_with_policy(
-                &path,
-                filename_rule,
-                netease_filename_format,
-                filename_policy,
-            );
+            let song_name =
+                derive_song_name_with_settings(&path, filename_rule, netease_filename_format);
             let entry = ScanCacheEntry {
                 source_path: path_key,
                 source_root: crate::scan_cache::normalize_path(&source_root)
@@ -762,7 +436,6 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_pol
                 filename_rule: filename_rule_cache_key(filename_rule).to_string(),
                 netease_filename_format: netease_filename_format_cache_key(netease_filename_format)
                     .to_string(),
-                filename_policy: filename_policy.cache_key().to_string(),
                 size_bytes,
                 modified_at_ms: modified_at,
                 derived_name: song_name.clone(),
@@ -772,8 +445,6 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_pol
                     .unwrap_or_default()
                     .to_lowercase(),
                 scan_issue: None,
-                safe_output_stem: Some(song_name.clone()),
-                ..Default::default()
             };
             cache.insert(entry);
             (song_name, None)
@@ -787,382 +458,19 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_pol
         }
 
         let size = size_bytes.to_string();
-        let key = unique_source_entry_key(&song_name, &path, &music_dict);
-        music_dict.insert(key, (size, path));
+        let should_replace = music_dict
+            .get(&song_name)
+            .map(|existing| should_prefer_file(&path, &size, existing))
+            .unwrap_or(true);
+        if should_replace {
+            music_dict.insert(song_name, (size, path));
+        }
     }
 
     if !cancelled {
         cache.remove_missing_sources(&source_root);
     }
     (music_dict, scan_issues, cancelled)
-}
-
-/// File-level scanner with a bounded scan-only worker set.  The configured
-/// budget supplies the worker limit, but no conversion permit is acquired:
-/// scanning must not consume FFmpeg capacity. Enumeration stays on the
-/// coordinator thread, while metadata/name derivation runs in a fixed worker
-/// set. Results are sorted back by enumeration index before they touch the
-/// cache or duplicate-selection map.
-#[allow(clippy::too_many_arguments)]
-pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget(
-    folder: &str,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    output_directory: &Path,
-    cache: &mut ScanCache,
-    budget: Arc<GlobalConcurrencyBudget>,
-    cancel: Arc<AtomicBool>,
-    observer: &mut ScanObserver<'_>,
-) -> (
-    HashMap<String, (String, PathBuf)>,
-    Vec<MusicScanIssue>,
-    bool,
-) {
-    get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy(
-        folder,
-        filename_rule,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-        output_directory,
-        cache,
-        budget,
-        cancel,
-        observer,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy(
-    folder: &str,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    output_directory: &Path,
-    cache: &mut ScanCache,
-    budget: Arc<GlobalConcurrencyBudget>,
-    cancel: Arc<AtomicBool>,
-    observer: &mut ScanObserver<'_>,
-) -> (
-    HashMap<String, (String, PathBuf)>,
-    Vec<MusicScanIssue>,
-    bool,
-) {
-    let source_root = Path::new(folder).to_path_buf();
-    let normalized_source_root = crate::scan_cache::normalize_path(&source_root);
-    let normalized_output_directory = crate::scan_cache::normalize_path(output_directory);
-    let (paths, mut scan_issues, enumeration_cancelled) =
-        enumerate_music_paths(folder, SUPPORTED_SOURCE_EXTENSIONS, &cancel);
-    if enumeration_cancelled {
-        return (HashMap::new(), scan_issues, true);
-    }
-    let (results, worker_error) = scan_paths_with_budget(
-        paths,
-        budget,
-        Arc::clone(&cancel),
-        filename_rule,
-        netease_filename_format,
-        filename_policy,
-        ScanPhase::Source,
-        observer,
-    );
-    if let Some(error) = worker_error {
-        scan_issues.push(MusicScanIssue {
-            path: source_root.clone(),
-            message: format!("扫描 worker 发生异常：{error}"),
-        });
-        return (HashMap::new(), scan_issues, false);
-    }
-    let mut music_dict = HashMap::new();
-    let mut cancelled = cancel.load(Ordering::SeqCst);
-    for result in results {
-        if cancel.load(Ordering::SeqCst) {
-            cancelled = true;
-            break;
-        }
-        let path = result.path;
-        let path_key = crate::scan_cache::normalize_path(&path)
-            .to_string_lossy()
-            .into_owned();
-        let cached = cache
-            .entries
-            .get(&path_key)
-            .filter(|cached| {
-                can_reuse_entry_normalized(
-                    cached,
-                    &crate::scan_cache::normalize_path(&path),
-                    &normalized_source_root,
-                    &normalized_output_directory,
-                    filename_rule_cache_key(filename_rule),
-                    netease_filename_format_cache_key(netease_filename_format),
-                    filename_policy.cache_key(),
-                    result.size_bytes,
-                    result.modified_at,
-                )
-            })
-            .cloned();
-        let (song_name, cached_issue) = if let Some(cached) = cached {
-            (
-                cached.safe_output_stem.unwrap_or(cached.derived_name),
-                cached.scan_issue,
-            )
-        } else {
-            let song_name = result.derived_name;
-            cache.insert(ScanCacheEntry {
-                source_path: path_key,
-                source_root: normalized_source_root.to_string_lossy().into_owned(),
-                output_directory: normalized_output_directory.to_string_lossy().into_owned(),
-                filename_rule: filename_rule_cache_key(filename_rule).to_string(),
-                netease_filename_format: netease_filename_format_cache_key(netease_filename_format)
-                    .to_string(),
-                filename_policy: filename_policy.cache_key().to_string(),
-                size_bytes: result.size_bytes,
-                modified_at_ms: result.modified_at,
-                derived_name: song_name.clone(),
-                source_extension: path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or_default()
-                    .to_lowercase(),
-                scan_issue: None,
-                safe_output_stem: Some(song_name.clone()),
-                ..Default::default()
-            });
-            (song_name, None)
-        };
-        if let Some(issue) = cached_issue {
-            scan_issues.push(MusicScanIssue {
-                path: path.clone(),
-                message: issue,
-            });
-        }
-        let size = result.size_bytes.to_string();
-        let key = unique_source_entry_key(&song_name, &path, &music_dict);
-        music_dict.insert(key, (size, path));
-    }
-    if !cancelled {
-        cache.remove_missing_sources(&source_root);
-    }
-    (music_dict, scan_issues, cancelled)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn get_music_dict_with_scan_issues_with_settings_and_observer_with_budget(
-    folder: &str,
-    allowed_extensions: &[&str],
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    budget: Arc<GlobalConcurrencyBudget>,
-    cancel: Arc<AtomicBool>,
-    phase: ScanPhase,
-    observer: &mut ScanObserver<'_>,
-) -> (
-    HashMap<String, (String, PathBuf)>,
-    Vec<MusicScanIssue>,
-    bool,
-) {
-    get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy(
-        folder,
-        allowed_extensions,
-        filename_rule,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-        budget,
-        cancel,
-        phase,
-        observer,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy(
-    folder: &str,
-    allowed_extensions: &[&str],
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    budget: Arc<GlobalConcurrencyBudget>,
-    cancel: Arc<AtomicBool>,
-    phase: ScanPhase,
-    observer: &mut ScanObserver<'_>,
-) -> (
-    HashMap<String, (String, PathBuf)>,
-    Vec<MusicScanIssue>,
-    bool,
-) {
-    let (paths, scan_issues, enumeration_cancelled) =
-        enumerate_music_paths(folder, allowed_extensions, &cancel);
-    if enumeration_cancelled {
-        return (HashMap::new(), scan_issues, true);
-    }
-    let (results, worker_error) = scan_paths_with_budget(
-        paths,
-        budget,
-        Arc::clone(&cancel),
-        filename_rule,
-        netease_filename_format,
-        filename_policy,
-        phase,
-        observer,
-    );
-    if let Some(error) = worker_error {
-        let mut scan_issues = scan_issues;
-        scan_issues.push(MusicScanIssue {
-            path: Path::new(folder).to_path_buf(),
-            message: format!("扫描 worker 发生异常：{error}"),
-        });
-        return (HashMap::new(), scan_issues, false);
-    }
-    let mut music_dict = HashMap::new();
-    let mut cancelled = cancel.load(Ordering::SeqCst);
-    for result in results {
-        if cancel.load(Ordering::SeqCst) {
-            cancelled = true;
-            break;
-        }
-        let size = result.size_bytes.to_string();
-        if matches!(phase, ScanPhase::Source) {
-            let key = unique_source_entry_key(&result.derived_name, &result.path, &music_dict);
-            music_dict.insert(key, (size, result.path));
-        } else {
-            let should_replace = music_dict
-                .get(&result.derived_name)
-                .map(|existing| should_prefer_file(&result.path, &size, existing))
-                .unwrap_or(true);
-            if should_replace {
-                music_dict.insert(result.derived_name, (size, result.path));
-            }
-        }
-    }
-    (music_dict, scan_issues, cancelled)
-}
-
-#[derive(Debug)]
-struct ScanWorkerResult {
-    index: usize,
-    path: PathBuf,
-    size_bytes: u64,
-    modified_at: Option<u64>,
-    derived_name: String,
-}
-
-fn metadata_modified_at_ms(metadata: &fs::Metadata) -> Option<u64> {
-    metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-}
-
-fn enumerate_music_paths(
-    folder: &str,
-    allowed_extensions: &[&str],
-    cancel: &AtomicBool,
-) -> (Vec<PathBuf>, Vec<MusicScanIssue>, bool) {
-    match enumerate_music_files_observed(folder, allowed_extensions, cancel, |_, _, _| {}) {
-        Ok(result) => (result.paths, result.issues, false),
-        Err(ScanEnumerationError::Cancelled) => (Vec::new(), Vec::new(), true),
-        Err(ScanEnumerationError::Failed(message)) => (
-            Vec::new(),
-            vec![MusicScanIssue {
-                path: Path::new(folder).to_path_buf(),
-                message,
-            }],
-            false,
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_paths_with_budget(
-    paths: Vec<PathBuf>,
-    budget: Arc<GlobalConcurrencyBudget>,
-    cancel: Arc<AtomicBool>,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    phase: ScanPhase,
-    observer: &mut ScanObserver<'_>,
-) -> (Vec<ScanWorkerResult>, Option<String>) {
-    if paths.is_empty() {
-        return (Vec::new(), None);
-    }
-    let queue = Arc::new(Mutex::new(
-        paths.into_iter().enumerate().collect::<VecDeque<_>>(),
-    ));
-    let (sender, receiver) = mpsc::channel();
-    let worker_error = Arc::new(Mutex::new(None::<String>));
-    let worker_count = budget
-        .limit()
-        .min(queue.lock().map(|q| q.len()).unwrap_or(0))
-        .max(1);
-    let mut workers = Vec::with_capacity(worker_count);
-    for worker_index in 0..worker_count {
-        let queue = Arc::clone(&queue);
-        let sender = sender.clone();
-        let cancel = Arc::clone(&cancel);
-        let worker_error = Arc::clone(&worker_error);
-        workers.push(thread::spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                loop {
-                    if cancel.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let item = queue.lock().expect("scan queue lock poisoned").pop_front();
-                    let Some((index, path)) = item else {
-                        break;
-                    };
-                    let metadata = fs::metadata(&path).ok();
-                    let result = ScanWorkerResult {
-                        index,
-                        size_bytes: metadata.as_ref().map_or(0, fs::Metadata::len),
-                        modified_at: metadata.as_ref().and_then(metadata_modified_at_ms),
-                        derived_name: derive_song_name_with_policy(
-                            &path,
-                            filename_rule,
-                            netease_filename_format,
-                            filename_policy,
-                        ),
-                        path,
-                    };
-                    if sender.send(result).is_err() {
-                        break;
-                    }
-                }
-            }));
-            if let Err(payload) = result {
-                let message = panic_message(payload);
-                if let Ok(mut error) = worker_error.lock()
-                    && error.is_none()
-                {
-                    *error = Some(format!("worker {worker_index}: {message}"));
-                }
-                eprintln!("scan worker {worker_index} panicked: {message}");
-            }
-        }));
-    }
-    drop(sender);
-    let mut results = Vec::new();
-    while let Ok(result) = receiver.recv() {
-        if !cancel.load(Ordering::SeqCst) && !observer(phase, &result.path) {
-            cancel.store(true, Ordering::SeqCst);
-        }
-        results.push(result);
-    }
-    for worker in workers {
-        let _ = worker.join();
-    }
-    results.sort_by_key(|result| result.index);
-    let worker_error = worker_error.lock().ok().and_then(|error| error.clone());
-    (results, worker_error)
-}
-
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|message| (*message).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "未知 panic".to_string())
 }
 
 fn filename_rule_cache_key(rule: FilenameRule) -> &'static str {
@@ -1204,7 +512,6 @@ pub fn get_destination_music_dict_with_rule(
         &["mp3", "wav", "aiff"],
         filename_rule,
         NeteaseFilenameFormat::default(),
-        FilenameNormalizationPolicy::SoundCloud,
     )
     .0
 }
@@ -1220,7 +527,6 @@ pub fn get_destination_music_dict_with_rule_and_observer(
         &["mp3", "wav", "aiff"],
         filename_rule,
         NeteaseFilenameFormat::default(),
-        FilenameNormalizationPolicy::SoundCloud,
         Some(observer),
         ScanPhase::Destination,
     );
@@ -1271,14 +577,12 @@ fn collect_music_dict_with_scan_issues(
     allowed_extensions: &[&str],
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
 ) -> (HashMap<String, (String, PathBuf)>, Vec<MusicScanIssue>) {
     let (music_dict, scan_issues, _cancelled) = collect_music_dict_with_scan_issues_observed(
         folder,
         allowed_extensions,
         filename_rule,
         netease_filename_format,
-        filename_policy,
         None,
         ScanPhase::Source,
     );
@@ -1290,7 +594,6 @@ fn collect_music_dict_with_scan_issues_observed(
     allowed_extensions: &[&str],
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
     mut observer: Option<&mut ScanObserver<'_>>,
     phase: ScanPhase,
 ) -> (
@@ -1329,28 +632,20 @@ fn collect_music_dict_with_scan_issues_observed(
         }
 
         let path = entry.path().to_path_buf();
-        let song_name = derive_song_name_with_policy(
-            entry.path(),
-            filename_rule,
-            netease_filename_format,
-            filename_policy,
-        );
+        let song_name =
+            derive_song_name_with_settings(entry.path(), filename_rule, netease_filename_format);
         let size = entry
             .metadata()
             .map(|m| m.len().to_string())
             .unwrap_or_else(|_| "0".to_string());
 
-        if matches!(phase, ScanPhase::Source) {
-            let key = unique_source_entry_key(&song_name, &path, &music_dict);
-            music_dict.insert(key, (size, path));
-        } else {
-            let should_replace = music_dict
-                .get(&song_name)
-                .map(|existing| should_prefer_file(&path, &size, existing))
-                .unwrap_or(true);
-            if should_replace {
-                music_dict.insert(song_name, (size, path));
-            }
+        let should_replace = music_dict
+            .get(&song_name)
+            .map(|existing| should_prefer_file(&path, &size, existing))
+            .unwrap_or(true);
+
+        if should_replace {
+            music_dict.insert(song_name, (size, path));
         }
     }
 
@@ -1372,7 +667,7 @@ fn is_temporary_artifact(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with(".w4dj-"))
 }
 
-pub fn is_ignored_music_file(path: &Path) -> bool {
+pub(crate) fn is_ignored_music_file(path: &Path) -> bool {
     is_temporary_artifact(path) || is_macos_appledouble_file(path)
 }
 
@@ -1432,12 +727,7 @@ pub fn compare_music_dicts<'a>(
             Mode::Compat => {
                 let expected_extension =
                     resolve_output_policy(*mode, lossless_format, "mp3").output_extension;
-                needs_regeneration(
-                    sf_dict.get(source_entry_name(name)),
-                    mode,
-                    "mp3",
-                    expected_extension,
-                )
+                needs_regeneration(sf_dict.get(*name), mode, "mp3", expected_extension)
             }
             Mode::Lossless => {
                 let source_extension = effective_source_extension(&wf_info.1);
@@ -1446,7 +736,7 @@ pub fn compare_music_dicts<'a>(
                         .output_extension;
 
                 needs_regeneration(
-                    sf_dict.get(source_entry_name(name)),
+                    sf_dict.get(*name),
                     mode,
                     &source_extension,
                     expected_extension,
@@ -1545,33 +835,8 @@ pub fn sync_music_library_transactional_with_observer(
     lossless_format: Option<LosslessFormat>,
     netease_filename_format: NeteaseFilenameFormat,
     task_controller: &TaskController,
-    finalize_output: impl FnMut(&str, &Path) -> io::Result<()>,
-    after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
-) -> io::Result<TaskSnapshot> {
-    sync_music_library_transactional_with_observer_and_context(
-        new_songs,
-        dest_folder,
-        mode,
-        lossless_format,
-        netease_filename_format,
-        task_controller,
-        finalize_output,
-        after_file,
-        &ConversionMetadataContext::default(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn sync_music_library_transactional_with_observer_and_context(
-    new_songs: &HashMap<&String, &(String, PathBuf)>,
-    dest_folder: &str,
-    mode: &Mode,
-    lossless_format: Option<LosslessFormat>,
-    netease_filename_format: NeteaseFilenameFormat,
-    task_controller: &TaskController,
     mut finalize_output: impl FnMut(&str, &Path) -> io::Result<()>,
     mut after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
-    metadata_context: &ConversionMetadataContext,
 ) -> io::Result<TaskSnapshot> {
     if new_songs.is_empty() {
         return Ok(task_controller.snapshot());
@@ -1608,11 +873,8 @@ pub fn sync_music_library_transactional_with_observer_and_context(
             mode,
             lossless_format,
             netease_filename_format,
-            FilenameNormalizationPolicy::SoundCloud,
             &bar,
             &mut finalize_output,
-            None,
-            metadata_context,
         );
         match task_result {
             Ok(()) => {
@@ -1621,9 +883,6 @@ pub fn sync_music_library_transactional_with_observer_and_context(
                 after_file(name, task_controller, None);
             }
             Err(err) => {
-                if err.kind() == ErrorKind::Interrupted && task_controller.is_cancelled() {
-                    continue;
-                }
                 let error_message = err.to_string();
                 failed_files += 1;
                 last_error = Some(io::Error::new(err.kind(), error_message.clone()));
@@ -1649,251 +908,9 @@ pub fn sync_music_library_transactional_with_observer_and_context(
     Ok(snapshot)
 }
 
-/// Concurrent conversion entry point used by the desktop coordinator.  The
-/// caller owns all shared state; workers only return per-song results and the
-/// `after_file` callback is invoked serially on this coordinator thread.
-#[allow(clippy::too_many_arguments)]
-pub fn sync_music_library_transactional_with_observer_and_budget(
-    new_songs: &HashMap<&String, &(String, PathBuf)>,
-    dest_folder: &str,
-    mode: &Mode,
-    lossless_format: Option<LosslessFormat>,
-    netease_filename_format: NeteaseFilenameFormat,
-    task_controller: &TaskController,
-    finalize_output: impl Fn(&str, &Path) -> io::Result<()> + Send + Sync + 'static,
-    after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
-    budget: Arc<GlobalConcurrencyBudget>,
-    ffmpeg_registry: Arc<ActiveFfmpegRegistry>,
-) -> io::Result<TaskSnapshot> {
-    sync_music_library_transactional_with_observer_and_budget_and_context(
-        new_songs,
-        dest_folder,
-        mode,
-        lossless_format,
-        netease_filename_format,
-        task_controller,
-        finalize_output,
-        after_file,
-        budget,
-        ffmpeg_registry,
-        &ConversionMetadataContext::default(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
-pub fn sync_music_library_transactional_with_observer_and_budget_and_context(
-    new_songs: &HashMap<&String, &(String, PathBuf)>,
-    dest_folder: &str,
-    mode: &Mode,
-    lossless_format: Option<LosslessFormat>,
-    netease_filename_format: NeteaseFilenameFormat,
-    task_controller: &TaskController,
-    finalize_output: impl Fn(&str, &Path) -> io::Result<()> + Send + Sync + 'static,
-    after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
-    budget: Arc<GlobalConcurrencyBudget>,
-    ffmpeg_registry: Arc<ActiveFfmpegRegistry>,
-    metadata_context: &ConversionMetadataContext,
-) -> io::Result<TaskSnapshot> {
-    sync_music_library_transactional_with_observer_and_budget_and_context_with_policy(
-        new_songs,
-        dest_folder,
-        mode,
-        lossless_format,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-        task_controller,
-        finalize_output,
-        after_file,
-        budget,
-        ffmpeg_registry,
-        metadata_context,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
-pub fn sync_music_library_transactional_with_observer_and_budget_and_context_with_policy(
-    new_songs: &HashMap<&String, &(String, PathBuf)>,
-    dest_folder: &str,
-    mode: &Mode,
-    lossless_format: Option<LosslessFormat>,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    task_controller: &TaskController,
-    finalize_output: impl Fn(&str, &Path) -> io::Result<()> + Send + Sync + 'static,
-    mut after_file: impl FnMut(&str, &TaskController, Option<&io::Error>),
-    budget: Arc<GlobalConcurrencyBudget>,
-    ffmpeg_registry: Arc<ActiveFfmpegRegistry>,
-    metadata_context: &ConversionMetadataContext,
-) -> io::Result<TaskSnapshot> {
-    if new_songs.is_empty() {
-        return Ok(task_controller.snapshot());
-    }
-
-    let bar = indicatif::ProgressBar::new(new_songs.len() as u64);
-    bar.set_style(
-        indicatif::ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})\\n{msg}",
-        )
-        .unwrap(),
-    );
-
-    let mut queued = new_songs
-        .iter()
-        .map(|(&name, (size, path))| OwnedConversionItem {
-            name: name.clone(),
-            info: (size.clone(), path.clone()),
-        })
-        .collect::<Vec<_>>();
-    queued.sort_by(|left, right| left.name.cmp(&right.name));
-    let queue = Arc::new(Mutex::new(VecDeque::from(queued)));
-    let (sender, receiver) = mpsc::channel::<(String, io::Result<()>)>();
-    let worker_count = budget.limit().min(new_songs.len()).max(1);
-    let destination = dest_folder.to_string();
-    let mode = *mode;
-    let callback: Arc<dyn Fn(&str, &Path) -> io::Result<()> + Send + Sync> =
-        Arc::new(finalize_output);
-    let mut workers = Vec::with_capacity(worker_count);
-
-    for _ in 0..worker_count {
-        let queue = Arc::clone(&queue);
-        let sender = sender.clone();
-        let task_controller = task_controller.clone();
-        let budget = Arc::clone(&budget);
-        let registry = Arc::clone(&ffmpeg_registry);
-        let destination = destination.clone();
-        let callback = Arc::clone(&callback);
-        let metadata_context = metadata_context.clone();
-        let cancel_signal = task_controller.cancellation_flag();
-        workers.push(thread::spawn(move || {
-            let worker_result = catch_unwind(AssertUnwindSafe(|| {
-                loop {
-                    if task_controller.is_cancelled() || task_controller.pause_after_current_file()
-                    {
-                        break;
-                    }
-                    let item = queue
-                        .lock()
-                        .expect("conversion queue lock poisoned")
-                        .pop_front();
-                    let Some(item) = item else {
-                        break;
-                    };
-                    let Some(_permit): Option<ConcurrencyPermit> = budget.acquire(|| {
-                        task_controller.is_cancelled() || task_controller.pause_after_current_file()
-                    }) else {
-                        break;
-                    };
-                    if task_controller.is_cancelled() || task_controller.pause_after_current_file()
-                    {
-                        break;
-                    }
-                    let bar = indicatif::ProgressBar::hidden();
-                    let mut finalize = |name: &str, path: &Path| callback(name, path);
-                    let result = process_music_file(
-                        &item.name,
-                        &item.info,
-                        &destination,
-                        &mode,
-                        lossless_format,
-                        netease_filename_format,
-                        filename_policy,
-                        &bar,
-                        &mut finalize,
-                        Some((&registry, &cancel_signal)),
-                        &metadata_context,
-                    );
-                    if sender.send((item.name, result)).is_err() {
-                        break;
-                    }
-                }
-            }));
-            if worker_result.is_err() && !task_controller.is_cancelled() {
-                let _ = sender.send((
-                    "<worker panic>".to_string(),
-                    Err(io::Error::other("转换 worker 发生异常")),
-                ));
-            }
-        }));
-    }
-    drop(sender);
-
-    let mut failed_files = 0usize;
-    let mut last_error: Option<io::Error> = None;
-    while let Ok((name, result)) = receiver.recv() {
-        match result {
-            Ok(()) => {
-                task_controller.complete_current_file();
-                bar.inc(1);
-                after_file(&name, task_controller, None);
-            }
-            Err(error) => {
-                if error.kind() == ErrorKind::Interrupted && task_controller.is_cancelled() {
-                    continue;
-                }
-                failed_files += 1;
-                last_error = Some(io::Error::new(error.kind(), error.to_string()));
-                bar.inc(1);
-                after_file(&name, task_controller, Some(&error));
-            }
-        }
-    }
-    for worker in workers {
-        let _ = worker.join();
-    }
-
-    let snapshot = task_controller.snapshot();
-    if snapshot.completed == 0 && failed_files > 0 && !snapshot.cancelled {
-        bar.abandon_with_message(format!("Sync failed after failing {failed_files} files."));
-        return Err(last_error.unwrap_or_else(|| {
-            io::Error::other(format!("Sync failed after failing {failed_files} files."))
-        }));
-    }
-    bar.finish_with_message(format!(
-        "Sync processing complete. {}/{} files processed, {} failed.",
-        snapshot.completed, snapshot.total, failed_files
-    ));
-    Ok(snapshot)
-}
-
-#[derive(Debug)]
-struct OwnedConversionItem {
-    name: String,
-    info: (String, PathBuf),
-}
-
 #[allow(dead_code)]
 #[allow(deprecated)]
 pub fn update_existing_metadata(source_path: &Path, destination_path: &Path) -> io::Result<()> {
-    // The legacy test/helper entry point is intentionally source-only. The
-    // desktop conversion coordinator supplies its real lazy resolver through
-    // the context-aware APIs below.
-    let context = ConversionMetadataContext {
-        netease: Arc::new(NeteaseMetadataResolver::default()),
-    };
-    update_existing_metadata_with_resolver(source_path, destination_path, &context)
-}
-
-pub fn update_existing_metadata_with_resolver(
-    source_path: &Path,
-    destination_path: &Path,
-    metadata_context: &ConversionMetadataContext,
-) -> io::Result<()> {
-    update_existing_metadata_with_resolver_and_policy(
-        source_path,
-        destination_path,
-        metadata_context,
-        FilenameNormalizationPolicy::SoundCloud,
-    )
-}
-
-pub fn update_existing_metadata_with_resolver_and_policy(
-    source_path: &Path,
-    destination_path: &Path,
-    metadata_context: &ConversionMetadataContext,
-    filename_policy: FilenameNormalizationPolicy,
-) -> io::Result<()> {
     let source_extension = source_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1929,17 +946,6 @@ pub fn update_existing_metadata_with_resolver_and_policy(
             )
         })?,
     };
-    let mut source_tag = source_tag;
-    if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
-        && !matches!(source_extension.as_str(), "ncm")
-        && let Some(recovered) = crate::netease::recover_local_metadata_with_resolver(
-            source_path,
-            &metadata_context.netease,
-        )
-        .metadata
-    {
-        merge_recovered_metadata(&mut source_tag, &recovered);
-    }
 
     let destination_extension = destination_path
         .extension()
@@ -1949,7 +955,7 @@ pub fn update_existing_metadata_with_resolver_and_policy(
     let result: io::Result<()> = match destination_extension.as_str() {
         "wav" => write_id3_tag_for_output(&source_tag, destination_path),
         "aiff" | "aif" => source_tag
-            .write_to_path(destination_path, Version::Id3v24)
+            .write_to_aiff_path(destination_path, Version::Id3v24)
             .map_err(io::Error::other),
         "mp3" => source_tag
             .write_to_path(destination_path, Version::Id3v24)
@@ -1977,83 +983,18 @@ pub fn update_existing_metadata_transactionally(
     netease_filename_format: NeteaseFilenameFormat,
     finalize_output: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    let context = ConversionMetadataContext {
-        netease: Arc::new(NeteaseMetadataResolver::default()),
-    };
-    update_existing_metadata_transactionally_with_context(
-        source_path,
-        destination_path,
-        netease_filename_format,
-        finalize_output,
-        &context,
-    )
-}
-
-pub fn update_existing_metadata_transactionally_with_context(
-    source_path: &Path,
-    destination_path: &Path,
-    netease_filename_format: NeteaseFilenameFormat,
-    finalize_output: impl FnOnce(&Path) -> io::Result<()>,
-    metadata_context: &ConversionMetadataContext,
-) -> io::Result<()> {
-    update_existing_metadata_transactionally_with_context_and_policy(
-        source_path,
-        destination_path,
-        netease_filename_format,
-        finalize_output,
-        metadata_context,
-        FilenameNormalizationPolicy::SoundCloud,
-    )
-}
-
-pub fn update_existing_metadata_transactionally_with_context_and_policy(
-    source_path: &Path,
-    destination_path: &Path,
-    netease_filename_format: NeteaseFilenameFormat,
-    finalize_output: impl FnOnce(&Path) -> io::Result<()>,
-    metadata_context: &ConversionMetadataContext,
-    filename_policy: FilenameNormalizationPolicy,
-) -> io::Result<()> {
     let name_stem = destination_path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("metadata-update");
     run_output_transaction(destination_path, name_stem, |temporary_output| {
         copy_file(destination_path, temporary_output)?;
-        update_existing_metadata_with_resolver_and_policy(
-            source_path,
-            temporary_output,
-            metadata_context,
-            filename_policy,
-        )?;
-        ensure_output_metadata_with_settings_with_context_and_policy(
+        update_existing_metadata(source_path, temporary_output)?;
+        ensure_output_metadata_with_settings(
             source_path,
             temporary_output,
             netease_filename_format,
-            filename_policy,
-            metadata_context,
         )?;
-        finalize_output(temporary_output)
-    })
-}
-
-/// Applies analysis tags to an already converted output without requiring the
-/// original source file to remain available.
-///
-/// Enhanced analysis is intentionally decoupled from conversion. The source
-/// may be an NCM file that has since been moved or removed, while the output
-/// still exists and can safely receive the cached analysis values.
-#[allow(dead_code)]
-pub fn update_analysis_metadata_transactionally(
-    destination_path: &Path,
-    finalize_output: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<()> {
-    let name_stem = destination_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("analysis-update");
-    run_output_transaction(destination_path, name_stem, |temporary_output| {
-        copy_file(destination_path, temporary_output)?;
         finalize_output(temporary_output)
     })
 }
@@ -2066,14 +1007,9 @@ fn process_music_file(
     mode: &Mode,
     lossless_format: Option<LosslessFormat>,
     netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
     bar: &indicatif::ProgressBar,
     finalize_output: &mut impl FnMut(&str, &Path) -> io::Result<()>,
-    control: Option<(&ActiveFfmpegRegistry, &AtomicBool)>,
-    metadata_context: &ConversionMetadataContext,
 ) -> io::Result<()> {
-    let name = source_entry_name(name);
-    ensure_not_cancelled(control)?;
     let src_path = info.1.as_path();
     if !src_path.exists() {
         return Err(Error::new(
@@ -2093,16 +1029,7 @@ fn process_music_file(
         extension.clone()
     };
     let output_policy = resolve_output_policy(*mode, lossless_format, &source_format);
-    let output_path = target_output_path_with_policy(
-        dest_folder,
-        name,
-        output_policy.output_extension,
-        filename_policy,
-    );
-    let output_lock = control.map(|(registry, _)| registry.lock_for_output(&output_path));
-    let _output_guard = output_lock
-        .as_ref()
-        .map(|lock| lock.lock().expect("FFmpeg output lock poisoned"));
+    let output_path = target_output_path(dest_folder, name, output_policy.output_extension);
 
     let result = match extension.as_str() {
         "mp3" | "wav" | "aiff" | "flac" | "ncm" => {
@@ -2112,57 +1039,29 @@ fn process_music_file(
                     "mp3" if matches!(output_policy.target_profile, TargetProfile::CompatMp3) => {
                         copy_file(src_path, temporary_output)?;
                     }
-                    "ncm" => {
-                        if let Some((registry, cancelled)) = control {
-                            process_ncm_file_to_output_managed(
-                                src_path,
-                                temporary_output,
-                                name,
-                                *mode,
-                                lossless_format,
-                                registry,
-                                cancelled,
-                            )?
-                        } else {
-                            process_ncm_file_to_output(
-                                src_path,
-                                temporary_output,
-                                name,
-                                *mode,
-                                lossless_format,
-                            )?
-                        }
-                    }
-                    _ => {
-                        if let Some((registry, cancelled)) = control {
-                            convert_audio_to_output_path_managed(
-                                src_path,
-                                temporary_output,
-                                output_policy.target_profile,
-                                name,
-                                registry,
-                                cancelled,
-                            )?
-                        } else {
-                            convert_audio_to_output_path(
-                                src_path,
-                                temporary_output,
-                                output_policy.target_profile,
-                                name,
-                            )?
-                        }
-                    }
+                    "ncm" => process_ncm_file_to_output(
+                        src_path,
+                        temporary_output,
+                        name,
+                        *mode,
+                        lossless_format,
+                    )?,
+                    _ => convert_audio_to_output_path(
+                        src_path,
+                        temporary_output,
+                        output_policy.target_profile,
+                        name,
+                    )?,
                 }
 
-                ensure_not_cancelled(control)?;
-                ensure_output_metadata_with_settings_with_context_and_policy(
+                ensure_output_metadata_with_settings(
                     src_path,
                     temporary_output,
                     netease_filename_format,
-                    filename_policy,
-                    metadata_context,
                 )?;
-                ensure_not_cancelled(control)?;
+                if matches!(output_policy.target_profile, TargetProfile::CompatMp3) {
+                    strip_163_key_from_mp3(temporary_output)?;
+                }
                 finalize_output(name, temporary_output)
             })
         }
@@ -2174,11 +1073,7 @@ fn process_music_file(
 
     if result.is_ok() {
         remove_conflicting_outputs(dest_folder, name, output_policy.output_extension, src_path)?;
-        if let Some(recovered) = crate::netease::recover_local_metadata_with_resolver(
-            src_path,
-            metadata_context.netease.as_ref(),
-        )
-        .metadata
+        if let Some(recovered) = crate::netease::recover_local_metadata(src_path)
             && !recovered.lyric_lrc_text.trim().is_empty()
             && let Err(error) = write_lrc_sidecar(&output_path, &recovered.lyric_lrc_text)
         {
@@ -2209,38 +1104,11 @@ fn copy_file(src_path: &Path, dest_path: &Path) -> io::Result<()> {
     })
 }
 
-fn ensure_not_cancelled(control: Option<(&ActiveFfmpegRegistry, &AtomicBool)>) -> io::Result<()> {
-    if control.is_some_and(|(_, cancelled)| cancelled.load(Ordering::SeqCst)) {
-        return Err(Error::new(ErrorKind::Interrupted, "转换已取消"));
-    }
-    Ok(())
-}
-
 fn convert_audio_to_output_path(
     src_path: &Path,
     output_path: &Path,
     target_profile: TargetProfile,
     name_stem: &str,
-) -> io::Result<()> {
-    let registry = ActiveFfmpegRegistry::new();
-    let cancelled = AtomicBool::new(false);
-    convert_audio_to_output_path_managed(
-        src_path,
-        output_path,
-        target_profile,
-        name_stem,
-        &registry,
-        &cancelled,
-    )
-}
-
-fn convert_audio_to_output_path_managed(
-    src_path: &Path,
-    output_path: &Path,
-    target_profile: TargetProfile,
-    name_stem: &str,
-    registry: &ActiveFfmpegRegistry,
-    cancelled: &AtomicBool,
 ) -> io::Result<()> {
     let ffmpeg_path = find_ffmpeg().ok_or_else(|| {
         Error::new(
@@ -2272,12 +1140,8 @@ fn convert_audio_to_output_path_managed(
         }
     }
 
-    if cancelled.load(Ordering::SeqCst) {
-        let _ = fs::remove_file(output_path);
-        return Err(Error::new(ErrorKind::Interrupted, "转换已取消"));
-    }
-    let child = match command.arg(output_path).spawn() {
-        Ok(child) => child,
+    let status = match command.arg(output_path).status() {
+        Ok(status) => status,
         Err(error) => {
             let _ = fs::remove_file(output_path);
             return Err(Error::new(
@@ -2286,14 +1150,9 @@ fn convert_audio_to_output_path_managed(
             ));
         }
     };
-    let child_id = registry.insert(child);
-    let status = registry.wait_for(child_id, cancelled)?;
 
     if !status.success() {
         let _ = fs::remove_file(output_path);
-        if cancelled.load(Ordering::SeqCst) {
-            return Err(Error::new(ErrorKind::Interrupted, "转换已取消"));
-        }
         return Err(Error::other(format!(
             "FFmpeg conversion failed for {}",
             name_stem
@@ -2373,7 +1232,6 @@ fn run_output_transaction(
     let temporary_output = create_persistent_temp_path(output_path, ".w4dj-", true)?;
     let result = operation(&temporary_output)
         .and_then(|()| ensure_generated_output(&temporary_output, name_stem))
-        .and_then(|()| strip_163_key_from_output(&temporary_output))
         .and_then(|()| commit_temporary_output(&temporary_output, output_path));
 
     if result.is_err() {
@@ -2410,17 +1268,6 @@ fn ensure_generated_output(output_path: &Path, name_stem: &str) -> io::Result<()
     Ok(())
 }
 
-fn strip_163_key_from_output(path: &Path) -> io::Result<()> {
-    let is_mp3 = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"));
-    if is_mp3 {
-        strip_163_key_from_mp3(path)?;
-    }
-    Ok(())
-}
-
 #[allow(dead_code)]
 fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<()> {
     let netease_filename_format = if source_prefers_title_artist_filename(source_path) {
@@ -2428,69 +1275,15 @@ fn ensure_output_metadata(source_path: &Path, output_path: &Path) -> io::Result<
     } else {
         NeteaseFilenameFormat::ArtistTitle
     };
-    let context = ConversionMetadataContext {
-        netease: Arc::new(NeteaseMetadataResolver::default()),
-    };
-    ensure_output_metadata_with_settings_with_context_and_policy(
-        source_path,
-        output_path,
-        netease_filename_format,
-        FilenameNormalizationPolicy::PreserveSource,
-        &context,
-    )
+    ensure_output_metadata_with_settings(source_path, output_path, netease_filename_format)
 }
 
-#[cfg(test)]
 fn ensure_output_metadata_with_settings(
     source_path: &Path,
     output_path: &Path,
     netease_filename_format: NeteaseFilenameFormat,
 ) -> io::Result<()> {
-    let context = ConversionMetadataContext {
-        netease: Arc::new(NeteaseMetadataResolver::default()),
-    };
-    ensure_output_metadata_with_settings_with_context(
-        source_path,
-        output_path,
-        netease_filename_format,
-        &context,
-    )
-}
-
-#[cfg(test)]
-fn ensure_output_metadata_with_settings_with_context(
-    source_path: &Path,
-    output_path: &Path,
-    netease_filename_format: NeteaseFilenameFormat,
-    metadata_context: &ConversionMetadataContext,
-) -> io::Result<()> {
-    ensure_output_metadata_with_settings_with_context_and_policy(
-        source_path,
-        output_path,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-        metadata_context,
-    )
-}
-
-fn ensure_output_metadata_with_settings_with_context_and_policy(
-    source_path: &Path,
-    output_path: &Path,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    metadata_context: &ConversionMetadataContext,
-) -> io::Result<()> {
-    let source_tag = match filename_policy {
-        FilenameNormalizationPolicy::PreserveSource => {
-            // Task 1 preserves the source filename character policy, while
-            // still allowing metadata to fall back to the read-only NetEase
-            // database for untagged FLAC/MP3 inputs.
-            source_metadata_as_id3_with_resolver(source_path, &metadata_context.netease)
-        }
-        FilenameNormalizationPolicy::SoundCloud => {
-            source_metadata_as_id3_without_resolver(source_path)
-        }
-    };
+    let source_tag = source_metadata_as_id3(source_path);
     let mut output_tag = read_id3_tag_or_empty(output_path);
     let fallback_name = source_path
         .file_stem()
@@ -2503,7 +1296,6 @@ fn ensure_output_metadata_with_settings_with_context_and_policy(
         source_tag.title(),
         source_artist,
         netease_filename_format,
-        filename_policy,
     );
     let source_has_valid_cover = source_tag
         .pictures()
@@ -2530,22 +1322,8 @@ pub fn apply_track_analysis_metadata(
     output_path: &Path,
     analysis: &EmbeddedAnalysis,
 ) -> io::Result<()> {
-    let context = ConversionMetadataContext::default();
-    apply_track_analysis_metadata_with_context(output_path, analysis, &context)
-}
-
-pub fn apply_track_analysis_metadata_with_context(
-    output_path: &Path,
-    analysis: &EmbeddedAnalysis,
-    metadata_context: &ConversionMetadataContext,
-) -> io::Result<()> {
     let mut tag = read_id3_tag_or_empty(output_path);
-    if let Some(recovered) = crate::netease::recover_local_metadata_with_resolver(
-        Path::new(&analysis.path),
-        &metadata_context.netease,
-    )
-    .metadata
-    {
+    if let Some(recovered) = crate::netease::recover_local_metadata(Path::new(&analysis.path)) {
         merge_recovered_metadata(&mut tag, &recovered);
     }
 
@@ -2659,44 +1437,6 @@ pub fn apply_track_analysis_metadata_with_context(
         }
     }
 
-    // Discogs-EffNet is an optional, namespaced projection.  Keep each head
-    // independent: a missing or failed head must not erase a previously
-    // successful value written by an earlier analysis run.  JSON is used here
-    // rather than a lossy label-only string so the Dashboard can reproduce
-    // thresholds, scores and the model version from the output file alone.
-    if let Some(discogs) = analysis
-        .high_level
-        .as_ref()
-        .and_then(|high| high.discogs_effnet.as_ref())
-    {
-        const NAMESPACED_HEADS: [(&str, &str); 5] = [
-            ("moodTheme", "W4DJ-Discogs-MoodTheme"),
-            ("approachability", "W4DJ-Discogs-Approachability"),
-            ("instrumentation", "W4DJ-Discogs-Instrumentation"),
-            ("timbre", "W4DJ-Discogs-Timbre"),
-            ("danceability", "W4DJ-Discogs-Danceability"),
-        ];
-        for (head_id, description) in NAMESPACED_HEADS {
-            let Some(head) = discogs.heads.get(head_id) else {
-                continue;
-            };
-            if head.status != "completed" {
-                continue;
-            }
-            let Ok(value) = serde_json::to_string(head) else {
-                continue;
-            };
-            if value.trim().is_empty() {
-                continue;
-            }
-            tag.remove_extended_text(Some(description), None);
-            tag.add_frame(ExtendedText {
-                description: description.to_string(),
-                value,
-            });
-        }
-    }
-
     tag.remove_comment(Some("W4DJ Essentia"), None);
     tag.add_frame(Comment {
         lang: String::from("eng"),
@@ -2705,119 +1445,6 @@ pub fn apply_track_analysis_metadata_with_context(
     });
 
     write_id3_tag_for_output(&tag, output_path)
-}
-
-/// Re-reads the native output after an analysis write and verifies the
-/// fields that make the result discoverable to DJ applications. A successful
-/// `write_id3_tag_for_output` alone is not enough: a later container/permission
-/// failure must not be reported as a completed analysis.
-pub fn validate_track_analysis_metadata(
-    output_path: &Path,
-    analysis: &EmbeddedAnalysis,
-) -> io::Result<()> {
-    let tag = id3::Tag::read_from_path(output_path).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("无法重新读取分析元数据：{error}"),
-        )
-    })?;
-
-    if analysis.bpm.is_some() && tag.text_for_frame_id("TBPM").is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "分析元数据回读缺少 TBPM",
-        ));
-    }
-    if analysis.key.is_some() && tag.text_for_frame_id("TKEY").is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "分析元数据回读缺少 TKEY",
-        ));
-    }
-
-    let expected = [
-        (
-            "W4DJ-Danceability",
-            analysis
-                .danceability
-                .filter(|value| value.is_finite())
-                .map(|value| format!("{value:.4}")),
-        ),
-        (
-            "W4DJ-Energy",
-            analysis
-                .energy
-                .filter(|value| value.is_finite())
-                .map(|value| format!("{value:.4}")),
-        ),
-        (
-            "W4DJ-Analysis-Version",
-            Some(analysis.analysis_version.clone()),
-        ),
-    ];
-    for (description, expected_value) in expected {
-        let Some(expected_value) = expected_value else {
-            continue;
-        };
-        let found = tag
-            .extended_texts()
-            .find(|frame| frame.description == description)
-            .map(|frame| frame.value.as_str());
-        if found != Some(expected_value.as_str()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("分析元数据回读缺少或不匹配 {description}"),
-            ));
-        }
-    }
-
-    if let Some(discogs) = analysis
-        .high_level
-        .as_ref()
-        .and_then(|high| high.discogs_effnet.as_ref())
-    {
-        const NAMESPACED_HEADS: [(&str, &str); 5] = [
-            ("moodTheme", "W4DJ-Discogs-MoodTheme"),
-            ("approachability", "W4DJ-Discogs-Approachability"),
-            ("instrumentation", "W4DJ-Discogs-Instrumentation"),
-            ("timbre", "W4DJ-Discogs-Timbre"),
-            ("danceability", "W4DJ-Discogs-Danceability"),
-        ];
-        for (head_id, description) in NAMESPACED_HEADS {
-            let Some(head) = discogs.heads.get(head_id) else {
-                continue;
-            };
-            if head.status != "completed" {
-                continue;
-            }
-            let expected = serde_json::to_string(head).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("生成 {description} 校验值失败：{error}"),
-                )
-            })?;
-            let found = tag
-                .extended_texts()
-                .find(|frame| frame.description == description)
-                .map(|frame| frame.value.as_str());
-            if found != Some(expected.as_str()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("分析元数据回读缺少或不匹配 {description}"),
-                ));
-            }
-        }
-    }
-    if !tag
-        .comments()
-        .any(|comment| comment.description == "W4DJ Essentia")
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "分析元数据回读缺少 W4DJ Essentia Comment",
-        ));
-    }
-    Ok(())
 }
 
 #[allow(dead_code)]
@@ -2899,30 +1526,6 @@ fn analysis_summary(analysis: &EmbeddedAnalysis) -> String {
         if !genres.is_empty() {
             values.push(format!("Genre {}", genres.join(", ")));
         }
-        if let Some(discogs) = &high_level.discogs_effnet {
-            for (head_id, title) in [
-                ("moodTheme", "Discogs Mood/Theme"),
-                ("approachability", "Discogs Approachability"),
-                ("instrumentation", "Discogs Instrumentation"),
-                ("timbre", "Discogs Timbre"),
-                ("danceability", "Discogs Danceability"),
-            ] {
-                let Some(head) = discogs.heads.get(head_id) else {
-                    continue;
-                };
-                if head.status != "completed" {
-                    continue;
-                }
-                let display = head
-                    .selected_class
-                    .as_deref()
-                    .or_else(|| head.labels.first().map(|label| label.label.as_str()))
-                    .unwrap_or_default();
-                if !display.trim().is_empty() {
-                    values.push(format!("{title} {display}"));
-                }
-            }
-        }
     }
     if values.is_empty() {
         String::from("W4DJ Essentia analysis")
@@ -2931,41 +1534,14 @@ fn analysis_summary(analysis: &EmbeddedAnalysis) -> String {
     }
 }
 
-fn source_metadata_as_id3_without_resolver(source_path: &Path) -> id3::Tag {
-    read_source_container_metadata(source_path)
-}
-
-fn source_metadata_as_id3_with_resolver(
-    source_path: &Path,
-    resolver: &NeteaseMetadataResolver,
-) -> id3::Tag {
-    let mut tag = read_source_container_metadata(source_path);
-
-    if !matches!(
-        source_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "ncm"
-    ) && let Some(recovered) =
-        crate::netease::recover_local_metadata_with_resolver(source_path, resolver).metadata
-    {
-        merge_recovered_metadata(&mut tag, &recovered);
-    }
-
-    tag
-}
-
-fn read_source_container_metadata(source_path: &Path) -> id3::Tag {
+fn source_metadata_as_id3(source_path: &Path) -> id3::Tag {
     let extension = source_path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    match extension.as_str() {
+    let mut tag = match extension.as_str() {
         "flac" => metaflac::Tag::read_from_path(source_path)
             .map(|tag| build_id3_tag_from_flac(&tag))
             .unwrap_or_else(|_| id3::Tag::new()),
@@ -2983,7 +1559,15 @@ fn read_source_container_metadata(source_path: &Path) -> id3::Tag {
             build_id3_tag(&info, &image)
         }
         _ => read_id3_tag_or_empty(source_path),
+    };
+
+    if !matches!(extension.as_str(), "ncm")
+        && let Some(recovered) = crate::netease::recover_local_metadata(source_path)
+    {
+        merge_recovered_metadata(&mut tag, &recovered);
     }
+
+    tag
 }
 
 fn merge_recovered_metadata(tag: &mut id3::Tag, recovered: &RecoveredMetadata) -> bool {
@@ -3236,16 +1820,7 @@ fn validate_written_metadata(
 
 #[allow(dead_code)]
 pub fn inspect_metadata_diagnostic(source_path: &Path, output_path: &Path) -> MetadataDiagnostic {
-    let resolver = NeteaseMetadataResolver::load(None).unwrap_or_default();
-    inspect_metadata_diagnostic_with_resolver(source_path, output_path, &resolver)
-}
-
-pub fn inspect_metadata_diagnostic_with_resolver(
-    source_path: &Path,
-    output_path: &Path,
-    resolver: &NeteaseMetadataResolver,
-) -> MetadataDiagnostic {
-    let source_tag = source_metadata_as_id3_with_resolver(source_path, resolver);
+    let source_tag = source_metadata_as_id3(source_path);
     let output_exists = output_path.is_file();
     let output_tag = output_exists.then(|| read_id3_tag_or_empty(output_path));
     let fallback_name = source_path
@@ -3253,23 +1828,12 @@ pub fn inspect_metadata_diagnostic_with_resolver(
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
     let prefer_title_artist = source_prefers_title_artist_filename(source_path);
-    let source_title = non_empty(source_tag.title()).map(str::to_string);
-    let source_artist =
-        non_empty(source_tag.artist().or_else(|| source_tag.album_artist())).map(str::to_string);
-    let source_tags_are_reliable = source_title.is_some() && source_artist.is_some();
-    let identity = if source_tags_are_reliable {
-        SongIdentity {
-            title: source_title.clone().unwrap_or_default(),
-            artist: source_artist.clone().unwrap_or_default(),
-        }
-    } else {
-        infer_song_identity_with_filename_preference(
-            fallback_name,
-            source_title.as_deref(),
-            source_artist.as_deref(),
-            prefer_title_artist,
-        )
-    };
+    let identity = infer_song_identity_with_filename_preference(
+        fallback_name,
+        source_tag.title(),
+        source_tag.artist().or_else(|| source_tag.album_artist()),
+        prefer_title_artist,
+    );
     let valid_cover = |tag: &id3::Tag| {
         tag.pictures()
             .any(|picture| crate::metadata::get_image_mime_type(&picture.data) != "image/*")
@@ -3327,25 +1891,10 @@ pub fn inspect_metadata_diagnostic_with_resolver(
         metadata_validation: if !output_exists {
             "输出文件不存在或转换失败".to_string()
         } else if output_matches {
-            if source_tags_are_reliable {
-                "通过：按源文件可靠标签比较，输出标题、歌手和可用封面已校验".to_string()
-            } else {
-                "通过：按文件名推断比较，输出标题、歌手和可用封面已校验".to_string()
-            }
-        } else if source_tags_are_reliable {
-            "未通过：输出标签或封面与源文件可靠标签不一致".to_string()
+            "通过：标题、歌手和可用封面已校验".to_string()
         } else {
-            "未通过：输出标签或封面与文件名推断不一致".to_string()
+            "未通过：输出标签或封面与识别结果不一致".to_string()
         },
-        validation_basis: Some(if source_tags_are_reliable {
-            "source_tags".to_string()
-        } else {
-            "filename_inference".to_string()
-        }),
-        output_tags_match: output_exists.then_some(output_matches),
-        netease_recovery: Some(
-            crate::netease::recover_local_metadata_with_resolver(source_path, resolver).diagnostic,
-        ),
     }
 }
 
@@ -3523,46 +2072,6 @@ fn process_ncm_file_to_output(
     mode: Mode,
     lossless_format: Option<LosslessFormat>,
 ) -> io::Result<()> {
-    process_ncm_file_to_output_control(
-        src_path,
-        output_path,
-        name_stem,
-        mode,
-        lossless_format,
-        None,
-    )
-}
-
-fn process_ncm_file_to_output_managed(
-    src_path: &Path,
-    output_path: &Path,
-    name_stem: &str,
-    mode: Mode,
-    lossless_format: Option<LosslessFormat>,
-    registry: &ActiveFfmpegRegistry,
-    cancelled: &AtomicBool,
-) -> io::Result<()> {
-    process_ncm_file_to_output_control(
-        src_path,
-        output_path,
-        name_stem,
-        mode,
-        lossless_format,
-        Some((registry, cancelled)),
-    )
-}
-
-fn process_ncm_file_to_output_control(
-    src_path: &Path,
-    output_path: &Path,
-    name_stem: &str,
-    mode: Mode,
-    lossless_format: Option<LosslessFormat>,
-    control: Option<(&ActiveFfmpegRegistry, &AtomicBool)>,
-) -> io::Result<()> {
-    if control.is_some_and(|(_, cancelled)| cancelled.load(Ordering::SeqCst)) {
-        return Err(Error::new(ErrorKind::Interrupted, "转换已取消"));
-    }
     let file = File::open(src_path).map_err(|error| {
         Error::new(
             error.kind(),
@@ -3661,15 +2170,6 @@ fn process_ncm_file_to_output_control(
         TargetProfile::CompatMp3 => {
             if file_format.as_str() == "mp3" {
                 fs::copy(&temp_source_path, output_path)?;
-            } else if let Some((registry, cancelled)) = control {
-                convert_audio_to_output_path_managed(
-                    &temp_source_path,
-                    output_path,
-                    TargetProfile::CompatMp3,
-                    name_stem,
-                    registry,
-                    cancelled,
-                )?;
             } else {
                 convert_audio_to_output_path(
                     &temp_source_path,
@@ -3680,23 +2180,12 @@ fn process_ncm_file_to_output_control(
             }
         }
         TargetProfile::LosslessWav | TargetProfile::LosslessAiff => {
-            if let Some((registry, cancelled)) = control {
-                convert_audio_to_output_path_managed(
-                    &temp_source_path,
-                    output_path,
-                    output_policy.target_profile,
-                    name_stem,
-                    registry,
-                    cancelled,
-                )?;
-            } else {
-                convert_audio_to_output_path(
-                    &temp_source_path,
-                    output_path,
-                    output_policy.target_profile,
-                    name_stem,
-                )?;
-            }
+            convert_audio_to_output_path(
+                &temp_source_path,
+                output_path,
+                output_policy.target_profile,
+                name_stem,
+            )?;
 
             write_container_tags(
                 output_path,
@@ -3710,19 +2199,16 @@ fn process_ncm_file_to_output_control(
     Ok(())
 }
 
-pub(crate) fn target_output_path_with_policy(
+pub(crate) fn target_output_path(
     dest_folder: &str,
     name_stem: &str,
     output_extension: &str,
-    filename_policy: FilenameNormalizationPolicy,
 ) -> PathBuf {
-    let stem = match filename_policy {
-        FilenameNormalizationPolicy::PreserveSource => {
-            sanitize_preserve_source_filename_component(name_stem)
-        }
-        FilenameNormalizationPolicy::SoundCloud => sanitize_filename_component(name_stem),
-    };
-    Path::new(dest_folder).join(format!("{}.{}", stem, output_extension))
+    Path::new(dest_folder).join(format!(
+        "{}.{}",
+        sanitize_filename_component(name_stem),
+        output_extension
+    ))
 }
 
 pub(crate) fn effective_source_extension(source_path: &Path) -> String {
@@ -3764,56 +2250,32 @@ fn remove_conflicting_outputs(
     keep_extension: &str,
     protected_source_path: &Path,
 ) -> io::Result<()> {
-    // Do not delete a same-stem file from another container without an
-    // explicit ownership record proving it belongs to this source.
-    let _ = (
-        dest_folder,
-        name_stem,
-        keep_extension,
-        protected_source_path,
-    );
-    Ok(())
-}
+    for extension in ["mp3", "flac", "wav", "aiff"] {
+        if extension == keep_extension {
+            continue;
+        }
 
-/// Remove an old output only after its replacement has been committed.
-/// Missing old paths are treated as already cleaned up. The source and the
-/// current output are protected so a stale preview cannot delete user input.
-pub fn remove_replaced_output(
-    previous_path: &Path,
-    current_path: &Path,
-    source_path: &Path,
-) -> io::Result<bool> {
-    if previous_path == current_path || previous_path == source_path {
-        return Ok(false);
+        let candidate_path = target_output_path(dest_folder, name_stem, extension);
+        if paths_refer_to_same_file(&candidate_path, protected_source_path) {
+            continue;
+        }
+        if candidate_path.exists() {
+            fs::remove_file(candidate_path)?;
+        }
     }
-    if !previous_path.exists() {
-        return Ok(false);
-    }
-    if current_path.exists() && paths_refer_to_same_file(previous_path, current_path) {
-        return Ok(false);
-    }
-    if paths_refer_to_same_file(previous_path, source_path) {
-        return Ok(false);
-    }
-    fs::remove_file(previous_path)?;
-    Ok(true)
+
+    Ok(())
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
+
     match (fs::canonicalize(left), fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
-}
-
-fn is_163_key_marker(value: &str) -> bool {
-    let normalized = value.trim().to_ascii_lowercase();
-    normalized == "163 key"
-        || normalized.starts_with("163 key(")
-        || normalized.starts_with("163 key (")
 }
 
 fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
@@ -3824,9 +2286,7 @@ fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
     };
     let comments_to_remove = tag
         .comments()
-        .filter(|comment| {
-            is_163_key_marker(&comment.text) || is_163_key_marker(&comment.description)
-        })
+        .filter(|comment| comment.text.starts_with("163 key(") || comment.description == "163 key")
         .map(|comment| {
             (
                 comment.lang.clone(),
@@ -3837,7 +2297,7 @@ fn strip_163_key_from_mp3(path: &Path) -> io::Result<()> {
         .collect::<Vec<(String, String, String)>>();
     let extended_texts_to_remove = tag
         .extended_texts()
-        .filter(|text| is_163_key_marker(&text.description))
+        .filter(|text| text.description == "163 key" || text.description.starts_with("163 key("))
         .map(|text| text.description.clone())
         .collect::<Vec<String>>();
 
@@ -3877,20 +2337,6 @@ fn derive_song_name_with_settings(
     filename_rule: FilenameRule,
     netease_filename_format: NeteaseFilenameFormat,
 ) -> String {
-    derive_song_name_with_policy(
-        path,
-        filename_rule,
-        netease_filename_format,
-        FilenameNormalizationPolicy::SoundCloud,
-    )
-}
-
-pub(crate) fn derive_song_name_with_policy(
-    path: &Path,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-) -> String {
     let fallback_name = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -3898,12 +2344,7 @@ pub(crate) fn derive_song_name_with_policy(
         .to_string();
 
     if matches!(filename_rule, FilenameRule::Original) {
-        return match filename_policy {
-            FilenameNormalizationPolicy::PreserveSource => {
-                sanitize_preserve_source_filename_component(&fallback_name)
-            }
-            FilenameNormalizationPolicy::SoundCloud => sanitize_filename_component(&fallback_name),
-        };
+        return sanitize_filename_component(&fallback_name);
     }
 
     let extension = path
@@ -3913,98 +2354,15 @@ pub(crate) fn derive_song_name_with_policy(
         .to_lowercase();
 
     let candidate = match extension.as_str() {
-        "mp3" | "wav" | "aiff" => song_name_from_audio_tag(
-            path,
-            filename_rule,
-            &fallback_name,
-            netease_filename_format,
-            filename_policy,
-        ),
-        "flac" => song_name_from_flac(
-            path,
-            filename_rule,
-            &fallback_name,
-            netease_filename_format,
-            filename_policy,
-        ),
-        "ncm" => song_name_from_ncm(
-            path,
-            filename_rule,
-            &fallback_name,
-            netease_filename_format,
-            filename_policy,
-        ),
+        "mp3" | "wav" | "aiff" => {
+            song_name_from_audio_tag(path, filename_rule, &fallback_name, netease_filename_format)
+        }
+        "flac" => song_name_from_flac(path, filename_rule, &fallback_name, netease_filename_format),
+        "ncm" => song_name_from_ncm(path, filename_rule, &fallback_name, netease_filename_format),
         _ => None,
     };
 
-    candidate.unwrap_or_else(|| {
-        normalize_fallback_song_name(&fallback_name, filename_rule, filename_policy)
-    })
-}
-
-/// Derive a destination stem using a conservative NetEase identity when the
-/// caller explicitly supplies the Task 1 metadata resolver. The resolver is
-/// consulted only while the destination path is first planned; later tag,
-/// cover and analysis updates never recalculate or rename this path.
-#[allow(dead_code)]
-pub(crate) fn derive_song_name_with_policy_and_resolver(
-    path: &Path,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    resolver: Option<&NeteaseMetadataResolver>,
-) -> String {
-    derive_song_name_with_policy_and_resolver_cancellable(
-        path,
-        filename_rule,
-        netease_filename_format,
-        filename_policy,
-        resolver,
-        None,
-    )
-}
-
-pub(crate) fn derive_song_name_with_policy_and_resolver_cancellable(
-    path: &Path,
-    filename_rule: FilenameRule,
-    netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
-    resolver: Option<&NeteaseMetadataResolver>,
-    cancel: Option<&AtomicBool>,
-) -> String {
-    if matches!(filename_rule, FilenameRule::Original)
-        || !matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
-    {
-        return derive_song_name_with_policy(
-            path,
-            filename_rule,
-            netease_filename_format,
-            filename_policy,
-        );
-    }
-
-    let identity = resolver.and_then(|resolver| {
-        cancel
-            .map(|cancel| resolver.track_identity_cancellable(path, cancel))
-            .unwrap_or_else(|| resolver.track_identity(path))
-    });
-    if let Some(identity) = identity
-        && let Some(name) = build_song_name_with_policy(
-            &identity.title,
-            &identity.artists,
-            filename_rule,
-            filename_policy,
-        )
-    {
-        return name;
-    }
-
-    derive_song_name_with_policy(
-        path,
-        filename_rule,
-        netease_filename_format,
-        filename_policy,
-    )
+    candidate.unwrap_or_else(|| normalize_fallback_song_name(&fallback_name, filename_rule))
 }
 
 fn song_name_from_flac(
@@ -4012,25 +2370,15 @@ fn song_name_from_flac(
     filename_rule: FilenameRule,
     fallback_name: &str,
     netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
 ) -> Option<String> {
-    // Filename derivation is based on the file's own tags and filename. A
-    // separately discovered NetEase record may enrich output metadata later,
-    // but it must not change the identity used for the destination path.
-    let tag = source_metadata_as_id3_without_resolver(path);
+    let tag = source_metadata_as_id3(path);
     let identity = infer_song_identity_with_netease_filename_format(
         fallback_name,
         tag.title(),
         tag.artist().or_else(|| tag.album_artist()),
         netease_filename_format,
-        filename_policy,
     );
-    build_song_name_with_policy(
-        &identity.title,
-        &identity.artist,
-        filename_rule,
-        filename_policy,
-    )
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
 fn song_name_from_audio_tag(
@@ -4038,23 +2386,16 @@ fn song_name_from_audio_tag(
     filename_rule: FilenameRule,
     fallback_name: &str,
     netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
 ) -> Option<String> {
-    let tag = source_metadata_as_id3_without_resolver(path);
+    let tag = source_metadata_as_id3(path);
     let artist = tag.artist().or_else(|| tag.album_artist());
     let identity = infer_song_identity_with_netease_filename_format(
         fallback_name,
         tag.title(),
         artist,
         netease_filename_format,
-        filename_policy,
     );
-    build_song_name_with_policy(
-        &identity.title,
-        &identity.artist,
-        filename_rule,
-        filename_policy,
-    )
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
 fn song_name_from_ncm(
@@ -4062,7 +2403,6 @@ fn song_name_from_ncm(
     filename_rule: FilenameRule,
     fallback_name: &str,
     netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
 ) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut ncm = Ncmdump::from_reader(file).ok()?;
@@ -4078,14 +2418,8 @@ fn song_name_from_ncm(
         Some(&info.name),
         Some(&artist),
         netease_filename_format,
-        filename_policy,
     );
-    build_song_name_with_policy(
-        &identity.title,
-        &identity.artist,
-        filename_rule,
-        filename_policy,
-    )
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4112,7 +2446,6 @@ fn infer_song_identity_with_netease_filename_format(
     metadata_title: Option<&str>,
     metadata_artist: Option<&str>,
     netease_filename_format: NeteaseFilenameFormat,
-    filename_policy: FilenameNormalizationPolicy,
 ) -> SongIdentity {
     let title = normalize_filename_part(metadata_title);
     let artist = normalize_filename_part(metadata_artist);
@@ -4123,24 +2456,20 @@ fn infer_song_identity_with_netease_filename_format(
         };
     }
 
-    let fallback = normalize_text_for_policy(fallback_name, filename_policy);
+    let fallback = normalize_display_text(fallback_name);
     let (fallback_title, fallback_artist) = match netease_filename_format {
         NeteaseFilenameFormat::TitleOnly => (fallback, String::new()),
-        NeteaseFilenameFormat::ArtistTitle => {
-            split_filename_identity_with_policy(&fallback, filename_policy)
-                .map(|(artist, title)| (title, artist))
-                .unwrap_or_else(|| (fallback, String::new()))
-        }
+        NeteaseFilenameFormat::ArtistTitle => split_filename_identity(&fallback)
+            .map(|(artist, title)| (title, artist))
+            .unwrap_or_else(|| (fallback, String::new())),
         NeteaseFilenameFormat::TitleArtist => {
-            split_filename_identity_with_policy(&fallback, filename_policy)
-                .unwrap_or_else(|| (fallback, String::new()))
+            split_filename_identity(&fallback).unwrap_or_else(|| (fallback, String::new()))
         }
     };
 
     SongIdentity {
-        title: title.unwrap_or_else(|| normalize_identity_part(&fallback_title, filename_policy)),
-        artist: artist
-            .unwrap_or_else(|| normalize_identity_part(&fallback_artist, filename_policy)),
+        title: title.unwrap_or_else(|| sanitize_filename_component(&fallback_title)),
+        artist: artist.unwrap_or_else(|| sanitize_filename_component(&fallback_artist)),
     }
 }
 
@@ -4209,9 +2538,7 @@ fn parse_filename_identity(
     prefer_title_artist_filename: bool,
 ) -> (String, String) {
     let display = normalize_display_text(fallback_name);
-    if let Some((left, right)) =
-        split_filename_identity_with_policy(&display, FilenameNormalizationPolicy::SoundCloud)
-    {
+    if let Some((left, right)) = split_filename_identity(&display) {
         return if prefer_title_artist_filename {
             (left, right)
         } else {
@@ -4222,14 +2549,7 @@ fn parse_filename_identity(
 }
 
 fn split_filename_identity(fallback_name: &str) -> Option<(String, String)> {
-    split_filename_identity_with_policy(fallback_name, FilenameNormalizationPolicy::SoundCloud)
-}
-
-fn split_filename_identity_with_policy(
-    fallback_name: &str,
-    filename_policy: FilenameNormalizationPolicy,
-) -> Option<(String, String)> {
-    let display = normalize_text_for_policy(fallback_name, filename_policy);
+    let display = normalize_display_text(fallback_name);
     display
         .split_once(" - ")
         .map(|(left, right)| (left.to_string(), right.to_string()))
@@ -4237,8 +2557,8 @@ fn split_filename_identity_with_policy(
 
 fn normalize_filename_part(value: Option<&str>) -> Option<String> {
     let value = value?;
-    let normalized = value.trim();
-    (!normalized.is_empty()).then_some(normalized.to_string())
+    let normalized = sanitize_filename_component(&normalize_display_text(value));
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[cfg(test)]
@@ -4246,28 +2566,13 @@ fn build_song_name(title: &str, artist: &str) -> Option<String> {
     build_song_name_with_rule(title, artist, FilenameRule::default())
 }
 
-#[cfg(test)]
 fn build_song_name_with_rule(
     title: &str,
     artist: &str,
     filename_rule: FilenameRule,
 ) -> Option<String> {
-    build_song_name_with_policy(
-        title,
-        artist,
-        filename_rule,
-        FilenameNormalizationPolicy::SoundCloud,
-    )
-}
-
-fn build_song_name_with_policy(
-    title: &str,
-    artist: &str,
-    filename_rule: FilenameRule,
-    filename_policy: FilenameNormalizationPolicy,
-) -> Option<String> {
-    let title = normalize_identity_part(title, filename_policy);
-    let artist = normalize_identity_part(artist, filename_policy);
+    let title = sanitize_filename_component(&normalize_display_text(title));
+    let artist = sanitize_filename_component(&normalize_display_text(artist));
 
     match (title.is_empty(), artist.is_empty()) {
         (true, true) => None,
@@ -4282,63 +2587,10 @@ fn build_song_name_with_policy(
     }
 }
 
-fn normalize_fallback_song_name(
-    fallback_name: &str,
-    filename_rule: FilenameRule,
-    filename_policy: FilenameNormalizationPolicy,
-) -> String {
-    let identity = if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource) {
-        infer_song_identity_with_netease_filename_format(
-            fallback_name,
-            None,
-            None,
-            NeteaseFilenameFormat::TitleArtist,
-            filename_policy,
-        )
-    } else {
-        infer_song_identity(fallback_name, None, None)
-    };
-    build_song_name_with_policy(
-        &identity.title,
-        &identity.artist,
-        filename_rule,
-        filename_policy,
-    )
-    .unwrap_or_else(|| normalize_text_for_policy(fallback_name, filename_policy))
-}
-
-fn normalize_text_for_policy(value: &str, filename_policy: FilenameNormalizationPolicy) -> String {
-    match filename_policy {
-        FilenameNormalizationPolicy::PreserveSource => value.to_string(),
-        FilenameNormalizationPolicy::SoundCloud => normalize_display_text(value),
-    }
-}
-
-fn normalize_identity_part(value: &str, filename_policy: FilenameNormalizationPolicy) -> String {
-    match filename_policy {
-        FilenameNormalizationPolicy::PreserveSource => {
-            sanitize_preserve_source_filename_component(value)
-        }
-        FilenameNormalizationPolicy::SoundCloud => {
-            sanitize_filename_component(&normalize_display_text(value))
-        }
-    }
-}
-
-/// Keeps the configured filename rule and all valid source characters while
-/// making only the two observed macOS path hazards representable in one
-/// filename component. This function is filename-only; source metadata keeps
-/// its original title and artist values.
-fn sanitize_preserve_source_filename_component(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\0' => output.push_str(", "),
-            '/' => output.push('／'),
-            other => output.push(other),
-        }
-    }
-    output
+fn normalize_fallback_song_name(fallback_name: &str, filename_rule: FilenameRule) -> String {
+    let identity = infer_song_identity(fallback_name, None, None);
+    build_song_name_with_rule(&identity.title, &identity.artist, filename_rule)
+        .unwrap_or_else(|| normalize_display_text(fallback_name))
 }
 
 fn normalize_display_text(value: &str) -> String {
@@ -4659,7 +2911,61 @@ fn normalize_spacing_around_punctuation(value: &str) -> String {
 }
 
 fn sanitize_filename_component(value: &str) -> String {
-    crate::filename_policy::sanitize_filename_component(value)
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let cleaned = trimmed
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            control if control.is_control() => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let cleaned = cleaned.trim_end_matches([' ', '.']).to_string();
+    let cleaned = if cleaned.is_empty() {
+        String::from("未命名")
+    } else {
+        cleaned
+    };
+    let stem = cleaned.split('.').next().unwrap_or_default();
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    let cleaned = if reserved {
+        format!("_{cleaned}")
+    } else {
+        cleaned
+    };
+
+    cleaned.chars().take(180).collect()
 }
 
 fn write_container_tags(
@@ -4683,35 +2989,19 @@ fn write_container_tags(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveFfmpegRegistry, ConversionMetadataContext, EmbeddedAnalysis, SongIdentity,
-        apply_track_analysis_metadata, build_song_name, build_song_name_with_policy,
+        EmbeddedAnalysis, SongIdentity, apply_track_analysis_metadata, build_song_name,
         build_song_name_with_rule, commit_temporary_output, compare_music_dicts, derive_song_name,
-        derive_song_name_with_policy, derive_song_name_with_policy_and_resolver,
         derive_song_name_with_rule, derive_song_name_with_settings, ensure_generated_output,
-        ensure_output_metadata, ensure_output_metadata_with_settings,
-        ensure_output_metadata_with_settings_with_context_and_policy, fill_missing_metadata,
+        ensure_output_metadata, ensure_output_metadata_with_settings, fill_missing_metadata,
         find_ffmpeg_next_to_exe, infer_song_identity, merge_recovered_metadata,
         remove_conflicting_outputs, run_output_transaction, sanitize_filename_component,
-        sanitize_preserve_source_filename_component, strip_163_key_from_mp3,
-        sync_music_library_transactional_with_observer_and_budget_and_context,
-        target_output_path_with_policy, update_analysis_metadata_transactionally,
-        update_existing_metadata_transactionally,
-        update_existing_metadata_transactionally_with_context_and_policy,
-        validate_track_analysis_metadata, write_riff_info_metadata,
+        strip_163_key_from_mp3, write_riff_info_metadata,
     };
-    use crate::concurrency::GlobalConcurrencyBudget;
-    use crate::config::{
-        FilenameNormalizationPolicy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
-    };
+    use crate::config::{FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat};
     use id3::{Tag, TagLike, Version};
-    use rusqlite::{Connection, params};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::time::Duration;
     use tempfile::tempdir;
 
     fn write_executable_file(path: &Path, contents: &[u8]) {
@@ -4727,69 +3017,11 @@ mod tests {
         }
     }
 
-    fn write_test_wav(path: &Path) {
-        let mut wav = Vec::with_capacity(48);
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&40u32.to_le_bytes());
-        wav.extend_from_slice(b"WAVEfmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes());
-        wav.extend_from_slice(&8_000u32.to_le_bytes());
-        wav.extend_from_slice(&16_000u32.to_le_bytes());
-        wav.extend_from_slice(&2u16.to_le_bytes());
-        wav.extend_from_slice(&16u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&4u32.to_le_bytes());
-        wav.extend_from_slice(&[0, 0, 0, 0]);
-        fs::write(path, wav).unwrap();
-    }
-
     #[test]
     fn sanitizes_invalid_filename_characters() {
         assert_eq!(sanitize_filename_component("A/B:C*D?"), "A-B-C-D-");
         assert_eq!(sanitize_filename_component("CON"), "_CON");
         assert_eq!(sanitize_filename_component("Track..."), "Track");
-    }
-
-    #[test]
-    fn preserve_source_only_replaces_nul_and_ascii_slash() {
-        assert_eq!(
-            sanitize_preserve_source_filename_component(
-                "バギー・ブギー/Buggy Boogie - ミッキー吉野\0小林亜星"
-            ),
-            "バギー・ブギー／Buggy Boogie - ミッキー吉野, 小林亜星"
-        );
-        assert_eq!(
-            sanitize_preserve_source_filename_component(
-                r#"Mass Destruction ("P3" + "P3F" ver.) - Artist"#
-            ),
-            r#"Mass Destruction ("P3" + "P3F" ver.) - Artist"#
-        );
-    }
-
-    #[test]
-    fn title_artist_rule_sanitizes_filename_without_changing_rule_order() {
-        assert_eq!(
-            build_song_name_with_policy(
-                "バギー・ブギー/Buggy Boogie",
-                "ミッキー吉野\0小林亜星",
-                FilenameRule::TitleArtist,
-                FilenameNormalizationPolicy::PreserveSource,
-            )
-            .as_deref(),
-            Some("バギー・ブギー／Buggy Boogie - ミッキー吉野, 小林亜星")
-        );
-        assert_eq!(
-            build_song_name_with_policy(
-                "バギー・ブギー/Buggy Boogie",
-                "ミッキー吉野\0小林亜星",
-                FilenameRule::ArtistTitle,
-                FilenameNormalizationPolicy::PreserveSource,
-            )
-            .as_deref(),
-            Some("ミッキー吉野, 小林亜星 - バギー・ブギー／Buggy Boogie")
-        );
     }
 
     #[test]
@@ -4920,60 +3152,6 @@ mod tests {
         assert_eq!(
             derive_song_name_with_rule(&path, FilenameRule::TitleArtist),
             "Mystic State, Third Degree - Mr Wankerman"
-        );
-    }
-
-    #[test]
-    fn netease_policy_preserves_quoted_title_and_soundcloud_policy_removes_quotes() {
-        let directory = tempdir().unwrap();
-        let path = directory
-            .path()
-            .join("Mass Destruction (P3 + P3F ver.) - 川村ゆみ, Lotus Juice.mp3");
-        fs::write(&path, b"audio-placeholder").unwrap();
-        let mut tag = Tag::new();
-        tag.set_title(r#"Mass Destruction ("P3" + "P3F" ver.)"#);
-        tag.set_artist("川村ゆみ, Lotus Juice");
-        tag.write_to_path(&path, Version::Id3v24).unwrap();
-
-        assert_eq!(
-            derive_song_name_with_policy(
-                &path,
-                FilenameRule::TitleArtist,
-                NeteaseFilenameFormat::TitleArtist,
-                FilenameNormalizationPolicy::PreserveSource,
-            ),
-            r#"Mass Destruction ("P3" + "P3F" ver.) - 川村ゆみ, Lotus Juice"#
-        );
-        assert_eq!(
-            derive_song_name_with_policy(
-                &path,
-                FilenameRule::TitleArtist,
-                NeteaseFilenameFormat::TitleArtist,
-                FilenameNormalizationPolicy::SoundCloud,
-            ),
-            "Mass Destruction (P3 + P3F ver.) - 川村ゆみ, Lotus Juice"
-        );
-        assert_eq!(
-            target_output_path_with_policy(
-                "/tmp/output",
-                r#"Mass Destruction ("P3" + "P3F" ver.) - 川村ゆみ, Lotus Juice"#,
-                "mp3",
-                FilenameNormalizationPolicy::PreserveSource,
-            )
-            .file_name()
-            .and_then(|name| name.to_str()),
-            Some(r#"Mass Destruction ("P3" + "P3F" ver.) - 川村ゆみ, Lotus Juice.mp3"#)
-        );
-        assert_eq!(
-            target_output_path_with_policy(
-                "/tmp/output",
-                "バギー・ブギー/Buggy Boogie - ミッキー吉野\0小林亜星",
-                "mp3",
-                FilenameNormalizationPolicy::PreserveSource,
-            )
-            .file_name()
-            .and_then(|name| name.to_str()),
-            Some("バギー・ブギー／Buggy Boogie - ミッキー吉野, 小林亜星.mp3")
         );
     }
 
@@ -5183,104 +3361,6 @@ mod tests {
     }
 
     #[test]
-    fn removes_dont_modify_163_key_from_existing_output_transaction() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("source.mp3");
-        let output_dir = dir.path().join("output");
-        let output = output_dir.join("弹舌.mp3");
-        fs::create_dir_all(&output_dir).unwrap();
-
-        for path in [&source, &output] {
-            fs::write(path, b"audio").unwrap();
-            let mut tag = Tag::new();
-            tag.set_title("弹舌");
-            tag.set_artist("网易云歌手");
-            tag.add_frame(id3::frame::Comment {
-                lang: "und".into(),
-                description: "163 key(Don't modify)".into(),
-                text: "encrypted-value".into(),
-            });
-            tag.add_frame(id3::frame::ExtendedText {
-                description: "163 key(Don't modify)".into(),
-                value: "encrypted-value".into(),
-            });
-            tag.write_to_path(path, Version::Id3v24).unwrap();
-        }
-
-        update_existing_metadata_transactionally(
-            &source,
-            &output,
-            NeteaseFilenameFormat::TitleArtist,
-            |_| Ok(()),
-        )
-        .unwrap();
-
-        let cleaned = Tag::read_from_path(&output).unwrap();
-        assert_eq!(cleaned.comments().count(), 0);
-        assert_eq!(cleaned.extended_texts().count(), 0);
-        assert_eq!(cleaned.title(), Some("弹舌"));
-        assert_eq!(cleaned.artist(), Some("网易云歌手"));
-    }
-
-    #[test]
-    fn metadata_only_update_uses_batch_resolver_cover_without_reencoding() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Song - Artist.mp3");
-        let output = dir.path().join("output.mp3");
-        for path in [&source, &output] {
-            fs::write(path, b"audio").unwrap();
-            let mut tag = Tag::new();
-            tag.set_title("Song");
-            tag.set_artist("Artist");
-            tag.write_to_path(path, Version::Id3v24).unwrap();
-        }
-        let database = dir.path().join("sqlite_storage.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE track (file TEXT, title TEXT, artist TEXT, album TEXT, cover BLOB);",
-            )
-            .unwrap();
-        let cover = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02];
-        connection
-            .execute(
-                "INSERT INTO track(file, title, artist, album, cover) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    source.to_string_lossy(),
-                    "Song",
-                    "Artist",
-                    "Album",
-                    cover.clone()
-                ],
-            )
-            .unwrap();
-        drop(connection);
-        let resolver =
-            Arc::new(crate::netease::NeteaseMetadataResolver::load(Some(&database)).unwrap());
-        let context = ConversionMetadataContext { netease: resolver };
-        let original_audio = fs::read(&output).unwrap();
-        update_existing_metadata_transactionally_with_context_and_policy(
-            &source,
-            &output,
-            NeteaseFilenameFormat::TitleArtist,
-            |_| Ok(()),
-            &context,
-            FilenameNormalizationPolicy::PreserveSource,
-        )
-        .unwrap();
-        let updated = Tag::read_from_path(&output).unwrap();
-        assert_eq!(updated.album(), Some("Album"));
-        assert_eq!(
-            updated
-                .pictures()
-                .next()
-                .map(|picture| picture.data.clone()),
-            Some(cover)
-        );
-        assert!(fs::read(&output).unwrap().len() > original_audio.len());
-    }
-
-    #[test]
     fn fills_missing_metadata_from_the_original_filename() {
         let mut output = Tag::new();
         let source = Tag::new();
@@ -5351,110 +3431,6 @@ mod tests {
         let tag = Tag::read_from_path(&output).unwrap();
         assert_eq!(tag.title(), Some("歌曲"));
         assert_eq!(tag.artist(), Some("歌手"));
-    }
-
-    #[test]
-    fn task1_resolver_fills_untagged_mp3_title_artist_and_album() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Database Song - Database Artist.mp3");
-        let output = dir.path().join("Database Song - Database Artist.mp3");
-        let database = dir.path().join("sqlite_storage.sqlite3");
-        fs::write(&source, b"audio").unwrap();
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE track (file TEXT, title TEXT, artist TEXT, album TEXT, tid TEXT, aid TEXT, filesize INTEGER);",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO track(file,title,artist,album,tid,aid,filesize) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    source.to_string_lossy(),
-                    "Database Song",
-                    "Database Artist",
-                    "Database Album",
-                    "track-1",
-                    "album-1",
-                    5_i64,
-                ],
-            )
-            .unwrap();
-        drop(connection);
-        let resolver =
-            Arc::new(crate::netease::NeteaseMetadataResolver::load_exact(&database).unwrap());
-        let context = ConversionMetadataContext {
-            netease: resolver.clone(),
-        };
-
-        ensure_output_metadata_with_settings_with_context_and_policy(
-            &source,
-            &output,
-            NeteaseFilenameFormat::TitleArtist,
-            FilenameNormalizationPolicy::PreserveSource,
-            &context,
-        )
-        .unwrap();
-        let tag = Tag::read_from_path(&output).unwrap();
-        assert_eq!(tag.title(), Some("Database Song"));
-        assert_eq!(tag.artist(), Some("Database Artist"));
-        assert_eq!(tag.album(), Some("Database Album"));
-        assert_eq!(
-            derive_song_name_with_policy_and_resolver(
-                &source,
-                FilenameRule::TitleArtist,
-                NeteaseFilenameFormat::TitleArtist,
-                FilenameNormalizationPolicy::PreserveSource,
-                Some(resolver.as_ref()),
-            ),
-            "Database Song - Database Artist"
-        );
-    }
-
-    #[test]
-    fn task2_source_policy_does_not_backfill_netease_metadata() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("Database Song - Database Artist.mp3");
-        let output = dir.path().join("Database Song - Database Artist.mp3");
-        let database = dir.path().join("sqlite_storage.sqlite3");
-        fs::write(&source, b"audio").unwrap();
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE track (file TEXT, title TEXT, artist TEXT, album TEXT, tid TEXT, aid TEXT, filesize INTEGER);",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO track(file,title,artist,album,tid,aid,filesize) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    source.to_string_lossy(),
-                    "Database Song",
-                    "Database Artist",
-                    "Database Album",
-                    "track-1",
-                    "album-1",
-                    5_i64,
-                ],
-            )
-            .unwrap();
-        drop(connection);
-        let resolver =
-            Arc::new(crate::netease::NeteaseMetadataResolver::load_exact(&database).unwrap());
-        let context = ConversionMetadataContext { netease: resolver };
-
-        ensure_output_metadata_with_settings_with_context_and_policy(
-            &source,
-            &output,
-            NeteaseFilenameFormat::TitleArtist,
-            FilenameNormalizationPolicy::SoundCloud,
-            &context,
-        )
-        .unwrap();
-        let tag = Tag::read_from_path(&output).unwrap();
-        assert_eq!(tag.title(), Some("Database Song"));
-        assert_eq!(tag.artist(), Some("Database Artist"));
-        assert_eq!(tag.album(), None);
     }
 
     #[test]
@@ -5570,7 +3546,6 @@ mod tests {
         };
 
         apply_track_analysis_metadata(&path, &analysis).unwrap();
-        validate_track_analysis_metadata(&path, &analysis).unwrap();
 
         let tag = Tag::read_from_path(&path).unwrap();
         assert_eq!(tag.text_for_frame_id("TBPM"), Some("140.25"));
@@ -5582,168 +3557,6 @@ mod tests {
         assert!(
             tag.comments()
                 .any(|comment| comment.description == "W4DJ Essentia")
-        );
-    }
-
-    #[test]
-    fn writes_discogs_heads_to_independent_namespaced_frames() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("Discogs.mp3");
-        fs::write(&path, b"audio").unwrap();
-        let mut tag = Tag::new();
-        tag.set_title("Discogs");
-        tag.write_to_path(&path, Version::Id3v24).unwrap();
-
-        let mut heads = BTreeMap::new();
-        for (model, label) in [
-            ("moodTheme", "dark"),
-            ("approachability", "approachable"),
-            ("instrumentation", "synth"),
-            ("timbre", "bright"),
-            ("danceability", "danceable"),
-        ] {
-            heads.insert(
-                model.to_string(),
-                crate::analysis::DiscogsEffnetHeadResult {
-                    model: model.to_string(),
-                    status: "completed".to_string(),
-                    version: "discogs-test".to_string(),
-                    labels: vec![crate::analysis::AnalysisLabel {
-                        label: label.to_string(),
-                        confidence: 0.91,
-                    }],
-                    scores: BTreeMap::from([(label.to_string(), 0.91)]),
-                    frame_count: 2,
-                    threshold: Some(0.35),
-                    selected_class: Some(label.to_string()),
-                    selected_confidence: Some(0.91),
-                    reason: None,
-                },
-            );
-        }
-        let analysis = EmbeddedAnalysis {
-            path: "/music/Discogs.mp3".into(),
-            title: "Discogs".into(),
-            artist: "Artist".into(),
-            album: "Album".into(),
-            genre: String::new(),
-            bpm: None,
-            key: None,
-            scale: None,
-            key_strength: None,
-            integrated_loudness_lufs: None,
-            loudness_range_lu: None,
-            energy: None,
-            danceability: None,
-            beat_positions: Vec::new(),
-            analyzer: "Essentia.js".into(),
-            analysis_version: "discogs-test".into(),
-            drop_loudness_lufs: None,
-            drop_analysis: None,
-            high_level: Some(crate::analysis::HighLevelAnalysis {
-                status: "completed".into(),
-                model_version: Some("discogs-test".into()),
-                reason: None,
-                genre: Vec::new(),
-                style: Vec::new(),
-                mood: Vec::new(),
-                instrument: Vec::new(),
-                emotion_candidates: None,
-                mood_cluster: Vec::new(),
-                mood_cluster_status: None,
-                mood_cluster_reason: None,
-                filtered: Vec::new(),
-                discogs_effnet: Some(crate::analysis::DiscogsEffnetAnalysis {
-                    embedding_model: "discogs-effnet-bs64-1".into(),
-                    embedding_dimensions: 1280,
-                    input_shape: vec![64, 128, 96],
-                    heads,
-                }),
-            }),
-        };
-
-        apply_track_analysis_metadata(&path, &analysis).unwrap();
-        validate_track_analysis_metadata(&path, &analysis).unwrap();
-        let tag = Tag::read_from_path(&path).unwrap();
-        for description in [
-            "W4DJ-Discogs-MoodTheme",
-            "W4DJ-Discogs-Approachability",
-            "W4DJ-Discogs-Instrumentation",
-            "W4DJ-Discogs-Timbre",
-            "W4DJ-Discogs-Danceability",
-        ] {
-            assert!(
-                tag.extended_texts()
-                    .any(|frame| frame.description == description)
-            );
-        }
-        // The Discogs danceability head is namespaced and must not replace
-        // the existing scalar W4DJ-Danceability field.
-        assert!(
-            !tag.extended_texts()
-                .any(|frame| frame.description == "W4DJ-Danceability")
-        );
-    }
-
-    #[test]
-    fn writes_analysis_when_original_source_is_missing() {
-        let dir = tempdir().unwrap();
-        let output = dir.path().join("Song.mp3");
-        fs::write(&output, b"audio").unwrap();
-        let mut tag = Tag::new();
-        tag.set_title("Song");
-        tag.write_to_path(&output, Version::Id3v24).unwrap();
-
-        let analysis = EmbeddedAnalysis {
-            path: dir.path().join("removed-source.ncm").display().to_string(),
-            title: "Song".into(),
-            artist: "Artist".into(),
-            album: String::new(),
-            genre: String::new(),
-            bpm: None,
-            key: None,
-            scale: None,
-            key_strength: None,
-            integrated_loudness_lufs: None,
-            loudness_range_lu: None,
-            energy: Some(0.42),
-            danceability: Some(0.88),
-            beat_positions: Vec::new(),
-            analyzer: "Essentia.js".into(),
-            analysis_version: "0.2.0".into(),
-            drop_loudness_lufs: None,
-            drop_analysis: None,
-            high_level: Some(crate::analysis::HighLevelAnalysis {
-                status: "failed".into(),
-                model_version: None,
-                reason: Some("模型输入失败".into()),
-                genre: Vec::new(),
-                style: Vec::new(),
-                mood: Vec::new(),
-                instrument: Vec::new(),
-                emotion_candidates: None,
-                mood_cluster: Vec::new(),
-                mood_cluster_status: None,
-                mood_cluster_reason: None,
-                filtered: Vec::new(),
-                discogs_effnet: None,
-            }),
-        };
-
-        update_analysis_metadata_transactionally(&output, |temporary_output| {
-            apply_track_analysis_metadata(temporary_output, &analysis)
-        })
-        .unwrap();
-
-        let tag = Tag::read_from_path(&output).unwrap();
-        assert!(
-            tag.extended_texts()
-                .any(|frame| { frame.description == "W4DJ-Energy" && frame.value == "0.4200" })
-        );
-        assert!(
-            tag.extended_texts().any(|frame| {
-                frame.description == "W4DJ-Danceability" && frame.value == "0.8800"
-            })
         );
     }
 
@@ -5781,7 +3594,7 @@ mod tests {
         remove_conflicting_outputs(dir.path().to_str().unwrap(), "Song", "mp3", &source).unwrap();
 
         assert!(source.exists());
-        assert!(stale_output.exists());
+        assert!(!stale_output.exists());
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -5799,91 +3612,5 @@ mod tests {
         let found = find_ffmpeg_next_to_exe(&exe_path).unwrap();
 
         assert_eq!(found, fallback);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn active_ffmpeg_registry_terminates_cancelled_children() {
-        let registry = ActiveFfmpegRegistry::new();
-        let child = Command::new("sh")
-            .args(["-c", "sleep 10"])
-            .spawn()
-            .expect("shell should start");
-        let child_id = registry.insert(child);
-        let cancelled = AtomicBool::new(true);
-        let started = std::time::Instant::now();
-        let status = registry.wait_for(child_id, &cancelled).unwrap();
-
-        assert!(!status.success());
-        assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(registry.active_count(), 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_conversion_runs_distinct_ffmpeg_outputs_in_parallel() {
-        let dir = tempdir().unwrap();
-        let fake_ffmpeg = dir.path().join("ffmpeg");
-        let log_path = dir.path().join("ffmpeg.log");
-        write_executable_file(
-            &fake_ffmpeg,
-            br##"#!/bin/sh
-input=""
-output=""
-previous=""
-for argument in "$@"; do
-  if [ "$previous" = "-i" ]; then input="$argument"; fi
-  output="$argument"
-  previous="$argument"
-done
-printf '%s\n' START >> "$W4DJ_FAKE_FFMPEG_LOG"
-sleep 0.25
-cp "$input" "$output"
-printf '%s\n' END >> "$W4DJ_FAKE_FFMPEG_LOG"
-"##,
-        );
-        unsafe {
-            std::env::set_var("W4DJ_FFMPEG_PATH", &fake_ffmpeg);
-            std::env::set_var("W4DJ_FAKE_FFMPEG_LOG", &log_path);
-        }
-
-        let destination = dir.path().join("output");
-        fs::create_dir_all(&destination).unwrap();
-        let mut songs = HashMap::new();
-        for index in 0..4 {
-            let source = dir.path().join(format!("Song {index}.wav"));
-            write_test_wav(&source);
-            let name = format!("Song {index}");
-            songs.insert(name, (String::from("1"), source));
-        }
-        let controller = crate::task::TaskController::running(songs.len());
-        let queued_songs = songs.iter().collect();
-        let result = sync_music_library_transactional_with_observer_and_budget_and_context(
-            &queued_songs,
-            destination.to_str().unwrap(),
-            &Mode::Lossless,
-            Some(LosslessFormat::Wav),
-            NeteaseFilenameFormat::default(),
-            &controller,
-            |_, _| Ok(()),
-            |_, _, _| {},
-            Arc::new(GlobalConcurrencyBudget::new(2)),
-            Arc::new(ActiveFfmpegRegistry::new()),
-            &ConversionMetadataContext::default(),
-        );
-        unsafe {
-            std::env::remove_var("W4DJ_FFMPEG_PATH");
-            std::env::remove_var("W4DJ_FAKE_FFMPEG_LOG");
-        }
-
-        assert!(result.is_ok(), "conversion should succeed: {result:?}");
-        assert_eq!(controller.snapshot().completed, 4);
-        let log = fs::read_to_string(log_path).unwrap();
-        let lines = log.lines().collect::<Vec<_>>();
-        assert!(
-            lines.len() >= 4,
-            "fake FFmpeg did not run four times: {log}"
-        );
-        assert_eq!(&lines[..2], ["START", "START"]);
     }
 }

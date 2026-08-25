@@ -1,32 +1,18 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { message, open, save } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
 import {
   analyzeAudioFile,
-  assessTrackAnalysisCompleteness,
   ESSENTIA_MODEL_IDS,
-  isBasicTrackAnalysisComplete,
-  isCompleteTrackAnalysis,
-  normalizeEssentiaModel,
   TRACK_ANALYSIS_VERSION,
   type EssentiaModelFile,
-  type EssentiaModelWire,
   type TrackAnalysis,
   type TrackMetadata,
 } from './analysis';
 import {
-  AnalysisWorkerCancelledError,
-  AnalysisWorkerClient,
-  AnalysisWorkerTimeoutError,
-  type AnalysisWorkerSession,
-} from './analysis-worker-client';
-import {
   renderLibraryDashboard,
   libraryColumnIds,
-  libraryOperatorsForField,
   saveLibraryColumnOrder,
-  saveLibraryColumnWidth,
   toggleLibraryColumn,
   type LibraryDashboardState,
   type LibraryField,
@@ -35,70 +21,10 @@ import {
   type LibraryOperator,
   type LibraryPage,
   type LibraryQuery,
-  type LibraryRefreshProgress,
-  type LibraryInvalidScanProgress,
   type LibrarySourceRecord,
   type LibraryStatus,
   type LibraryTrack,
-  isLibraryRefreshActive,
 } from './library-dashboard';
-import {
-  buildNeteaseImportText,
-  splitNeteaseQrPages,
-  type ImportedDjPlaylist,
-  type ImportedDjPlaylistSummary,
-  type NeteaseQrPage,
-} from './dj-playlist';
-import { renderPlaintextQrDataUrl } from './qr-code';
-
-export type NeteaseDiscoveryProgress = {
-  status: 'running' | 'completed' | 'error';
-  stage: 'locatingDatabase' | 'readingRecords' | 'checkingMusicFolder';
-  processed: number;
-  total: number | null;
-  currentItem: string;
-  message: string;
-  suggestion: LibraryStatus['netease'] | null;
-  error: string | null;
-};
-
-export type NeteaseMetadataDatabaseStatus = {
-  manualPath: string | null;
-  effectivePath: string | null;
-  source: 'manual' | 'automatic' | 'unavailable';
-  loaded: boolean;
-  recordCount: number;
-  warning: string | null;
-  cacheStatus?: 'idle' | 'ready' | 'stale' | 'building' | 'cancelling' | 'cancelled' | 'error' | null;
-  cachedRecordCount?: number;
-  databaseChanged?: boolean;
-};
-
-export type NeteaseMetadataCacheProgress = {
-  status: 'idle' | 'ready' | 'stale' | 'building' | 'cancelling' | 'cancelled' | 'error';
-  stage: string;
-  processed: number;
-  total: number | null;
-  currentItem: string;
-  message: string;
-  error: string | null;
-  databasePath: string | null;
-  cachedRecordCount: number;
-};
-
-export type NeteaseMetadataDatabaseUiState = {
-  status: NeteaseMetadataDatabaseStatus | null;
-  busy: boolean;
-  message: string | null;
-  error: string | null;
-};
-
-export type LibraryAnalysisCandidate = {
-  path: string;
-  name: string;
-  sizeBytes: number;
-  slotIndex?: SyncSlotIndex;
-};
 
 export type AppMode = 'compat' | 'lossless';
 export type AppLosslessFormat = 'wav' | 'aiff';
@@ -107,8 +33,8 @@ export type AppConflictStrategy = 'skip' | 'overwrite' | 'rename' | 'update_meta
 export type AppFilenameRule = 'title_artist' | 'artist_title' | 'original';
 export type AppNeteaseFilenameFormat = 'title_only' | 'artist_title' | 'title_artist';
 export type AppStatus = 'idle' | 'running' | 'paused' | 'completed' | 'error' | 'cancelled';
-export type AppScanStatus = 'idle' | 'running' | 'cancelling' | 'completed' | 'cancelled' | 'error';
-export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destination' | 'matching_metadata' | 'checking' | 'analyzing' | 'completed' | 'cancelled' | 'error';
+export type AppScanStatus = 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
+export type AppScanPhase = 'preparing' | 'scanning_source' | 'scanning_destination' | 'checking' | 'analyzing' | 'completed' | 'cancelled' | 'error';
 export type AppLanguage = 'zh' | 'en';
 export type AppTheme = 'light' | 'dark';
 export type SyncSlotIndex = 0 | 1;
@@ -120,16 +46,6 @@ type OnboardingStep = 0 | 1 | 2 | 3 | 4;
 type OnboardingTarget = 'mode' | 'source' | 'destination' | 'start' | 'tutorial';
 
 const ONBOARDING_STEP_COUNT = 5;
-
-// Keep the enhanced-analysis state, model loading, and cache actions available
-// while the unstable controls are temporarily hidden from the conversion rail.
-// Flip this single flag back to true when the complete enhanced-analysis UI is
-// ready to return; the Rust analysis backend remains available throughout.
-const ENHANCED_ANALYSIS_FEATURES_VISIBLE = false;
-
-// Keep the song-library backend and state intact while its user-facing entry
-// point remains hidden during the current stability/product rollout.
-const SONG_LIBRARY_FEATURE_VISIBLE = false;
 
 function createAnalysisBatchId(): string {
   const timestamp = Date.now().toString(36);
@@ -151,7 +67,6 @@ export type AppSyncSlotViewState = {
   progressText: string;
   currentFile: string;
   logs: string[];
-  activeConcurrencyLimit: number | null;
 };
 
 export type AppViewState = {
@@ -163,7 +78,6 @@ export type AppViewState = {
   conflictStrategy: AppConflictStrategy;
   filenameRule: AppFilenameRule;
   neteaseFilenameFormat: AppNeteaseFilenameFormat;
-  concurrencyLimit: number;
   lang: AppLanguage;
   theme: AppTheme;
 };
@@ -182,7 +96,6 @@ export type DesktopSyncSlotState = {
   failed_files: AppFailedFile[];
   current_file: string;
   logs: string[];
-  active_concurrency_limit: number | null;
 };
 
 export type DesktopState = {
@@ -194,7 +107,6 @@ export type DesktopState = {
   conflict_strategy: AppConflictStrategy;
   filename_rule: AppFilenameRule;
   netease_filename_format: AppNeteaseFilenameFormat;
-  concurrency_limit: number;
 };
 
 export type AppErrorCategory =
@@ -221,10 +133,6 @@ export type AppPreviewCandidate = {
   source_size_bytes: number;
   estimated_output_bytes: number | null;
   operation: 'convert' | 'update_metadata';
-  netease_track_id?: string | null;
-  netease_album_id?: string | null;
-  album?: string | null;
-  disambiguation_reason?: string | null;
 };
 
 export type AppPreviewIssue = {
@@ -273,104 +181,18 @@ export type AppUpdateCheck = {
 };
 
 export type AppAnalysisState = {
-  slotIndex: SyncSlotIndex | null;
   status: 'idle' | 'running' | 'completed' | 'cancelled' | 'error';
   completed: number;
   total: number;
   resultCount: number;
   failedCount: number;
   message: string;
-  currentItem?: string;
-  stage?: string;
-  stageProcessed?: number;
-  stageTotal?: number;
-  workerJobId?: string;
-  startedAt?: string;
-  resumeAvailable?: boolean;
 };
 
 export type AppAnalysisFailure = {
   path: string;
   message: string;
-  status?: 'failed' | 'timeout';
-  stage?: string;
-  elapsedMs?: number;
 };
-
-export type DjPlaylistMatchCandidate = {
-  trackKey: string;
-  title: string;
-  artistDisplay: string;
-  durationSeconds: number | null;
-  destinationFilename: string;
-  score: number;
-  reason: string;
-};
-
-export type DjPlaylistTrackMatch = {
-  position: number;
-  dedupeKey: string;
-  title: string;
-  artistDisplay: string;
-  neteaseTrackId: string | null;
-  kind: 'neteaseTrackId' | 'uniqueTitleArtistFallback' | 'ambiguous' | 'unmatched' | 'missing' | 'manual';
-  status: 'matched' | 'unmatched' | 'ambiguous' | 'missing';
-  trackKey: string | null;
-  matchMethod: string | null;
-  score: number | null;
-  reason: string;
-  candidates: DjPlaylistMatchCandidate[];
-  manual: boolean;
-};
-
-export type DjPlaylistMatchReport = {
-  playlistId: string;
-  total: number;
-  matchedCount: number;
-  ambiguousCount: number;
-  unmatchedCount: number;
-  missingCount: number;
-  matches: DjPlaylistTrackMatch[];
-};
-
-export type DjPlaylistM3u8ExportResult = {
-  path: string;
-  matchedCount: number;
-  total: number;
-  omitted: Array<{ position: number; reason: string }>;
-};
-
-export type DjPlaylistUiState = {
-  visible: boolean;
-  launcher?: boolean;
-  busy: boolean;
-  error: string | null;
-  notice: string | null;
-  playlist: ImportedDjPlaylist | null;
-  pages: NeteaseQrPage[];
-  pageIndex: number;
-  qrDataUrl: string | null;
-  qrRevision: number;
-  matchBusy: boolean;
-  matchReport: DjPlaylistMatchReport | null;
-  exportBusy: boolean;
-  dropActive: boolean;
-};
-
-type ResumableAnalysis = {
-  batchId: string;
-  previews: AppPreview[];
-  analysis?: AppAnalysisSummary | null;
-  attemptId?: string;
-};
-
-type PersistAnalysisCandidate = (
-  candidate: AppPreviewCandidate,
-  analysis: TrackAnalysis | null,
-  failure: AppAnalysisFailure | null,
-) => Promise<void>;
-
-const RESUMABLE_ANALYSIS_STORAGE_KEY = 'w4dj.resumable-analysis.v1';
 
 export type AppAudioFileFingerprint = {
   sizeBytes: number;
@@ -383,7 +205,6 @@ export function canReuseTrackAnalysis(
   neteaseFilenameFormat: AppNeteaseFilenameFormat,
   highLevelModelVersion: string | null = null,
   highLevelModelsAvailable = false,
-  enhancedMode = highLevelModelsAvailable,
 ): cached is TrackAnalysis {
   const basicMatch = cached?.analysisVersion === TRACK_ANALYSIS_VERSION
     && cached.sourceSizeBytes === fingerprint.sizeBytes
@@ -392,31 +213,14 @@ export function canReuseTrackAnalysis(
   if (!basicMatch) {
     return false;
   }
-  if (!enhancedMode) {
-    return isBasicTrackAnalysisComplete(cached);
+  if (!highLevelModelsAvailable) {
+    return true;
   }
-  if (!highLevelModelsAvailable) return false;
-  return isCompleteTrackAnalysis(cached)
-    && cached.highLevel?.modelVersion === highLevelModelVersion;
+  return cached.highLevel?.status === 'completed'
+    && cached.highLevel.modelVersion === highLevelModelVersion;
 }
 
 export type AppHistoryStatus = 'completed' | 'partial' | 'cancelled' | 'error';
-
-export type AppAnalysisSummary = {
-  status: 'notRequested' | 'pending' | 'running' | 'completed' | 'partial' | 'cancelled' | 'interrupted' | 'error';
-  total: number;
-  completed: number;
-  failed: number;
-  timedOut: number;
-  pending: number;
-  currentItem?: string | null;
-  currentStage?: string | null;
-  workerJobId?: string | null;
-  requestedAt?: string | null;
-  startedAt?: string | null;
-  finishedAt?: string | null;
-  terminationReason?: string | null;
-};
 
 export type AppHistoryEntry = {
   id: string;
@@ -443,7 +247,6 @@ export type AppHistoryEntry = {
   conflict_strategy: AppConflictStrategy;
   filename_rule: AppFilenameRule;
   report_path: string | null;
-  analysis?: AppAnalysisSummary | null;
 };
 
 export type AppPreviewModalState = {
@@ -466,12 +269,6 @@ export type AppScanTaskProgress = {
   phase: AppScanPhase;
   processed: number;
   total: number;
-  source_processed?: number;
-  source_total?: number | null;
-  destination_processed?: number;
-  destination_total?: number | null;
-  metadata_processed?: number;
-  metadata_total?: number | null;
   current_file: string;
 };
 
@@ -490,7 +287,7 @@ export type AppServices = {
   chooseEnhancedMode: (enabled: boolean) => Promise<DesktopState>;
   chooseConflictStrategy: (strategy: AppConflictStrategy) => Promise<DesktopState>;
   chooseFilenameRule: (rule: AppFilenameRule) => Promise<DesktopState>;
-  chooseConcurrencyLimit: (value: string) => Promise<DesktopState>;
+  chooseNeteaseFilenameFormat: (format: AppNeteaseFilenameFormat) => Promise<DesktopState>;
   previewAllSync: () => Promise<AppPreview[]>;
   startScan: () => Promise<AppScanProgress>;
   loadScanState: () => Promise<AppScanProgress>;
@@ -511,18 +308,8 @@ export type AppServices = {
     analysisFailures: AppAnalysisFailure[],
   ) => Promise<DesktopState>;
   loadHistory: () => Promise<AppHistoryEntry[]>;
-  loadIncompleteAnalysisRun?: () => Promise<ResumableAnalysis | null>;
-  claimAnalysisRun?: (batchId: string, attemptId: string) => Promise<boolean>;
   retryHistoryFailures: (id: string) => Promise<AppPreview>;
   exportHistoryErrorReport: (id: string, path: string) => Promise<void>;
-  exportRuntimeSession: (id: string, path: string) => Promise<void>;
-  saveFile?: (options: SaveFileOptions) => Promise<string | null>;
-  recordRuntimeSessionEvent?: (
-    batchId: string,
-    event: string,
-    details: Record<string, unknown>,
-  ) => Promise<void>;
-  finalizeAnalysisSession?: (batchId: string) => Promise<void>;
   deleteHistoryEntry: (id: string) => Promise<void>;
   clearHistory: () => Promise<void>;
   loadAppInfo: () => Promise<AppInfo>;
@@ -543,49 +330,16 @@ export type AppServices = {
   clearTrackAnalyses: () => Promise<void>;
   exportRekordboxXml: (path: string) => Promise<void>;
   getEssentiaModelStatus?: () => Promise<EssentiaModelStatus>;
-  ensureEssentiaModels?: () => Promise<EssentiaModelStatus>;
+  downloadEssentiaModels?: () => Promise<EssentiaModelStatus>;
   loadEssentiaModel?: (id: string) => Promise<EssentiaModelFile>;
-  createAnalysisWorker?: () => AnalysisWorkerSession;
   loadLibraryStatus?: () => Promise<LibraryStatus>;
-  locateNeteaseLibrary?: (force?: boolean) => Promise<LibraryStatus['netease']>;
-  refreshLibraryCatalog?: () => Promise<LibraryRefreshProgress>;
-  cancelLibraryRefresh?: () => Promise<LibraryRefreshProgress>;
-  loadNeteaseMetadataDatabaseStatus?: () => Promise<NeteaseMetadataDatabaseStatus>;
-  prepareNeteaseMetadataCache?: () => Promise<NeteaseMetadataCacheProgress>;
-  cancelNeteaseMetadataCache?: () => Promise<NeteaseMetadataCacheProgress>;
-  loadNeteaseMetadataCacheStatus?: () => Promise<NeteaseMetadataCacheProgress>;
-  selectNeteaseMetadataDatabase?: (path: string) => Promise<NeteaseMetadataDatabaseStatus>;
-  clearNeteaseMetadataDatabase?: () => Promise<NeteaseMetadataDatabaseStatus>;
-  selectNeteaseDatabaseFallback?: (path: string) => Promise<LibraryStatus>;
-  clearNeteaseDatabaseFallback?: () => Promise<LibraryStatus>;
-  pickNeteaseDatabase?: () => Promise<string | null>;
-  listenLibraryRefreshProgress?: (handler: (progress: LibraryRefreshProgress) => void) => Promise<UnlistenFn>;
-  listenNeteaseDiscoveryProgress?: (handler: (progress: NeteaseDiscoveryProgress) => void) => Promise<UnlistenFn>;
-  listenNeteaseMetadataCacheProgress?: (handler: (progress: NeteaseMetadataCacheProgress) => void) => Promise<UnlistenFn>;
+  locateNeteaseLibrary?: () => Promise<LibraryStatus['netease']>;
+  refreshLibraryCatalog?: () => Promise<unknown>;
   queryLibraryCatalog?: (query: LibraryQuery) => Promise<LibraryPage>;
   getLibraryTrackDetail?: (trackKey: string) => Promise<LibraryTrack | null>;
   getLibraryTrackSourceRecords?: (trackKey: string) => Promise<LibrarySourceRecord[]>;
   getLibraryTrackCover?: (trackKey: string) => Promise<string | null>;
-  listLibraryAnalysisCandidates?: () => Promise<LibraryAnalysisCandidate[]>;
   clearLibraryCatalogCache?: () => Promise<void>;
-  pickLibraryTrackFile?: () => Promise<string | null>;
-  relocateLibraryTrack?: (trackKey: string, path: string) => Promise<void>;
-  removeLibraryTrack?: (trackKey: string) => Promise<boolean>;
-  clearInvalidLibraryTracks?: () => Promise<number>;
-  findInvalidLibraryTracks?: () => Promise<LibraryInvalidScanProgress>;
-  cancelInvalidLibraryScan?: () => Promise<LibraryInvalidScanProgress>;
-  listenInvalidLibraryScanProgress?: (handler: (progress: LibraryInvalidScanProgress) => void) => Promise<UnlistenFn>;
-  pickW4djPlaylist?: () => Promise<string | null>;
-  importW4djPlaylist?: (path: string) => Promise<ImportedDjPlaylist>;
-  listImportedDjPlaylists?: () => Promise<ImportedDjPlaylistSummary[]>;
-  loadImportedDjPlaylist?: (playlistId: string) => Promise<ImportedDjPlaylist>;
-  exportImportedDjPlaylistW4dj?: (playlistId: string, path: string) => Promise<void>;
-  exportNeteasePlaylistText?: (path: string, text: string) => Promise<void>;
-  matchImportedDjPlaylist?: (playlistId: string) => Promise<DjPlaylistMatchReport>;
-  loadImportedDjPlaylistMatches?: (playlistId: string) => Promise<DjPlaylistMatchReport>;
-  setImportedDjPlaylistMatch?: (playlistId: string, position: number, trackKey: string) => Promise<DjPlaylistMatchReport>;
-  clearImportedDjPlaylistMatch?: (playlistId: string, position: number) => Promise<DjPlaylistMatchReport>;
-  exportImportedDjPlaylistM3u8?: (playlistId: string, path: string, allowPartial: boolean) => Promise<DjPlaylistM3u8ExportResult>;
 };
 
 export type EssentiaModelStatus = {
@@ -594,32 +348,8 @@ export type EssentiaModelStatus = {
   genre: boolean;
   mood: boolean;
   instrument: boolean;
-  installing: boolean;
-  emotionContinuous?: boolean;
-  emotionCluster?: boolean;
-  discogsEffnet?: {
-    embedding: boolean;
-    moodTheme: boolean;
-    approachability: boolean;
-    instrumentation: boolean;
-    timbre: boolean;
-    danceability: boolean;
-  };
+  downloading: boolean;
 };
-
-const MODEL_FILE_EXTENSIONS = new Set(['zip', 'json', 'bin']);
-
-function containsModelFile(paths: string[]): boolean {
-  return paths.some((path) => {
-    const name = path.replaceAll('\\', '/').split('/').pop() ?? '';
-    const extension = name.includes('.') ? name.split('.').pop()?.toLowerCase() ?? '' : '';
-    return MODEL_FILE_EXTENSIONS.has(extension);
-  });
-}
-
-function w4djPlaylistPaths(paths: string[]): string[] {
-  return paths.filter((path) => (path.replaceAll('\\', '/').split('/').pop() ?? '').toLowerCase().endsWith('.w4dj'));
-}
 
 const defaultEssentiaModelStatus: EssentiaModelStatus = {
   version: '',
@@ -627,17 +357,7 @@ const defaultEssentiaModelStatus: EssentiaModelStatus = {
   genre: false,
   mood: false,
   instrument: false,
-  installing: false,
-  emotionContinuous: false,
-  emotionCluster: false,
-  discogsEffnet: {
-    embedding: false,
-    moodTheme: false,
-    approachability: false,
-    instrumentation: false,
-    timbre: false,
-    danceability: false,
-  },
+  downloading: false,
 };
 
 export type DropTargetRect = {
@@ -685,15 +405,6 @@ const translations = {
     sourceKicker: '歌曲文件夹或单曲（网易云、SoundCloud 等）',
     destKicker: '任务 1 / 任务 2 独立运行，窗口较小时可滚动',
     sourceLabel: '歌曲文件夹或单曲',
-    scanLocalNetease: '扫描本地网易云文件夹',
-    selectNeteaseDatabase: '选择网易云数据库',
-    clearNeteaseDatabase: '恢复自动定位',
-    neteaseDatabaseSelected: '已选择数据库，开始转换或分析时使用',
-    neteaseDatabaseUnavailable: '未找到可用网易云数据库，将使用自动定位',
-    scanLocalNeteaseRunning: '正在扫描本地网易云文件夹…',
-    scanLocalNeteaseFallback: '手动选择文件夹',
-    scanLocalNeteaseNotFound: '未能自动找到网易云音乐文件夹，请手动选择',
-    scanLocalNeteaseSelected: '已选择网易云音乐文件夹',
     destLabel: '输出目录',
     clearSource: '清空输入来源',
     clearDestination: '清空输出目录',
@@ -724,8 +435,6 @@ const translations = {
     enhancedModeOffNote: '只转换，不执行音乐分析',
     enhancedModeOnNote: '自动分析 BPM、Key、响度和能量并写入元数据',
     advancedOptions: '高级选项',
-    concurrencyLimit: '并行处理数量',
-    activeConcurrency: '当前任务并发',
     losslessFormat: '无损格式',
     syncSlot: '任务',
     fallback: '未单独设置，使用输出目录 1',
@@ -744,30 +453,28 @@ const translations = {
     existingFiles: '已存在',
     willSkip: '将跳过',
     errorFiles: '错误文件',
-    duplicateDisambiguated: '同名歌曲共：{count}首，已按专辑区分并写入文件名',
     estimatedOutput: '预计输出',
     confirmStart: '确认并开始转换',
     cancel: '取消',
+    editBeforeStart: '返回修改',
     noProcessableFiles: '没有可处理的文件',
     history: '转换历史',
     noHistory: '还没有转换记录',
     retryFailures: '重试失败项目',
-    exportSession: '导出错误报告',
-    exportRuntimeSession: '导出运行会话记录',
-    exportReportSuccess: '错误报告已导出',
-    exportReportFailed: '错误报告导出失败',
-    exportRuntimeSuccess: '运行会话记录已导出',
-    exportRuntimeFailed: '运行会话记录导出失败',
-    reportPath: '错误报告位置',
+    exportReport: '导出完整错误报告',
     completedCount: '完成',
     failedCount: '失败',
     sourcePath: '输入来源',
     destinationPath: '输出目录',
-    conflictStrategy: '已存在歌曲策略',
-    conflictSkip: '跳过',
-    conflictOverwrite: '覆盖',
-    conflictMetadata: '仅更新元数据',
-    filenameRule: '输出文件名规则',
+    conflictStrategy: '已存在文件',
+    conflictSkip: '已存在文件：跳过',
+    conflictOverwrite: '已存在文件：覆盖',
+    conflictMetadata: '高级选项：仅更新元数据',
+    filenameRule: '文件名规则',
+    neteaseFilenameFormat: '网易云源文件名格式',
+    neteaseTitleOnly: '仅歌曲名',
+    neteaseArtistTitle: '歌手 - 歌曲名',
+    neteaseTitleArtist: '歌曲名 - 歌手',
     titleArtist: '歌曲名 - 歌手（默认）',
     artistTitle: '歌手 - 歌曲名',
     originalName: '保留原文件名',
@@ -775,7 +482,6 @@ const translations = {
     insufficientSpace: '磁盘空间不足，无法开始转换',
     cancelTask: '取消任务',
     resumeTasks: '继续未完成任务',
-    resumeAnalysis: '继续未完成分析',
     deleteHistory: '删除记录',
     clearHistory: '清空历史',
     historyLoadError: '转换历史读取失败，原记录未被覆盖。请检查历史文件后再重试。',
@@ -838,14 +544,16 @@ const translations = {
     clearScanCacheConfirm: '确定清除扫描缓存吗？下一次开始时会重新扫描全部歌曲。不会删除增强模式缓存或模型。',
     scanCacheCleared: '扫描缓存已清除。',
     essentiaModelsTitle: 'Essentia 预训练模型',
-    essentiaModelsReady: '内置模型已就绪，增强模式会识别流派、情绪和人声/器乐。',
-    essentiaModelsMissing: '内置模型缺失或损坏；重启应用后会自动修复，当前仍可进行基础分析和 Drop LUFS。',
-    essentiaModelsDropDisabled: '模型导入入口已移除，增强模式使用内置模型。',
+    essentiaModelsReady: '已下载，增强模式会识别流派、情绪和人声/器乐。',
+    essentiaModelsMissing: '未下载；增强模式仍可进行基础分析和 Drop LUFS。',
+    essentiaModelsDownload: '下载分析模型',
+    essentiaModelsDownloading: '正在下载模型…',
+    essentiaModelsDownloaded: 'Essentia 预训练模型已下载。',
+    essentiaModelsPartial: '模型未全部下载完成，增强模式仍可运行基础分析。',
     scanTitle: '扫描歌曲',
     scanPreparing: '正在准备扫描',
     scanSource: '正在扫描输入目录',
     scanDestination: '正在扫描输出目录',
-    scanMatchingMetadata: '正在匹配网易云元数据',
     scanChecking: '正在检查转换条件',
     scanAnalyzing: '正在分析歌曲并写入元数据',
     scanCompleted: '扫描完成',
@@ -857,35 +565,6 @@ const translations = {
     conversionRunning: '正在转换',
     analysisCancel: '取消分析',
     scanClose: '关闭',
-    importDjPlaylist: '导入.w4dj',
-    openLatestDjPlaylist: '打开最近歌单',
-    djPlaylistDialogTitle: 'DJ 歌单',
-    djPlaylistSource: 'W4DJ 歌单来源：',
-    djPlaylistSourceLink: 'dj-crate-digger skill（GitHub）',
-    djPlaylistImportButton: '导入.w4dj',
-    djPlaylistExportButton: '导出 m3u8',
-    djPlaylistInstructions: '导入 .w4dj 之后，可以扫描二维码，在网易云-我的-三竖点-一键导入外部歌单-文字导入，粘贴结果。即可导入歌单；在 W4DJ RKB 进行成功转换之后，可以一键导出 m3u8。',
-    djPlaylistDrop: '松开导入 DJ 歌单',
-    djPlaylistImporting: '正在导入 DJ 歌单…',
-    djPlaylistTracks: '首歌曲',
-    djPlaylistSkipped: '条重复已跳过',
-    djPlaylistPage: '第 {current}/{total} 页',
-    djPlaylistBytes: '{tracks} 首 · {bytes} 字节',
-    djPlaylistPrevious: '上一页',
-    djPlaylistNext: '下一页',
-    djPlaylistCopyPage: '复制当前页',
-    djPlaylistCopyAll: '复制全部',
-    djPlaylistExportTxt: '导出 TXT',
-    djPlaylistMatchExport: '识别并生成 M3U8',
-    djPlaylistRematch: '重新识别',
-    djPlaylistExportM3u8: '生成 M3U8',
-    djPlaylistPartialExport: '仅导出已匹配',
-    djPlaylistMatched: '已匹配 {matched}/{total}',
-    djPlaylistUnresolved: '未解决歌曲',
-    djPlaylistClose: '关闭',
-    djPlaylistImportError: 'DJ 歌单导入失败',
-    djPlaylistExportSuccess: 'M3U8 已导出',
-    djPlaylistPartialConfirm: '仍有 {count} 首未匹配。只导出已匹配歌曲吗？',
   },
   en: {
     eyebrow: 'W4DJ RKB',
@@ -894,15 +573,6 @@ const translations = {
     sourceKicker: 'Music folders or tracks (NetEase, SoundCloud, etc.)',
     destKicker: 'Task 1 and Task 2 run independently. Scroll when the window is short.',
     sourceLabel: 'Music Folder or Track',
-    scanLocalNetease: 'Scan local NetEase folder',
-    selectNeteaseDatabase: 'Choose NetEase database',
-    clearNeteaseDatabase: 'Use automatic location',
-    neteaseDatabaseSelected: 'Database selected; it will be used when conversion or analysis starts',
-    neteaseDatabaseUnavailable: 'No usable NetEase database; automatic location will be used',
-    scanLocalNeteaseRunning: 'Scanning local NetEase folder…',
-    scanLocalNeteaseFallback: 'Choose folder manually',
-    scanLocalNeteaseNotFound: 'Could not auto-locate a NetEase music folder. Choose one manually.',
-    scanLocalNeteaseSelected: 'NetEase music folder selected',
     destLabel: 'Output Folder',
     clearSource: 'Clear input source',
     clearDestination: 'Clear output folder',
@@ -933,8 +603,6 @@ const translations = {
     enhancedModeOffNote: 'Convert only; music analysis stays off',
     enhancedModeOnNote: 'Analyze BPM, key, loudness, and energy and write metadata',
     advancedOptions: 'Advanced options',
-    concurrencyLimit: 'Parallel processing count',
-    activeConcurrency: 'Current task concurrency',
     losslessFormat: 'Lossless format',
     syncSlot: 'Task',
     fallback: 'Use output directory 1 when empty',
@@ -953,30 +621,28 @@ const translations = {
     existingFiles: 'Already exists',
     willSkip: 'Will skip',
     errorFiles: 'Errors',
-    duplicateDisambiguated: 'Duplicate songs: {count}; separated by album and written into filenames',
     estimatedOutput: 'Estimated output',
     confirmStart: 'Confirm and convert',
     cancel: 'Cancel',
+    editBeforeStart: 'Edit settings',
     noProcessableFiles: 'No files to process',
     history: 'Conversion history',
     noHistory: 'No conversion history yet',
     retryFailures: 'Retry failed files',
-    exportSession: 'Export error report',
-    exportRuntimeSession: 'Export runtime session',
-    exportReportSuccess: 'Error report exported',
-    exportReportFailed: 'Error report export failed',
-    exportRuntimeSuccess: 'Runtime session exported',
-    exportRuntimeFailed: 'Runtime session export failed',
-    reportPath: 'Error report path',
+    exportReport: 'Export full error report',
     completedCount: 'Completed',
     failedCount: 'Failed',
     sourcePath: 'Input source',
     destinationPath: 'Output',
-    conflictStrategy: 'Existing song strategy',
-    conflictSkip: 'Skip',
-    conflictOverwrite: 'Overwrite',
-    conflictMetadata: 'Update metadata only',
-    filenameRule: 'Output filename rule',
+    conflictStrategy: 'Existing files',
+    conflictSkip: 'Existing file: skip',
+    conflictOverwrite: 'Existing file: overwrite',
+    conflictMetadata: 'Advanced: update metadata only',
+    filenameRule: 'Filename rule',
+    neteaseFilenameFormat: 'NetEase source filename format',
+    neteaseTitleOnly: 'Title only',
+    neteaseArtistTitle: 'Artist - Title',
+    neteaseTitleArtist: 'Title - Artist',
     titleArtist: 'Title - Artist (default)',
     artistTitle: 'Artist - Title',
     originalName: 'Keep original filename',
@@ -984,7 +650,6 @@ const translations = {
     insufficientSpace: 'Not enough disk space to start',
     cancelTask: 'Cancel task',
     resumeTasks: 'Resume unfinished tasks',
-    resumeAnalysis: 'Resume unfinished analysis',
     deleteHistory: 'Delete entry',
     clearHistory: 'Clear history',
     historyLoadError: 'Conversion history could not be read. Existing records were not overwritten. Check the history file and try again.',
@@ -1047,14 +712,16 @@ const translations = {
     clearScanCacheConfirm: 'Clear the scan cache? The next run will scan all songs again. Enhanced-mode cache and models will not be deleted.',
     scanCacheCleared: 'Scan cache cleared.',
     essentiaModelsTitle: 'Essentia pretrained models',
-    essentiaModelsReady: 'Bundled models are ready; Enhanced mode can identify genre, mood, and voice/instrument.',
-    essentiaModelsMissing: 'Bundled models are missing or damaged; restart the app to repair them automatically. Basic analysis and Drop LUFS still work.',
-    essentiaModelsDropDisabled: 'Model import is no longer available; Enhanced mode uses the bundled models.',
+    essentiaModelsReady: 'Downloaded; Enhanced mode can identify genre, mood, and voice/instrument.',
+    essentiaModelsMissing: 'Not downloaded; basic analysis and Drop LUFS still work.',
+    essentiaModelsDownload: 'Download analysis models',
+    essentiaModelsDownloading: 'Downloading models…',
+    essentiaModelsDownloaded: 'Essentia pretrained models downloaded.',
+    essentiaModelsPartial: 'The full model set is not ready; basic analysis still works.',
     scanTitle: 'Scanning songs',
     scanPreparing: 'Preparing scan',
     scanSource: 'Scanning input folders',
     scanDestination: 'Scanning output folders',
-    scanMatchingMetadata: 'Matching NetEase metadata',
     scanChecking: 'Checking conversion conditions',
     scanAnalyzing: 'Analyzing tracks and writing metadata',
     scanCompleted: 'Scan complete',
@@ -1066,35 +733,6 @@ const translations = {
     conversionRunning: 'Converting',
     analysisCancel: 'Cancel analysis',
     scanClose: 'Close',
-    importDjPlaylist: 'Import .w4dj',
-    openLatestDjPlaylist: 'Open recent playlist',
-    djPlaylistDialogTitle: 'DJ playlist',
-    djPlaylistSource: 'W4DJ playlist source:',
-    djPlaylistSourceLink: 'dj-crate-digger skill (GitHub)',
-    djPlaylistImportButton: 'Import .w4dj',
-    djPlaylistExportButton: 'Export m3u8',
-    djPlaylistInstructions: 'After importing a .w4dj playlist, scan the QR code and use NetEase Cloud Music → My → ⋮ → Import external playlist → Text import, then paste the result. After a successful conversion in W4DJ RKB, export an m3u8 with one click.',
-    djPlaylistDrop: 'Drop to import DJ playlist',
-    djPlaylistImporting: 'Importing DJ playlist…',
-    djPlaylistTracks: 'tracks',
-    djPlaylistSkipped: 'duplicates skipped',
-    djPlaylistPage: 'Page {current}/{total}',
-    djPlaylistBytes: '{tracks} tracks · {bytes} bytes',
-    djPlaylistPrevious: 'Previous',
-    djPlaylistNext: 'Next',
-    djPlaylistCopyPage: 'Copy page',
-    djPlaylistCopyAll: 'Copy all',
-    djPlaylistExportTxt: 'Export TXT',
-    djPlaylistMatchExport: 'Recognize and generate M3U8',
-    djPlaylistRematch: 'Recognize again',
-    djPlaylistExportM3u8: 'Generate M3U8',
-    djPlaylistPartialExport: 'Export matched only',
-    djPlaylistMatched: 'Matched {matched}/{total}',
-    djPlaylistUnresolved: 'Unresolved tracks',
-    djPlaylistClose: 'Close',
-    djPlaylistImportError: 'DJ playlist import failed',
-    djPlaylistExportSuccess: 'M3U8 exported',
-    djPlaylistPartialConfirm: '{count} tracks are unresolved. Export matched tracks only?',
   },
 } as const;
 
@@ -1145,7 +783,6 @@ function defaultSlot(lang: AppLanguage): AppSyncSlotViewState {
     progressText: t('idle', lang),
     currentFile: '',
     logs: ['Desktop shell ready'],
-    activeConcurrencyLimit: null,
   };
 }
 
@@ -1162,37 +799,23 @@ const defaultState: AppViewState = {
   conflictStrategy: 'skip',
   filenameRule: 'title_artist',
   neteaseFilenameFormat: 'title_artist',
-  concurrencyLimit: 2,
   lang: initialLanguage,
   theme: initialTheme,
 };
 
 const defaultAnalysisState: AppAnalysisState = {
-  slotIndex: null,
   status: 'idle',
   completed: 0,
   total: 0,
   resultCount: 0,
   failedCount: 0,
   message: '',
-  currentItem: '',
-  stage: '',
-  stageProcessed: 0,
-  stageTotal: 0,
-  workerJobId: '',
-  startedAt: '',
-  resumeAvailable: false,
 };
 
 type SourcePickerOpenOptions = {
   directory: boolean;
   title: string;
   filters?: Array<{ name: string; extensions: string[] }>;
-};
-
-type SaveFileOptions = {
-  defaultPath: string;
-  title: string;
 };
 
 export async function pickSourceWithPlatformDialog(
@@ -1242,8 +865,8 @@ const defaultServices: AppServices = {
     try {
       return await invoke<string | null>('pick_source_path', { title });
     } catch (error) {
-      const errorText = error instanceof Error ? error.message : String(error);
-      if (!errorText.includes('unified source picker is only available on macOS')) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes('unified source picker is only available on macOS')) {
         throw error;
       }
 
@@ -1293,8 +916,8 @@ const defaultServices: AppServices = {
   chooseConflictStrategy: (strategy) =>
     invoke<DesktopState>('choose_conflict_strategy', { strategy }),
   chooseFilenameRule: (rule) => invoke<DesktopState>('choose_filename_rule', { rule }),
-  chooseConcurrencyLimit: (value) =>
-    invoke<DesktopState>('choose_concurrency_limit', { value }),
+  chooseNeteaseFilenameFormat: (format) =>
+    invoke<DesktopState>('choose_netease_filename_format', { format }),
   previewAllSync: () => invoke<AppPreview[]>('preview_all_sync'),
   startScan: () => invoke<AppScanProgress>('start_scan'),
   loadScanState: () => invoke<AppScanProgress>('load_scan_state'),
@@ -1306,7 +929,7 @@ const defaultServices: AppServices = {
     retryOf = null,
     analyses = [],
     analysisFailures = [],
-    batchId = undefined,
+    batchId = null,
   ) =>
     invoke<DesktopState>('start_confirmed_sync', {
       previews,
@@ -1323,18 +946,9 @@ const defaultServices: AppServices = {
       analysisFailures,
     }),
   loadHistory: () => invoke<AppHistoryEntry[]>('load_history'),
-  loadIncompleteAnalysisRun: () => invoke<ResumableAnalysis | null>('load_incomplete_analysis_run'),
-  claimAnalysisRun: (batchId, attemptId) => invoke<boolean>('claim_analysis_run', { batchId, attemptId }),
   retryHistoryFailures: (id) => invoke<AppPreview>('retry_history_failures', { id }),
   exportHistoryErrorReport: (id, path) =>
     invoke<void>('export_history_error_report', { id, path }),
-  exportRuntimeSession: (id, path) =>
-    invoke<void>('export_runtime_session', { id, path }),
-  saveFile: (options) => save(options),
-  recordRuntimeSessionEvent: (batchId, event, details) =>
-    invoke<void>('record_runtime_session_event', { batchId, event, details }),
-  finalizeAnalysisSession: (batchId) =>
-    invoke<void>('finalize_analysis_session', { batchId }),
   deleteHistoryEntry: (id) => invoke<void>('delete_history_entry_command', { id }),
   clearHistory: () => invoke<void>('clear_history_command'),
   loadAppInfo: () => invoke<AppInfo>('app_info'),
@@ -1355,101 +969,16 @@ const defaultServices: AppServices = {
   clearTrackAnalyses: () => invoke<void>('clear_track_analyses'),
   exportRekordboxXml: (path) => invoke<void>('export_rekordbox_xml', { path }),
   getEssentiaModelStatus: () => invoke<EssentiaModelStatus>('get_essentia_model_status'),
-  ensureEssentiaModels: () => invoke<EssentiaModelStatus>('ensure_essentia_models'),
-  loadEssentiaModel: async (id) => normalizeEssentiaModel(
-    await invoke<EssentiaModelWire>('load_essentia_model', { id }),
-  ),
-  createAnalysisWorker: () => new AnalysisWorkerClient(),
+  downloadEssentiaModels: () => invoke<EssentiaModelStatus>('download_essentia_models'),
+  loadEssentiaModel: (id) => invoke<EssentiaModelFile>('load_essentia_model', { id }),
   loadLibraryStatus: () => invoke<LibraryStatus>('load_library_status'),
-  locateNeteaseLibrary: (force = false) =>
-    invoke<LibraryStatus['netease']>('locate_netease_library', { force }),
-  refreshLibraryCatalog: () => invoke<LibraryRefreshProgress>('refresh_library_catalog'),
-  cancelLibraryRefresh: () => invoke<LibraryRefreshProgress>('cancel_library_refresh'),
-  loadNeteaseMetadataDatabaseStatus: () =>
-    invoke<NeteaseMetadataDatabaseStatus>('load_netease_metadata_database_status'),
-  prepareNeteaseMetadataCache: () =>
-    invoke<NeteaseMetadataCacheProgress>('prepare_netease_metadata_cache'),
-  cancelNeteaseMetadataCache: () =>
-    invoke<NeteaseMetadataCacheProgress>('cancel_netease_metadata_cache'),
-  loadNeteaseMetadataCacheStatus: () =>
-    invoke<NeteaseMetadataCacheProgress>('load_netease_metadata_cache_status'),
-  selectNeteaseMetadataDatabase: (path) =>
-    invoke<NeteaseMetadataDatabaseStatus>('select_netease_metadata_database', { path }),
-  clearNeteaseMetadataDatabase: () =>
-    invoke<NeteaseMetadataDatabaseStatus>('clear_netease_metadata_database'),
-  selectNeteaseDatabaseFallback: (path) => invoke<LibraryStatus>('select_netease_database_fallback', { path }),
-  clearNeteaseDatabaseFallback: () => invoke<LibraryStatus>('clear_netease_database_fallback'),
-  pickNeteaseDatabase: async () => {
-    const selected = await open({
-      directory: false,
-      multiple: false,
-      title: '选择网易云数据库',
-      filters: [{ name: 'SQLite database', extensions: ['sqlite3', 'sqlite', 'db'] }],
-    });
-    return typeof selected === 'string' ? selected : null;
-  },
-  listenLibraryRefreshProgress: (handler) =>
-    listen<LibraryRefreshProgress>('library-refresh-progress', (event) => handler(event.payload)),
-  listenNeteaseDiscoveryProgress: (handler) =>
-    listen<NeteaseDiscoveryProgress>('netease-discovery-progress', (event) => handler(event.payload)),
-  listenNeteaseMetadataCacheProgress: (handler) =>
-    listen<NeteaseMetadataCacheProgress>('netease-metadata-cache-progress', (event) => handler(event.payload)),
-  findInvalidLibraryTracks: () => invoke<LibraryInvalidScanProgress>('find_invalid_library_tracks'),
-  cancelInvalidLibraryScan: () => invoke<LibraryInvalidScanProgress>('cancel_invalid_library_scan'),
-  listenInvalidLibraryScanProgress: (handler) =>
-    listen<LibraryInvalidScanProgress>('library-invalid-scan-progress', (event) => handler(event.payload)),
+  locateNeteaseLibrary: () => invoke<LibraryStatus['netease']>('locate_netease_library'),
+  refreshLibraryCatalog: () => invoke<unknown>('refresh_library_catalog'),
   queryLibraryCatalog: (query) => invoke<LibraryPage>('query_library_catalog', { query }),
   getLibraryTrackDetail: (trackKey) => invoke<LibraryTrack | null>('get_library_track_detail', { trackKey }),
   getLibraryTrackSourceRecords: (trackKey) => invoke<LibrarySourceRecord[]>('get_library_track_source_records', { trackKey }),
   getLibraryTrackCover: (trackKey) => invoke<string | null>('get_library_track_cover', { trackKey }),
-  listLibraryAnalysisCandidates: () => invoke<LibraryAnalysisCandidate[]>('list_library_analysis_candidates'),
   clearLibraryCatalogCache: () => invoke<void>('clear_library_catalog_cache'),
-  pickLibraryTrackFile: async () => {
-    const lang = (localStorage.getItem('w4dj_lang') as AppLanguage) || 'zh';
-    const selected = await open({
-      directory: false,
-      multiple: false,
-      title: lang === 'zh' ? '选择新的歌曲文件' : 'Choose a replacement audio file',
-      filters: [{
-        name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
-        extensions: ['mp3', 'flac', 'ncm', 'wav', 'aif', 'aiff'],
-      }],
-    });
-    return typeof selected === 'string' ? selected : null;
-  },
-  relocateLibraryTrack: (trackKey, path) =>
-    invoke<void>('relocate_library_track', { trackKey, path }),
-  removeLibraryTrack: (trackKey) =>
-    invoke<boolean>('remove_library_track', { trackKey }),
-  clearInvalidLibraryTracks: () =>
-    invoke<number>('clear_invalid_library_tracks'),
-  pickW4djPlaylist: async () => {
-    const selected = await open({
-      directory: false,
-      multiple: false,
-      title: '导入 DJ 歌单',
-      filters: [{ name: 'W4DJ playlist', extensions: ['w4dj'] }],
-    });
-    return typeof selected === 'string' ? selected : null;
-  },
-  importW4djPlaylist: (path) => invoke<ImportedDjPlaylist>('import_w4dj_playlist', { path }),
-  listImportedDjPlaylists: () => invoke<ImportedDjPlaylistSummary[]>('list_imported_dj_playlists'),
-  loadImportedDjPlaylist: (playlistId) => invoke<ImportedDjPlaylist>('load_imported_dj_playlist', { playlistId }),
-  exportImportedDjPlaylistW4dj: (playlistId, path) =>
-    invoke<void>('export_imported_dj_playlist_w4dj', { playlistId, path }),
-  exportNeteasePlaylistText: (path, text) => invoke<void>('export_netease_playlist_text', { path, text }),
-  matchImportedDjPlaylist: (playlistId) => invoke<DjPlaylistMatchReport>('match_imported_dj_playlist', { playlistId }),
-  loadImportedDjPlaylistMatches: (playlistId) => invoke<DjPlaylistMatchReport>('load_imported_dj_playlist_matches', { playlistId }),
-  setImportedDjPlaylistMatch: (playlistId, position, trackKey) =>
-    invoke<DjPlaylistMatchReport>('set_imported_dj_playlist_match', { playlistId, position, trackKey }),
-  clearImportedDjPlaylistMatch: (playlistId, position) =>
-    invoke<DjPlaylistMatchReport>('clear_imported_dj_playlist_match', { playlistId, position }),
-  exportImportedDjPlaylistM3u8: (playlistId, path, allowPartial) =>
-    invoke<DjPlaylistM3u8ExportResult>('export_imported_dj_playlist_m3u8', {
-      playlistId,
-      path,
-      allowPartial,
-    }),
 };
 
 export function renderApp(
@@ -1472,17 +1001,6 @@ export function renderApp(
   historyLoadError: string | null = null,
   modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus,
   libraryState: LibraryDashboardState | null = null,
-  neteaseDiscoveryProgress: NeteaseDiscoveryProgress | null = null,
-  libraryRefreshProgress: LibraryRefreshProgress | null = null,
-  neteaseDiscoveryInFlight = false,
-  neteaseMetadataDatabase: NeteaseMetadataDatabaseUiState = {
-    status: null,
-    busy: false,
-    message: null,
-    error: null,
-  },
-  djPlaylistState: DjPlaylistUiState | null = null,
-  importedDjPlaylistSummaries: ImportedDjPlaylistSummary[] = [],
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -1495,11 +1013,8 @@ export function renderApp(
     root.dataset.selectionMotion = selectionMotion;
   }
   const isRunning = state.slots.some((slot) => slot.status === 'running');
-  const scanRunning = scanProgress?.status === 'running' || scanProgress?.status === 'cancelling';
-  const scanCancelling = scanProgress?.status === 'cancelling';
+  const scanRunning = scanProgress?.status === 'running';
   const analysisRunning = analysisState.status === 'running';
-  const analysisResumeAvailable = analysisState.status === 'cancelled'
-    && analysisState.resumeAvailable === true;
   const conversionRunning = isRunning && !scanRunning && !analysisRunning;
   const hasCancelled = state.slots.some((slot) => slot.status === 'cancelled');
   const configuredTasks = state.slots.filter((slot) => slot.sourceDirectory.trim()).length;
@@ -1517,18 +1032,10 @@ export function renderApp(
           ${icon('help')}
           <span>${t('tutorial', state.lang)}</span>
         </button>
-        <button type="button" class="help-button" data-action="open-library" aria-label="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" title="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" data-feature-hidden="${SONG_LIBRARY_FEATURE_VISIBLE ? 'false' : 'true'}"${SONG_LIBRARY_FEATURE_VISIBLE ? '' : ' hidden'}>
+        <button type="button" class="help-button" data-action="open-library" aria-label="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" title="${state.lang === 'zh' ? '歌曲库' : 'Song library'}">
           ${icon('list')}
           <span>${state.lang === 'zh' ? '歌曲库' : 'Library'}</span>
         </button>
-        <button type="button" class="help-button" data-action="import-dj-playlist" aria-label="${t('importDjPlaylist', state.lang)}" title="${t('importDjPlaylist', state.lang)}">
-          ${icon('list')}
-          <span>${t('importDjPlaylist', state.lang)}</span>
-        </button>
-        ${importedDjPlaylistSummaries.length > 0 ? `<button type="button" class="help-button" data-action="open-latest-dj-playlist" aria-label="${t('openLatestDjPlaylist', state.lang)}" title="${t('openLatestDjPlaylist', state.lang)}">
-          ${icon('list')}
-          <span>${t('openLatestDjPlaylist', state.lang)}</span>
-        </button>` : ''}
         <button type="button" class="lang-button" data-action="open-about">${t('about', state.lang)}</button>
         <button type="button" class="theme-button" data-action="toggle-theme" aria-label="${
           state.theme === 'light' ? t('darkTheme', state.lang) : t('lightTheme', state.lang)
@@ -1586,11 +1093,9 @@ export function renderApp(
           </div>
           ${renderLosslessFormats(state, pendingSelection)}
           <div
-            class="enhanced-mode-row mode-row${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? '' : ' enhanced-mode-row-hidden'}"
+            class="enhanced-mode-row mode-row"
             data-role="enhanced-mode-switch"
             data-selected-enhanced-mode="${state.enhancedMode ? 'on' : 'off'}"
-            data-feature-hidden="${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? 'false' : 'true'}"
-            ${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? '' : 'hidden'}
             aria-label="${t('enhancedAnalysis', state.lang)}"
           >
             <button
@@ -1630,27 +1135,26 @@ export function renderApp(
           </div>
           ${renderOutputSettings(state, outputSettingsExpanded, modelStatus)}
           <div class="global-action-group">
-            <button type="button" class="global-action"${onboardingTarget === 'start' ? ' data-onboarding-target="start"' : ''} data-action="${scanRunning ? 'cancel-scan' : analysisRunning ? 'cancel-analysis' : conversionRunning ? 'cancel-all' : 'start-all'}" ${scanCancelling || (!scanRunning && !analysisRunning && !conversionRunning && (configuredTasks === 0 || pendingAction !== null)) ? 'disabled' : ''} aria-busy="${pendingAction !== null}">
+            <button type="button" class="global-action"${onboardingTarget === 'start' ? ' data-onboarding-target="start"' : ''} data-action="${scanRunning ? 'cancel-scan' : analysisRunning ? 'cancel-analysis' : conversionRunning ? 'cancel-all' : 'start-all'}" ${
+              !scanRunning && !analysisRunning && !conversionRunning && (configuredTasks === 0 || pendingAction !== null) ? 'disabled' : ''
+            } aria-busy="${pendingAction !== null}">
               ${scanRunning || analysisRunning || conversionRunning ? icon('pause') : icon('play')}
-              ${scanCancelling
-                ? (state.lang === 'zh' ? '正在取消扫描…' : 'Cancelling scan…')
-                : scanRunning
-                  ? t('scanCancel', state.lang)
+              ${scanRunning
+                ? t('scanCancel', state.lang)
                 : analysisRunning
                   ? t('analysisCancel', state.lang)
                   : conversionRunning
                     ? t('conversionCancel', state.lang)
-                    : hasCancelled && !analysisResumeAvailable ? t('resumeTasks', state.lang) : t('startAll', state.lang)}
+                    : hasCancelled ? t('resumeTasks', state.lang) : t('startAll', state.lang)}
             </button>
-            ${analysisResumeAvailable && !scanRunning && !analysisRunning && !conversionRunning && pendingAction === null
-              ? `<button type="button" class="secondary-action analysis-resume-action" data-action="resume-analysis">${t('resumeAnalysis', state.lang)}</button>`
-              : ''}
-            ${!conversionRunning && scanProgress && (scanProgress.status === 'error' || scanProgress.status === 'cancelled' || scanProgress.status === 'cancelling')
+            ${scanProgress && (scanProgress.status === 'error' || scanProgress.status === 'cancelled')
               ? `<small class="global-stage-message" data-role="scan-message">${escapeHtml(scanProgress.message || scanPhaseLabel(scanProgress.phase, state.lang))}</small>`
-                : !conversionRunning && neteaseDiscoveryProgress?.status === 'running'
-                    ? `<small class="global-stage-message" data-role="netease-discovery-progress">${escapeHtml(neteaseDiscoveryProgress.message)} ${neteaseDiscoveryProgress.processed}${neteaseDiscoveryProgress.total == null ? '' : `/${neteaseDiscoveryProgress.total}`}</small>`
-                    : !conversionRunning && neteaseDiscoveryProgress?.status === 'error'
-                      ? `<small class="global-stage-message library-error" data-role="netease-discovery-progress">${escapeHtml(neteaseDiscoveryProgress.error || neteaseDiscoveryProgress.message)}</small>`
+              : analysisRunning
+                ? `<small class="global-stage-message" data-role="analysis-message">${t('analysisRunning', state.lang)} ${analysisState.completed}/${analysisState.total}</small>`
+                : analysisState.status === 'cancelled'
+                  ? `<small class="global-stage-message" data-role="analysis-message">${escapeHtml(analysisState.message || t('analysisCancelled', state.lang))}</small>`
+                : conversionRunning
+                  ? `<small class="global-stage-message" data-role="conversion-message">${t('conversionRunning', state.lang)}</small>`
                   : ''}
           </div>
         </div>
@@ -1667,24 +1171,8 @@ export function renderApp(
             onboardingTarget === 'source' || onboardingTarget === 'destination' ? onboardingTarget : null,
             scanProgress?.tasks?.find((task) => task.slot_index === 0),
             scanRunning,
-            neteaseDiscoveryProgress,
-            libraryRefreshProgress,
-            neteaseDiscoveryInFlight,
-            analysisState,
-            neteaseMetadataDatabase,
           )}
-          ${renderSyncSlot(
-            state,
-            1,
-            null,
-            scanProgress?.tasks?.find((task) => task.slot_index === 1),
-            scanRunning,
-            null,
-            null,
-            false,
-            analysisState,
-            undefined,
-          )}
+          ${renderSyncSlot(state, 1, null, scanProgress?.tasks?.find((task) => task.slot_index === 1), scanRunning)}
         </div>
         ${renderHistory(history, state.lang, historyExpanded, historyLoadError)}
       </div>
@@ -1694,7 +1182,6 @@ export function renderApp(
     ${renderHelpModal(helpVisible, state.lang)}
     ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
     ${renderLibraryDashboard(libraryState, state.lang)}
-    ${renderDjPlaylistModal(djPlaylistState, state.lang)}
   `;
 
   return root;
@@ -1733,6 +1220,7 @@ function renderPreviewModal(
         ${canConfirm ? '' : `<p class="preview-empty">${t('noProcessableFiles', lang)}</p>`}
         <footer class="preview-actions">
           <button type="button" class="secondary-action" data-action="cancel-preview" ${busy ? 'disabled' : ''}>${t('cancel', lang)}</button>
+          <button type="button" class="secondary-action" data-action="edit-preview" ${busy ? 'disabled' : ''}>${t('editBeforeStart', lang)}</button>
           <button type="button" class="global-action preview-confirm" data-action="confirm-start" ${canConfirm && !busy ? '' : 'disabled'}>${busy ? t('scanning', lang) : t('confirmStart', lang)}</button>
         </footer>
       </div>
@@ -1742,7 +1230,6 @@ function renderPreviewModal(
 
 function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
   const preview = item.preview;
-  const disambiguatedCount = preview.candidates.filter((candidate) => Boolean(candidate.disambiguation_reason)).length;
   const issues = [
     ...preview.errors.map(
       (issue) => `<li>${escapeHtml(issue.path)}：${escapeHtml(humanizeError(issue.message, lang))}</li>`,
@@ -1772,96 +1259,9 @@ function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
         ${preview.available_space_bytes == null ? '' : `<p><span>${t('availableSpace', lang)}</span>${formatBytes(preview.available_space_bytes, lang)}</p>`}
       </div>
       ${preview.disk_space_sufficient === false ? `<p class="disk-space-error">${t('insufficientSpace', lang)}</p>` : ''}
-      ${disambiguatedCount > 0 ? `<p class="preview-warning">${t('duplicateDisambiguated', lang).replace('{count}', String(disambiguatedCount))}</p>` : ''}
       ${issues ? `<ul class="preview-errors">${issues}</ul>` : ''}
     </article>
   `;
-}
-
-function djPlaylistText(key: keyof typeof translations.zh, lang: AppLanguage, values: Record<string, string | number> = {}): string {
-  return Object.entries(values).reduce(
-    (text, [name, value]) => text.replaceAll(`{${name}}`, String(value)),
-    t(key, lang),
-  );
-}
-
-function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguage): string {
-  if (!state) return '';
-  const overlay = state.dropActive
-    ? `<div class="dj-playlist-drop-overlay" data-role="dj-playlist-drop-overlay" aria-live="polite"><div>${t('djPlaylistDrop', lang)}</div></div>`
-    : '';
-  if (!state.visible) return overlay;
-  if (state.launcher) {
-    return `${overlay}
-      <div class="dj-playlist-modal" data-role="dj-playlist-launcher" role="dialog" aria-modal="true" aria-label="${t('djPlaylistDialogTitle', lang)}">
-        <div class="dj-playlist-dialog dj-playlist-launcher-dialog">
-          <header class="dj-playlist-head">
-            <div><p class="panel-kicker">W4DJ RKB</p><h2>${t('djPlaylistDialogTitle', lang)}</h2></div>
-            <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
-          </header>
-          <p class="dj-playlist-launcher-source">${t('djPlaylistSource', lang)} <a href="https://github.com/komakizhu/dj-crate-digger-skill" data-action="open-dj-crate-digger-link" target="_blank" rel="noreferrer">${t('djPlaylistSourceLink', lang)}</a></p>
-          <div class="dj-playlist-launcher-actions">
-            <button type="button" class="global-action dj-playlist-launcher-button" data-action="dj-playlist-open-import">${t('djPlaylistImportButton', lang)}</button>
-            <button type="button" class="global-action dj-playlist-launcher-button" data-action="dj-playlist-open-export">${t('djPlaylistExportButton', lang)}</button>
-          </div>
-          <p class="dj-playlist-launcher-instructions">${t('djPlaylistInstructions', lang)}</p>
-        </div>
-      </div>`;
-  }
-  const playlist = state.playlist;
-  const page = state.pages[state.pageIndex] || null;
-  const report = state.matchReport;
-  const matchKindLabel = (kind: DjPlaylistTrackMatch['kind']) => {
-    if (kind === 'neteaseTrackId') return lang === 'zh' ? '网易云 ID 精确匹配' : 'NetEase ID exact match';
-    if (kind === 'uniqueTitleArtistFallback') return lang === 'zh' ? '标题+歌手唯一回退' : 'Unique title + artist fallback';
-    if (kind === 'ambiguous') return lang === 'zh' ? '需要确认（候选有歧义）' : 'Needs confirmation (ambiguous)';
-    if (kind === 'manual') return lang === 'zh' ? '手动确认' : 'Manual confirmation';
-    if (kind === 'missing') return lang === 'zh' ? '输出已失效' : 'Output unavailable';
-    return lang === 'zh' ? '未匹配' : 'Unmatched';
-  };
-  const pageText = page?.text || '';
-  return `${overlay}
-    <div class="dj-playlist-modal" data-role="dj-playlist-dialog" role="dialog" aria-modal="true" aria-label="${t('djPlaylistDialogTitle', lang)}">
-      <div class="dj-playlist-dialog">
-        <header class="dj-playlist-head">
-          <div><p class="panel-kicker">W4DJ RKB</p><h2>${escapeHtml(playlist?.name || t('djPlaylistDialogTitle', lang))}</h2></div>
-          <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
-        </header>
-        ${state.busy ? `<p class="dj-playlist-loading">${t('djPlaylistImporting', lang)}</p>` : ''}
-        ${state.error ? `<p class="library-error" role="alert">${escapeHtml(state.error)}</p>` : ''}
-        ${playlist ? `
-          <p class="dj-playlist-summary">${playlist.tracks.length} ${t('djPlaylistTracks', lang)} · ${playlist.warnings.length} ${t('djPlaylistSkipped', lang)}</p>
-          <div class="dj-playlist-preview-list">${playlist.tracks.slice(0, 12).map((track) => `<div><span>${track.position}.</span> ${escapeHtml(track.neteaseImportLine)}${track.neteaseTrackId ? ` <code title="NetEase track ID">ID ${escapeHtml(track.neteaseTrackId)}</code>` : ''}</div>`).join('')}${playlist.tracks.length > 12 ? '<div>…</div>' : ''}</div>
-          <section class="dj-playlist-qr-panel">
-            <div class="dj-playlist-qr-meta">
-              <strong>${page ? djPlaylistText('djPlaylistPage', lang, { current: page.index + 1, total: page.total }) : '—'}</strong>
-              ${page ? `<span>${djPlaylistText('djPlaylistBytes', lang, { tracks: page.trackCount, bytes: page.byteLength })}</span>` : ''}
-            </div>
-            <div class="dj-playlist-qr-image">${state.qrDataUrl && page ? `<img src="${state.qrDataUrl}" alt="${escapeHtml(djPlaylistText('djPlaylistPage', lang, { current: page.index + 1, total: page.total }))}">` : '<span>QR…</span>'}</div>
-            <div class="dj-playlist-qr-nav">
-              <button type="button" class="secondary-action" data-action="dj-playlist-prev" ${state.pageIndex <= 0 || !page ? 'disabled' : ''}>${t('djPlaylistPrevious', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-next" ${state.pageIndex >= state.pages.length - 1 || !page ? 'disabled' : ''}>${t('djPlaylistNext', lang)}</button>
-            </div>
-            <pre class="dj-playlist-plaintext">${escapeHtml(pageText)}</pre>
-            <div class="dj-playlist-actions">
-              <button type="button" class="secondary-action" data-action="dj-playlist-copy-page" ${page ? '' : 'disabled'}>${t('djPlaylistCopyPage', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-copy-all">${t('djPlaylistCopyAll', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-export-txt">${t('djPlaylistExportTxt', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-export-w4dj">${lang === 'zh' ? '导出 W4DJ v2' : 'Export W4DJ v2'}</button>
-            </div>
-          </section>
-          <section class="dj-playlist-match-panel">
-            <div class="dj-playlist-match-head"><strong>${report ? djPlaylistText('djPlaylistMatched', lang, { matched: report.matchedCount, total: report.total }) : t('djPlaylistMatchExport', lang)}</strong><button type="button" class="secondary-action" data-action="dj-playlist-match" ${state.matchBusy ? 'disabled' : ''}>${state.matchBusy ? '…' : t('djPlaylistMatchExport', lang)}</button></div>
-            ${state.notice ? `<p class="dj-playlist-notice">${escapeHtml(state.notice)}</p>` : ''}
-            ${report ? `<div class="dj-playlist-match-list">${report.matches.map((row) => `<article class="dj-playlist-match-row"><div><strong>${row.position}. ${escapeHtml(row.title)}</strong><small>${escapeHtml(row.artistDisplay)} · ${escapeHtml(matchKindLabel(row.kind))}${row.neteaseTrackId ? ` · ID ${escapeHtml(row.neteaseTrackId)}` : ''}</small><small>${escapeHtml(row.reason)}</small></div>${row.status === 'matched' ? '<span class="dj-playlist-match-ok">✓</span>' : `<div class="dj-playlist-candidates">${row.candidates.slice(0, 4).map((candidate) => `<button type="button" class="secondary-action" data-action="dj-playlist-set-match" data-position="${row.position}" data-track-key="${escapeHtml(candidate.trackKey)}">${escapeHtml(candidate.destinationFilename)}</button>`).join('')} ${row.manual ? `<button type="button" class="secondary-action" data-action="dj-playlist-clear-match" data-position="${row.position}">×</button>` : ''}</div>`}</article>`).join('')}</div>` : ''}
-            <div class="dj-playlist-match-actions">
-              <button type="button" class="global-action" data-action="dj-playlist-export-m3u8" ${!report || report.matchedCount !== report.total || state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? '…' : t('djPlaylistExportM3u8', lang)}</button>
-              ${report && report.matchedCount < report.total ? `<button type="button" class="secondary-action" data-action="dj-playlist-export-partial" ${state.exportBusy ? 'disabled' : ''}>${t('djPlaylistPartialExport', lang)}</button>` : ''}
-            </div>
-          </section>
-        ` : ''}
-      </div>
-    </div>`;
 }
 
 function previewHasRetryErrors(modal: AppPreviewModalState): boolean {
@@ -1899,12 +1299,6 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
   const failures = entry.failed_files
     .map((failedFile) => `<li><strong>${escapeHtml(failedFile.name)}</strong><span class="failure-category">${t('errorCategory', lang)}：${errorCategoryLabel(failedFile.category, lang)}</span><span>${escapeHtml(humanizeError(failedFile.message, lang, failedFile.category))}</span></li>`)
     .join('');
-  const analysis = entry.analysis;
-  const analysisSummary = analysis
-    ? lang === 'zh'
-      ? `增强分析：${analysis.completed}/${analysis.total}，失败 ${analysis.failed}，超时 ${analysis.timedOut}，待处理 ${analysis.pending}`
-      : `Enhanced analysis: ${analysis.completed}/${analysis.total}, failed ${analysis.failed}, timeout ${analysis.timedOut}, pending ${analysis.pending}`
-    : lang === 'zh' ? '增强分析：未请求' : 'Enhanced analysis: not requested';
   return `
     <article class="history-entry" data-history-id="${escapeHtml(entry.id)}">
       <header class="history-entry-head">
@@ -1915,14 +1309,10 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
         <span>${entry.completed_count}/${entry.new_count} · ${entry.failed_count} ${t('failedCount', lang)}${pendingFiles.length > 0 ? ` · ${pendingFiles.length} ${t('pendingCount', lang)}` : ''}</span>
       </header>
       <p class="history-output">${escapeHtml(entry.destination_directory)}</p>
-      <p class="history-conversion-summary">${lang === 'zh' ? '转换' : 'Conversion'}：${entry.completed_count}/${entry.new_count} · ${entry.failed_count} ${t('failedCount', lang)} · ${entry.pending_files.length} ${t('pendingCount', lang)}</p>
-      <p class="history-analysis-summary" data-analysis-status="${escapeHtml(analysis?.status || 'notRequested')}">${escapeHtml(analysisSummary)}</p>
-      ${entry.report_path ? `<p class="history-report-path">${t('reportPath', lang)}：${escapeHtml(entry.report_path)}</p>` : ''}
       ${failures ? `<details class="history-failures"><summary>${entry.failed_count} ${t('failedCount', lang)}</summary><ul>${failures}</ul></details>` : ''}
       <footer class="history-entry-actions">
         ${entry.failed_count > 0 || pendingFiles.length > 0 ? `<button type="button" class="secondary-action" data-action="retry-history" data-history-id="${escapeHtml(entry.id)}">${pendingFiles.length > 0 ? t('resumeTasks', lang) : t('retryFailures', lang)}</button>` : ''}
-        <button type="button" class="secondary-action" data-action="export-error-report" data-history-id="${escapeHtml(entry.id)}">${t('exportSession', lang)}</button>
-        <button type="button" class="secondary-action" data-action="export-runtime-session" data-history-id="${escapeHtml(entry.id)}">${t('exportRuntimeSession', lang)}</button>
+        <button type="button" class="secondary-action" data-action="export-history" data-history-id="${escapeHtml(entry.id)}">${t('exportReport', lang)}</button>
         <button type="button" class="secondary-action history-delete" data-action="delete-history" data-history-id="${escapeHtml(entry.id)}">${t('deleteHistory', lang)}</button>
       </footer>
     </article>
@@ -1935,188 +1325,37 @@ function renderSyncSlot(
   onboardingTarget: 'source' | 'destination' | null = null,
   scanTask: AppScanTaskProgress | undefined = undefined,
   scanActive = false,
-  neteaseDiscoveryProgress: NeteaseDiscoveryProgress | null = null,
-  libraryRefreshProgress: LibraryRefreshProgress | null = null,
-  neteaseDiscoveryInFlight = false,
-  analysisState: AppAnalysisState = defaultAnalysisState,
-  neteaseMetadataDatabase: NeteaseMetadataDatabaseUiState | undefined = undefined,
 ): string {
   const slot = state.slots[slotIndex];
   const fallbackDestination = state.slots[0].destinationDirectory;
   const usesFallback = slotIndex === 1 && slot.destinationDirectory.trim() === '';
   const displayedDestination = usesFallback ? fallbackDestination : slot.destinationDirectory;
   const slotNumber = slotIndex + 1;
-  const taskScanActive = scanActive && Boolean(scanTask);
-  const sourcePhase = scanTask?.phase === 'scanning_source';
-  const metadataPhase = scanTask?.phase === 'matching_metadata';
-  const phaseProcessed = scanTask
-    ? sourcePhase
-      ? scanTask.source_processed ?? scanTask.processed
-      : metadataPhase
-        ? scanTask.metadata_processed ?? scanTask.processed
-        : scanTask.destination_processed ?? scanTask.processed
+  const scanPercent = scanTask && scanTask.total > 0
+    ? Math.min(100, Math.round((scanTask.processed / scanTask.total) * 100))
     : 0;
-  const phaseTotal = scanTask
-    ? sourcePhase
-      ? scanTask.source_total !== undefined
-        ? scanTask.source_total
-        : scanTask.total > 0 ? scanTask.total : null
-      : metadataPhase
-        ? scanTask.metadata_total !== undefined
-          ? scanTask.metadata_total
-          : scanTask.source_total !== undefined
-            ? scanTask.source_total
-            : scanTask.total > 0 ? scanTask.total : null
-        : scanTask.destination_total !== undefined
-          ? scanTask.destination_total
-          : scanTask.total > 0 ? scanTask.total : null
-    : null;
-  // A stale backend may report a denominator from a previous enumeration.
-  // Never render an impossible ratio; keep the phase indeterminate until its
-  // own total catches up with the observed count.
-  const renderedPhaseTotal = phaseTotal != null && phaseProcessed <= phaseTotal
-    ? phaseTotal
-    : null;
-  const scanPercent = renderedPhaseTotal && renderedPhaseTotal > 0
-    ? Math.min(100, Math.round((phaseProcessed / renderedPhaseTotal) * 100))
-    : 0;
-  const neteaseRefreshActive = slotIndex === 0 && isLibraryRefreshActive(libraryRefreshProgress);
-  const neteaseDiscoveryActive = slotIndex === 0 && neteaseDiscoveryProgress?.status === 'running';
-  const neteaseDiscoveryFailed = slotIndex === 0 && neteaseDiscoveryProgress?.status === 'error';
-  const neteaseRefreshVisible = slotIndex === 0 && libraryRefreshProgress?.status !== undefined && libraryRefreshProgress.status !== 'idle';
-  const neteaseDiscoveryVisible = slotIndex === 0 && neteaseDiscoveryProgress?.status !== undefined;
-  const conversionInProgress = slotIndex === 0
-    && slot.status === 'running'
-    && !scanActive
-    && analysisState.status !== 'running';
-  const neteaseProgress = neteaseRefreshActive
-    ? libraryRefreshProgress
-    : neteaseDiscoveryActive
-      ? neteaseDiscoveryProgress
-      : neteaseRefreshVisible && !conversionInProgress
-        ? libraryRefreshProgress
-        : neteaseDiscoveryVisible
-          ? neteaseDiscoveryProgress
-          : null;
-  const neteaseProgressTotal = neteaseProgress?.total;
-  const neteaseProgressPercent = neteaseProgress && neteaseProgressTotal && neteaseProgressTotal > 0
-    ? Math.min(100, Math.round((neteaseProgress.processed / neteaseProgressTotal) * 100))
-    : 0;
-  const neteaseProgressText = neteaseProgress
-    ? `${neteaseProgress.message}${neteaseProgress.currentItem ? ` · ${neteaseProgress.currentItem}` : ''} ${neteaseProgress.processed}${neteaseProgressTotal == null ? '' : `/${neteaseProgressTotal}`}`
-    : null;
-  const analysisProgressVisible = analysisState.slotIndex === slotIndex
-    && analysisState.status !== 'idle'
-    && Boolean(analysisState.message);
-  const analysisProgressSummary = analysisProgressVisible
-    ? `${analysisState.message} ${analysisState.completed}/${analysisState.total}`
-    : null;
-  const analysisProgressText = analysisProgressVisible
-    ? `${analysisProgressSummary}${analysisState.currentItem ? ` · ${analysisState.currentItem}` : ''}`
-    : null;
-  const analysisProgressPercent = analysisState.total > 0
-    ? Math.min(100, Math.round((analysisState.completed / analysisState.total) * 100))
-    : 0;
-  const analysisIsActive = analysisState.status === 'running';
-  const conversionProgressActive = slot.status === 'running'
-    && !scanActive
-    && !analysisIsActive
-    && !neteaseRefreshActive
-    && !neteaseDiscoveryActive;
-  const scanProgressText = taskScanActive && scanTask
-    ? renderedPhaseTotal == null
-      ? `${scanPhaseLabel(scanTask.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
-      : `${scanPhaseLabel(scanTask.phase, state.lang)} ${phaseProcessed}/${renderedPhaseTotal}`
-    : null;
-  const displayedProgressText = (analysisIsActive ? analysisProgressText : null)
-    || scanProgressText
-    || (conversionProgressActive ? slot.progressText : null)
-    || analysisProgressText
-    || neteaseProgressText
-    || slot.progressText;
-  const showingAnalysisProgress = analysisProgressText !== null
-    && displayedProgressText === analysisProgressText;
-  const showProgressText = displayedProgressText !== slot.progressText
+  const displayedProgressText = scanActive && scanTask
+    ? `${scanPhaseLabel(scanTask.phase, state.lang)} ${scanTask.processed}/${scanTask.total}`
+    : slot.progressText;
+  const showProgressText = scanActive && scanTask
     ? true
     : slot.status !== 'idle' && slot.progressText !== t('idle', state.lang);
   const isNumericProgress = /^\d+\/\d+$/.test(displayedProgressText);
-  const displayedProgressPercent = analysisIsActive && analysisProgressText !== null
-    ? analysisProgressPercent
-    : scanProgressText !== null
-      ? scanPercent
-      : conversionProgressActive
-        ? progressPercent(slot)
-        : analysisProgressText !== null
-          ? analysisProgressPercent
-          : neteaseProgress
-            ? neteaseProgressPercent
-            : progressPercent(slot);
-  const scanProgressIndeterminate = scanProgressText !== null && renderedPhaseTotal == null;
-  const indeterminateProgress = !showingAnalysisProgress
-    && !conversionProgressActive
-    && scanProgressText === null
-    && Boolean(neteaseProgress && neteaseProgressTotal == null);
-  const displayedSlotStatus = taskScanActive ? 'running' : slot.status;
-  const neteaseScanActive = neteaseDiscoveryInFlight || neteaseDiscoveryActive || neteaseRefreshActive;
-  const neteaseScanLabel = neteaseScanActive
-    ? t('scanLocalNeteaseRunning', state.lang)
-    : neteaseDiscoveryFailed
-      ? t('scanLocalNeteaseFallback', state.lang)
-      : t('scanLocalNetease', state.lang);
-  const manualDatabasePath = neteaseMetadataDatabase?.status?.manualPath || null;
-  const databaseFileName = manualDatabasePath
-    ? manualDatabasePath.split(/[\\/]/).filter(Boolean).pop() || manualDatabasePath
-    : null;
-  const databaseBusy = neteaseMetadataDatabase?.busy === true;
-  const databaseMessage = neteaseMetadataDatabase?.error
-    || neteaseMetadataDatabase?.status?.warning
-    || neteaseMetadataDatabase?.message
-    || (manualDatabasePath ? t('neteaseDatabaseSelected', state.lang) : null)
-    || (neteaseMetadataDatabase?.status?.source === 'unavailable'
-      ? t('neteaseDatabaseUnavailable', state.lang)
-      : null);
-  const progressCopy = showingAnalysisProgress
-    ? `<span class="status-copy progress-copy analysis-progress-copy" data-role="analysis-message">
-        <span class="analysis-progress-summary" data-role="analysis-summary">${escapeHtml(analysisProgressSummary || '')}</span>
-        <span class="analysis-progress-current" data-role="analysis-current">${escapeHtml(analysisState.currentItem || '')}</span>
-      </span>`
-    : `<span class="status-copy progress-copy ${isNumericProgress ? 'progress-copy--numeric' : ''}" data-role="slot-progress-message">${escapeHtml(displayedProgressText)}</span>`;
   return `
-    <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${displayedSlotStatus}">
+    <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${slot.status}">
       <header class="sync-slot-head">
         <div>
           <h2>${t('syncSlot', state.lang)} ${slotNumber}</h2>
         </div>
         <div class="slot-head-actions">
-          <span class="slot-status" data-status="${displayedSlotStatus}">${statusLabel(displayedSlotStatus, state.lang)}</span>
+          <span class="slot-status" data-status="${slot.status}">${statusLabel(slot.status, state.lang)}</span>
+          ${slot.status === 'running' ? `<button type="button" class="secondary-action slot-cancel" data-action="cancel-slot" data-slot="${slotIndex}">${t('cancelTask', state.lang)}</button>` : ''}
         </div>
       </header>
 
       <div class="path-flow">
           <div class="path-field" data-role="source-picker"${onboardingTarget === 'source' ? ' data-onboarding-target="source"' : ''} data-drop-kind="source" data-slot="${slotIndex}">
-          <div class="path-field-heading">
-            <span>${t('sourceLabel', state.lang)}</span>
-            ${slotIndex === 0
-              ? `<div class="netease-source-actions" data-role="netease-source-actions">
-                  <button type="button" class="netease-scan-button" data-action="scan-local-netease" data-slot="0" ${neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
-                    ${icon('refresh')}
-                    <span>${neteaseScanLabel}</span>
-                  </button>
-                  <button type="button" class="netease-scan-button netease-database-button" data-action="select-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''} title="${escapeHtml(manualDatabasePath || t('selectNeteaseDatabase', state.lang))}">
-                    ${icon('folder')}
-                    <span>${escapeHtml(databaseFileName || t('selectNeteaseDatabase', state.lang))}</span>
-                  </button>
-                  ${manualDatabasePath
-                    ? `<button type="button" class="netease-scan-button netease-database-clear" data-action="clear-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
-                        <span>${t('clearNeteaseDatabase', state.lang)}</span>
-                      </button>`
-                    : ''}
-                </div>`
-              : ''}
-          </div>
-          ${slotIndex === 0 && databaseMessage
-            ? `<small class="netease-database-status${neteaseMetadataDatabase?.error ? ' is-error' : ''}" data-role="netease-database-status">${escapeHtml(databaseMessage)}</small>`
-            : ''}
+          <span>${t('sourceLabel', state.lang)}</span>
           <div class="path-control source-path-control">
             <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
               ${icon('folder')}
@@ -2160,9 +1399,9 @@ function renderSyncSlot(
       </div>
 
       <footer class="slot-status-strip">
-        ${showProgressText ? progressCopy : ''}
+        ${showProgressText ? `<span class="status-copy progress-copy ${isNumericProgress ? 'progress-copy--numeric' : ''}">${escapeHtml(displayedProgressText)}</span>` : ''}
         <div class="progress-track" aria-hidden="true">
-          <div class="progress-fill${indeterminateProgress || scanProgressIndeterminate ? ' is-indeterminate' : ''}"${showingAnalysisProgress ? ' data-role="analysis-progress"' : ' data-role="slot-progress"'} style="width: ${displayedProgressPercent}%"></div>
+          <div class="progress-fill" style="width: ${scanActive && scanTask ? scanPercent : progressPercent(slot)}%"></div>
         </div>
       </footer>
     </article>
@@ -2193,129 +1432,17 @@ export function bindApp(
   let historyExpanded = false;
   let scanProgress: AppScanProgress | null = null;
   let scanTimer: ReturnType<typeof setTimeout> | null = null;
-  let neteaseMetadataCachePreparing = false;
-  let scanPreparationCancelled = false;
   let analysisCancelRequested = false;
-  let analysisWorker: AnalysisWorkerSession | null = null;
-  const terminatedAnalysisWorkers = new WeakSet<object>();
-  const terminateAnalysisWorker = (worker: AnalysisWorkerSession | null, reason?: unknown) => {
-    if (!worker || terminatedAnalysisWorkers.has(worker)) {
-      if (analysisWorker === worker) {
-        analysisWorker = null;
-      }
-      return;
-    }
-    terminatedAnalysisWorkers.add(worker);
-    worker.terminate(reason);
-    if (analysisWorker === worker) {
-      analysisWorker = null;
-    }
-  };
-  const onboardingSeen = (() => {
-    try {
-      return localStorage.getItem('w4dj_onboarding_seen') === '1'
-        || sessionStorage.getItem('w4dj_onboarding_seen') === '1';
-    } catch {
-      // If storage is unavailable, do not trap the user in the guide on every
-      // WebView reload.
-      return true;
-    }
-  })();
-  const wasWebViewReload = (() => {
-    try {
-      const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
-      return navigation?.type === 'reload';
-    } catch {
-      return false;
-    }
-  })();
-  let onboardingVisible = !onboardingSeen && !wasWebViewReload;
+  let onboardingVisible = localStorage.getItem('w4dj_onboarding_seen') !== '1';
   let onboardingStep: OnboardingStep = 0;
-  const markOnboardingSeen = () => {
-    try {
-      localStorage.setItem('w4dj_onboarding_seen', '1');
-    } catch {
-      // The session marker below still prevents a reload loop when persistent
-      // WebView storage is unavailable.
-    }
-    try {
-      sessionStorage.setItem('w4dj_onboarding_seen', '1');
-    } catch {
-      // Ignore restricted storage environments.
-    }
-  };
   let analysisState: AppAnalysisState = { ...defaultAnalysisState };
   let analysisCache: TrackAnalysis[] = [];
   let analysisCacheLoadPromise: Promise<void> = Promise.resolve();
-  // Conversion controls are rendered before the native desktop state arrives.
-  // Keep the first snapshot as a barrier so a fast start click cannot make a
-  // decision from the default (enhanced-off) state.
-  let desktopStateHydration: Promise<void> = Promise.resolve();
   let analysisCacheRevision = 0;
-  const loadResumableAnalysis = (): ResumableAnalysis | null => {
-    try {
-      const raw = localStorage.getItem(RESUMABLE_ANALYSIS_STORAGE_KEY);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as Partial<ResumableAnalysis>;
-      if (typeof parsed.batchId !== 'string' || !Array.isArray(parsed.previews)) {
-        return null;
-      }
-      return parsed as ResumableAnalysis;
-    } catch {
-      return null;
-    }
-  };
-  let resumableAnalysis: ResumableAnalysis | null = loadResumableAnalysis();
-  const setResumableAnalysis = (value: ResumableAnalysis | null) => {
-    resumableAnalysis = value;
-    try {
-      if (value) {
-        localStorage.setItem(RESUMABLE_ANALYSIS_STORAGE_KEY, JSON.stringify(value));
-      } else {
-        localStorage.removeItem(RESUMABLE_ANALYSIS_STORAGE_KEY);
-      }
-    } catch {
-      // Analysis can continue in memory when WebView storage is unavailable.
-    }
-  };
-  const clearResumableAnalysisForBatch = (batchId: string) => {
-    resumableAnalysis = null;
-    try {
-      const raw = localStorage.getItem(RESUMABLE_ANALYSIS_STORAGE_KEY);
-      const stored = raw ? JSON.parse(raw) as Partial<ResumableAnalysis> : null;
-      if (!stored?.batchId || stored.batchId === batchId) {
-        localStorage.removeItem(RESUMABLE_ANALYSIS_STORAGE_KEY);
-      }
-    } catch {
-      // Ignore unavailable storage; the in-memory state is still cleared.
-    }
-  };
-  let analysisRunActive = false;
-  let resumeAnalysisRequested = false;
   let libraryState: LibraryDashboardState | null = null;
   let librarySearchTimer: ReturnType<typeof setTimeout> | null = null;
-  let librarySearchComposing = false;
-  let libraryRenderDeferred = false;
   let draggedLibraryColumn: string | null = null;
-  let resizingLibraryColumn: {
-    id: string;
-    startX: number;
-    startWidth: number;
-    width: number;
-    header: HTMLElement;
-  } | null = null;
-  let libraryQueryRevision = 0;
-  let neteaseDiscoveryProgress: NeteaseDiscoveryProgress | null = null;
-  let libraryRefreshProgress: LibraryRefreshProgress | null = null;
-  let neteaseDiscoveryInFlight = false;
-  let neteaseMetadataDatabase: NeteaseMetadataDatabaseUiState = {
-    status: null,
-    busy: false,
-    message: null,
-    error: null,
-  };
-  let djPlaylistState: DjPlaylistUiState | null = null;
-  let importedDjPlaylistSummaries: ImportedDjPlaylistSummary[] = [];
+  let neteaseDiscoveryStarted = false;
 
   const loadAnalysisCache = async () => {
     const loadRevision = analysisCacheRevision;
@@ -2340,23 +1467,6 @@ export function bindApp(
   };
 
   const render = () => {
-    if (librarySearchComposing) {
-      libraryRenderDeferred = true;
-      return;
-    }
-    const activeElement = document.activeElement;
-    const activeLibrarySearch = activeElement instanceof HTMLInputElement
-      && root.contains(activeElement)
-      && activeElement.dataset.action === 'library-search'
-      ? {
-        start: activeElement.selectionStart ?? activeElement.value.length,
-        end: activeElement.selectionEnd ?? activeElement.value.length,
-      }
-      : null;
-    const currentLibraryTable = root.querySelector<HTMLElement>('.library-table-wrap');
-    const libraryScroll = currentLibraryTable
-      ? { top: currentLibraryTable.scrollTop, left: currentLibraryTable.scrollLeft }
-      : null;
     root.replaceChildren(
       renderApp(
         state,
@@ -2378,12 +1488,6 @@ export function bindApp(
         historyLoadError,
         modelStatus,
         libraryState,
-        neteaseDiscoveryProgress,
-        libraryRefreshProgress,
-        neteaseDiscoveryInFlight,
-        neteaseMetadataDatabase,
-        djPlaylistState,
-        importedDjPlaylistSummaries,
       ),
     );
 
@@ -2393,175 +1497,10 @@ export function bindApp(
       root.querySelector<HTMLButtonElement>('[data-action="close-help"]')?.focus();
     }
 
-    if (!onboardingVisible && !helpVisible && activeLibrarySearch) {
-      const nextSearch = root.querySelector<HTMLInputElement>('input[data-action="library-search"]');
-      if (nextSearch) {
-        nextSearch.focus();
-        const start = Math.min(activeLibrarySearch.start, nextSearch.value.length);
-        const end = Math.min(activeLibrarySearch.end, nextSearch.value.length);
-        nextSearch.setSelectionRange(start, end);
-      }
-    }
-    if (libraryScroll) {
-      const nextLibraryTable = root.querySelector<HTMLElement>('.library-table-wrap');
-      if (nextLibraryTable) {
-        nextLibraryTable.scrollTop = libraryScroll.top;
-        nextLibraryTable.scrollLeft = libraryScroll.left;
-      }
-    }
-
     const historyDetails = root.querySelector<HTMLDetailsElement>('[data-role="history"]');
     historyDetails?.querySelector('summary')?.addEventListener('click', () => {
       historyExpanded = !historyDetails.open;
     });
-  };
-
-  const updateAnalysisProgressDom = () => {
-    const analysisSlot = analysisState.slotIndex === null
-      ? null
-      : root.querySelector<HTMLElement>(
-          `[data-role="sync-slot"][data-slot="${analysisState.slotIndex}"]`,
-        );
-    const messageElement = analysisSlot?.querySelector<HTMLElement>('[data-role="analysis-message"]');
-    if (!messageElement || analysisState.status !== 'running') {
-      return;
-    }
-    const summary = `${analysisState.message || t('analysisRunning', state.lang)} ${analysisState.completed}/${analysisState.total}`;
-    const summaryElement = messageElement.querySelector<HTMLElement>('[data-role="analysis-summary"]');
-    const currentElement = messageElement.querySelector<HTMLElement>('[data-role="analysis-current"]');
-    if (summaryElement) {
-      summaryElement.textContent = summary;
-      if (currentElement) {
-        currentElement.textContent = analysisState.currentItem || '';
-      }
-    } else {
-      const current = analysisState.currentItem ? ` · ${analysisState.currentItem}` : '';
-      messageElement.textContent = `${summary}${current}`;
-    }
-    messageElement.dataset.stage = analysisState.stage || '';
-    messageElement.dataset.completed = String(analysisState.completed);
-    messageElement.dataset.total = String(analysisState.total);
-    if (analysisState.stageProcessed == null) {
-      delete messageElement.dataset.stageProcessed;
-    } else {
-      messageElement.dataset.stageProcessed = String(analysisState.stageProcessed);
-    }
-    if (analysisState.stageTotal == null) {
-      delete messageElement.dataset.stageTotal;
-    } else {
-      messageElement.dataset.stageTotal = String(analysisState.stageTotal);
-    }
-    const progressElement = analysisSlot?.querySelector<HTMLElement>('[data-role="analysis-progress"]');
-    if (progressElement) {
-      const percent = analysisState.total > 0
-        ? Math.min(100, Math.round((analysisState.completed / analysisState.total) * 100))
-        : 0;
-      progressElement.style.width = `${percent}%`;
-    }
-  };
-
-  const updateScanProgressDom = (progress: AppScanProgress): boolean => {
-    if (!progress.tasks || progress.tasks.length === 0) {
-      return false;
-    }
-    let updated = false;
-    for (const task of progress.tasks) {
-      const slot = root.querySelector<HTMLElement>(
-        `[data-role="sync-slot"][data-slot="${task.slot_index}"]`,
-      );
-      const messageElement = slot?.querySelector<HTMLElement>('[data-role="slot-progress-message"]');
-      const fill = slot?.querySelector<HTMLElement>('[data-role="slot-progress"]');
-      if (!slot || !messageElement || !fill) {
-        continue;
-      }
-      const sourcePhase = task.phase === 'scanning_source';
-      const metadataPhase = task.phase === 'matching_metadata';
-      const processed = sourcePhase
-        ? task.source_processed ?? task.processed
-        : metadataPhase
-          ? task.metadata_processed ?? task.processed
-          : task.destination_processed ?? task.processed;
-      const total = sourcePhase
-        ? task.source_total ?? (task.total > 0 ? task.total : null)
-        : metadataPhase
-          ? task.metadata_total ?? task.source_total ?? (task.total > 0 ? task.total : null)
-          : task.destination_total ?? (task.total > 0 ? task.total : null);
-      const renderedTotal = total != null && processed <= total ? total : null;
-      const progressText = renderedTotal == null
-        ? `${scanPhaseLabel(task.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${processed} 项` : `${processed} scanned`}`
-        : `${scanPhaseLabel(task.phase, state.lang)} ${processed}/${renderedTotal}`;
-      messageElement.textContent = progressText;
-      const percent = renderedTotal && renderedTotal > 0
-        ? Math.min(100, Math.round((processed / renderedTotal) * 100))
-        : 0;
-      fill.style.width = `${percent}%`;
-      fill.classList.toggle('is-indeterminate', renderedTotal == null);
-      updated = true;
-    }
-    return updated;
-  };
-
-  const updateLibraryRefreshProgressDom = (progress: LibraryRefreshProgress) => {
-    const slot = root.querySelector<HTMLElement>('[data-role="sync-slot"][data-slot="0"]');
-    if (!slot || slot.querySelector('[data-role="analysis-message"]')) return;
-    const messageElement = slot.querySelector<HTMLElement>('[data-role="slot-progress-message"]');
-    const currentItem = progress.currentItem ? ` · ${progress.currentItem}` : '';
-    const total = progress.total == null ? '' : `/${progress.total}`;
-    if (messageElement) {
-      messageElement.textContent = `${progress.message}${currentItem} ${progress.processed}${total}`;
-    }
-    const fill = slot.querySelector<HTMLElement>('[data-role="slot-progress"]');
-    if (fill) {
-      const percent = progress.total && progress.total > 0
-        ? Math.min(100, Math.round((progress.processed / progress.total) * 100))
-        : 0;
-      fill.style.width = `${percent}%`;
-      fill.classList.toggle('is-indeterminate', progress.total == null);
-    }
-  };
-
-  const updateNeteaseDiscoveryProgressDom = (progress: NeteaseDiscoveryProgress): boolean => {
-    const slot = root.querySelector<HTMLElement>('[data-role="sync-slot"][data-slot="0"]');
-    const messageElement = slot?.querySelector<HTMLElement>('[data-role="slot-progress-message"]');
-    const canUpdateSlot = Boolean(messageElement && !slot?.querySelector('[data-role="analysis-message"]'));
-    if (canUpdateSlot && messageElement) {
-      const currentItem = progress.currentItem ? ` · ${progress.currentItem}` : '';
-      const total = progress.total == null ? '' : `/${progress.total}`;
-      messageElement.textContent = `${progress.message}${currentItem} ${progress.processed}${total}`;
-      messageElement.dataset.stage = progress.stage;
-      messageElement.dataset.processed = String(progress.processed);
-      if (progress.total == null) {
-        delete messageElement.dataset.total;
-      } else {
-        messageElement.dataset.total = String(progress.total);
-      }
-      const fill = slot?.querySelector<HTMLElement>('[data-role="slot-progress"]');
-      if (fill) {
-        const percent = progress.total && progress.total > 0
-          ? Math.min(100, Math.round((progress.processed / progress.total) * 100))
-          : 0;
-        fill.style.width = `${percent}%`;
-        fill.classList.toggle('is-indeterminate', progress.total == null);
-      }
-    }
-
-    const globalMessage = root.querySelector<HTMLElement>('[data-role="netease-discovery-progress"]');
-    if (globalMessage) {
-      const total = progress.total == null ? '' : `/${progress.total}`;
-      globalMessage.textContent = progress.status === 'error'
-        ? progress.error || progress.message
-        : `${progress.message} ${progress.processed}${total}`;
-    }
-    return canUpdateSlot || Boolean(globalMessage);
-  };
-
-  const updateInvalidScanProgressDom = (progress: LibraryInvalidScanProgress) => {
-    if (!libraryState?.visible) return;
-    const messageElement = root.querySelector<HTMLElement>('[data-role="library-scan-progress"]');
-    if (!messageElement) return;
-    const count = progress.total > 0 ? ` ${progress.processed}/${progress.total}` : '';
-    const current = progress.currentItem ? ` · ${progress.currentItem}` : '';
-    messageElement.textContent = `${progress.message}${count}${current}`;
   };
 
   const syncSlidingSelectionControl = (
@@ -2882,19 +1821,15 @@ export function bindApp(
   };
 
   const pollScan = async () => {
-    if (!scanProgress || !['running', 'cancelling'].includes(scanProgress.status)) {
+    if (!scanProgress || scanProgress.status !== 'running') {
       return;
     }
     try {
       scanProgress = await services.loadScanState();
-      const active = scanProgress.status === 'running' || scanProgress.status === 'cancelling';
-      if (active) {
-        if (!updateScanProgressDom(scanProgress)) {
-          render();
-        }
+      render();
+      if (scanProgress.status === 'running') {
         scanTimer = setTimeout(() => void pollScan(), 120);
       } else {
-        render();
         await finishScan(scanProgress);
       }
     } catch (error) {
@@ -2912,11 +1847,10 @@ export function bindApp(
   };
 
   const beginScan = async () => {
-    if (scanProgress && ['running', 'cancelling'].includes(scanProgress.status) || pendingGlobalAction !== null) {
+    if (scanProgress?.status === 'running' || pendingGlobalAction !== null) {
       return;
     }
     pendingGlobalAction = 'start-all';
-    scanPreparationCancelled = false;
     scanProgress = {
       status: 'running',
       phase: 'preparing',
@@ -2925,60 +1859,11 @@ export function bindApp(
       current_file: '',
       message: t('scanPreparing', state.lang),
     };
-    neteaseMetadataCachePreparing = Boolean(services.prepareNeteaseMetadataCache);
     render();
     try {
-      await desktopStateHydration;
-      if (scanPreparationCancelled) {
-        neteaseMetadataCachePreparing = false;
-      }
-      if (services.prepareNeteaseMetadataCache) {
-        if (scanPreparationCancelled) {
-          scanProgress = {
-            ...scanProgress,
-            status: 'cancelled',
-            phase: 'cancelled',
-            message: t('scanCancelled', state.lang),
-          };
-          pendingGlobalAction = null;
-          render();
-          return;
-        }
-        try {
-          let cacheProgress = await services.prepareNeteaseMetadataCache();
-          while (
-            services.loadNeteaseMetadataCacheStatus
-            && (cacheProgress.status === 'building' || cacheProgress.status === 'cancelling')
-          ) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            cacheProgress = await services.loadNeteaseMetadataCacheStatus();
-          }
-          if (cacheProgress.status === 'error' || cacheProgress.status === 'cancelled') {
-            console.warn('NetEase metadata cache was not prepared:', cacheProgress.message);
-          }
-        } catch (error) {
-          // A machine without a NetEase database is still allowed to scan
-          // ordinary folders; conversion will use embedded/file-name fallback.
-          console.warn('NetEase metadata cache preparation skipped:', error);
-        } finally {
-          neteaseMetadataCachePreparing = false;
-        }
-      }
-      if (scanPreparationCancelled) {
-        scanProgress = {
-          ...scanProgress,
-          status: 'cancelled',
-          phase: 'cancelled',
-          message: t('scanCancelled', state.lang),
-        };
-        pendingGlobalAction = null;
-        render();
-        return;
-      }
-      render();
       scanProgress = await services.startScan();
       render();
-      if (scanProgress.status === 'running' || scanProgress.status === 'cancelling') {
+      if (scanProgress.status === 'running') {
         scanTimer = setTimeout(() => void pollScan(), 0);
       } else {
         await finishScan(scanProgress);
@@ -3003,31 +1888,7 @@ export function bindApp(
     }
     try {
       pendingGlobalAction = 'cancel-scan';
-      scanProgress = {
-        ...scanProgress,
-        status: 'cancelling',
-        message: state.lang === 'zh' ? '正在取消扫描' : 'Cancelling scan',
-      };
-      render();
-      if (neteaseMetadataCachePreparing) {
-        scanPreparationCancelled = true;
-        if (services.cancelNeteaseMetadataCache) {
-          await services.cancelNeteaseMetadataCache();
-        }
-        scanProgress = {
-          ...scanProgress,
-          status: 'cancelled',
-          phase: 'cancelled',
-          message: t('scanCancelled', state.lang),
-        };
-        pendingGlobalAction = null;
-        render();
-        return;
-      }
-      const cancelSnapshot = await services.cancelScan();
-      scanProgress = cancelSnapshot.status === 'running'
-        ? { ...cancelSnapshot, status: 'cancelling', message: state.lang === 'zh' ? '正在取消扫描' : 'Cancelling scan' }
-        : cancelSnapshot;
+      scanProgress = await services.cancelScan();
       render();
     } catch (error) {
       scanProgress = { ...scanProgress, status: 'error', phase: 'error', message: String(error) };
@@ -3041,46 +1902,13 @@ export function bindApp(
       return;
     }
     analysisCancelRequested = true;
-    terminateAnalysisWorker(analysisWorker, new AnalysisWorkerCancelledError());
     analysisState = {
       ...analysisState,
       status: 'cancelled',
       message: t('analysisCancelled', state.lang),
-      currentItem: '',
-      stage: 'cancelled',
-      stageProcessed: 0,
-      stageTotal: 0,
-      workerJobId: '',
-      resumeAvailable: resumableAnalysis !== null,
     };
     pendingGlobalAction = null;
     render();
-  };
-
-  const resumeAnalysisFlow = () => {
-    const pending = resumableAnalysis;
-    if (analysisState.status !== 'cancelled' || !pending || analysisRunActive) {
-      if (analysisState.status === 'cancelled' && pending && analysisRunActive) {
-        // The cancel button renders the resumable action immediately, while
-        // the current candidate still unwinds its async I/O. Remember the
-        // click and start it from the cancellation finalizer instead of
-        // creating a timer that could outlive the view.
-        resumeAnalysisRequested = true;
-      }
-      return;
-    }
-    resumeAnalysisRequested = false;
-    analysisCancelRequested = false;
-    analysisState = {
-      ...analysisState,
-      status: 'running',
-      message: t('scanAnalyzing', state.lang),
-      currentItem: '',
-      stage: 'preparing',
-      resumeAvailable: false,
-    };
-    render();
-    void runPostConversionAnalysis(pending.batchId, pending.previews);
   };
 
   const confirmPreview = async () => {
@@ -3101,7 +1929,6 @@ export function bindApp(
     pendingGlobalAction = 'start-all';
     render();
     try {
-      await desktopStateHydration;
       const previews = previewModal.previews;
       const retryOf = previewModal.retryOf;
       const batchId = createAnalysisBatchId();
@@ -3142,38 +1969,17 @@ export function bindApp(
     }
   };
 
-  const exportHistoryErrorReport = async (id: string) => {
+  const exportHistory = async (id: string) => {
     try {
-      const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
-      const path = await saveFile({
-        defaultPath: `W4DJ-error-report-${id}.txt`,
-        title: state.lang === 'zh' ? '保存错误报告' : 'Save error report',
+      const path = await save({
+        defaultPath: 'W4DJ-complete-error-report.txt',
+        title: state.lang === 'zh' ? '保存完整错误报告' : 'Save full error report',
       });
       if (typeof path === 'string') {
         await services.exportHistoryErrorReport(id, path);
-        await refreshHistory();
-        window.alert(`${t('exportReportSuccess', state.lang)}：${path}`);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      window.alert(`${t('exportReportFailed', state.lang)}：${message}`);
-    }
-  };
-
-  const exportRuntimeSession = async (id: string) => {
-    try {
-      const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
-      const path = await saveFile({
-        defaultPath: `W4DJ-runtime-session-${id}.json`,
-        title: state.lang === 'zh' ? '保存运行会话记录' : 'Save runtime session',
-      });
-      if (typeof path === 'string') {
-        await services.exportRuntimeSession(id, path);
-        window.alert(`${t('exportRuntimeSuccess', state.lang)}：${path}`);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      window.alert(`${t('exportRuntimeFailed', state.lang)}：${message}`);
+      reportError(error);
     }
   };
 
@@ -3241,6 +2047,25 @@ export function bindApp(
     }
   };
 
+  const downloadEssentiaModels = async () => {
+    if (!services.downloadEssentiaModels) {
+      return;
+    }
+    modelStatus = { ...modelStatus, downloading: true };
+    render();
+    try {
+      modelStatus = await services.downloadEssentiaModels();
+      window.alert(modelStatus.embedding && modelStatus.genre && modelStatus.mood && modelStatus.instrument
+        ? t('essentiaModelsDownloaded', state.lang)
+        : t('essentiaModelsPartial', state.lang));
+    } catch (error) {
+      reportError(error);
+    } finally {
+      modelStatus = { ...modelStatus, downloading: false };
+      render();
+    }
+  };
+
   const defaultLibraryQuery = (): LibraryQuery => ({
     text: '',
     filters: [],
@@ -3303,25 +2128,8 @@ export function bindApp(
     render();
     try {
       const status = await services.loadLibraryStatus();
-      libraryRefreshProgress = status.refresh;
       const page = await loadLibraryPage(query);
-      // The first status/page load can finish after the user has already
-      // started typing into the visible search field. Preserve that newer
-      // query instead of replacing it with the initial empty query.
-      const currentQuery = libraryState?.query || query;
-      libraryState = {
-        ...libraryState,
-        visible: true,
-        busy: isLibraryRefreshActive(status.refresh)
-          || status.invalidScan?.status === 'running'
-          || status.invalidScan?.status === 'cancelling',
-        status,
-        page,
-        query: currentQuery,
-        detail: null,
-        error: status.databaseWarning,
-        coverData: libraryState?.coverData || {},
-      };
+      libraryState = { visible: true, busy: false, status, page, query, detail: null, error: null, coverData: {} };
       void loadLibraryCovers(page);
     } catch (error) {
       libraryState = {
@@ -3333,406 +2141,29 @@ export function bindApp(
     render();
   };
 
-  const searchLibrary = () => {
-    if (!libraryState || !services.queryLibraryCatalog) return;
-    const input = root.querySelector<HTMLInputElement>('input[data-action="library-search"]');
-    const query = {
-      ...libraryState.query,
-      text: input?.value ?? libraryState.query.text,
-      offset: 0,
-    };
-    if (librarySearchTimer) {
-      clearTimeout(librarySearchTimer);
-      librarySearchTimer = null;
-    }
-    libraryQueryRevision += 1;
-    libraryState = { ...libraryState, query, error: null, contextMenu: null };
-    void queryLibrary(query);
-  };
-
-  const persistAnalysisCandidate = async (
-    batchId: string,
-    previews: AppPreview[],
-    candidate: AppPreviewCandidate,
-    analysis: TrackAnalysis | null,
-    failure: AppAnalysisFailure | null,
-  ): Promise<DesktopState> => {
-    const sourcePreview = previews.find((preview) => preview.preview.candidates.some(
-      (item) => item.source_path === candidate.source_path,
-    ));
-    if (!sourcePreview) {
-      throw new Error(`找不到分析候选所属任务槽：${candidate.source_path}`);
-    }
-    const singleCandidatePreview: AppPreview = {
-      ...sourcePreview,
-      preview: {
-        ...sourcePreview.preview,
-        candidates: [candidate],
-      },
-    };
-    return services.applyTrackAnalysisResults(
-      batchId,
-      [singleCandidatePreview],
-      analysis ? [analysis] : [],
-      failure ? [failure] : [],
-    );
-  };
-
-  const reanalyzeLibrary = async () => {
-    if (!libraryState || libraryState.busy || analysisRunActive || !services.listLibraryAnalysisCandidates) {
-      return;
-    }
-    libraryState = { ...libraryState, busy: true, error: null, notice: null };
+  const refreshLibrary = async () => {
+    if (!libraryState || !services.refreshLibraryCatalog || !services.loadLibraryStatus) return;
+    libraryState = { ...libraryState, busy: true, error: null };
     render();
     try {
-      const candidates = await services.listLibraryAnalysisCandidates();
-      if (candidates.length === 0) {
-        libraryState = {
-          ...libraryState,
-          busy: false,
-          notice: state.lang === 'zh' ? '当前歌曲库没有可分析的本地输出文件' : 'No readable output files are available for analysis',
-        };
-        render();
-        return;
-      }
-      const preview: AppPreview = {
-        slot_index: candidates.find((candidate) => candidate.slotIndex === 1)?.slotIndex ?? 0,
-        mode: state.mode,
-        lossless_format: state.losslessFormat,
-        conflict_strategy: 'update_metadata',
-        filename_rule: state.filenameRule,
-        retry_of: null,
-        preview: {
-          source_directory: '',
-          destination_directory: '',
-          new_count: 0,
-          existing_count: candidates.length,
-          skipped_count: 0,
-          error_count: 0,
-          estimated_output_bytes: null,
-          candidates: candidates.map((candidate) => ({
-            name: candidate.name,
-            source_path: candidate.path,
-            destination_path: candidate.path,
-            source_size_bytes: candidate.sizeBytes,
-            estimated_output_bytes: null,
-            operation: 'update_metadata',
-          })),
-          skipped: [],
-          errors: [],
-          warnings: [],
-          available_space_bytes: null,
-          disk_space_sufficient: null,
-        },
-      };
-      const batchId = `library-analysis-${createAnalysisBatchId()}`;
-      const attemptId = `attempt-${createAnalysisBatchId()}`;
-      setResumableAnalysis({ batchId, previews: [preview], attemptId });
-      if (services.claimAnalysisRun) {
-        await services.claimAnalysisRun(batchId, attemptId);
-      }
-      const analysis = await analyzePreviewCandidates(
-        [preview],
-        batchId,
-        async (candidate, result, failure) => {
-          analysisState = {
-            ...analysisState,
-            slotIndex: preview.slot_index,
-            stage: 'writingBack',
-            message: state.lang === 'zh' ? '正在写回分析结果' : 'Writing analysis results',
-            currentItem: candidate.name,
-            stageProcessed: 0,
-            stageTotal: 1,
-          };
-          updateAnalysisProgressDom();
-          const nextState = await persistAnalysisCandidate(
-            batchId,
-            [preview],
-            candidate,
-            result,
-            failure,
-          );
-          applyDesktopState(nextState);
-          analysisState = {
-            ...analysisState,
-            stage: 'completed',
-            stageProcessed: 1,
-            stageTotal: 1,
-          };
-          updateAnalysisProgressDom();
-        },
-        attemptId,
-      );
-      if (analysis.cancelled) {
-        if (libraryState) {
-          libraryState = {
-            ...libraryState,
-            busy: false,
-            notice: state.lang === 'zh' ? '分析已取消，可稍后继续' : 'Analysis cancelled; it can be resumed later',
-          };
-        }
-        render();
-        return;
-      }
-      if (analysis.analyses.length === 0 && analysis.failures.length === 0) {
-        clearResumableAnalysisForBatch(batchId);
-        throw new Error(state.lang === 'zh' ? '没有生成任何分析结果' : 'No analysis results were produced');
-      }
-      clearResumableAnalysisForBatch(batchId);
-      await reloadLibraryProjection();
-      if (libraryState) {
-        libraryState = {
-          ...libraryState,
-          busy: false,
-          notice: state.lang === 'zh'
-            ? `已完成 ${analysis.analyses.length}/${candidates.length} 首歌曲分析并回写`
-            : `Analyzed and wrote back ${analysis.analyses.length}/${candidates.length} tracks`,
-        };
-      }
-    } catch (error) {
-      if (analysisCancelRequested || error instanceof AnalysisWorkerCancelledError) {
-        if (libraryState) {
-          libraryState = {
-            ...libraryState,
-            busy: false,
-            notice: state.lang === 'zh' ? '分析已取消，可稍后继续' : 'Analysis cancelled; it can be resumed later',
-          };
-        }
-      } else if (libraryState) {
-        libraryState = {
-          ...libraryState,
-          busy: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-      render();
-    }
-  };
-
-  const findInvalidLibraryRecords = async () => {
-    if (!libraryState || libraryState.busy || !services.findInvalidLibraryTracks) return;
-    try {
-      const progress = await services.findInvalidLibraryTracks();
-      const status = libraryState.status
-        ? { ...libraryState.status, invalidScan: progress }
-        : null;
-      libraryState = { ...libraryState, status, busy: true, error: null };
-      render();
-    } catch (error) {
-      libraryState = {
-        ...libraryState,
-        busy: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-      render();
-    }
-  };
-
-  const cancelInvalidLibraryScan = async () => {
-    if (!libraryState || !services.cancelInvalidLibraryScan) return;
-    try {
-      const progress = await services.cancelInvalidLibraryScan();
-      if (libraryState) {
-        libraryState = {
-          ...libraryState,
-          status: libraryState.status ? { ...libraryState.status, invalidScan: progress } : null,
-        };
-        render();
-      }
-    } catch (error) {
-      if (libraryState) {
-        libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
-        render();
-      }
-    }
-  };
-
-  const reloadLibraryProjection = async () => {
-    if (!libraryState || !services.loadLibraryStatus || !services.queryLibraryCatalog) return;
-    const status = await services.loadLibraryStatus();
-    const page = await services.queryLibraryCatalog(libraryState.query);
-    libraryRefreshProgress = status.refresh;
-    libraryState = {
-      ...libraryState,
-      status,
-      page,
-      busy: isLibraryRefreshActive(status.refresh),
-      error: status.databaseWarning,
-      detail: null,
-    };
-    void loadLibraryCovers(page);
-  };
-
-  const clearInvalidLibraryRecords = async () => {
-    if (!libraryState || libraryState.busy || !libraryState.confirmClearInvalid || !services.clearInvalidLibraryTracks) return;
-    libraryState = { ...libraryState, busy: true, error: null, notice: null };
-    render();
-    try {
-      const removed = await services.clearInvalidLibraryTracks();
-      if (!libraryState?.visible) return;
-      await reloadLibraryProjection();
-      if (libraryState) {
-        libraryState = {
-          ...libraryState,
-          busy: false,
-          confirmClearInvalid: false,
-          notice: state.lang === 'zh' ? `已清除 ${removed} 首失效歌曲` : `${removed} invalid track(s) removed`,
-        };
-      }
-    } catch (error) {
-      if (libraryState) {
-        libraryState = { ...libraryState, busy: false, error: error instanceof Error ? error.message : String(error) };
-      }
-    }
-    render();
-  };
-
-  const relocateLibraryTrack = async () => {
-    if (!libraryState || libraryState.busy || !services.pickLibraryTrackFile || !services.relocateLibraryTrack) return;
-    const context = libraryState.contextMenu;
-    if (!context) return;
-    const trackKey = context.trackKey;
-    const currentLibraryState = libraryState;
-    libraryState = { ...currentLibraryState, contextMenu: null, busy: true, error: null, notice: null };
-    render();
-    try {
-      const path = await services.pickLibraryTrackFile();
-      if (!path) {
-        if (libraryState) libraryState = { ...libraryState, busy: false };
-        render();
-        return;
-      }
-      await services.relocateLibraryTrack(trackKey, path);
-      if (!libraryState?.visible) return;
-      await reloadLibraryProjection();
-      if (libraryState) {
-        libraryState = {
-          ...libraryState,
-          busy: false,
-          notice: state.lang === 'zh' ? '文件已重新定位，原有分析结果已保留' : 'File relocated; existing analysis was preserved',
-        };
-      }
-    } catch (error) {
-      if (libraryState) {
-        libraryState = { ...libraryState, busy: false, error: error instanceof Error ? error.message : String(error) };
-      }
-    }
-    render();
-  };
-
-  const removeLibraryTrack = async () => {
-    if (!libraryState || libraryState.busy || !services.removeLibraryTrack) return;
-    const context = libraryState.contextMenu;
-    if (!context) return;
-    const trackKey = context.trackKey;
-    const currentLibraryState = libraryState;
-    libraryState = { ...currentLibraryState, contextMenu: null, busy: true, error: null, notice: null };
-    render();
-    try {
-      const removed = await services.removeLibraryTrack(trackKey);
-      if (!libraryState?.visible) return;
-      await reloadLibraryProjection();
-      if (libraryState) {
-        libraryState = {
-          ...libraryState,
-          busy: false,
-          notice: state.lang === 'zh'
-            ? (removed ? '记录已从 W4DJ SQLite 移除，本地音乐和网易云数据未被删除' : '记录不存在或已经移除')
-            : (removed ? 'Record removed from W4DJ SQLite; local and NetEase data were kept' : 'Record was already absent'),
-        };
-      }
-    } catch (error) {
-      if (libraryState) {
-        libraryState = { ...libraryState, busy: false, error: error instanceof Error ? error.message : String(error) };
-      }
-    }
-    render();
-  };
-
-  const handleLibraryRefreshProgress = async (progress: LibraryRefreshProgress) => {
-    const currentId = libraryState?.status?.refresh.refreshId || libraryRefreshProgress?.refreshId;
-    if (currentId && progress.refreshId && currentId !== progress.refreshId) return;
-    libraryRefreshProgress = progress;
-    const terminal = ['completed', 'cancelled', 'error'].includes(progress.status);
-    if (!libraryState?.visible) {
-      if (!terminal) updateLibraryRefreshProgressDom(progress);
-      else render();
-      return;
-    }
-    const nextStatus = libraryState.status ? { ...libraryState.status, refresh: progress } : null;
-    libraryState = { ...libraryState, status: nextStatus, busy: isLibraryRefreshActive(progress) };
-    if (!terminal) {
-      updateLibraryRefreshProgressDom(progress);
-      return;
-    }
-    if (!services.loadLibraryStatus) {
-      render();
-      return;
-    }
-    try {
+      await services.refreshLibraryCatalog();
       const status = await services.loadLibraryStatus();
-      const page = progress.status === 'completed' && services.queryLibraryCatalog
+      const page = services.queryLibraryCatalog
         ? await services.queryLibraryCatalog(libraryState.query)
         : libraryState.page;
-      libraryState = { ...libraryState, busy: false, status, page, error: status.databaseWarning };
+      libraryState = { ...libraryState, busy: false, status, page };
       void loadLibraryCovers(page);
-      render();
     } catch (error) {
       libraryState = { ...libraryState, busy: false, error: error instanceof Error ? error.message : String(error) };
-      render();
     }
-  };
-
-  const handleInvalidLibraryScanProgress = async (progress: LibraryInvalidScanProgress) => {
-    if (libraryState?.status?.invalidScan?.scanId
-      && progress.scanId
-      && libraryState.status.invalidScan.scanId !== progress.scanId) {
-      return;
-    }
-    if (libraryState?.status) {
-      libraryState = {
-        ...libraryState,
-        busy: progress.status === 'running' || progress.status === 'cancelling',
-        status: { ...libraryState.status, invalidScan: progress },
-      };
-      if (!['completed', 'cancelled', 'error'].includes(progress.status)) {
-        updateInvalidScanProgressDom(progress);
-      }
-    }
-    if (!['completed', 'cancelled', 'error'].includes(progress.status)
-      || !libraryState?.visible
-      || !services.loadLibraryStatus
-      || !services.queryLibraryCatalog) {
-      return;
-    }
-    try {
-      const status = await services.loadLibraryStatus();
-      const page = await services.queryLibraryCatalog(libraryState.query);
-      libraryState = {
-        ...libraryState,
-        busy: false,
-        status,
-        page,
-        error: status.databaseWarning,
-      };
-      render();
-    } catch (error) {
-      if (libraryState) {
-        libraryState = {
-          ...libraryState,
-          busy: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-        render();
-      }
-    }
+    render();
   };
 
   const clearLibraryCache = async () => {
     if (!libraryState || !services.clearLibraryCatalogCache) return;
     if (!window.confirm(state.lang === 'zh'
-      ? '确定清除 W4DJ 分析歌曲库吗？音乐文件、扫描缓存和增强分析缓存不会被删除。'
-      : 'Clear the W4DJ analysis library? Audio files, scan cache and analysis cache will stay intact.')) {
+      ? '确定清除歌曲库索引吗？网易云数据库、音乐文件、扫描缓存和增强分析缓存不会被删除。'
+      : 'Clear the song-library index? NetEase data, audio files, scan cache and analysis cache will stay intact.')) {
       return;
     }
     try {
@@ -3747,19 +2178,16 @@ export function bindApp(
 
   const queryLibrary = async (query: LibraryQuery) => {
     if (!libraryState || !services.queryLibraryCatalog) return;
-    const requestRevision = ++libraryQueryRevision;
     try {
       const page = await services.queryLibraryCatalog(query);
-      if (requestRevision === libraryQueryRevision && libraryState.visible) {
-        libraryState = { ...libraryState, query, page, error: null, contextMenu: null };
+      if (libraryState.visible) {
+        libraryState = { ...libraryState, query, page, error: null };
         void loadLibraryCovers(page);
         render();
       }
     } catch (error) {
-      if (requestRevision === libraryQueryRevision) {
-        libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
-        render();
-      }
+      libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
+      render();
     }
   };
 
@@ -3812,301 +2240,6 @@ export function bindApp(
     }
   };
 
-  const copyDjPlaylistText = async (text: string) => {
-    if (!text) return;
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.append(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        textarea.remove();
-      }
-      djPlaylistState = djPlaylistState ? { ...djPlaylistState, notice: '已复制到剪贴板' } : null;
-      render();
-    } catch (error) {
-      reportError(error);
-    }
-  };
-
-  const sanitizedDjPlaylistName = (name: string, extension: string) => {
-    const safe = name.trim().replace(/[\\/:*?"<>|\r\n]+/g, '_').replace(/\s+/g, ' ').slice(0, 80) || 'w4dj-playlist';
-    return `${safe}.${extension}`;
-  };
-
-  const refreshDjPlaylistQr = async () => {
-    const current = djPlaylistState;
-    if (!current?.visible || !current.pages[current.pageIndex]) return;
-    const revision = current.qrRevision + 1;
-    djPlaylistState = { ...current, qrRevision: revision, qrDataUrl: null };
-    render();
-    try {
-      const qrDataUrl = await renderPlaintextQrDataUrl(current.pages[current.pageIndex].text);
-      if (djPlaylistState?.visible && djPlaylistState.qrRevision === revision) {
-        djPlaylistState = { ...djPlaylistState, qrDataUrl };
-        render();
-      }
-    } catch (error) {
-      if (djPlaylistState?.visible && djPlaylistState.qrRevision === revision) {
-        djPlaylistState = { ...djPlaylistState, error: error instanceof Error ? error.message : String(error) };
-        render();
-      }
-    }
-  };
-
-  const showDjPlaylist = (playlist: ImportedDjPlaylist, report: DjPlaylistMatchReport | null = null) => {
-    const pages = splitNeteaseQrPages(playlist.tracks);
-    djPlaylistState = {
-      visible: true,
-      launcher: false,
-      busy: false,
-      error: null,
-      notice: null,
-      playlist,
-      pages,
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: report,
-      exportBusy: false,
-      dropActive: false,
-    };
-    render();
-    void refreshDjPlaylistQr();
-  };
-
-  const openDjPlaylistLauncher = () => {
-    djPlaylistState = {
-      visible: true,
-      launcher: true,
-      busy: false,
-      error: null,
-      notice: null,
-      playlist: null,
-      pages: [],
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: null,
-      exportBusy: false,
-      dropActive: false,
-    };
-    render();
-  };
-
-  const loadImportedDjPlaylistList = async () => {
-    if (!services.listImportedDjPlaylists) return;
-    try {
-      importedDjPlaylistSummaries = await services.listImportedDjPlaylists();
-      render();
-    } catch (error) {
-      console.warn('Failed to load imported DJ playlists:', error);
-    }
-  };
-
-  const openLatestDjPlaylist = async () => {
-    const summary = importedDjPlaylistSummaries[0];
-    if (!summary || !services.loadImportedDjPlaylist) return;
-    djPlaylistState = {
-      visible: true,
-      launcher: false,
-      busy: true,
-      error: null,
-      notice: null,
-      playlist: null,
-      pages: [],
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: null,
-      exportBusy: false,
-      dropActive: false,
-    };
-    render();
-    try {
-      const playlist = await services.loadImportedDjPlaylist(summary.playlistId);
-      let report: DjPlaylistMatchReport | null = null;
-      if (services.loadImportedDjPlaylistMatches) {
-        try {
-          report = await services.loadImportedDjPlaylistMatches(summary.playlistId);
-        } catch {
-          // A playlist can be persisted before its first matching pass.
-        }
-      }
-      showDjPlaylist(playlist, report);
-    } catch (error) {
-      djPlaylistState = {
-        ...djPlaylistState!,
-        busy: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-      render();
-    }
-  };
-
-  const importDjPlaylistPath = async (path: string) => {
-    if (!services.importW4djPlaylist) return;
-    djPlaylistState = {
-      visible: true,
-      launcher: false,
-      busy: true,
-      error: null,
-      notice: null,
-      playlist: null,
-      pages: [],
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: null,
-      exportBusy: false,
-      dropActive: false,
-    };
-    render();
-    try {
-      const playlist = await services.importW4djPlaylist(path);
-      showDjPlaylist(playlist);
-      void loadImportedDjPlaylistList();
-    } catch (error) {
-      djPlaylistState = { ...djPlaylistState!, busy: false, error: error instanceof Error ? error.message : String(error) };
-      render();
-    }
-  };
-
-  const importDjPlaylist = async () => {
-    if (!services.pickW4djPlaylist) return;
-    try {
-      const path = await services.pickW4djPlaylist();
-      if (path) await importDjPlaylistPath(path);
-    } catch (error) {
-      reportError(error);
-    }
-  };
-
-  const openDjPlaylistExport = async () => {
-    if (!djPlaylistState?.playlist && importedDjPlaylistSummaries.length > 0) {
-      await openLatestDjPlaylist();
-    }
-    const playlist = djPlaylistState?.playlist;
-    if (!playlist) {
-      djPlaylistState = {
-        ...(djPlaylistState || {
-          visible: true,
-          busy: false,
-          error: null,
-          notice: null,
-          playlist: null,
-          pages: [],
-          pageIndex: 0,
-          qrDataUrl: null,
-          qrRevision: 0,
-          matchBusy: false,
-          matchReport: null,
-          exportBusy: false,
-          dropActive: false,
-        }),
-        visible: true,
-        launcher: true,
-        notice: state.lang === 'zh' ? '请先导入 .w4dj 歌单。' : 'Import a .w4dj playlist first.',
-      };
-      render();
-      return;
-    }
-    if (djPlaylistState?.matchReport?.matchedCount === djPlaylistState.matchReport.total) {
-      await exportDjPlaylistM3u8(false);
-      return;
-    }
-    await matchDjPlaylist();
-  };
-
-  const exportDjPlaylistTxt = async () => {
-    const playlist = djPlaylistState?.playlist;
-    if (!playlist || !services.exportNeteasePlaylistText) return;
-    try {
-      const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
-      const path = await saveFile({
-        defaultPath: sanitizedDjPlaylistName(playlist.name, 'txt'),
-        title: state.lang === 'zh' ? '导出网易云歌单 TXT' : 'Export NetEase playlist TXT',
-      });
-      if (typeof path === 'string') {
-        await services.exportNeteasePlaylistText(path, buildNeteaseImportText(playlist.tracks));
-        djPlaylistState = { ...djPlaylistState!, notice: `已导出：${path}` };
-        render();
-      }
-    } catch (error) {
-      djPlaylistState = { ...djPlaylistState!, error: error instanceof Error ? error.message : String(error) };
-      render();
-    }
-  };
-
-  const exportDjPlaylistW4dj = async () => {
-    const playlist = djPlaylistState?.playlist;
-    if (!playlist || !services.exportImportedDjPlaylistW4dj) return;
-    try {
-      const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
-      const path = await saveFile({
-        defaultPath: sanitizedDjPlaylistName(playlist.name, 'w4dj'),
-        title: state.lang === 'zh' ? '导出 W4DJ v2 歌单' : 'Export W4DJ v2 playlist',
-      });
-      if (typeof path !== 'string') return;
-      await services.exportImportedDjPlaylistW4dj(playlist.playlistId, path);
-      djPlaylistState = { ...djPlaylistState!, notice: `已导出：${path}` };
-      render();
-    } catch (error) {
-      djPlaylistState = { ...djPlaylistState!, error: error instanceof Error ? error.message : String(error) };
-      render();
-    }
-  };
-
-  const exportDjPlaylistM3u8 = async (allowPartial: boolean) => {
-    const playlist = djPlaylistState?.playlist;
-    if (!playlist || !services.exportImportedDjPlaylistM3u8) return;
-    if (allowPartial && djPlaylistState?.matchReport) {
-      const omitted = djPlaylistState.matchReport.total - djPlaylistState.matchReport.matchedCount;
-      if (omitted > 0 && !window.confirm(djPlaylistText('djPlaylistPartialConfirm', state.lang, { count: omitted }))) return;
-    }
-    try {
-      const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
-      const path = await saveFile({
-        defaultPath: sanitizedDjPlaylistName(playlist.name, 'm3u8'),
-        title: '导出 M3U8',
-      });
-      if (typeof path !== 'string') return;
-      djPlaylistState = { ...djPlaylistState!, exportBusy: true, error: null };
-      render();
-      const result = await services.exportImportedDjPlaylistM3u8(playlist.playlistId, path, allowPartial);
-      djPlaylistState = { ...djPlaylistState!, exportBusy: false, notice: `${t('djPlaylistExportSuccess', state.lang)}：${result.path}` };
-      render();
-    } catch (error) {
-      djPlaylistState = { ...djPlaylistState!, exportBusy: false, error: error instanceof Error ? error.message : String(error) };
-      render();
-    }
-  };
-
-  const matchDjPlaylist = async () => {
-    const playlist = djPlaylistState?.playlist;
-    if (!playlist || !services.matchImportedDjPlaylist) return;
-    djPlaylistState = { ...djPlaylistState!, matchBusy: true, error: null };
-    render();
-    try {
-      const report = await services.matchImportedDjPlaylist(playlist.playlistId);
-      djPlaylistState = { ...djPlaylistState!, matchBusy: false, matchReport: report };
-      render();
-      if (report.matchedCount === report.total && report.total > 0) void exportDjPlaylistM3u8(false);
-    } catch (error) {
-      djPlaylistState = { ...djPlaylistState!, matchBusy: false, error: error instanceof Error ? error.message : String(error) };
-      render();
-    }
-  };
-
   const downloadLibraryLyrics = () => {
     const track = libraryState?.detail;
     const text = selectedLibraryLyrics();
@@ -4121,206 +2254,23 @@ export function bindApp(
     setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
-  const scanLocalNeteaseFolder = async () => {
-    if (neteaseDiscoveryInFlight) return;
-
-    const finishDiscovery = (progress: NeteaseDiscoveryProgress) => {
-      neteaseDiscoveryProgress = progress;
-      render();
-      if (progress.status === 'completed') {
-        setTimeout(() => {
-          if (neteaseDiscoveryProgress === progress) {
-            neteaseDiscoveryProgress = null;
-            render();
-          }
-        }, 1800);
-      }
-    };
-
-    if (neteaseDiscoveryProgress?.status === 'error') {
-      neteaseDiscoveryInFlight = true;
-      render();
-      try {
-        await desktopStateHydration;
-        const path = await services.pickSource(0);
-        if (!path) {
-          return;
-        }
-        applyDesktopState(await services.selectSourceDirectory(0, path));
-        finishDiscovery({
-          status: 'completed',
-          stage: 'checkingMusicFolder',
-          processed: 0,
-          total: null,
-          currentItem: '',
-          message: t('scanLocalNeteaseSelected', state.lang),
-          suggestion: null,
-          error: null,
-        });
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        neteaseDiscoveryProgress = {
-          status: 'error',
-          stage: 'checkingMusicFolder',
-          processed: 0,
-          total: null,
-          currentItem: '',
-          message: t('scanLocalNeteaseFallback', state.lang),
-          suggestion: null,
-          error: detail,
-        };
-        render();
-      } finally {
-        neteaseDiscoveryInFlight = false;
-        render();
-      }
-      return;
-    }
-
-    neteaseDiscoveryInFlight = true;
-    neteaseDiscoveryProgress = {
-      status: 'running',
-      stage: 'locatingDatabase',
-      processed: 0,
-      total: null,
-      currentItem: '',
-      message: t('scanLocalNeteaseRunning', state.lang),
-      suggestion: null,
-      error: null,
-    };
-    render();
+  const discoverNeteaseAfterOnboarding = async () => {
+    if (neteaseDiscoveryStarted || !services.locateNeteaseLibrary) return;
+    neteaseDiscoveryStarted = true;
     try {
-      await desktopStateHydration;
-      const discovery = services.locateNeteaseLibrary
-        ? await services.locateNeteaseLibrary(true)
-        : null;
-      const path = discovery?.musicFolder?.trim();
-      if (!path) {
-        const message = t('scanLocalNeteaseNotFound', state.lang);
-        finishDiscovery({
-          status: 'error',
-          stage: 'checkingMusicFolder',
-          processed: discovery?.localFileCount || 0,
-          total: discovery?.localFileCount || null,
-          currentItem: '',
-          message,
-          suggestion: discovery,
-          error: message,
-        });
-        return;
+      const discovery = await services.locateNeteaseLibrary();
+      if (discovery.musicFolder && !state.slots[0].sourceDirectory.trim()) {
+        const nextState = await services.selectSourceDirectory(0, discovery.musicFolder);
+        applyDesktopState(nextState);
       }
-      applyDesktopState(await services.selectSourceDirectory(0, path));
-      if ((discovery?.localFileCount || 0) > 0) {
-        finishDiscovery({
-          status: 'completed',
-          stage: 'checkingMusicFolder',
-          processed: discovery?.localFileCount || 0,
-          total: discovery?.localFileCount || null,
-          currentItem: '',
-          message: `${t('scanLocalNeteaseSelected', state.lang)} ${discovery?.localFileCount || 0}`,
-          suggestion: discovery,
-          error: null,
+      if (discovery.databasePath && services.refreshLibraryCatalog) {
+        void services.refreshLibraryCatalog().catch((error) => {
+          console.warn('NetEase library auto-refresh failed:', error);
         });
-      } else {
-        neteaseDiscoveryProgress = {
-          status: 'running',
-          stage: 'checkingMusicFolder',
-          processed: 0,
-          total: null,
-          currentItem: '',
-          message: t('scanLocalNeteaseSelected', state.lang),
-          suggestion: discovery,
-          error: null,
-        };
-        render();
       }
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      const message = t('scanLocalNeteaseNotFound', state.lang);
-      neteaseDiscoveryProgress = {
-        status: 'error',
-        stage: 'locatingDatabase',
-        processed: 0,
-        total: null,
-        currentItem: '',
-        message,
-        suggestion: null,
-        error: `${message}：${detail}`,
-      };
-      render();
-    } finally {
-      neteaseDiscoveryInFlight = false;
-      render();
+      console.warn('NetEase library auto-discovery failed:', error);
     }
-  };
-
-  const selectNeteaseMetadataDatabase = async () => {
-    if (
-      neteaseMetadataDatabase.busy
-      || !services.pickNeteaseDatabase
-      || !services.selectNeteaseMetadataDatabase
-    ) {
-      return;
-    }
-    const path = await services.pickNeteaseDatabase();
-    if (!path) {
-      return;
-    }
-    neteaseMetadataDatabase = {
-      ...neteaseMetadataDatabase,
-      busy: true,
-      message: null,
-      error: null,
-    };
-    render();
-    try {
-      const status = await services.selectNeteaseMetadataDatabase(path);
-      neteaseMetadataDatabase = {
-        status,
-        busy: false,
-        message: t('neteaseDatabaseSelected', state.lang),
-        error: null,
-      };
-    } catch (error) {
-      neteaseMetadataDatabase = {
-        ...neteaseMetadataDatabase,
-        busy: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-    render();
-  };
-
-  const clearNeteaseMetadataDatabase = async () => {
-    if (
-      neteaseMetadataDatabase.busy
-      || !services.clearNeteaseMetadataDatabase
-    ) {
-      return;
-    }
-    neteaseMetadataDatabase = {
-      ...neteaseMetadataDatabase,
-      busy: true,
-      message: null,
-      error: null,
-    };
-    render();
-    try {
-      const status = await services.clearNeteaseMetadataDatabase();
-      neteaseMetadataDatabase = {
-        status,
-        busy: false,
-        message: null,
-        error: null,
-      };
-    } catch (error) {
-      neteaseMetadataDatabase = {
-        ...neteaseMetadataDatabase,
-        busy: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-    render();
   };
 
   const yieldToUi = async () => {
@@ -4335,75 +2285,24 @@ export function bindApp(
 
   const analyzePreviewCandidates = async (
     previews: AppPreview[],
-    sessionId?: string,
-    onCandidateResult?: PersistAnalysisCandidate,
-    attemptId?: string,
   ): Promise<{ analyses: TrackAnalysis[]; failures: AppAnalysisFailure[]; cancelled: boolean }> => {
     analysisCancelRequested = false;
-    const recordSessionEvent = (
-      event: string,
-      details: Record<string, unknown> = {},
-    ): Promise<void> => {
-      if (!sessionId || !services.recordRuntimeSessionEvent) {
-        return Promise.resolve();
-      }
-      return services.recordRuntimeSessionEvent(sessionId, event, details)
-        .catch((error) => console.warn(`Failed to record runtime session event ${event}:`, error));
-    };
-    const groups = new Map<SyncSlotIndex, AppPreviewCandidate[]>();
-    const seenSourcePaths = new Set<string>();
-    for (const preview of previews) {
-      const group = groups.get(preview.slot_index) || [];
-      for (const candidate of preview.preview.candidates) {
-        if (seenSourcePaths.has(candidate.source_path)) {
-          continue;
-        }
-        seenSourcePaths.add(candidate.source_path);
-        group.push(candidate);
-      }
-      if (group.length > 0) {
-        groups.set(preview.slot_index, group);
-      }
-    }
-    const candidates = Array.from(groups.values()).flat();
+    const candidates = Array.from(new Map(
+      previews
+        .flatMap((item) => item.preview.candidates)
+        .map((candidate) => [candidate.source_path, candidate]),
+    ).values());
     if (candidates.length === 0) {
-      analysisRunActive = false;
-      terminateAnalysisWorker(analysisWorker);
-      analysisState = {
-        ...defaultAnalysisState,
-        status: 'completed',
-        message: t('analysisNoResults', state.lang),
-      };
-      render();
       return { analyses: [], failures: [], cancelled: false };
     }
-    // Prepare the first cancellation handle before any asynchronous cache or
-    // model work. This keeps the Cancel button effective even while startup
-    // awaits those services; the same Worker is consumed by the first song.
-    let preallocatedWorker: AnalysisWorkerSession | null = services.createAnalysisWorker?.()
-      ?? new AnalysisWorkerClient();
-    let preallocatedWorkerJobId = `analysis-${createAnalysisBatchId()}`;
-    analysisWorker = preallocatedWorker;
-    await recordSessionEvent('analysis_started', {
-      candidate_count: candidates.length,
-      slot_count: groups.size,
-      enhanced_mode: state.enhancedMode,
-      attempt_id: attemptId,
-    });
-    analysisRunActive = true;
-    const firstGroup = groups.entries().next().value as [SyncSlotIndex, AppPreviewCandidate[]];
 
     analysisState = {
-      slotIndex: firstGroup[0],
       status: 'running',
       completed: 0,
-      total: firstGroup[1].length,
-      resultCount: 0,
+      total: candidates.length,
+      resultCount: analysisState.resultCount,
       failedCount: 0,
       message: t('scanAnalyzing', state.lang),
-      currentItem: '',
-      stage: 'preparing',
-      resumeAvailable: false,
     };
     render();
 
@@ -4412,14 +2311,14 @@ export function bindApp(
     const failures: AppAnalysisFailure[] = [];
     let failedCount = 0;
     const analysisCacheRevisionAtStart = analysisCacheRevision;
-    const persistFreshResults = async (entries: TrackAnalysis[] = freshResults) => {
-      if (entries.length === 0 || analysisCacheRevisionAtStart !== analysisCacheRevision) {
+    const persistFreshResults = async () => {
+      if (freshResults.length === 0 || analysisCacheRevisionAtStart !== analysisCacheRevision) {
         return;
       }
       try {
-        await services.saveTrackAnalyses(entries);
+        await services.saveTrackAnalyses(freshResults);
         if (analysisCacheRevisionAtStart === analysisCacheRevision) {
-          mergeAnalysisCache(entries);
+          mergeAnalysisCache(freshResults);
         }
       } catch (error) {
         console.warn('Failed to save Essentia analysis cache:', error);
@@ -4427,461 +2326,120 @@ export function bindApp(
     };
     const finishCancelledAnalysis = async () => {
       await persistFreshResults();
-      terminateAnalysisWorker(analysisWorker, new AnalysisWorkerCancelledError());
-      await recordSessionEvent('analysis_cancelled', {
-        completed_count: results.length,
-        failed_count: failedCount,
-        candidate_count: candidates.length,
-      });
       analysisState = {
         ...analysisState,
         status: 'cancelled',
         resultCount: results.length,
         failedCount,
         message: t('analysisCancelled', state.lang),
-        currentItem: '',
-        stage: 'cancelled',
-        stageProcessed: 0,
-        stageTotal: 0,
-        workerJobId: '',
-        resumeAvailable: resumableAnalysis !== null,
       };
-      // Make the resumable action usable as soon as the cancelled state is
-      // rendered; the outer finally also performs this assignment for normal
-      // exits, but the button can be clicked before that microtask runs.
-      analysisRunActive = false;
       render();
-      if (resumeAnalysisRequested) {
-        setTimeout(() => resumeAnalysisFlow(), 0);
-      }
       return { analyses: results, failures, cancelled: true };
     };
-    try {
-      await analysisCacheLoadPromise;
-      const cacheByPath = new Map(analysisCache.map((entry) => [entry.path, entry]));
-      let highLevelModels: EssentiaModelFile[] | undefined;
-      if (state.enhancedMode && services.loadEssentiaModel) {
-        // Startup deliberately leaves the model directory untouched. Ensure
-        // and inspect it only after the user has requested enhanced analysis;
-        // test doubles and older integrations without the new command retain
-        // the previous status-query fallback.
-        if (services.ensureEssentiaModels) {
-          recordSessionEvent('analysis_models_initializing', {
-            model_ids: ESSENTIA_MODEL_IDS,
-            model_version: modelStatus.version,
-          });
-          try {
-            modelStatus = await services.ensureEssentiaModels();
-            render();
-          } catch (error) {
-            recordSessionEvent('analysis_models_unavailable', {
-              model_version: modelStatus.version,
-              reason: 'model_initialization_failed',
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        } else if (!modelStatus.embedding && services.getEssentiaModelStatus) {
-          try {
-            modelStatus = await services.getEssentiaModelStatus();
-          } catch (error) {
-            recordSessionEvent('analysis_models_unavailable', {
-              model_version: modelStatus.version,
-              reason: 'model_status_unavailable',
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-
-        if (modelStatus.embedding) {
-          recordSessionEvent('analysis_models_loading', {
-            model_ids: ESSENTIA_MODEL_IDS,
-            model_version: modelStatus.version,
-          });
-          const loadedModels: EssentiaModelFile[] = [];
-          const missingModels: string[] = [];
-          for (const id of ESSENTIA_MODEL_IDS) {
-            try {
-              const model = await services.loadEssentiaModel(id);
-              loadedModels.push(model);
-            } catch (error) {
-              missingModels.push(id);
-              recordSessionEvent('analysis_model_unavailable', {
-                model_id: id,
-                model_version: modelStatus.version,
-                error: error instanceof Error ? error.message : String(error),
-              });
-            }
-          }
-          highLevelModels = loadedModels;
-          recordSessionEvent('analysis_models_loaded', {
-            model_ids: loadedModels.map((model) => model.id),
-            missing_model_ids: missingModels,
-            model_version: modelStatus.version,
-          });
-        }
-      } else if (state.enhancedMode) {
-        recordSessionEvent('analysis_models_unavailable', {
-          model_version: modelStatus.version,
-          reason: 'required_models_missing',
-          embedding: modelStatus.embedding,
-          genre: modelStatus.genre,
-          mood: modelStatus.mood,
-          instrument: modelStatus.instrument,
-          emotion_continuous: modelStatus.emotionContinuous,
-          emotion_cluster: modelStatus.emotionCluster,
-        });
+    await analysisCacheLoadPromise;
+    const cacheByPath = new Map(analysisCache.map((entry) => [entry.path, entry]));
+    let highLevelModels: EssentiaModelFile[] | undefined;
+    if (state.enhancedMode && services.loadEssentiaModel
+      && modelStatus.embedding && modelStatus.genre && modelStatus.mood && modelStatus.instrument) {
+      try {
+        highLevelModels = await Promise.all(
+          ESSENTIA_MODEL_IDS.map((id) => services.loadEssentiaModel?.(id) as Promise<EssentiaModelFile>),
+        );
+      } catch (error) {
+        console.warn('Failed to load Essentia high-level models; continuing with basic analysis:', error);
       }
+    }
 
+    if (analysisCancelRequested) {
+      return finishCancelledAnalysis();
+    }
+
+    for (const candidate of candidates) {
       if (analysisCancelRequested) {
         return finishCancelledAnalysis();
       }
+      let fingerprint: AppAudioFileFingerprint | null = null;
+      try {
+        fingerprint = await services.getAudioFileFingerprint(candidate.source_path);
+      } catch (error) {
+        console.warn(`Failed to fingerprint ${candidate.source_path}; reanalyzing it:`, error);
+      }
 
-      for (const [slotIndex, group] of groups) {
-        let groupFailedCount = 0;
-        let groupResultCount = 0;
-        analysisState = {
-          ...analysisState,
-          slotIndex,
-          completed: 0,
-          total: group.length,
-          resultCount: 0,
-          failedCount: 0,
-          currentItem: '',
-          stage: 'preparing',
-          stageProcessed: 0,
-          stageTotal: 0,
-          workerJobId: '',
-          message: t('scanAnalyzing', state.lang),
-        };
-        render();
+      const cached = cacheByPath.get(candidate.source_path);
+      const highLevelModelsAvailable = Boolean(
+        state.enhancedMode
+        && highLevelModels?.length === ESSENTIA_MODEL_IDS.length
+        && modelStatus.version,
+      );
+      const canReuse = fingerprint !== null
+        && canReuseTrackAnalysis(
+          cached,
+          fingerprint,
+          state.neteaseFilenameFormat,
+          modelStatus.version || null,
+          highLevelModelsAvailable,
+        );
 
-        for (const candidate of group) {
-          if (analysisCancelRequested) {
-            return finishCancelledAnalysis();
-          }
-          const candidateWorker: AnalysisWorkerSession = preallocatedWorker
-            ?? (services.createAnalysisWorker?.() ?? new AnalysisWorkerClient());
-          const workerJobId = preallocatedWorkerJobId || `analysis-${createAnalysisBatchId()}`;
-          const candidateStartedAt = Date.now();
-          preallocatedWorker = null;
-          preallocatedWorkerJobId = '';
-          analysisWorker = candidateWorker;
-          await recordSessionEvent('analysis_candidate_started', {
-            slot_index: slotIndex,
-            name: candidate.name,
-            source_path: candidate.source_path,
-            destination_path: candidate.destination_path,
-            worker_job_id: workerJobId,
-          });
-          analysisState = {
-            ...analysisState,
-            currentItem: candidate.name,
-            stage: 'preparing',
-            stageProcessed: 0,
-            stageTotal: 0,
-            workerJobId,
-            message: t('scanAnalyzing', state.lang),
-          };
-          updateAnalysisProgressDom();
-          let fingerprint: AppAudioFileFingerprint | null = null;
+      if (canReuse && cached) {
+        results.push(cached);
+      } else {
+        try {
+          const bytes = await services.readAudioFile(candidate.source_path);
+          let metadata: TrackMetadata | undefined;
           try {
-            fingerprint = await services.getAudioFileFingerprint(candidate.source_path);
-          } catch (error) {
-            console.warn(`Failed to fingerprint ${candidate.source_path}; reanalyzing it:`, error);
+            metadata = await services.readTrackMetadata(candidate.source_path);
+          } catch {
+            // Analysis can continue using the filename identity.
           }
-
-          const cached = cacheByPath.get(candidate.source_path);
-          const highLevelModelsAvailable = Boolean(
-            state.enhancedMode
-            && highLevelModels?.some((model) => model.id === 'musicnn_embedding')
-            && modelStatus.version,
+          const analysis = await analyzeAudioFile(
+            candidate.source_path,
+            Uint8Array.from(bytes),
+            metadata,
+            {
+              fingerprint: fingerprint || undefined,
+              neteaseFilenameFormat: state.neteaseFilenameFormat,
+              highLevelModels,
+            },
           );
-            const canReuse = fingerprint !== null
-              && canReuseTrackAnalysis(
-                cached,
-                fingerprint,
-                state.neteaseFilenameFormat,
-                modelStatus.version || null,
-                highLevelModelsAvailable,
-                state.enhancedMode,
-              );
-
-          if (canReuse && cached) {
-            if (onCandidateResult) {
-              await onCandidateResult(candidate, cached, null);
-            }
-            results.push(cached);
-            groupResultCount += 1;
-            await recordSessionEvent('analysis_candidate_finished', {
-              slot_index: slotIndex,
-              name: candidate.name,
-              source_path: candidate.source_path,
-              destination_path: candidate.destination_path,
-              status: 'completed',
-              cached: true,
-              worker_job_id: workerJobId,
-              elapsed_ms: 0,
-            });
-            await recordSessionEvent('analysis_worker_terminated', {
-              slot_index: slotIndex,
-              name: candidate.name,
-              source_path: candidate.source_path,
-              destination_path: candidate.destination_path,
-              worker_job_id: workerJobId,
-              cached: true,
-            });
-            terminateAnalysisWorker(candidateWorker);
-          } else {
-            let lastProgressEventAt = 0;
-            let lastProgressStage = '';
-            try {
-              // A Worker belongs to exactly one uncached song. Keeping this
-              // lifetime narrow prevents Essentia/WASM state from surviving
-              // into the next song and also makes cancellation local to the
-              // current candidate.
-              analysisState = {
-                ...analysisState,
-                workerJobId,
-                startedAt: new Date().toISOString(),
-              };
-              await recordSessionEvent('analysis_worker_starting', {
-                slot_index: slotIndex,
-                name: candidate.name,
-                source_path: candidate.source_path,
-                destination_path: candidate.destination_path,
-                worker_job_id: workerJobId,
-              });
-              await candidateWorker.start(workerJobId, highLevelModels ?? []);
-              await recordSessionEvent('analysis_worker_started', {
-                slot_index: slotIndex,
-                name: candidate.name,
-                source_path: candidate.source_path,
-                destination_path: candidate.destination_path,
-                worker_job_id: workerJobId,
-                high_level_models: Boolean(highLevelModels),
-              });
-              const bytes = await services.readAudioFile(candidate.source_path);
-              if (analysisCancelRequested) {
-                return finishCancelledAnalysis();
-              }
-              let metadata: TrackMetadata | undefined;
-              try {
-                metadata = await services.readTrackMetadata(candidate.source_path);
-              } catch {
-                // Analysis can continue using the filename identity.
-              }
-              if (analysisCancelRequested) {
-                return finishCancelledAnalysis();
-              }
-              const analysis = await analyzeAudioFile(
-                candidate.source_path,
-                Uint8Array.from(bytes),
-                metadata,
-                {
-                  fingerprint: fingerprint || undefined,
-                  neteaseFilenameFormat: state.neteaseFilenameFormat,
-                  highLevelModels,
-                  workerClient: candidateWorker,
-                  workerJobId,
-                  onProgress: (progress) => {
-                    analysisState = {
-                      ...analysisState,
-                      stage: progress.stage,
-                      message: progress.message,
-                      currentItem: candidate.name,
-                      stageProcessed: progress.processed,
-                      stageTotal: progress.total,
-                      workerJobId,
-                    };
-                    updateAnalysisProgressDom();
-                    const now = Date.now();
-                    const stageChanged = progress.stage !== lastProgressStage;
-                    if (stageChanged || now - lastProgressEventAt >= 1000) {
-                      lastProgressEventAt = now;
-                      lastProgressStage = progress.stage;
-                      void recordSessionEvent('analysis_candidate_progress', {
-                        slot_index: slotIndex,
-                        name: candidate.name,
-                        source_path: candidate.source_path,
-                        destination_path: candidate.destination_path,
-                        worker_job_id: workerJobId,
-                        stage: progress.stage,
-                        model_id: progress.modelId,
-                        processed: progress.processed,
-                        total: progress.total,
-                        message: progress.message,
-                        stage_started_at: progress.stageStartedAt,
-                        elapsed_ms: progress.elapsedMs,
-                        backend: progress.backend,
-                        patch_count: progress.patchCount,
-                        tf_memory: progress.tfMemory,
-                      });
-                    }
-                  },
-                },
-              );
-              const completeness = state.enhancedMode
-                ? assessTrackAnalysisCompleteness(analysis)
-                : {
-                  complete: isBasicTrackAnalysisComplete(analysis),
-                  reasons: isBasicTrackAnalysisComplete(analysis) ? [] : ['基础分析未完成'],
-                  discogsCompletedHeads: 0,
-                  discogsTotalHeads: 0,
-                };
-              if (completeness.complete) {
-                if (onCandidateResult) {
-                  await onCandidateResult(candidate, analysis, null);
-                }
-                results.push(analysis);
-                groupResultCount += 1;
-              } else {
-                const failure: AppAnalysisFailure = {
-                  path: candidate.source_path,
-                  message: completeness.reasons.join('；') || '分析未满足完整性要求',
-                  status: 'failed',
-                  stage: 'analysis-completion',
-                  elapsedMs: Date.now() - candidateStartedAt,
-                };
-                failures.push(failure);
-                failedCount += 1;
-                groupFailedCount += 1;
-                // Persist partial basic values and successful individual
-                // heads together with the terminal failure. The Rust side
-                // keeps the existing successful head projections intact.
-                if (onCandidateResult) {
-                  await onCandidateResult(candidate, analysis, failure);
-                }
-                await recordSessionEvent('analysis_completion_rejected', {
-                  slot_index: slotIndex,
-                  name: candidate.name,
-                  source_path: candidate.source_path,
-                  destination_path: candidate.destination_path,
-                  worker_job_id: workerJobId,
-                  reasons: completeness.reasons,
-                  discogs_completed_heads: completeness.discogsCompletedHeads,
-                  discogs_total_heads: completeness.discogsTotalHeads,
-                });
-              }
-              freshResults.push(analysis);
-              await persistFreshResults([analysis]);
-              await recordSessionEvent('analysis_candidate_finished', {
-                slot_index: slotIndex,
-                name: candidate.name,
-                source_path: candidate.source_path,
-                destination_path: candidate.destination_path,
-                status: completeness.complete ? 'completed' : 'failed',
-                cached: false,
-                worker_job_id: workerJobId,
-                stage: completeness.complete ? 'completed' : 'analysis-completion',
-                elapsed_ms: Date.now() - candidateStartedAt,
-              });
-            } catch (error) {
-              if (analysisCancelRequested || error instanceof AnalysisWorkerCancelledError) {
-                return finishCancelledAnalysis();
-              }
-              failedCount += 1;
-              groupFailedCount += 1;
-              const failure: AppAnalysisFailure = {
-                path: candidate.source_path,
-                message: error instanceof Error ? error.message : String(error),
-              };
-              if (error instanceof AnalysisWorkerTimeoutError) {
-                failure.status = 'timeout';
-                failure.stage = error.stage;
-                failure.elapsedMs = error.elapsedMs;
-              }
-              failures.push(failure);
-              if (onCandidateResult) {
-                try {
-                  await onCandidateResult(candidate, null, failure);
-                } catch (persistenceError) {
-                  console.warn(`Failed to persist Essentia analysis failure for ${candidate.source_path}:`, persistenceError);
-                }
-              }
-              await recordSessionEvent('analysis_candidate_finished', {
-                slot_index: slotIndex,
-                name: candidate.name,
-                source_path: candidate.source_path,
-                status: failure.status ?? 'failed',
-                cached: false,
-                error: error instanceof Error ? error.message : String(error),
-                worker_job_id: workerJobId,
-                stage: failure.stage,
-                elapsed_ms: failure.elapsedMs ?? Date.now() - candidateStartedAt,
-              });
-              console.warn(`Essentia analysis failed for ${candidate.source_path}`, error);
-            } finally {
-              if (candidateWorker) {
-                await recordSessionEvent('analysis_worker_terminated', {
-                  slot_index: slotIndex,
-                  name: candidate.name,
-                  source_path: candidate.source_path,
-                  destination_path: candidate.destination_path,
-                  worker_job_id: workerJobId,
-                  elapsed_ms: Date.now() - candidateStartedAt,
-                });
-                terminateAnalysisWorker(candidateWorker);
-              }
-            }
-          }
-          if (analysisCancelRequested) {
-            return finishCancelledAnalysis();
-          }
-          analysisState = {
-            ...analysisState,
-            completed: analysisState.completed + 1,
-            resultCount: groupResultCount,
-            failedCount: groupFailedCount,
-            currentItem: candidate.name,
-            stage: 'completed',
-            stageProcessed: 0,
-            stageTotal: 0,
-            workerJobId: '',
-            message: t('scanAnalyzing', state.lang),
-          };
-          updateAnalysisProgressDom();
-          await yieldToUi();
+          results.push(analysis);
+          freshResults.push(analysis);
+        } catch (error) {
+          failedCount += 1;
+          failures.push({
+            path: candidate.source_path,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          console.warn(`Essentia analysis failed for ${candidate.source_path}`, error);
         }
       }
-
+      if (analysisCancelRequested) {
+        return finishCancelledAnalysis();
+      }
       analysisState = {
         ...analysisState,
-        slotIndex: null,
-        status: results.length > 0 ? 'completed' : 'error',
-        resultCount: results.length,
+        completed: analysisState.completed + 1,
         failedCount,
-        currentItem: '',
-        stage: results.length > 0 ? 'completed' : 'error',
-        stageProcessed: 0,
-        stageTotal: 0,
-        workerJobId: '',
-        resumeAvailable: false,
-        message: failedCount > 0
-          ? t('analysisPartial', state.lang)
-            .replace('{done}', String(results.length))
-            .replace('{total}', String(candidates.length))
-            .replace('{failed}', String(failedCount))
-          : t('analysisComplete', state.lang).replace('{count}', String(results.length)),
+        message: t('scanAnalyzing', state.lang),
       };
-      await persistFreshResults();
-      await recordSessionEvent('analysis_completed', {
-        result_count: results.length,
-        failure_count: failures.length,
-        candidate_count: candidates.length,
-      });
       render();
-      return { analyses: results, failures, cancelled: false };
-    } catch (error) {
-      if (!analysisCancelRequested && !(error instanceof AnalysisWorkerCancelledError)) {
-        await recordSessionEvent('analysis_error', {
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
-      throw error;
-    } finally {
-      analysisRunActive = false;
-      terminateAnalysisWorker(analysisWorker);
+      await yieldToUi();
     }
+
+    analysisState = {
+      ...analysisState,
+      status: results.length > 0 ? 'completed' : 'error',
+      resultCount: results.length,
+      failedCount,
+      message: failedCount > 0
+        ? t('analysisPartial', state.lang)
+          .replace('{done}', String(results.length))
+          .replace('{total}', String(candidates.length))
+          .replace('{failed}', String(failedCount))
+        : t('analysisComplete', state.lang).replace('{count}', String(results.length)),
+    };
+    await persistFreshResults();
+    render();
+    return { analyses: results, failures, cancelled: false };
   };
 
   const waitForConversionBatch = async (previews: AppPreview[]) => {
@@ -4901,168 +2459,33 @@ export function bindApp(
   };
 
   const runPostConversionAnalysis = async (batchId: string, previews: AppPreview[]) => {
-    const attemptId = `attempt-${createAnalysisBatchId()}`;
-    setResumableAnalysis({ batchId, previews, attemptId });
-    const recordSessionEvent = (
-      event: string,
-      details: Record<string, unknown> = {},
-    ): Promise<void> => {
-      if (!services.recordRuntimeSessionEvent) {
-        return Promise.resolve();
-      }
-      return services.recordRuntimeSessionEvent(batchId, event, details)
-        .catch((error) => console.warn(`Failed to record runtime session event ${event}:`, error));
-    };
-    const finalizeSession = async () => {
-      if (!services.finalizeAnalysisSession) {
-        return;
-      }
-      try {
-        await services.finalizeAnalysisSession(batchId);
-      } catch (error) {
-        console.warn('Failed to finalize runtime analysis session:', error);
-      }
-    };
-    await recordSessionEvent('analysis_requested', {
-      candidate_count: previews.reduce(
-        (total, preview) => total + preview.preview.candidates.length,
-        0,
-      ),
-      enhanced_mode: state.enhancedMode,
-      attempt_id: attemptId,
-    });
     try {
       const conversionReady = await waitForConversionBatch(previews);
       if (!conversionReady) {
-        await recordSessionEvent('analysis_cancelled', { reason: 'conversion_wait_cancelled' });
-        await finalizeSession();
         analysisState = {
           ...analysisState,
           status: 'cancelled',
           message: t('analysisCancelled', state.lang),
-          currentItem: '',
-          stage: 'cancelled',
-          resumeAvailable: resumableAnalysis !== null,
         };
         render();
         return;
       }
-      await recordSessionEvent('analysis_conversion_ready');
-      if (services.claimAnalysisRun) {
-        await services.claimAnalysisRun(batchId, attemptId);
-      }
-      const analysis = await analyzePreviewCandidates(
-        previews,
-        batchId,
-        async (candidate, result, failure) => {
-          // Keep writeback visible as its own post-conversion phase.  The
-          // worker has already completed here; exposing this transition makes
-          // it clear that the output-tag transaction, not model inference, is
-          // the current operation.
-          const sourcePreview = previews.find((preview) => preview.preview.candidates.some(
-            (item) => item.source_path === candidate.source_path,
-          ));
-          analysisState = {
-            ...analysisState,
-            slotIndex: sourcePreview?.slot_index ?? analysisState.slotIndex,
-            stage: 'writingBack',
-            message: state.lang === 'zh' ? '正在写回分析结果' : 'Writing analysis results',
-            currentItem: candidate.name,
-            stageProcessed: 0,
-            stageTotal: 1,
-          };
-          updateAnalysisProgressDom();
-          const nextState = await persistAnalysisCandidate(
-            batchId,
-            previews,
-            candidate,
-            result,
-            failure,
-          );
-          applyDesktopState(nextState);
-          await recordSessionEvent('analysis_candidate_persisted', {
-            source_path: candidate.source_path,
-            destination_path: candidate.destination_path,
-            status: failure?.status ?? (failure ? 'failed' : 'completed'),
-            stage: failure?.stage,
-            elapsed_ms: failure?.elapsedMs,
-          });
-          analysisState = {
-            ...analysisState,
-            stage: 'completed',
-            stageProcessed: 1,
-            stageTotal: 1,
-          };
-          updateAnalysisProgressDom();
-        },
-        attemptId,
-      );
-      if (analysis.cancelled) {
-        await finalizeSession();
-        return;
-      }
+      const analysis = await analyzePreviewCandidates(previews);
       if (analysis.analyses.length === 0 && analysis.failures.length === 0) {
-        await recordSessionEvent('analysis_completed', {
-          result_count: 0,
-          failure_count: 0,
-          persisted: false,
-          reason: 'no_results',
-        });
-        await finalizeSession();
-        clearResumableAnalysisForBatch(batchId);
-        analysisState = {
-          ...analysisState,
-          slotIndex: null,
-          status: 'completed',
-          message: t('analysisNoResults', state.lang),
-          currentItem: '',
-          stage: 'completed',
-          resumeAvailable: false,
-        };
-        render();
         return;
       }
-      await recordSessionEvent('analysis_results_ready', {
-        result_count: analysis.analyses.length,
-        failure_count: analysis.failures.length,
-      });
-      await recordSessionEvent('analysis_persisted', {
-        result_count: analysis.analyses.length,
-        failure_count: analysis.failures.length,
-        persistence: 'per_candidate',
-      });
-      await refreshHistory(false);
-      await finalizeSession();
-      clearResumableAnalysisForBatch(batchId);
-      analysisState = { ...analysisState, resumeAvailable: false };
+      const nextState = await services.applyTrackAnalysisResults(
+        batchId,
+        previews,
+        analysis.analyses,
+        analysis.failures,
+      );
+      applyDesktopState(nextState);
     } catch (error) {
-      if (analysisCancelRequested || error instanceof AnalysisWorkerCancelledError) {
-        await recordSessionEvent('analysis_cancelled', {
-          reason: 'worker_cancelled',
-          message: error instanceof Error ? error.message : String(error),
-        });
-        await finalizeSession();
-        analysisState = {
-          ...analysisState,
-          status: 'cancelled',
-          message: t('analysisCancelled', state.lang),
-          currentItem: '',
-          stage: 'cancelled',
-          resumeAvailable: resumableAnalysis !== null,
-        };
-        render();
-        return;
-      }
-      await recordSessionEvent('analysis_error', {
-        message: error instanceof Error ? error.message : String(error),
-      });
-      await finalizeSession();
       analysisState = {
         ...analysisState,
-        slotIndex: null,
         status: 'error',
         message: error instanceof Error ? error.message : String(error),
-        resumeAvailable: resumableAnalysis !== null,
       };
       console.warn('Enhanced analysis did not complete:', error);
       render();
@@ -5118,42 +2541,6 @@ export function bindApp(
     }
   };
 
-  // The native WebView menu exposes a Reload action that recreates the page and
-  // can interrupt the first-use flow. Reloading the app is intentionally not a
-  // product action; the explicit NetEase scan button owns that workflow.
-  root.addEventListener('contextmenu', (event) => {
-    const target = event.target as HTMLElement | null;
-    const row = target?.closest<HTMLElement>('[data-action="library-track-detail"]');
-    const trackKey = row?.dataset.trackKey;
-    if (row && trackKey && libraryState?.visible && !libraryState.busy) {
-      const pointer = event as MouseEvent;
-      event.preventDefault();
-      libraryState = {
-        ...libraryState,
-        contextMenu: { trackKey, x: pointer.clientX, y: pointer.clientY },
-      };
-      render();
-      return;
-    }
-    event.preventDefault();
-  });
-
-  // Native WebView reload/close can happen without a DOM click. Persist a
-  // best-effort unloading marker and ask for confirmation while a song is in
-  // flight; recovery remains based on the durable state file, not this event.
-  window.addEventListener('beforeunload', (event) => {
-    if (!analysisRunActive || !resumableAnalysis || !services.recordRuntimeSessionEvent) {
-      return;
-    }
-    event.preventDefault();
-    event.returnValue = '';
-    void services.recordRuntimeSessionEvent(
-      resumableAnalysis.batchId,
-      'analysis_renderer_unloading',
-      { attempt_id: resumableAnalysis.attemptId, reason: 'window_unload' },
-    );
-  });
-
   root.addEventListener('dragstart', (event) => {
     const header = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-library-column-header]');
     if (!header || !libraryState?.visible) return;
@@ -5189,64 +2576,13 @@ export function bindApp(
     draggedLibraryColumn = null;
   });
 
-  root.addEventListener('pointerdown', (event) => {
-    const resizer = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-library-column-resizer]');
-    if (!resizer) return;
-    const header = resizer.closest<HTMLElement>('[data-library-column-header]');
-    const id = resizer.dataset.libraryColumnResizer;
-    if (!header || !id) return;
-    resizingLibraryColumn = {
-      id,
-      startX: event.clientX,
-      startWidth: header.getBoundingClientRect().width,
-      width: header.getBoundingClientRect().width,
-      header,
-    };
-    header.draggable = false;
-    resizer.setPointerCapture?.(event.pointerId);
-    event.preventDefault();
-    event.stopPropagation();
-  });
-
-  root.addEventListener('pointermove', (event) => {
-    if (!resizingLibraryColumn) return;
-    const header = Array.from(root.querySelectorAll<HTMLElement>('[data-library-column-header]'))
-      .find((candidate) => candidate.dataset.libraryColumnHeader === resizingLibraryColumn?.id);
-    if (header) {
-      const width = Math.max(72, Math.min(420, resizingLibraryColumn.startWidth + event.clientX - resizingLibraryColumn.startX));
-      resizingLibraryColumn.width = width;
-      header.style.width = `${width}px`;
-    }
-  });
-
-  const finishLibraryColumnResize = () => {
-    if (!resizingLibraryColumn) return;
-    saveLibraryColumnWidth(resizingLibraryColumn.id, resizingLibraryColumn.width);
-    resizingLibraryColumn.header.draggable = true;
-    resizingLibraryColumn = null;
-  };
-
-  root.addEventListener('pointerup', finishLibraryColumnResize);
-  root.addEventListener('pointercancel', finishLibraryColumnResize);
-
   root.addEventListener('click', (event) => {
     const target = event.target as HTMLElement | null;
-    const contextAction = target?.closest<HTMLElement>('[data-action="relocate-library-track"], [data-action="remove-library-track"]');
-    const clearedContextMenu = Boolean(libraryState?.contextMenu && !contextAction);
-    if (clearedContextMenu && libraryState) {
-      libraryState = { ...libraryState, contextMenu: null };
-    }
     const modal = target?.closest('.about-modal');
     const libraryModal = target?.closest('.library-modal');
-    const djPlaylistModal = target?.closest('.dj-playlist-modal');
-    const dialog = target?.closest('.about-dialog, .help-dialog, .library-dialog, .dj-playlist-dialog');
+    const dialog = target?.closest('.about-dialog, .help-dialog, .library-dialog');
     if (libraryModal && !dialog) {
       libraryState = null;
-      render();
-      return;
-    }
-    if (djPlaylistModal && !dialog) {
-      djPlaylistState = null;
       render();
       return;
     }
@@ -5260,13 +2596,6 @@ export function bindApp(
       return;
     }
 
-    const sourceLink = target?.closest<HTMLAnchorElement>('[data-action="open-dj-crate-digger-link"]');
-    if (sourceLink) {
-      event.preventDefault();
-      void services.openExternalUrl(sourceLink.href);
-      return;
-    }
-
     const libraryRow = target?.closest<HTMLElement>('[data-action="library-track-detail"]');
     if (libraryRow && libraryState?.visible) {
       const trackKey = libraryRow.dataset.trackKey;
@@ -5276,7 +2605,6 @@ export function bindApp(
 
     const button = target?.closest<HTMLButtonElement>('button');
     if (!button) {
-      if (clearedContextMenu) render();
       return;
     }
 
@@ -5327,140 +2655,14 @@ export function bindApp(
       return;
     }
 
-    if (action === 'import-dj-playlist') {
-      openDjPlaylistLauncher();
-      return;
-    }
-
-    if (action === 'dj-playlist-open-import') {
-      void importDjPlaylist();
-      return;
-    }
-
-    if (action === 'dj-playlist-open-export') {
-      void openDjPlaylistExport();
-      return;
-    }
-
-    if (action === 'open-latest-dj-playlist') {
-      void openLatestDjPlaylist();
-      return;
-    }
-
-    if (action === 'close-dj-playlist') {
-      djPlaylistState = null;
-      render();
-      return;
-    }
-
-    if (action === 'dj-playlist-prev' || action === 'dj-playlist-next') {
-      if (djPlaylistState?.pages.length) {
-        const delta = action === 'dj-playlist-prev' ? -1 : 1;
-        const pageIndex = Math.max(0, Math.min(djPlaylistState.pages.length - 1, djPlaylistState.pageIndex + delta));
-        if (pageIndex !== djPlaylistState.pageIndex) {
-          djPlaylistState = { ...djPlaylistState, pageIndex };
-          render();
-          void refreshDjPlaylistQr();
-        }
-      }
-      return;
-    }
-
-    if (action === 'dj-playlist-copy-page') {
-      const page = djPlaylistState?.pages[djPlaylistState.pageIndex];
-      if (page) void copyDjPlaylistText(page.text);
-      return;
-    }
-
-    if (action === 'dj-playlist-copy-all') {
-      if (djPlaylistState?.playlist) void copyDjPlaylistText(buildNeteaseImportText(djPlaylistState.playlist.tracks));
-      return;
-    }
-
-    if (action === 'dj-playlist-export-txt') {
-      void exportDjPlaylistTxt();
-      return;
-    }
-
-    if (action === 'dj-playlist-export-w4dj') {
-      void exportDjPlaylistW4dj();
-      return;
-    }
-
-    if (action === 'dj-playlist-match') {
-      void matchDjPlaylist();
-      return;
-    }
-
-    if (action === 'dj-playlist-export-m3u8') {
-      void exportDjPlaylistM3u8(false);
-      return;
-    }
-
-    if (action === 'dj-playlist-export-partial') {
-      void exportDjPlaylistM3u8(true);
-      return;
-    }
-
-    if (action === 'dj-playlist-set-match') {
-      const position = Number(button.dataset.position);
-      const trackKey = button.dataset.trackKey;
-      if (djPlaylistState?.playlist && Number.isInteger(position) && trackKey && services.setImportedDjPlaylistMatch) {
-        void services.setImportedDjPlaylistMatch(djPlaylistState.playlist.playlistId, position, trackKey)
-          .then((report) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, matchReport: report }; render(); } })
-          .catch((error) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, error: error instanceof Error ? error.message : String(error) }; render(); } });
-      }
-      return;
-    }
-
-    if (action === 'dj-playlist-clear-match') {
-      const position = Number(button.dataset.position);
-      if (djPlaylistState?.playlist && Number.isInteger(position) && services.clearImportedDjPlaylistMatch) {
-        void services.clearImportedDjPlaylistMatch(djPlaylistState.playlist.playlistId, position)
-          .then((report) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, matchReport: report }; render(); } })
-          .catch((error) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, error: error instanceof Error ? error.message : String(error) }; render(); } });
-      }
-      return;
-    }
-
     if (action === 'close-library') {
       libraryState = null;
       render();
       return;
     }
 
-    if (action === 'search-library') {
-      searchLibrary();
-      return;
-    }
-
-    if (action === 'reanalyze-library') {
-      void reanalyzeLibrary();
-      return;
-    }
-
-    if (action === 'find-invalid-library') {
-      void findInvalidLibraryRecords();
-      return;
-    }
-
-    if (action === 'cancel-invalid-scan') {
-      void cancelInvalidLibraryScan();
-      return;
-    }
-
-    if (action === 'clear-invalid-library') {
-      void clearInvalidLibraryRecords();
-      return;
-    }
-
-    if (action === 'relocate-library-track') {
-      void relocateLibraryTrack();
-      return;
-    }
-
-    if (action === 'remove-library-track') {
-      void removeLibraryTrack();
+    if (action === 'refresh-library') {
+      void refreshLibrary();
       return;
     }
 
@@ -5488,20 +2690,11 @@ export function bindApp(
       const field = button.dataset.libraryField as LibraryField | undefined;
       if (!field) return;
       const current = libraryState.query.sorts.find((sort) => sort.field === field);
-      let sorts: LibraryQuery['sorts'];
-      if (event.shiftKey) {
-        sorts = current
-          ? current.direction === 'asc'
-            ? libraryState.query.sorts.map((sort) => sort.field === field ? { ...sort, direction: 'desc' as const } : sort)
-            : libraryState.query.sorts.filter((sort) => sort.field !== field)
-          : [...libraryState.query.sorts, { field, direction: 'asc' as const }];
-      } else {
-        sorts = current
-          ? current.direction === 'asc'
-            ? [{ field, direction: 'desc' as const }]
-            : []
-          : [{ field, direction: 'asc' as const }];
-      }
+      const sorts = current
+        ? current.direction === 'asc'
+          ? libraryState.query.sorts.map((sort) => sort.field === field ? { ...sort, direction: 'desc' as const } : sort)
+          : libraryState.query.sorts.filter((sort) => sort.field !== field)
+        : [{ field, direction: 'asc' as const }];
       void queryLibrary({ ...libraryState.query, sorts, offset: 0 });
       return;
     }
@@ -5520,22 +2713,16 @@ export function bindApp(
       const fieldSelect = root.querySelector<HTMLSelectElement>('select[data-action="library-filter-field"]');
       const operatorSelect = root.querySelector<HTMLSelectElement>('select[data-action="library-filter-operator"]');
       const valueInput = root.querySelector<HTMLInputElement>('input[data-action="library-filter-value"]');
-      const secondValueInput = root.querySelector<HTMLInputElement>('input[data-action="library-filter-second-value"]');
       if (!fieldSelect || !operatorSelect || !valueInput) return;
-      const field = fieldSelect.value as LibraryField;
       const operator = operatorSelect.value as LibraryOperator;
-      if (!libraryOperatorsForField(field).includes(operator)) return;
-      if (valueInput.type === 'number' && valueInput.value.trim() && !Number.isFinite(Number(valueInput.value))) return;
       const filter: LibraryFilter = {
-        field,
+        field: fieldSelect.value as LibraryField,
         operator,
         value: ['is_empty', 'is_not_empty', 'is_true', 'is_false'].includes(operator)
           ? null
           : valueInput.value,
-        secondValue: operator === 'between' ? secondValueInput?.value || null : null,
       };
       if (!filter.value && !['is_empty', 'is_not_empty', 'is_true', 'is_false'].includes(operator)) return;
-      if (operator === 'between' && !filter.secondValue) return;
       void queryLibrary({ ...libraryState.query, filters: [...libraryState.query.filters, filter], offset: 0 });
       return;
     }
@@ -5576,8 +2763,9 @@ export function bindApp(
     if (action === 'dismiss-onboarding') {
       onboardingVisible = false;
       onboardingStep = 0;
-      markOnboardingSeen();
+      localStorage.setItem('w4dj_onboarding_seen', '1');
       render();
+      void discoverNeteaseAfterOnboarding();
       return;
     }
 
@@ -5585,11 +2773,14 @@ export function bindApp(
       if (onboardingStep === ONBOARDING_STEP_COUNT - 1) {
         onboardingVisible = false;
         onboardingStep = 0;
-        markOnboardingSeen();
+        localStorage.setItem('w4dj_onboarding_seen', '1');
       } else {
         onboardingStep = (onboardingStep + 1) as OnboardingStep;
       }
       render();
+      if (!onboardingVisible) {
+        void discoverNeteaseAfterOnboarding();
+      }
       return;
     }
 
@@ -5649,7 +2840,7 @@ export function bindApp(
       return;
     }
 
-    if (action === 'cancel-preview') {
+    if (action === 'cancel-preview' || action === 'edit-preview') {
       if (!previewBusy) {
         previewModal = null;
         render();
@@ -5663,7 +2854,7 @@ export function bindApp(
     }
 
     if (action === 'close-scan') {
-      if (scanProgress?.status !== 'running' && scanProgress?.status !== 'cancelling') {
+      if (scanProgress?.status !== 'running') {
         scanProgress = null;
         pendingGlobalAction = null;
         render();
@@ -5684,18 +2875,10 @@ export function bindApp(
       return;
     }
 
-    if (action === 'export-error-report') {
+    if (action === 'export-history') {
       const historyId = button.dataset.historyId;
       if (historyId) {
-        void exportHistoryErrorReport(historyId);
-      }
-      return;
-    }
-
-    if (action === 'export-runtime-session') {
-      const historyId = button.dataset.historyId;
-      if (historyId) {
-        void exportRuntimeSession(historyId);
+        void exportHistory(historyId);
       }
       return;
     }
@@ -5723,18 +2906,8 @@ export function bindApp(
       return;
     }
 
-    if (action === 'scan-local-netease') {
-      void scanLocalNeteaseFolder();
-      return;
-    }
-
-    if (action === 'select-netease-database') {
-      void selectNeteaseMetadataDatabase();
-      return;
-    }
-
-    if (action === 'clear-netease-database') {
-      void clearNeteaseMetadataDatabase();
+    if (action === 'download-essentia-models') {
+      void downloadEssentiaModels();
       return;
     }
 
@@ -5750,11 +2923,6 @@ export function bindApp(
 
     if (action === 'cancel-analysis') {
       cancelAnalysisFlow();
-      return;
-    }
-
-    if (action === 'resume-analysis') {
-      resumeAnalysisFlow();
       return;
     }
 
@@ -5846,27 +3014,8 @@ export function bindApp(
   });
 
   root.addEventListener('keydown', (event) => {
-    const searchInput = (event.target as HTMLElement | null)?.closest<HTMLInputElement>('input[data-action="library-search"]');
-    if (event.key === 'Enter' && searchInput && libraryState?.visible && !librarySearchComposing && !event.isComposing) {
-      event.preventDefault();
-      if (librarySearchTimer) {
-        clearTimeout(librarySearchTimer);
-        librarySearchTimer = null;
-      }
-      libraryQueryRevision += 1;
-      const query = { ...libraryState.query, text: searchInput.value, offset: 0 };
-      libraryState = { ...libraryState, query };
-      void queryLibrary(query);
-      return;
-    }
-
     if (event.key === 'Escape' && libraryState?.visible) {
       event.preventDefault();
-      if (libraryState.contextMenu) {
-        libraryState = { ...libraryState, contextMenu: null };
-        render();
-        return;
-      }
       libraryState = null;
       render();
       return;
@@ -5874,12 +3023,6 @@ export function bindApp(
     if (event.key === 'Escape' && helpVisible) {
       event.preventDefault();
       helpVisible = false;
-      render();
-      return;
-    }
-    if (event.key === 'Escape' && djPlaylistState?.visible) {
-      event.preventDefault();
-      djPlaylistState = null;
       render();
       return;
     }
@@ -5892,8 +3035,9 @@ export function bindApp(
       event.preventDefault();
       onboardingVisible = false;
       onboardingStep = 0;
-      markOnboardingSeen();
+      localStorage.setItem('w4dj_onboarding_seen', '1');
       render();
+      void discoverNeteaseAfterOnboarding();
       return;
     }
 
@@ -5909,7 +3053,8 @@ export function bindApp(
       if (onboardingStep === ONBOARDING_STEP_COUNT - 1) {
         onboardingVisible = false;
         onboardingStep = 0;
-        markOnboardingSeen();
+        localStorage.setItem('w4dj_onboarding_seen', '1');
+        void discoverNeteaseAfterOnboarding();
       } else {
         onboardingStep = (onboardingStep + 1) as OnboardingStep;
       }
@@ -5928,58 +3073,8 @@ export function bindApp(
   }, true);
 
   root.addEventListener('change', (event) => {
-    const checkbox = (event.target as HTMLElement | null)?.closest<HTMLInputElement>('input[data-action="library-confirm-clear-invalid"]');
-    if (checkbox && libraryState) {
-      libraryState = { ...libraryState, confirmClearInvalid: checkbox.checked, notice: null };
-      render();
-      return;
-    }
-    const concurrencyInput = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
-      'input[data-action="choose-concurrency-number"]',
-    );
-    if (concurrencyInput) {
-      const parsed = Number(concurrencyInput.value);
-      const normalized = Number.isFinite(parsed)
-        ? Math.min(10, Math.max(1, Math.round(parsed)))
-        : state.concurrencyLimit;
-      concurrencyInput.value = String(normalized);
-      void runAction(() => services.chooseConcurrencyLimit(String(normalized)), 'all');
-      return;
-    }
-    const concurrencyRange = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
-      'input[data-action="choose-concurrency-range"]',
-    );
-    if (concurrencyRange) {
-      const parsed = Number(concurrencyRange.value);
-      const normalized = Number.isFinite(parsed)
-        ? Math.min(10, Math.max(1, Math.round(parsed)))
-        : state.concurrencyLimit;
-      concurrencyRange.value = String(normalized);
-      void runAction(() => services.chooseConcurrencyLimit(String(normalized)), 'all');
-      return;
-    }
     const select = (event.target as HTMLElement | null)?.closest<HTMLSelectElement>('select');
     if (!select) {
-      return;
-    }
-
-    if (select.dataset.action === 'library-filter-field') {
-      const operator = root.querySelector<HTMLSelectElement>('select[data-action="library-filter-operator"]');
-      const value = root.querySelector<HTMLInputElement>('input[data-action="library-filter-value"]');
-      const field = select.value as LibraryField;
-      const allowed = libraryOperatorsForField(field);
-      if (operator) {
-        operator.replaceChildren(...allowed.map((item) => {
-          const option = document.createElement('option');
-          option.value = item;
-          option.textContent = item;
-          return option;
-        }));
-      }
-      if (value) {
-        value.type = ['bpm', 'bitrate', 'file_size', 'duration', 'energy', 'danceability', 'loudness', 'updated_at'].includes(field) ? 'number' : 'text';
-        value.value = '';
-      }
       return;
     }
 
@@ -5999,104 +3094,35 @@ export function bindApp(
       return;
     }
 
-  });
-
-  root.addEventListener('compositionstart', (event) => {
-    const input = (event.target as HTMLElement | null)?.closest<HTMLInputElement>('input[data-action="library-search"]');
-    if (!input) return;
-    librarySearchComposing = true;
-    libraryQueryRevision += 1;
-    if (librarySearchTimer) {
-      clearTimeout(librarySearchTimer);
-      librarySearchTimer = null;
-    }
-  });
-
-  root.addEventListener('compositionend', (event) => {
-    const input = (event.target as HTMLElement | null)?.closest<HTMLInputElement>('input[data-action="library-search"]');
-    if (input) {
-      librarySearchComposing = false;
+    if (select.dataset.action === 'choose-netease-filename-format') {
+      const format = select.value as AppNeteaseFilenameFormat;
+      if (format !== state.neteaseFilenameFormat) {
+        void runAction(() => services.chooseNeteaseFilenameFormat(format), 'all');
+      }
     }
   });
 
   root.addEventListener('input', (event) => {
     const target = event.target as HTMLElement | null;
     const input = target?.closest<HTMLInputElement>('input');
-    if (!input) return;
-    if (input.dataset.action === 'choose-concurrency-range') {
-      const normalized = Math.min(10, Math.max(1, Math.round(Number(input.value))));
-      const numberInput = root.querySelector<HTMLInputElement>('input[data-action="choose-concurrency-number"]');
-      if (numberInput) numberInput.value = String(normalized);
-      return;
-    }
-    if (!libraryState) return;
+    if (!input || !libraryState) return;
     if (input.dataset.action === 'library-search') {
-      // Invalidate an in-flight request as soon as the user changes the text.
-      // Waiting until the next debounce fires lets an older, shorter query
-      // overwrite the current IME/search value in the meantime.
-      libraryQueryRevision += 1;
       const query = { ...libraryState.query, text: input.value, offset: 0 };
-      // Keep the state in sync immediately. A result from an older debounced
-      // request can otherwise re-render the input with stale text and move the
-      // caret while the user is still typing.
-      libraryState = { ...libraryState, query };
-      if (librarySearchComposing || (event as InputEvent).isComposing) {
-        librarySearchComposing = true;
-        if (librarySearchTimer) {
-          clearTimeout(librarySearchTimer);
-          librarySearchTimer = null;
-        }
-        return;
-      }
-      if (libraryRenderDeferred) {
-        libraryRenderDeferred = false;
-        render();
-      }
       if (librarySearchTimer) clearTimeout(librarySearchTimer);
       librarySearchTimer = setTimeout(() => {
         librarySearchTimer = null;
         void queryLibrary(query);
-      }, 250);
+      }, 180);
     } else if (input.dataset.action === 'library-lyrics-search') {
       libraryState = { ...libraryState, lyricsSearch: input.value };
       render();
     }
   });
 
-  const setDjDropActive = (active: boolean) => {
-    if (!djPlaylistState && !active) return;
-    if (djPlaylistState?.dropActive === active) return;
-    if (active) {
-      djPlaylistState = djPlaylistState
-        ? { ...djPlaylistState, dropActive: true }
-        : {
-          visible: false,
-          busy: false,
-          error: null,
-          notice: null,
-          playlist: null,
-          pages: [],
-          pageIndex: 0,
-          qrDataUrl: null,
-          qrRevision: 0,
-          matchBusy: false,
-          matchReport: null,
-          exportBusy: false,
-          dropActive: true,
-        };
-    } else if (djPlaylistState) {
-      djPlaylistState = { ...djPlaylistState, dropActive: false };
-    }
-    render();
-  };
-
-  let nativePlaylistDragActive = false;
-
   const clearDropTargets = () => {
     root.querySelectorAll<HTMLElement>('[data-drop-kind].is-drag-over').forEach((target) => {
       target.classList.remove('is-drag-over');
     });
-    setDjDropActive(false);
   };
 
   const dropTargetAt = (position: { x: number; y: number }, scaleFactor: number) => {
@@ -6123,26 +3149,25 @@ export function bindApp(
     );
   };
 
-  const pathsFromBrowserDrop = (event: DragEvent): string[] => {
-    const files = Array.from(event.dataTransfer?.files ?? []) as Array<File & { path?: string }>;
-    const paths = files
-      .map((file) => file.path || file.name)
-      .filter((path): path is string => Boolean(path));
-    if (paths.length > 0) {
-      return paths;
+  const pathFromBrowserDrop = (event: DragEvent): string | null => {
+    const file = event.dataTransfer?.files[0] as (File & { path?: string }) | undefined;
+    if (file?.path) {
+      return file.path;
     }
 
-    return (event.dataTransfer?.getData('text/uri-list') ?? '')
+    const uri = event.dataTransfer?.getData('text/uri-list')
       .split('\n')
       .map((value) => value.trim())
-      .filter((value) => value && !value.startsWith('#') && value.startsWith('file://'))
-      .flatMap((uri) => {
-        try {
-          return [decodeURIComponent(new URL(uri).pathname)];
-        } catch {
-          return [];
-        }
-      });
+      .find((value) => value && !value.startsWith('#'));
+    if (!uri || !uri.startsWith('file://')) {
+      return null;
+    }
+
+    try {
+      return decodeURIComponent(new URL(uri).pathname);
+    } catch {
+      return null;
+    }
   };
 
   const browserDropTargetAt = (event: DragEvent): HTMLElement | null => {
@@ -6178,19 +3203,6 @@ export function bindApp(
   };
 
   root.addEventListener('dragover', (event) => {
-    const paths = pathsFromBrowserDrop(event);
-    const playlistPaths = w4djPlaylistPaths(paths);
-    if (playlistPaths.length > 0) {
-      clearDropTargets();
-      if (playlistPaths.length === 1 && paths.length === 1) setDjDropActive(true);
-      event.preventDefault();
-      return;
-    }
-    if (containsModelFile(paths)) {
-      clearDropTargets();
-      event.preventDefault();
-      return;
-    }
     const target = browserDropTargetAt(event);
     clearDropTargets();
     if (!target) {
@@ -6202,24 +3214,6 @@ export function bindApp(
   });
 
   root.addEventListener('drop', (event) => {
-    const paths = pathsFromBrowserDrop(event);
-    const playlistPaths = w4djPlaylistPaths(paths);
-    if (playlistPaths.length > 0) {
-      clearDropTargets();
-      event.preventDefault();
-      if (playlistPaths.length === 1 && paths.length === 1) {
-        void importDjPlaylistPath(playlistPaths[0]);
-      } else {
-        window.alert(state.lang === 'zh' ? '请一次只拖入一个 .w4dj 文件。' : 'Drop exactly one .w4dj file.');
-      }
-      return;
-    }
-    if (containsModelFile(paths)) {
-      clearDropTargets();
-      event.preventDefault();
-      window.alert(t('essentiaModelsDropDisabled', state.lang));
-      return;
-    }
     const target = browserDropTargetAt(event);
     clearDropTargets();
     if (!target) {
@@ -6227,14 +3221,7 @@ export function bindApp(
     }
 
     event.preventDefault();
-    handleDirectoryDrop(target, paths[0] ?? null);
-  });
-
-  root.addEventListener('dragleave', (event) => {
-    if (event.relatedTarget instanceof Node && root.contains(event.relatedTarget)) {
-      return;
-    }
-    clearDropTargets();
+    handleDirectoryDrop(target, pathFromBrowserDrop(event));
   });
 
   try {
@@ -6244,43 +3231,7 @@ export function bindApp(
       .catch(() => window.devicePixelRatio || 1);
     const listener = currentWindow.onDragDropEvent(async ({ payload }: { payload: DragDropEvent }) => {
       if (payload.type === 'leave') {
-        nativePlaylistDragActive = false;
         clearDropTargets();
-        return;
-      }
-
-      const droppedPaths = payload.type === 'enter' || payload.type === 'drop' ? payload.paths : [];
-      const playlistPaths = w4djPlaylistPaths(droppedPaths);
-      if (playlistPaths.length > 0) {
-        clearDropTargets();
-        if (playlistPaths.length === 1 && droppedPaths.length === 1) {
-          nativePlaylistDragActive = payload.type !== 'drop';
-          setDjDropActive(true);
-          if (payload.type === 'drop') {
-            nativePlaylistDragActive = false;
-            void importDjPlaylistPath(playlistPaths[0]);
-          }
-        } else if (payload.type === 'drop') {
-          nativePlaylistDragActive = false;
-          window.alert(state.lang === 'zh' ? '请一次只拖入一个 .w4dj 文件。' : 'Drop exactly one .w4dj file.');
-        }
-        return;
-      }
-
-      if (payload.type === 'over' && nativePlaylistDragActive) {
-        clearDropTargets();
-        setDjDropActive(true);
-        return;
-      }
-      if (payload.type === 'drop') {
-        nativePlaylistDragActive = false;
-      }
-
-      if ((payload.type === 'enter' || payload.type === 'drop') && containsModelFile(payload.paths)) {
-        clearDropTargets();
-        if (payload.type === 'drop') {
-          window.alert(t('essentiaModelsDropDisabled', state.lang));
-        }
         return;
       }
 
@@ -6299,144 +3250,21 @@ export function bindApp(
     // Tauri drag-and-drop is unavailable in the browser test environment.
   }
 
-  if (services.listenLibraryRefreshProgress) {
-    void services.listenLibraryRefreshProgress((progress) => {
-      void handleLibraryRefreshProgress(progress);
-    }).catch((error) => console.warn('Failed to subscribe to library refresh progress:', error));
-  }
-
-  if (services.listenInvalidLibraryScanProgress) {
-    void services.listenInvalidLibraryScanProgress((progress) => {
-      void handleInvalidLibraryScanProgress(progress);
-    }).catch((error) => console.warn('Failed to subscribe to invalid library scan progress:', error));
-  }
-
-  if (services.listenNeteaseDiscoveryProgress) {
-    void services.listenNeteaseDiscoveryProgress((progress) => {
-      neteaseDiscoveryProgress = progress;
-      if (progress.status === 'running') {
-        if (!updateNeteaseDiscoveryProgressDom(progress)) {
-          render();
-        }
-        return;
-      }
-      if (progress.status === 'completed') {
-        setTimeout(() => {
-          if (neteaseDiscoveryProgress === progress) {
-            neteaseDiscoveryProgress = null;
-            render();
-          }
-        }, 1800);
-      }
-      render();
-    }).catch((error) => console.warn('Failed to subscribe to NetEase discovery progress:', error));
-  }
-
-  if (services.listenNeteaseMetadataCacheProgress) {
-    void services.listenNeteaseMetadataCacheProgress((progress) => {
-      const status = neteaseMetadataDatabase.status;
-      neteaseMetadataDatabase = {
-        ...neteaseMetadataDatabase,
-        status: status
-          ? {
-            ...status,
-            cacheStatus: progress.status,
-            cachedRecordCount: progress.cachedRecordCount,
-          }
-          : status,
-        busy: progress.status === 'building' || progress.status === 'cancelling',
-        message: progress.message || neteaseMetadataDatabase.message,
-        error: progress.error,
-      };
-      render();
-    }).catch((error) => console.warn('Failed to subscribe to NetEase metadata cache progress:', error));
-  }
-
-  if (resumableAnalysis) {
-    const resumableTotal = resumableAnalysis.previews.reduce(
-      (total, preview) => total + preview.preview.candidates.length,
-      0,
-    );
-    analysisState = {
-      ...analysisState,
-      status: 'cancelled',
-      total: resumableTotal,
-      stage: 'cancelled',
-      message: state.lang === 'zh' ? '上次增强分析未完成，可继续' : 'The previous enhanced analysis was interrupted; resume it',
-      resumeAvailable: true,
-    };
-  }
-
-  // The WebView can lose localStorage on a reload or after an application
-  // restart. Runtime sessions are the durable source of truth; restore only
-  // the resumable offer here and never start analysis automatically.
-  if (services.loadIncompleteAnalysisRun) {
-    void services.loadIncompleteAnalysisRun()
-      .then((run) => {
-        if (!run || run.previews.length === 0) {
-          return;
-        }
-        setResumableAnalysis({
-          batchId: run.batchId,
-          previews: run.previews,
-          analysis: run.analysis,
-        });
-        const total = run.analysis?.total
-          ?? run.previews.reduce(
-            (count, preview) => count + preview.preview.candidates.length,
-            0,
-          );
-        analysisState = {
-          ...analysisState,
-          status: 'cancelled',
-          total,
-          completed: run.analysis?.completed ?? analysisState.completed,
-          failedCount: (run.analysis?.failed ?? 0) + (run.analysis?.timedOut ?? 0),
-          currentItem: run.analysis?.currentItem ?? '',
-          stage: run.analysis?.currentStage ?? 'cancelled',
-          workerJobId: run.analysis?.workerJobId ?? '',
-          message: state.lang === 'zh'
-            ? '上次增强分析未完成，可继续'
-            : 'The previous enhanced analysis was interrupted; resume it',
-          resumeAvailable: true,
-        };
-        render();
-      })
-      .catch((error) => console.warn('Failed to restore incomplete analysis run:', error));
-  }
-
   render();
   analysisCacheLoadPromise = loadAnalysisCache();
-  void loadImportedDjPlaylistList();
-  desktopStateHydration = services.loadDesktopState()
-    .then((desktopState) => applyDesktopState(desktopState))
-    .catch((error) => {
-      console.warn('Failed to hydrate desktop state before conversion:', error);
-    });
-  if (services.loadNeteaseMetadataDatabaseStatus) {
-    void desktopStateHydration
-      .then(async () => {
-        try {
-          const status = await services.loadNeteaseMetadataDatabaseStatus?.();
-          if (status) {
-            neteaseMetadataDatabase = {
-              status,
-              busy: false,
-              message: null,
-              error: null,
-            };
-            render();
-          }
-        } catch (error) {
-          neteaseMetadataDatabase = {
-            ...neteaseMetadataDatabase,
-            error: error instanceof Error ? error.message : String(error),
-          };
-          render();
-        }
-      });
-  }
+  void runAction(() => services.loadDesktopState());
   void refreshHistory();
+  if (!onboardingVisible) {
+    void discoverNeteaseAfterOnboarding();
+  }
+  if (services.getEssentiaModelStatus) {
+    void services.getEssentiaModelStatus()
+      .then((status) => {
+        modelStatus = status;
+        render();
+      })
+      .catch((error) => console.warn('Failed to load Essentia model status:', error));
+  }
 }
 
 function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSelection = null): string {
@@ -6463,16 +3291,10 @@ function renderOutputSettings(
   expanded = false,
   modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus,
 ): string {
-  const discogs = modelStatus.discogsEffnet;
-  const discogsReady = !discogs || Object.values(discogs).every(Boolean);
-  const modelsReady = modelStatus.embedding
-    && modelStatus.genre
-    && modelStatus.mood
-    && modelStatus.instrument
-    && discogsReady;
+  const modelsReady = modelStatus.embedding && modelStatus.genre && modelStatus.mood && modelStatus.instrument;
   return `
     <details class="output-settings" data-role="advanced-output-settings" aria-label="${t('advancedOptions', state.lang)}" ${expanded ? 'open' : ''}>
-      <summary aria-label="${t('advancedOptions', state.lang)}">${t('advancedOptions', state.lang)}</summary>
+      <summary>${t('advancedOptions', state.lang)}</summary>
       <div class="output-settings-content">
         <label>
           <span>${t('conflictStrategy', state.lang)}</span>
@@ -6490,44 +3312,29 @@ function renderOutputSettings(
             <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
           </select>
         </label>
-        <div class="concurrency-setting" data-role="concurrency-setting">
-          <label for="concurrency-limit-range"><span>${t('concurrencyLimit', state.lang)}</span></label>
-          <div class="concurrency-controls">
-            <input
-              id="concurrency-limit-range"
-              type="range"
-              min="1"
-              max="10"
-              step="1"
-              value="${state.concurrencyLimit}"
-              data-action="choose-concurrency-range"
-              aria-label="${t('concurrencyLimit', state.lang)}"
-            />
-            <input
-              type="number"
-              min="1"
-              max="10"
-              step="1"
-              value="${state.concurrencyLimit}"
-              data-action="choose-concurrency-number"
-              aria-label="${t('concurrencyLimit', state.lang)}"
-            />
+        <label>
+          <span>${t('neteaseFilenameFormat', state.lang)}</span>
+          <select data-action="choose-netease-filename-format" aria-label="${t('neteaseFilenameFormat', state.lang)}">
+            <option value="title_only" ${state.neteaseFilenameFormat === 'title_only' ? 'selected' : ''}>${t('neteaseTitleOnly', state.lang)}</option>
+            <option value="artist_title" ${state.neteaseFilenameFormat === 'artist_title' ? 'selected' : ''}>${t('neteaseArtistTitle', state.lang)}</option>
+            <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('neteaseTitleArtist', state.lang)}</option>
+          </select>
+        </label>
+        <div class="essentia-model-settings">
+          <span class="essentia-model-title">${t('essentiaModelsTitle', state.lang)}</span>
+          <small>${modelsReady ? t('essentiaModelsReady', state.lang) : t('essentiaModelsMissing', state.lang)}</small>
+          <div class="essentia-model-actions">
+            <button type="button" class="secondary-action essentia-model-download" data-action="download-essentia-models" ${modelStatus.downloading ? 'disabled' : ''}>
+              ${modelStatus.downloading ? t('essentiaModelsDownloading', state.lang) : t('essentiaModelsDownload', state.lang)}
+            </button>
+            <button type="button" class="secondary-action enhanced-cache-clear" data-action="clear-analysis-cache">
+              ${t('clearEnhancedCache', state.lang)}
+            </button>
           </div>
         </div>
-        ${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? `
-          <div class="essentia-model-settings">
-            <span class="essentia-model-title">${t('essentiaModelsTitle', state.lang)}</span>
-            <small>${modelsReady ? t('essentiaModelsReady', state.lang) : t('essentiaModelsMissing', state.lang)}</small>
-            <div class="essentia-model-actions">
-              <button type="button" class="secondary-action enhanced-cache-clear" data-action="clear-analysis-cache">
-                ${t('clearEnhancedCache', state.lang)}
-              </button>
-            </div>
-          </div>
-          <button type="button" class="secondary-action scan-cache-clear" data-action="clear-scan-cache">
-            ${t('clearScanCache', state.lang)}
-          </button>
-        ` : ''}
+        <button type="button" class="secondary-action scan-cache-clear" data-action="clear-scan-cache">
+          ${t('clearScanCache', state.lang)}
+        </button>
       </div>
     </details>
   `;
@@ -6672,7 +3479,6 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
       progressText: formatDesktopProgress(slot, lang),
       currentFile: slot.current_file,
       logs: slot.logs,
-      activeConcurrencyLimit: slot.active_concurrency_limit ?? null,
     })) as [AppSyncSlotViewState, AppSyncSlotViewState],
     mode: state.mode,
     losslessFormat: state.lossless_format,
@@ -6681,7 +3487,6 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
     conflictStrategy: state.conflict_strategy,
     filenameRule: state.filename_rule,
     neteaseFilenameFormat: state.netease_filename_format,
-    concurrencyLimit: Math.min(10, Math.max(1, Math.round(state.concurrency_limit || 2))),
     lang,
     theme,
   };
@@ -6712,7 +3517,6 @@ function scanPhaseLabel(phase: AppScanPhase, lang: AppLanguage): string {
     preparing: 'scanPreparing',
     scanning_source: 'scanSource',
     scanning_destination: 'scanDestination',
-    matching_metadata: 'scanMatchingMetadata',
     checking: 'scanChecking',
     analyzing: 'scanAnalyzing',
     completed: 'scanCompleted',
@@ -6796,7 +3600,7 @@ function parseSlotIndex(value: string | undefined): SyncSlotIndex | null {
   return null;
 }
 
-function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' | 'convert' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow' | 'help' | 'refresh'): string {
+function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' | 'convert' | 'disc' | 'play' | 'pause' | 'list' | 'sun' | 'moon' | 'arrow' | 'help'): string {
   const icons = {
     folder: '<path d="M2.5 5.1h3.4l1.1 1.2h6.5v5.2H2.5z"/><path d="M2.5 4.5h3.2l1.3 1.2"/>',
     music: '<path d="M6.2 11.2V4.6l6-1.2v6.4"/><path d="M6.2 6.5l6-1.2"/><circle cx="4.5" cy="11.5" r="1.7"/><circle cx="10.5" cy="10.1" r="1.7"/>',
@@ -6813,7 +3617,6 @@ function icon(name: 'folder' | 'music' | 'export' | 'open' | 'trash' | 'check' |
     moon: '<path d="M12.7 10.4A5.3 5.3 0 0 1 5.6 3.3a5.3 5.3 0 1 0 7.1 7.1z"/>',
     arrow: '<path d="M2.5 8h10.2"/><path d="m9.4 4.8 3.3 3.2-3.3 3.2"/>',
     help: '<circle cx="8" cy="8" r="5.5"/><path d="M6.4 6.3a1.8 1.8 0 1 1 3.1 1.3c-.8.6-1.4 1-1.4 2"/><path d="M8 11.9h.01"/>',
-    refresh: '<path d="M13 5.2A5.4 5.4 0 1 0 13.2 9"/><path d="M13 2.8v2.8h-2.8"/>',
   } as const;
 
   return `<span class="ui-icon ui-icon-${name}"><svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">${icons[name]}</svg></span>`;
