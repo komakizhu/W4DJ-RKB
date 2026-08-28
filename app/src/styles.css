@@ -920,13 +920,6 @@ h1 {
   text-align: right;
 }
 
-.netease-situation-label {
-  flex: 0 0 auto;
-  color: var(--text);
-  font-weight: 800;
-  letter-spacing: 0.04em;
-}
-
 .netease-situation-value {
   min-width: 0;
   overflow: hidden;

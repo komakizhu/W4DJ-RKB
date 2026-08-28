@@ -773,7 +773,9 @@ describe('renderApp', () => {
     const neteaseToolbar = root.querySelector('[data-role="netease-source-toolbar"]');
     const databaseStatus = root.querySelector('[data-role="netease-database-status"]');
     const situation = root.querySelector('[data-role="netease-situation"]');
-    expect(situation?.querySelector('.netease-situation-label')?.textContent).toBe('情况');
+    expect(situation?.querySelector('.netease-situation-label')).toBeNull();
+    expect(situation?.querySelector('[data-role="netease-situation-value"]')?.textContent)
+      .toBe('数据库已选');
     expect(situation?.getAttribute('data-tone')).toBe('success');
     expect(databaseStatus?.parentElement).toBe(neteaseToolbar);
     expect(databaseStatus?.nextElementSibling).toBe(
@@ -781,9 +783,9 @@ describe('renderApp', () => {
     );
   });
 
-  it('resolves the NetEase situation label across loading, cache, fallback, and error states', () => {
+  it('resolves compact NetEase status text while retaining diagnostic details', () => {
     expect(resolveNeteaseSituation(undefined, 'zh')).toEqual({
-      message: '正在读取网易云状态…',
+      message: '读取中',
       tone: 'running',
     });
     expect(resolveNeteaseSituation({
@@ -815,7 +817,8 @@ describe('renderApp', () => {
       message: null,
       error: null,
     }, 'en')).toEqual({
-      message: 'NetEase lightweight index is ready · 42 records',
+      message: 'Index ready',
+      detail: 'Index ready · 42',
       tone: 'success',
     });
     expect(resolveNeteaseSituation({
@@ -843,7 +846,7 @@ describe('renderApp', () => {
       busy: false,
       message: null,
       error: 'schema 不受支持',
-    }, 'zh')).toEqual({ message: 'schema 不受支持', tone: 'error' });
+    }, 'zh')).toEqual({ message: '读取错误', detail: 'schema 不受支持', tone: 'error' });
   });
 
   it('puts enhanced analysis progress in the Task 1 slot footer', () => {
@@ -2265,7 +2268,7 @@ describe('bindApp', () => {
     expect(startConfirmedSync).not.toHaveBeenCalled();
     expect(refreshLibraryCatalog).not.toHaveBeenCalled();
     expect(root.querySelector('[data-role="netease-database-status"]')?.textContent)
-      .toContain('已选择数据库');
+      .toContain('数据库已选');
   });
 
   it('does not overwrite the previous database state when the picker is cancelled or validation fails', async () => {
@@ -2299,6 +2302,8 @@ describe('bindApp', () => {
     expect(root.querySelector('[data-action="select-netease-database"]')?.textContent)
       .toContain('old.sqlite3');
     expect(root.querySelector('[data-role="netease-database-status"]')?.textContent)
+      .toContain('读取错误');
+    expect(root.querySelector('[data-role="netease-database-status"]')?.getAttribute('title'))
       .toContain('schema 不受支持');
   });
 

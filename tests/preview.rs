@@ -319,6 +319,115 @@ fn disambiguation_leaves_non_duplicate_candidate_unchanged() {
 }
 
 #[test]
+fn disambiguation_keeps_existing_identity_in_preview_details() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_a = source.path().join("stone-a.ncm");
+    let source_b = source.path().join("stone-b.ncm");
+    write_file(&source_a, 1);
+    write_file(&source_b, 1);
+    let existing_path = destination.path().join("STONE KOLD - Skybreak, Subten.mp3");
+    let mut tag = Tag::new();
+    tag.set_title("STONE KOLD");
+    tag.set_artist("Skybreak, Subten");
+    tag.set_album("HALF BLOOD");
+    write_file(&existing_path, 1);
+    tag.write_to_path(&existing_path, Version::Id3v24).unwrap();
+
+    let mut preview = SyncPreview {
+        source_directory: source.path().display().to_string(),
+        destination_directory: destination.path().display().to_string(),
+        new_count: 2,
+        existing_count: 0,
+        skipped_count: 0,
+        error_count: 0,
+        estimated_output_bytes: Some(2),
+        candidates: vec![
+            PreviewCandidate {
+                name: "STONE KOLD - Skybreak, Subten".to_string(),
+                source_path: source_a.display().to_string(),
+                destination_path: existing_path.display().to_string(),
+                source_size_bytes: 1,
+                estimated_output_bytes: Some(1),
+                previous_destination_path: None,
+                operation: PreviewOperation::Convert,
+                netease_track_id: None,
+                netease_album_id: None,
+                album: None,
+                netease_title: None,
+                netease_artist: None,
+                disambiguation_reason: None,
+            },
+            PreviewCandidate {
+                name: "STONE KOLD - Skybreak, Subten".to_string(),
+                source_path: source_b.display().to_string(),
+                destination_path: existing_path.display().to_string(),
+                source_size_bytes: 1,
+                estimated_output_bytes: Some(1),
+                previous_destination_path: None,
+                operation: PreviewOperation::Convert,
+                netease_track_id: None,
+                netease_album_id: None,
+                album: None,
+                netease_title: None,
+                netease_artist: None,
+                disambiguation_reason: None,
+            },
+        ],
+        skipped: Vec::new(),
+        errors: Vec::new(),
+        warnings: Vec::new(),
+        available_space_bytes: None,
+        disk_space_sufficient: None,
+        input_count: 2,
+        output_duplicate_count: 0,
+        action_kind: "overwrite".to_string(),
+        action_count: 0,
+        database_directory: None,
+        detail_items: Vec::new(),
+    };
+    let identities = HashMap::from([
+        (
+            source_a.display().to_string(),
+            OutputTrackIdentity {
+                track_id: Some("track-a".to_string()),
+                album_id: Some("album-a".to_string()),
+                title: "STONE KOLD".to_string(),
+                artists: "Skybreak, Subten".to_string(),
+                album: "HALF BLOOD".to_string(),
+                source_path: source_a.clone(),
+            },
+        ),
+        (
+            source_b.display().to_string(),
+            OutputTrackIdentity {
+                track_id: Some("track-b".to_string()),
+                album_id: Some("album-b".to_string()),
+                title: "STONE KOLD".to_string(),
+                artists: "Skybreak, Subten".to_string(),
+                album: "OTHER ALBUM".to_string(),
+                source_path: source_b.clone(),
+            },
+        ),
+    ]);
+
+    disambiguate_duplicate_output_names(&mut preview, &identities);
+
+    assert_eq!(preview.candidates.len(), 1);
+    let detail = preview
+        .detail_items
+        .iter()
+        .find(|detail| detail.classification == "duplicate")
+        .expect("existing duplicate should remain visible in preview details");
+    assert_eq!(detail.name, "STONE KOLD - Skybreak, Subten");
+    assert!(detail.existing_output);
+    assert_eq!(
+        detail.destination_path.as_deref(),
+        Some(existing_path.to_str().unwrap())
+    );
+}
+
+#[test]
 fn output_identity_stable_key_prefers_track_id_and_falls_back_to_source() {
     let mut first = OutputTrackIdentity {
         track_id: Some("2714172644".into()),

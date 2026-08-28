@@ -171,6 +171,7 @@ pub fn disambiguate_duplicate_output_names(
     }
 
     let mut removals = HashSet::new();
+    let mut removed_details = Vec::new();
     for indices in groups.into_values().filter(|indices| indices.len() > 1) {
         let base_path = PathBuf::from(&preview.candidates[indices[0]].destination_path);
         let existing_metadata = base_path.is_file().then(|| read_track_metadata(&base_path));
@@ -210,6 +211,15 @@ pub fn disambiguate_duplicate_output_names(
         let mut occupied = HashSet::<PathBuf>::new();
         for index in ordered {
             if Some(index) == existing_index {
+                let candidate = &preview.candidates[index];
+                removed_details.push(PreviewDetailItem {
+                    name: candidate.name.clone(),
+                    source_path: candidate.source_path.clone(),
+                    destination_path: Some(candidate.destination_path.clone()),
+                    existing_output: true,
+                    classification: "duplicate".to_string(),
+                    reason: Some("输出文件已存在且与来源身份匹配".to_string()),
+                });
                 removals.insert(index);
                 continue;
             }
@@ -284,6 +294,7 @@ pub fn disambiguate_duplicate_output_names(
         }
         preview.candidates = retained;
     }
+    preview.detail_items.extend(removed_details);
 }
 
 /// Attach the immutable NetEase identity to candidates after scanning.  This
@@ -1258,7 +1269,8 @@ fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrateg
             .count(),
     };
 
-    let mut items = Vec::with_capacity(preview.input_count);
+    let mut items = std::mem::take(&mut preview.detail_items);
+    items.reserve(preview.input_count);
     for candidate in &preview.candidates {
         let destination = Path::new(&candidate.destination_path);
         let existing_output = destination.exists()

@@ -735,19 +735,18 @@ const translations = {
     sourceKicker: '歌曲文件夹或单曲（网易云、SoundCloud 等）',
     destKicker: '任务 1 / 任务 2 独立运行，窗口较小时可滚动',
     sourceLabel: '歌曲文件夹或单曲',
-    neteaseSituationLabel: '情况',
-    neteaseStatusLoading: '正在读取网易云状态…',
-    neteaseIndexNotReady: '网易云轻量索引未就绪，转换前会按需准备',
-    neteaseIndexBuilding: '正在建立网易云轻量索引',
-    neteaseIndexReady: '网易云轻量索引已就绪',
-    neteaseIndexCancelling: '正在取消网易云轻量索引…',
-    neteaseIndexCancelled: '网易云轻量索引已取消',
-    neteaseIndexError: '网易云轻量索引失败',
+    neteaseStatusLoading: '读取中',
+    neteaseIndexNotReady: '索引未就绪',
+    neteaseIndexBuilding: '建立索引中',
+    neteaseIndexReady: '索引已就绪',
+    neteaseIndexCancelling: '取消中',
+    neteaseIndexCancelled: '已取消',
+    neteaseIndexError: '读取错误',
     scanLocalNetease: '扫描本地网易云文件夹',
     selectNeteaseDatabase: '选择网易云数据库',
     clearNeteaseDatabase: '恢复自动定位',
-    neteaseDatabaseSelected: '已选择数据库，开始转换或分析时使用',
-    neteaseDatabaseUnavailable: '未找到可用网易云数据库，将使用自动定位',
+    neteaseDatabaseSelected: '数据库已选',
+    neteaseDatabaseUnavailable: '无数据库',
     scanLocalNeteaseRunning: '正在扫描本地网易云文件夹…',
     scanLocalNeteaseFallback: '手动选择文件夹',
     scanLocalNeteaseNotFound: '未能自动找到网易云音乐文件夹，请手动选择',
@@ -973,19 +972,18 @@ const translations = {
     sourceKicker: 'Music folders or tracks (NetEase, SoundCloud, etc.)',
     destKicker: 'Task 1 and Task 2 run independently. Scroll when the window is short.',
     sourceLabel: 'Music Folder or Track',
-    neteaseSituationLabel: 'Status',
-    neteaseStatusLoading: 'Reading NetEase status…',
-    neteaseIndexNotReady: 'NetEase lightweight index is not ready; it will be prepared when needed',
-    neteaseIndexBuilding: 'Building NetEase lightweight index',
-    neteaseIndexReady: 'NetEase lightweight index is ready',
-    neteaseIndexCancelling: 'Cancelling NetEase lightweight index…',
-    neteaseIndexCancelled: 'NetEase lightweight index cancelled',
-    neteaseIndexError: 'NetEase lightweight index failed',
+    neteaseStatusLoading: 'Reading',
+    neteaseIndexNotReady: 'Index not ready',
+    neteaseIndexBuilding: 'Building index',
+    neteaseIndexReady: 'Index ready',
+    neteaseIndexCancelling: 'Cancelling',
+    neteaseIndexCancelled: 'Cancelled',
+    neteaseIndexError: 'Read error',
     scanLocalNetease: 'Scan local NetEase folder',
     selectNeteaseDatabase: 'Choose NetEase database',
     clearNeteaseDatabase: 'Use automatic location',
-    neteaseDatabaseSelected: 'Database selected; it will be used when conversion or analysis starts',
-    neteaseDatabaseUnavailable: 'No usable NetEase database; automatic location will be used',
+    neteaseDatabaseSelected: 'Database selected',
+    neteaseDatabaseUnavailable: 'No database',
     scanLocalNeteaseRunning: 'Scanning local NetEase folder…',
     scanLocalNeteaseFallback: 'Choose folder manually',
     scanLocalNeteaseNotFound: 'Could not auto-locate a NetEase music folder. Choose one manually.',
@@ -1214,6 +1212,7 @@ export type NeteaseSituationTone = 'neutral' | 'running' | 'success' | 'warning'
 
 export type NeteaseSituation = {
   message: string;
+  detail?: string;
   tone: NeteaseSituationTone;
 };
 
@@ -1232,52 +1231,55 @@ export function resolveNeteaseSituation(
   }
 
   if (database.error) {
-    return { message: database.error, tone: 'error' };
+    return { message: t('neteaseIndexError', lang), detail: database.error, tone: 'error' };
   }
 
   const notReadyWarning = status.warning
     && (status.warning.includes('未就绪') || status.warning.includes('not ready'));
   if (status.warning && !notReadyWarning) {
-    // Other warnings (for example a stale manual database) remain visibly
-    // distinct and take precedence over ordinary cache progress.
-    return { message: status.warning, tone: 'warning' };
+    // Keep the visible state compact while retaining the actionable backend
+    // warning in the tooltip and diagnostic report.
+    const isFallback = status.warning.includes('回退') || status.warning.includes('fallback');
+    return {
+      message: isFallback ? (lang === 'zh' ? '已回退自动' : 'Auto fallback') : (lang === 'zh' ? '数据库失效' : 'Database invalid'),
+      detail: status.warning,
+      tone: 'warning',
+    };
   }
 
   const cacheStatus = status.cacheStatus;
   if (database.busy || cacheStatus === 'building' || cacheStatus === 'cancelling') {
-    const message = database.message
-      || (cacheStatus === 'cancelling'
-        ? t('neteaseIndexCancelling', lang)
-        : t('neteaseIndexBuilding', lang));
     return {
-      message,
+      message: cacheStatus === 'cancelling' ? t('neteaseIndexCancelling', lang) : t('neteaseIndexBuilding', lang),
+      detail: database.message || undefined,
       tone: 'running',
     };
   }
 
   if (cacheStatus === 'cancelled') {
-    return { message: database.message || t('neteaseIndexCancelled', lang), tone: 'warning' };
+    return { message: t('neteaseIndexCancelled', lang), detail: database.message || undefined, tone: 'warning' };
   }
 
   if (cacheStatus === 'error') {
     return {
-      message: database.error || database.message || t('neteaseIndexError', lang),
+      message: t('neteaseIndexError', lang),
+      detail: database.error || database.message || undefined,
       tone: 'error',
     };
   }
 
   if (notReadyWarning) {
-    return { message: status.warning!, tone: 'neutral' };
+    return { message: t('neteaseIndexNotReady', lang), detail: status.warning!, tone: 'neutral' };
   }
 
   if (status.source === 'manual' && status.manualPath) {
-    return { message: t('neteaseDatabaseSelected', lang), tone: 'success' };
+    return { message: t('neteaseDatabaseSelected', lang), detail: database.message || undefined, tone: 'success' };
   }
 
   if (status.source === 'automatic' && (cacheStatus === 'ready' || status.loaded)) {
     const count = status.cachedRecordCount ?? status.recordCount;
-    const suffix = count > 0 ? ` · ${count} ${lang === 'zh' ? '条' : count === 1 ? 'record' : 'records'}` : '';
-    return { message: `${t('neteaseIndexReady', lang)}${suffix}`, tone: 'success' };
+    const detail = count > 0 ? `${t('neteaseIndexReady', lang)} · ${count}` : t('neteaseIndexReady', lang);
+    return { message: t('neteaseIndexReady', lang), detail, tone: 'success' };
   }
 
   if (status.source === 'unavailable') {
@@ -1285,7 +1287,7 @@ export function resolveNeteaseSituation(
   }
 
   if (database.message) {
-    return { message: database.message, tone: 'neutral' };
+    return { message: t('neteaseStatusLoading', lang), detail: database.message, tone: 'neutral' };
   }
 
   return { message: t('neteaseIndexNotReady', lang), tone: 'neutral' };
@@ -2399,9 +2401,8 @@ function renderSyncSlot(
             <span>${t('sourceLabel', state.lang)}</span>
             ${slotIndex === 0
               ? `<div class="netease-source-toolbar" data-role="netease-source-toolbar">
-                  <div class="netease-database-status${neteaseSituation.tone === 'error' ? ' is-error' : ''}" data-role="netease-database-status" title="${escapeHtml(neteaseSituation.message)}">
-                    <div class="netease-situation netease-situation--${neteaseSituation.tone}" data-role="netease-situation" data-tone="${neteaseSituation.tone}" title="${escapeHtml(neteaseSituation.message)}">
-                      <span class="netease-situation-label">${t('neteaseSituationLabel', state.lang)}</span>
+                  <div class="netease-database-status${neteaseSituation.tone === 'error' ? ' is-error' : ''}" data-role="netease-database-status" title="${escapeHtml(neteaseSituation.detail || neteaseSituation.message)}">
+                    <div class="netease-situation netease-situation--${neteaseSituation.tone}" data-role="netease-situation" data-tone="${neteaseSituation.tone}" title="${escapeHtml(neteaseSituation.detail || neteaseSituation.message)}">
                       <span class="netease-situation-value" data-role="netease-situation-value">${escapeHtml(neteaseSituation.message)}</span>
                     </div>
                   </div>
@@ -2732,11 +2733,11 @@ export function bindApp(
     const resolved = resolveNeteaseSituation(neteaseMetadataDatabase, state.lang);
     situation.dataset.tone = resolved.tone;
     situation.className = `netease-situation netease-situation--${resolved.tone}`;
-    situation.title = resolved.message;
+    situation.title = resolved.detail || resolved.message;
     value.textContent = resolved.message;
     const container = situation.closest<HTMLElement>('[data-role="netease-database-status"]');
     if (container) {
-      container.title = resolved.message;
+      container.title = resolved.detail || resolved.message;
       container.classList.toggle('is-error', resolved.tone === 'error');
     }
     return true;
