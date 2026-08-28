@@ -79,6 +79,7 @@ use w4dj::sync::{
     ConversionMetadataContext, update_analysis_metadata_transactionally,
     update_existing_metadata_transactionally_with_context_and_policy,
     remove_replaced_output,
+    planned_output_path_with_policy,
     validate_track_analysis_metadata,
     ScanEnumerationError, ScanPhase, enumerate_music_files_observed,
 };
@@ -2602,9 +2603,11 @@ fn run_scan_task(
             {
                 task.source_total = source_total;
                 task.destination_total = destination_total;
-                task.total = source_total
-                    .unwrap_or(0)
-                    .saturating_add(destination_total.unwrap_or(0));
+                // The task progress bar follows the active phase.  Its
+                // denominator must not combine input and output entries;
+                // otherwise an empty destination or a stale output count can
+                // leak into the final input ratio.
+                task.total = source_total.unwrap_or(0);
             }
         });
 
@@ -2618,7 +2621,6 @@ fn run_scan_task(
                     ScanPhase::Destination => ScanProgressPhase::ScanningDestination,
                     ScanPhase::Metadata => ScanProgressPhase::MatchingMetadata,
                 };
-                state.processed = state.processed.saturating_add(1);
                 state.current_file = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -2644,24 +2646,41 @@ fn run_scan_task(
                         }
                         ScanPhase::Metadata => {
                             if task.metadata_total.is_none() {
-                                task.metadata_total = Some(task.source_processed);
-                                task.source_total = Some(task.source_processed);
+                                task.metadata_total = task.source_total.or(Some(task.source_processed));
                             }
                             task.metadata_processed = task.metadata_processed.saturating_add(1);
                         }
                     }
-                    task.processed = task
-                        .source_processed
-                        .saturating_add(task.destination_processed);
+                    let (processed, total) = match phase {
+                        ScanPhase::Source => (task.source_processed, task.source_total),
+                        ScanPhase::Destination => {
+                            (task.destination_processed, task.destination_total)
+                        }
+                        ScanPhase::Metadata => (task.metadata_processed, task.metadata_total),
+                    };
+                    task.processed = processed;
+                    task.total = total.unwrap_or(0);
                     task.current_file = path
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| path.display().to_string());
                 }
-                state.total = state
+                state.processed = state
                     .tasks
                     .iter()
                     .map(|task| task.processed)
+                    .sum::<usize>();
+                state.total = state
+                    .tasks
+                    .iter()
+                    .map(|task| match task.phase {
+                        ScanProgressPhase::ScanningSource => task.source_total,
+                        ScanProgressPhase::ScanningDestination => task.destination_total,
+                        ScanProgressPhase::MatchingMetadata => task.metadata_total,
+                        ScanProgressPhase::Completed => task.source_total,
+                        _ => Some(task.total),
+                    }
+                    .unwrap_or(0))
                     .sum::<usize>();
             });
             !scan_cancel.load(Ordering::SeqCst)
@@ -2702,25 +2721,25 @@ fn run_scan_task(
             retry_of: None,
         });
         update_scan_progress(&progress, |state| {
-            let discovered_total = state
+            let input_processed = state
                 .tasks
                 .iter()
-                .map(|task| task.processed)
+                .map(|task| task.source_processed)
                 .sum::<usize>();
-            state.total = discovered_total;
+            let input_total = state
+                .tasks
+                .iter()
+                .map(|task| task.source_total.unwrap_or(task.source_processed))
+                .sum::<usize>();
+            state.processed = input_processed;
+            state.total = input_total;
             if let Some(task) = state
                 .tasks
                 .iter_mut()
                 .find(|task| task.slot_index == slot_index)
             {
-                task.source_total = Some(task.source_processed);
-                task.destination_total = Some(task.destination_processed);
-                task.metadata_total = Some(task.metadata_processed);
-                task.total = task
-                    .source_total
-                    .unwrap_or(0)
-                    .saturating_add(task.destination_total.unwrap_or(0))
-                    .saturating_add(task.metadata_total.unwrap_or(0));
+                task.total = task.source_total.unwrap_or(task.source_processed);
+                task.metadata_total = task.metadata_total.or(Some(task.metadata_processed));
                 task.phase = ScanProgressPhase::Completed;
                 task.current_file.clear();
             }
@@ -2762,7 +2781,7 @@ fn run_scan_task(
         state.status = ScanStatus::Completed;
         state.phase = ScanProgressPhase::Completed;
         state.current_file.clear();
-        state.message = "扫描完成".to_string();
+        state.message = "扫描成功".to_string();
     });
 }
 
@@ -4194,11 +4213,10 @@ fn open_library_catalog(path: &Path) -> Result<(LibraryCatalog, Option<PathBuf>)
 }
 
 fn open_w4dj_library(path: &Path) -> Result<(W4djLibrary, Option<PathBuf>), String> {
-    let (mut library, backup) = W4djLibrary::open_or_recover(path).map_err(|error| error.to_string())?;
-    library
-        .remove_internal_temp_records()
-        .map_err(|error| error.to_string())?;
-    Ok((library, backup))
+    // Opening the private catalog is intentionally side-effect free.  In
+    // particular, do not clean old temporary rows or inspect their paths on
+    // a status/query call: startup must only open SQLite and render the UI.
+    W4djLibrary::open_or_recover(path).map_err(|error| error.to_string())
 }
 
 fn manual_netease_database_path(state: &AppState) -> Option<PathBuf> {
@@ -6662,6 +6680,7 @@ fn main() {
                 .parent()
                 .expect("preferences path should have a parent")
                 .join("w4dj.sqlite3");
+            let startup_library_path = w4dj_library_path.clone();
             let test_monitor_path = app
                 .path()
                 .download_dir()
@@ -6723,6 +6742,14 @@ fn main() {
                 *path_guard = w4dj_library_path;
             }
 
+            // Opening the private SQLite catalog is the only library work
+            // performed during setup.  Historical imports, output traversal,
+            // file probes and NetEase reads all wait for an explicit command
+            // or a successful conversion callback.
+            if let Err(error) = W4djLibrary::open_or_recover(&startup_library_path) {
+                eprintln!("Failed to open W4DJ output library at startup: {error}");
+            }
+
             {
                 let state = app.state::<AppState>();
                 let mut path_guard = state
@@ -6753,28 +6780,6 @@ fn main() {
                     .lock()
                     .expect("concurrency budget lock poisoned") =
                     Arc::new(GlobalConcurrencyBudget::new(limit));
-            }
-
-            {
-                let state = app.state::<AppState>();
-                let w4dj_path = state
-                    .library
-                    .catalog_path
-                    .lock()
-                    .expect("library catalog path lock poisoned")
-                    .clone();
-                let analysis_path = analysis_file_path(&history_path);
-                match W4djLibrary::open(&w4dj_path).and_then(|mut library| {
-                    library.import_initial_history(&history_path, &analysis_path)
-                }) {
-                    Ok(imported) if imported > 0 => {
-                        eprintln!("Imported {imported} committed output(s) into W4DJ library");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        eprintln!("Failed to initialize W4DJ output library: {error}");
-                    }
-                }
             }
 
             if !headless_mode {
@@ -6821,109 +6826,41 @@ fn apply_analysis_for_candidate_to_path(
 fn register_committed_output(
     library: &mut Option<W4djLibrary>,
     slot_index: usize,
-    destination_root: &Path,
+    _destination_root: &Path,
     candidate: &PreviewCandidate,
-    analyses: &HashMap<String, EmbeddedAnalysis>,
+    _analyses: &HashMap<String, EmbeddedAnalysis>,
 ) -> Option<String> {
     let Some(library) = library else {
         return None;
     };
-    if let Err(error) = library.upsert_output_file(
+    let title = candidate.netease_title.as_deref().unwrap_or_default();
+    let artist = candidate.netease_artist.as_deref().unwrap_or_default();
+    if let Err(error) = library.upsert_lightweight_output(
         slot_index,
-        destination_root,
         Some(Path::new(&candidate.source_path)),
         Path::new(&candidate.destination_path),
+        candidate.netease_track_id.as_deref(),
+        candidate.netease_album_id.as_deref(),
+        title,
+        artist,
     ) {
         eprintln!(
             "W4DJ output registration warning for {}: {}",
             candidate.destination_path, error
         );
         return Some(format!(
-            "歌曲库登记警告：{}（音频已保留，可稍后重新扫描歌曲库修复）",
-            error
-        ));
-    }
-    if (candidate.netease_track_id.is_some() || candidate.netease_album_id.is_some())
-        && let Err(error) = library.set_output_identity(
-            Path::new(&candidate.destination_path),
-            candidate.netease_track_id.as_deref(),
-            candidate.netease_album_id.as_deref(),
-        )
-    {
-        return Some(format!(
-            "歌曲库身份登记警告：{}（音频已保留，可稍后重新扫描歌曲库修复）",
-            error
-        ));
-    }
-    // A normal conversion may replace the bytes behind an existing output
-    // path. Keep the output row, but invalidate analysis that belonged to the
-    // previous file. Inline analysis supplied for a retry is already written
-    // before registration and must remain attached to the new output.
-    if !analyses.contains_key(&candidate.source_path)
-        && let Err(error) = library.invalidate_analysis_for_destination(
-            Path::new(&candidate.destination_path),
-        )
-    {
-        return Some(format!(
-            "歌曲库分析状态重置警告：{}（音频已保留，可稍后重新分析）",
+            "歌曲库轻量登记警告：{}（音频已保留，可稍后重试登记）",
             error
         ));
     }
     None
 }
 
-fn register_output_directory(path: &Path, slot_index: usize, output_root: &Path) -> Vec<String> {
-    let Ok(mut library) = W4djLibrary::open(path) else {
-        return vec![String::from(
-            "歌曲库登记警告：无法打开 W4DJ 数据库（音频已保留，可稍后重新扫描歌曲库修复）",
-        )];
-    };
-    let mut warnings = Vec::new();
-    let mut directories = vec![output_root.to_path_buf()];
-    while let Some(directory) = directories.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
-            warnings.push(format!(
-                "歌曲库登记警告：无法读取输出目录 {}（音频已保留）",
-                directory.display()
-            ));
-            continue;
-        };
-        for entry in entries.flatten() {
-            let destination = entry.path();
-            if destination.is_dir() {
-                directories.push(destination);
-                continue;
-            }
-            if is_ignored_music_file(&destination) {
-                continue;
-            }
-            if destination.is_file()
-            && destination
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| {
-                    matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "mp3" | "flac" | "wav" | "aif" | "aiff"
-                    )
-                })
-            && let Err(error) =
-                library.upsert_output_file(slot_index, output_root, None, &destination)
-        {
-            let warning = format!(
-                "歌曲库登记警告：{}（音频已保留，可稍后重新扫描歌曲库修复）",
-                error
-            );
-            eprintln!(
-                "W4DJ output registration warning for {}: {}",
-                destination.display(),
-                error
-            );
-            warnings.push(warning);
-        }
-        }
-    }
-    warnings
+/// Replaced-output cleanup is only valid for a rename inside the active
+/// destination root. A successful conversion to a different root updates
+/// the lightweight index but must never inspect or remove the old root.
+fn replacement_is_inside_destination_root(previous_path: &Path, destination_root: &Path) -> bool {
+    previous_path.starts_with(destination_root)
 }
 
 fn embedded_analysis_from_track(analysis: &TrackAnalysis) -> EmbeddedAnalysis {
@@ -7283,6 +7220,12 @@ fn run_confirmed_sync_task(
                             candidate
                                 .and_then(|candidate| candidate.previous_destination_path.as_deref())
                                 .and_then(|previous_path| {
+                                    if !replacement_is_inside_destination_root(
+                                        Path::new(previous_path),
+                                        Path::new(&job.destination),
+                                    ) {
+                                        return None;
+                                    }
                                     candidate.and_then(|candidate| {
                                         match remove_replaced_output(
                                             Path::new(previous_path),
@@ -7967,6 +7910,13 @@ fn run_sync_task(
     }
 
     let mut failed_files = 0usize;
+    let mut w4dj_library = match W4djLibrary::open(&w4dj_path) {
+        Ok(library) => Some(library),
+        Err(error) => {
+            eprintln!("W4DJ output library unavailable; conversion will continue: {error}");
+            None
+        }
+    };
     let result = sync_music_library_transactional_with_observer_and_budget_and_context_with_policy(
         &queued_files,
         &destination,
@@ -7984,6 +7934,44 @@ fn run_sync_task(
             }
             if error.is_some() {
                 failed_files += 1;
+            }
+
+            if error.is_none()
+                && let Some((_, source_path)) = source_files
+                    .get(name)
+                    .or_else(|| {
+                        source_files
+                            .iter()
+                            .find(|(key, _)| w4dj::sync::source_entry_name(key) == name)
+                            .map(|(_, value)| value)
+                    })
+                && let Ok(destination_path) = planned_output_path_with_policy(
+                    &destination,
+                    w4dj::sync::source_entry_name(name),
+                    source_path,
+                    mode,
+                    lossless_format,
+                    filename_normalization_policy_for_slot(slot_index),
+                )
+                && let Some(library) = w4dj_library.as_mut()
+                && let Err(registration_error) = {
+                    let identity = metadata_context.netease.track_identity(source_path);
+                    library.upsert_lightweight_output(
+                        slot_index,
+                        Some(source_path),
+                        &destination_path,
+                        identity.as_ref().and_then(|value| value.track_id.as_deref()),
+                        identity.as_ref().and_then(|value| value.album_id.as_deref()),
+                        identity.as_ref().map_or("", |value| value.title.as_str()),
+                        identity.as_ref().map_or("", |value| value.artists.as_str()),
+                    )
+                }
+            {
+                eprintln!(
+                    "W4DJ lightweight output registration warning for {}: {}",
+                    destination_path.display(),
+                    registration_error
+                );
             }
 
             let mut controller = controller.lock().expect("desktop lock poisoned");
@@ -8010,20 +7998,7 @@ fn run_sync_task(
             )
             .expect("sync slot index validated before worker start");
     }
-    let registration_warnings = if result.is_ok() {
-        // Register outputs after the converter's safe-commit callback has
-        // returned, and before taking the UI controller lock.  SQLite/media
-        // work must not block keyboard/button state updates.
-        register_output_directory(&w4dj_path, slot_index, Path::new(&destination))
-    } else {
-        Vec::new()
-    };
     let mut controller = controller.lock().expect("desktop lock poisoned");
-    for warning in registration_warnings {
-        controller
-            .push_log(slot_index, warning)
-            .expect("sync slot index validated before worker start");
-    }
     match result {
         Ok(snapshot) => controller
             .finish_sync(slot_index, snapshot)
@@ -8174,6 +8149,7 @@ mod tests {
     use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
     use w4dj::preview::{PreviewCandidate, PreviewIssue, SlotPreview, SyncPreview};
     use w4dj::task::TaskController;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn headless_acceptance_requires_absolute_report_path() {
@@ -8212,6 +8188,49 @@ mod tests {
         assert!(parse_headless_acceptance_args(&args)
             .expect("normal arguments should parse")
             .is_none());
+    }
+
+    #[test]
+    fn opening_startup_catalog_does_not_import_history_or_probe_old_outputs() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "w4dj-startup-test-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let stale_output = directory.join("old-output/song.mp3");
+        fs::create_dir_all(stale_output.parent().unwrap()).unwrap();
+        fs::write(&stale_output, b"legacy output").unwrap();
+        // A malformed history file proves the startup opener does not even
+        // attempt to parse it.  Historical import remains an explicit,
+        // compatibility-only API and is never part of Tauri setup.
+        fs::write(directory.join("history.json"), b"not-json").unwrap();
+        let database_path = directory.join("w4dj.sqlite3");
+
+        let (library, backup) = super::open_w4dj_library(&database_path)
+            .expect("startup catalog should open without historical inputs");
+        assert!(backup.is_none());
+        assert_eq!(library.stats().unwrap().total, 0);
+        assert!(!library.is_initial_import_done().unwrap());
+        assert!(stale_output.is_file());
+        drop(library);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn replaced_output_cleanup_is_scoped_to_the_active_destination_root() {
+        assert!(super::replacement_is_inside_destination_root(
+            Path::new("/music/B/old.mp3"),
+            Path::new("/music/B"),
+        ));
+        assert!(!super::replacement_is_inside_destination_root(
+            Path::new("/music/A/old.mp3"),
+            Path::new("/music/B"),
+        ));
     }
 
     #[test]
@@ -8582,6 +8601,12 @@ mod tests {
                 warnings: Vec::new(),
                 available_space_bytes: None,
                 disk_space_sufficient: None,
+                input_count: 0,
+                output_duplicate_count: 0,
+                action_kind: String::new(),
+                action_count: 0,
+                database_directory: None,
+                detail_items: Vec::new(),
             },
         }
     }

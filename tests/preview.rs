@@ -237,6 +237,12 @@ fn duplicate_preview() -> SyncPreview {
         warnings: Vec::new(),
         available_space_bytes: None,
         disk_space_sufficient: None,
+        input_count: 2,
+        output_duplicate_count: 0,
+        action_kind: "convert".to_string(),
+        action_count: 2,
+        database_directory: None,
+        detail_items: Vec::new(),
     }
 }
 

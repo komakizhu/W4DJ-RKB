@@ -305,3 +305,43 @@ App 内置包不再携带重复的旧 `discogs_effnet.{json,bin}`，只分发
 旧模型继续可用。离线生成脚本已停止复制旧副本，资源校验新增 canonical-only 断言和旧 ID 导入回归。
 
 最新 arm64 App 约 95.5 MiB（此前约 112.9 MiB），版本 `3.2.0-beta.3`。Tauri 64 项模型相关/应用测试、根 `cargo test --all`、fmt、Clippy（Tauri target）和 diff-check 已通过；未提交、未推送。
+
+## 2026-08-28 零启动扫描与轻量输出索引交接
+
+本轮已实施 `/private/tmp/W4DJ-zero-startup-scan-lightweight-index-handoff.md` 的代码阶段。启动挂起根因是 Tauri setup 首次调用历史导入并在主线程遍历输出、读取音频元数据及合并网易云记录；当前 setup 只创建/打开私有 `w4dj.sqlite3` 并加载偏好，历史、输出目录、网易云歌曲表和高级模型均不在启动路径。兼容历史导入 API 未删除，但没有生产调用方。
+
+新的 `W4djLibrary::upsert_lightweight_output` 是普通转换唯一的输出登记入口：仅使用最终安全提交已知的来源/目标、槽位、网易云 ID（若有）和最小 Title/Artist，短事务写入轻量身份、`local_files` 占位及输出映射；不 stat/probe/NCM 完整读取、不写 `output_roots` 或 `slot_output_roots`。后续同 ID 或同来源转换到 B 会更新原记录并清除旧分析，不访问或删除 A。转换后的全目录登记扫描已移除。
+
+Dashboard 分析候选、DJ 匹配与 M3U8 重新解析全部来自 W4DJ 轻量索引，不按旧 `available/missing` 状态过滤；导出时才检查被选择的具体路径。网易云数据库和 `library-dashboard.sqlite3` 不再枚举 Dashboard 歌曲。
+
+自动化验证已通过：根 `cargo test --all`、Tauri 101 项、Tauri check、Tauri 严格 Clippy、前端 Vitest 12 文件/198 项、TypeScript、Vite、Rust fmt 和 diff-check。兼容直转入口会传递可获得的网易云身份，输出替换清理仅允许当前输出根目录内的路径；根 workspace 严格 all-targets Clippy 仍有既有 `dead_code` 与 `tests/duplicate_track_acceptance.rs` 的 `map_identity`，在显式放宽这两项后无新增诊断。
+
+跨用户后台启动验收已完成：使用最新 arm64 App 的临时副本并通过 `open -g` 触发，包装脚本仅用于把 `HOME/TMPDIR` 固定到隔离用户目录。全新用户 1 秒内观察到实际进程并创建空 `w4dj.sqlite3`（0 首、0 分析）；升级用户 1 秒内启动，`tracks`、`local_files`、`w4dj_track_meta`、`analysis_results`、`w4dj_output_identities` 的行内容和目标路径与生产副本一致，没有历史导入。升级副本只发生了既有 `w4dj_track_meta` 外键迁移，导致 SQLite 文件 mtime 更新，数据行未变化。辅助功能权限未授予，窗口计数为 `access-denied`；进程、临时锁和 SQLite 证据均已记录。
+
+接手者下一步：在真实转换成功后核对只新增/更新一条轻量索引并确认分析追加到同一输出；外置 T7/2,398 文件、89 首 FLAC、Windows、Rekordbox 和人工 GUI/播放器验收仍待对应环境。验收继续使用 `open -g`，不调用 `activate`、`AXRaise`、截图或 `view_image`。
+
+## 2026-08-28 生产包不携带验收资源
+
+生产 Vite 配置已设置 `publicDir: false`。验收音频、验收页面和用于验收的模型链接仍
+保留在工作区 `app/public`，仅由工作区验收工具按需调用，不会再复制到 `app/dist` 或
+嵌入 W4DJ App。正式 Essentia 模型只从 `src-tauri/resources/essentia-models` 打包一次，
+隐藏运行时入口保持不变。
+
+最新 arm64 App 已重新构建，体积约 95 MB，版本 `3.2.0-beta.3`：
+`/Users/mac2/Documents/W4DJ RKB/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/W4DJ RKB.app`。
+生产 `dist` 未发现 `acceptance-audio`、验收页面或前端模型副本；前端 198/198、TypeScript、
+Vite 构建通过。未提交、未推送、未发布。
+
+## 2026-08-28 任务 1 网易云“情况”栏（已实施）
+
+任务 1 的网易云操作区新增固定“情况”/“Status”标签。前端 `resolveNeteaseSituation` 按错误 > 警告 > 活跃进度 > 手动数据库 > 轻量索引 > 默认提示解析状态，支持中英文、语义色、完整悬停消息和单行省略。网易云轻量缓存构建的高频事件只更新情况值，不重建整棵界面；按钮状态和终态仍触发必要重绘。现有扫描、选择数据库、恢复自动定位动作保持不变。
+
+验证：app.test.ts 124/124、TypeScript、Vite、diff-check 通过。最新 arm64 App 仍为 `3.2.0-beta.3`，未提交或推送。
+
+## 2026-08-28 任务 1 扫描进度与转换预览口径修复（独立 worktree）
+
+独立 worktree：`/private/tmp/w4dj-task1-scan-preview-worktree`，分支 `codex/task1-scan-preview-20260828`。扫描阶段现在分别显示输入、输出和元数据匹配计数，完成态固定使用输入曲目分母；缓存准备进度映射到任务 1，完成快照在下一次操作前保留。预览 DTO 增加输入曲目、输出重复曲目、动态操作数量、实际数据库目录和逐曲明细；覆盖模式不会把已存在输出计入跳过。确认窗口的预计输出与可用空间在同一右侧列分两行，统计卡片可打开按 A–Z 排序的歌曲明细和安全文件打开按钮。
+
+自动化：前端 app.test.ts 126/126、TypeScript、Vite、Tauri check、根 Rust 测试和格式检查通过。尚未在用户真实 1173 首目录执行现场扫描/覆盖转换，也未执行 GUI 文件打开验收。主工作树未被修改；未改版本号、未提交、未推送。
+
+最终验收补充：独立 worktree 前端 Vitest 14 文件/209 项、TypeScript、Vite、根 Rust 全量、Tauri check、严格 Tauri Clippy、fmt 和 diff-check 均通过。最新 arm64 App 为 `/private/tmp/w4dj-task1-scan-preview-worktree/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/W4DJ RKB.app`（`3.2.0-beta.3`，约 95 MB）。主工作树未修改，未 commit、push、merge 或 release；真实 1173 首现场扫描/覆盖转换/文件打开链接仍待用户环境。

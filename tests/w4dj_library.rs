@@ -1,3 +1,4 @@
+use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::fs;
 use tempfile::tempdir;
@@ -146,6 +147,133 @@ fn output_without_analysis_can_be_removed_from_the_independent_library() {
     assert!(library.remove_analyzed_track(&key).unwrap());
     assert_eq!(library.stats().unwrap().total, 0);
     assert!(output.is_file());
+}
+
+#[test]
+fn lightweight_output_registration_never_requires_the_files_to_exist() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("sources/song.ncm");
+    let destination = directory.path().join("exports/song.mp3");
+    let database_path = directory.path().join("w4dj.sqlite3");
+    let mut library = W4djLibrary::open(&database_path).unwrap();
+
+    let key = library
+        .upsert_lightweight_output(
+            1,
+            Some(&source),
+            &destination,
+            Some("28712318"),
+            Some("3409113568"),
+            "Song",
+            "Artist",
+        )
+        .unwrap();
+
+    assert_eq!(key, "netease:28712318");
+    assert_eq!(library.stats().unwrap().total, 1);
+    let track = library.track_detail(&key).unwrap().unwrap();
+    assert_eq!(track.title, "Song");
+    assert_eq!(track.artists, "Artist");
+    assert_eq!(track.netease_track_id.as_deref(), Some("28712318"));
+    assert_eq!(
+        library.local_files_for_track(&key).unwrap()[0].path,
+        destination
+    );
+    // Neither the source nor destination exists.  The successful registration
+    // is evidence that no metadata probe/stat/open was hidden in this path.
+    assert!(!source.exists());
+    assert!(
+        library
+            .local_files_for_track(&key)
+            .unwrap()
+            .first()
+            .unwrap()
+            .readable
+    );
+    drop(library);
+    let connection = Connection::open(database_path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM output_roots", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM slot_output_roots", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn lightweight_registration_updates_one_identity_when_output_moves() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.flac");
+    let first = directory.path().join("A/first.mp3");
+    let second = directory.path().join("B/second.mp3");
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+
+    let first_key = library
+        .upsert_lightweight_output(
+            0,
+            Some(&source),
+            &first,
+            Some("42"),
+            None,
+            "First",
+            "Artist",
+        )
+        .unwrap();
+    let second_key = library
+        .upsert_lightweight_output(
+            0,
+            Some(&source),
+            &second,
+            Some("42"),
+            None,
+            "Second",
+            "Artist",
+        )
+        .unwrap();
+
+    assert_eq!(first_key, second_key);
+    assert_eq!(library.stats().unwrap().total, 1);
+    let candidates = library.available_dj_output_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].destination_path, second);
+    assert_eq!(candidates[0].netease_track_id.as_deref(), Some("42"));
+}
+
+#[test]
+fn lightweight_registration_without_netease_id_reuses_source_identity() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.flac");
+    let first = directory.path().join("A/first.mp3");
+    let second = directory.path().join("B/second.mp3");
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+
+    let first_key = library
+        .upsert_lightweight_output(0, Some(&source), &first, None, None, "First", "Artist")
+        .unwrap();
+    let second_key = library
+        .upsert_lightweight_output(0, Some(&source), &second, None, None, "Second", "Artist")
+        .unwrap();
+
+    assert_eq!(first_key, "source:".to_string() + &source.to_string_lossy());
+    assert_eq!(second_key, first_key);
+    assert_eq!(library.stats().unwrap().total, 1);
+    assert_eq!(
+        library
+            .available_dj_output_candidates()
+            .unwrap()
+            .first()
+            .unwrap()
+            .destination_path,
+        second
+    );
 }
 
 #[test]

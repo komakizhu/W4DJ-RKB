@@ -333,6 +333,40 @@ pub struct SyncPreview {
     pub available_space_bytes: Option<u64>,
     #[serde(default)]
     pub disk_space_sufficient: Option<bool>,
+    /// Total supported input tracks represented by this preview. This is
+    /// intentionally independent from the destination duplicate count.
+    #[serde(default)]
+    pub input_count: usize,
+    /// Number of input tracks whose resolved output already existed before
+    /// this preview was built.
+    #[serde(default)]
+    pub output_duplicate_count: usize,
+    /// Primary action represented by `action_count` (skip/overwrite/
+    /// update_metadata/rename).
+    #[serde(default)]
+    pub action_kind: String,
+    #[serde(default)]
+    pub action_count: usize,
+    /// Database path used for this immutable preview snapshot.
+    #[serde(default)]
+    pub database_directory: Option<String>,
+    /// One row per input/issue, rendered lazily by the confirmation UI.
+    #[serde(default)]
+    pub detail_items: Vec<PreviewDetailItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviewDetailItem {
+    pub name: String,
+    pub source_path: String,
+    #[serde(default)]
+    pub destination_path: Option<String>,
+    #[serde(default)]
+    pub existing_output: bool,
+    /// new | duplicate | skip | overwrite | update_metadata | rename | error
+    pub classification: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -690,6 +724,14 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         warnings: Vec::new(),
         available_space_bytes: None,
         disk_space_sufficient: None,
+        input_count: 0,
+        output_duplicate_count: 0,
+        action_kind: String::new(),
+        action_count: 0,
+        database_directory: metadata_resolver
+            .and_then(|resolver| resolver.database_path())
+            .map(|path| path.display().to_string()),
+        detail_items: Vec::new(),
     };
 
     let source_path = Path::new(source_directory);
@@ -1164,6 +1206,8 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         });
     }
 
+    finalize_preview_summary(&mut preview, conflict_strategy);
+
     preview.available_space_bytes = available_disk_space(Path::new(destination_directory));
     if let (Some(required), Some(available)) = (
         preview.estimated_output_bytes,
@@ -1183,6 +1227,94 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     }
 
     Ok(Some(preview))
+}
+
+fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrategy) {
+    preview.input_count = preview
+        .candidates
+        .len()
+        .saturating_add(preview.skipped.len())
+        .saturating_add(preview.errors.len());
+    preview.output_duplicate_count = preview.existing_count;
+    preview.action_kind = match strategy {
+        ConflictStrategy::Skip => "skip",
+        ConflictStrategy::Overwrite => "overwrite",
+        ConflictStrategy::Rename => "rename",
+        ConflictStrategy::UpdateMetadata => "update_metadata",
+    }
+    .to_string();
+    preview.action_count = match strategy {
+        ConflictStrategy::Skip => preview.skipped_count,
+        ConflictStrategy::Overwrite => preview
+            .candidates
+            .iter()
+            .filter(|candidate| Path::new(&candidate.destination_path).exists())
+            .count(),
+        ConflictStrategy::Rename => preview.candidates.len(),
+        ConflictStrategy::UpdateMetadata => preview
+            .candidates
+            .iter()
+            .filter(|candidate| matches!(candidate.operation, CandidateOperation::UpdateMetadata))
+            .count(),
+    };
+
+    let mut items = Vec::with_capacity(preview.input_count);
+    for candidate in &preview.candidates {
+        let destination = Path::new(&candidate.destination_path);
+        let existing_output = destination.exists()
+            || candidate
+                .previous_destination_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).exists());
+        let classification = if matches!(candidate.operation, CandidateOperation::UpdateMetadata) {
+            "update_metadata"
+        } else if matches!(strategy, ConflictStrategy::Overwrite) && existing_output {
+            "overwrite"
+        } else if matches!(strategy, ConflictStrategy::Rename) {
+            "rename"
+        } else if existing_output {
+            "duplicate"
+        } else {
+            "new"
+        };
+        items.push(PreviewDetailItem {
+            name: candidate.name.clone(),
+            source_path: candidate.source_path.clone(),
+            destination_path: Some(candidate.destination_path.clone()),
+            existing_output,
+            classification: classification.to_string(),
+            reason: candidate.disambiguation_reason.clone(),
+        });
+    }
+    for issue in &preview.skipped {
+        let existing_output = !issue.message.contains("本批次") && !issue.message.contains("batch");
+        items.push(PreviewDetailItem {
+            name: Path::new(&issue.path)
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| issue.path.clone()),
+            source_path: issue.path.clone(),
+            destination_path: None,
+            existing_output,
+            classification: "skip".to_string(),
+            reason: Some(issue.message.clone()),
+        });
+    }
+    for issue in &preview.errors {
+        items.push(PreviewDetailItem {
+            name: Path::new(&issue.path)
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| issue.path.clone()),
+            source_path: issue.path.clone(),
+            destination_path: None,
+            existing_output: false,
+            classification: "error".to_string(),
+            reason: Some(issue.message.clone()),
+        });
+    }
+    items.sort_by_cached_key(|item| item.name.to_lowercase());
+    preview.detail_items = items;
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
@@ -1211,6 +1343,12 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
         warnings: Vec::new(),
         available_space_bytes: None,
         disk_space_sufficient: None,
+        input_count: 0,
+        output_duplicate_count: 0,
+        action_kind: String::new(),
+        action_count: 0,
+        database_directory: None,
+        detail_items: Vec::new(),
     };
 
     for pending_file in &entry.pending_files {

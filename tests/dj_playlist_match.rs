@@ -179,7 +179,7 @@ fn duplicate_outputs_for_one_id_are_ambiguous_but_remain_id_matches() {
 }
 
 #[test]
-fn non_available_output_is_ignored() {
+fn indexed_output_identity_is_matched_before_export_checks_its_path() {
     let report = match_imported_playlist(
         &playlist(vec![track(1, "Song", "Artist", None)]),
         &[DjOutputCandidate {
@@ -187,7 +187,8 @@ fn non_available_output_is_ignored() {
             ..candidate("missing", "Song", "Artist", None)
         }],
     );
-    assert_eq!(report.unmatched_count, 1);
+    assert_eq!(report.matched_count, 1);
+    assert_eq!(report.matches[0].track_key.as_deref(), Some("missing"));
 }
 
 #[test]

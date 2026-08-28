@@ -177,8 +177,7 @@ impl W4djLibrary {
                 measured_duration_seconds REAL,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
-                FOREIGN KEY(track_key) REFERENCES tracks(track_key) ON DELETE CASCADE,
-                FOREIGN KEY(output_root) REFERENCES output_roots(root_path)
+                FOREIGN KEY(track_key) REFERENCES tracks(track_key) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS w4dj_track_meta_source_path
                 ON w4dj_track_meta(source_path);
@@ -253,6 +252,7 @@ impl W4djLibrary {
                 ON imported_dj_playlist_matches(playlist_id, position);
             "#,
         )?;
+        self.migrate_track_meta_without_root_foreign_key()?;
         let netease_track_id_exists: bool = self.catalog.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlist_tracks') WHERE name='netease_track_id')",
             [],
@@ -279,6 +279,58 @@ impl W4djLibrary {
             "INSERT INTO library_meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [W4DJ_SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Older W4DJ builds coupled each output row to the output-root scope
+    /// state machine through a foreign key.  The lightweight index no longer
+    /// maintains that state.  Rebuild the small compatibility table once so
+    /// new registrations can store the root for display/relative paths
+    /// without inserting or updating `output_roots`.
+    fn migrate_track_meta_without_root_foreign_key(&mut self) -> W4djResult<()> {
+        let has_root_foreign_key: bool = self.catalog.connection().query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_foreign_key_list('w4dj_track_meta')
+                WHERE \"table\"='output_roots'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_root_foreign_key {
+            return Ok(());
+        }
+        self.catalog.connection().execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE w4dj_track_meta_light (
+                track_key TEXT PRIMARY KEY,
+                source_path TEXT,
+                destination_path TEXT NOT NULL UNIQUE,
+                slot_index INTEGER NOT NULL,
+                output_root TEXT NOT NULL,
+                status TEXT NOT NULL,
+                analysis_status TEXT NOT NULL DEFAULT 'notAnalyzed',
+                analysis_error TEXT,
+                measured_duration_seconds REAL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY(track_key) REFERENCES tracks(track_key) ON DELETE CASCADE
+             );
+             INSERT INTO w4dj_track_meta_light(
+                track_key,source_path,destination_path,slot_index,output_root,
+                status,analysis_status,analysis_error,measured_duration_seconds,
+                created_at_ms,updated_at_ms
+             ) SELECT track_key,source_path,destination_path,slot_index,output_root,
+                status,analysis_status,analysis_error,measured_duration_seconds,
+                created_at_ms,updated_at_ms
+             FROM w4dj_track_meta;
+             DROP TABLE w4dj_track_meta;
+             ALTER TABLE w4dj_track_meta_light RENAME TO w4dj_track_meta;
+             CREATE INDEX IF NOT EXISTS w4dj_track_meta_source_path
+                ON w4dj_track_meta(source_path);
+             CREATE INDEX IF NOT EXISTS w4dj_track_meta_status
+                ON w4dj_track_meta(status);
+             COMMIT;",
         )?;
         Ok(())
     }
@@ -450,9 +502,10 @@ impl W4djLibrary {
         }))
     }
 
-    /// Return only current, readable W4DJ outputs. This query intentionally
-    /// never consults the NetEase database, conversion history, or the legacy
-    /// dashboard projection.
+    /// Return every output owned by the lightweight W4DJ index. Availability
+    /// flags are returned as stored compatibility hints, but they are not
+    /// used to decide whether a song can be matched; the exporter checks only
+    /// the selected paths. No filesystem or NetEase lookup happens here.
     pub fn available_dj_output_candidates(&self) -> W4djResult<Vec<DjOutputCandidate>> {
         let mut statement = self.catalog.connection().prepare(
             "SELECT m.track_key,t.title,t.artists,
@@ -464,7 +517,6 @@ impl W4djLibrary {
                               WHERE lf.path=m.destination_path LIMIT 1), 1)
              FROM w4dj_track_meta m
              JOIN tracks t ON t.track_key=m.track_key
-             WHERE m.status='available'
              ORDER BY m.destination_path, m.track_key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -479,20 +531,7 @@ impl W4djLibrary {
                 readable: row.get::<_, i64>(7)? != 0,
             })
         })?;
-        let mut candidates = Vec::new();
-        for row in rows {
-            let mut candidate = row?;
-            let readable = candidate.readable
-                && fs::metadata(&candidate.destination_path)
-                    .map(|metadata| metadata.is_file() && metadata.len() > 0)
-                    .unwrap_or(false)
-                && fs::File::open(&candidate.destination_path).is_ok();
-            candidate.readable = readable;
-            if readable {
-                candidates.push(candidate);
-            }
-        }
-        Ok(candidates)
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn compute_imported_dj_playlist_matches(
@@ -542,7 +581,6 @@ impl W4djLibrary {
         let mut effective_report = report.clone();
         let available_by_key = candidates
             .iter()
-            .filter(|candidate| candidate.status == "available" && candidate.readable)
             .map(|candidate| (candidate.track_key.as_str(), candidate))
             .collect::<std::collections::HashMap<_, _>>();
         for row in &mut effective_report.matches {
@@ -665,7 +703,6 @@ impl W4djLibrary {
             let candidates = self.available_dj_output_candidates()?;
             let available_by_key = candidates
                 .iter()
-                .filter(|candidate| candidate.status == "available" && candidate.readable)
                 .map(|candidate| (candidate.track_key.as_str(), candidate))
                 .collect::<std::collections::HashMap<_, _>>();
             let mut refreshed = stored;
@@ -875,6 +912,237 @@ impl W4djLibrary {
         }
         self.mark_initial_import_done()?;
         Ok(imported)
+    }
+
+    /// Register an output using only facts already known by the conversion
+    /// preview.  This is the production ingestion path for new conversions:
+    /// it deliberately does not stat, probe, open, or read either the source
+    /// or destination file.  The safe-commit callback has already proved that
+    /// the destination exists; the index stores that fact as a lightweight
+    /// local binding and defers all expensive metadata work to the explicit
+    /// analysis/maintenance commands.
+    ///
+    /// The legacy `w4dj_track_meta` table still carries an output-root column
+    /// for relative-path rendering, but its old foreign key/state machine is
+    /// migrated away.  This path does not touch `output_roots` or
+    /// `slot_output_roots`, and never transitions a previous row to
+    /// `outOfScope`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_lightweight_output(
+        &mut self,
+        slot_index: usize,
+        source_path: Option<&Path>,
+        destination_path: &Path,
+        netease_track_id: Option<&str>,
+        netease_album_id: Option<&str>,
+        title: &str,
+        artist: &str,
+    ) -> W4djResult<String> {
+        let destination = normalize_index_path(destination_path);
+        if destination.is_empty() {
+            return Err(W4djLibraryError::Invalid("输出路径不能为空".to_string()));
+        }
+        let source = source_path.map(normalize_index_path);
+        let track_id = nonempty_identity(netease_track_id);
+        let album_id = nonempty_identity(netease_album_id);
+        let title = title.trim();
+        let artist = artist.trim();
+        let fallback_title = Path::new(&destination)
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| destination.clone());
+        let title = if title.is_empty() {
+            fallback_title.as_str()
+        } else {
+            title
+        };
+        let artist_list_json = serde_json::to_string(
+            &artist
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+        let output_root = Path::new(&destination)
+            .parent()
+            .map(normalize_index_path)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+        let now = now_ms();
+
+        let transaction = self.catalog.connection_mut().transaction()?;
+
+        // Resolve the stable identity in the documented priority order.  The
+        // side table is consulted as well because older rows may have stored
+        // the NetEase ID there before the wide `tracks` projection was
+        // updated.
+        let mut existing_key: Option<String> = None;
+        if let Some(track_id) = track_id.as_deref() {
+            existing_key = transaction
+                .query_row(
+                    "SELECT track_key FROM tracks WHERE netease_track_id=?1 LIMIT 1",
+                    [track_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing_key.is_none() {
+                existing_key = transaction
+                    .query_row(
+                        "SELECT m.track_key
+                         FROM w4dj_output_identities oi
+                         JOIN w4dj_track_meta m ON m.destination_path=oi.destination_path
+                         WHERE oi.netease_track_id=?1
+                         ORDER BY oi.updated_at_ms DESC
+                         LIMIT 1",
+                        [track_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+            }
+        }
+        if existing_key.is_none()
+            && let Some(source) = source.as_deref()
+        {
+            existing_key = transaction
+                .query_row(
+                    "SELECT track_key FROM w4dj_track_meta WHERE source_path=?1 LIMIT 1",
+                    [source],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+        }
+        if existing_key.is_none() {
+            existing_key = transaction
+                .query_row(
+                    "SELECT track_key FROM w4dj_track_meta WHERE destination_path=?1 LIMIT 1",
+                    [&destination],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+        }
+        let track_key = existing_key.unwrap_or_else(|| {
+            track_id
+                .as_deref()
+                .map(|value| format!("netease:{value}"))
+                .or_else(|| source.as_deref().map(|value| format!("source:{value}")))
+                .unwrap_or_else(|| format!("output:{destination}"))
+        });
+
+        // A destination can only belong to one output.  If a new identity is
+        // committed over an old row, remove that stale row inside this same
+        // transaction; no audio file is touched.
+        if let Some(destination_key) = transaction
+            .query_row(
+                "SELECT track_key FROM w4dj_track_meta WHERE destination_path=?1",
+                [&destination],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            && destination_key != track_key
+        {
+            transaction.execute("DELETE FROM tracks WHERE track_key=?1", [&destination_key])?;
+        }
+
+        // Capture all previous paths before replacing the binding so their
+        // identity rows can be removed without probing the old files.
+        let previous_destinations = {
+            let mut statement = transaction
+                .prepare("SELECT destination_path FROM w4dj_track_meta WHERE track_key=?1")?;
+            let rows = statement.query_map([&track_key], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        transaction.execute(
+            "INSERT INTO tracks(
+                track_key, netease_track_id, title, artists, artist_list_json,
+                local_status, updated_at_ms
+             ) VALUES (?1,?2,?3,?4,?5,'available',?6)
+             ON CONFLICT(track_key) DO UPDATE SET
+                netease_track_id=excluded.netease_track_id,
+                title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE tracks.title END,
+                artists=CASE WHEN excluded.artists<>'' THEN excluded.artists ELSE tracks.artists END,
+                artist_list_json=CASE WHEN excluded.artists<>'' THEN excluded.artist_list_json ELSE tracks.artist_list_json END,
+                local_status='available', updated_at_ms=excluded.updated_at_ms",
+            params![track_key, track_id, title, artist, artist_list_json, now],
+        )?;
+
+        for previous in previous_destinations {
+            transaction.execute(
+                "DELETE FROM w4dj_output_identities WHERE destination_path=?1",
+                [previous],
+            )?;
+        }
+        transaction.execute("DELETE FROM local_files WHERE track_key=?1", [&track_key])?;
+        transaction.execute(
+            "INSERT INTO local_files(
+                track_key,path,size_bytes,modified_at_ms,measured_format,
+                measured_bitrate_bps,measured_duration_seconds,sample_rate_hz,
+                channels,readable,probe_error
+             ) VALUES (?1,?2,0,NULL,NULL,NULL,NULL,NULL,NULL,1,NULL)",
+            params![track_key, destination],
+        )?;
+        transaction.execute(
+            "INSERT INTO w4dj_track_meta(
+                track_key,source_path,destination_path,slot_index,output_root,
+                status,analysis_status,analysis_error,measured_duration_seconds,
+                created_at_ms,updated_at_ms
+             ) VALUES (?1,?2,?3,?4,?5,'available','notAnalyzed',NULL,NULL,?6,?6)
+             ON CONFLICT(track_key) DO UPDATE SET
+                source_path=excluded.source_path,
+                destination_path=excluded.destination_path,
+                slot_index=excluded.slot_index,
+                output_root=excluded.output_root,
+                status='available',
+                analysis_status='notAnalyzed',
+                analysis_error=NULL,
+                measured_duration_seconds=NULL,
+                updated_at_ms=excluded.updated_at_ms",
+            params![
+                track_key,
+                source,
+                destination,
+                slot_index as i64,
+                output_root,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO w4dj_output_identities(
+                destination_path,netease_track_id,netease_album_id,updated_at_ms
+             ) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(destination_path) DO UPDATE SET
+                netease_track_id=excluded.netease_track_id,
+                netease_album_id=excluded.netease_album_id,
+                updated_at_ms=excluded.updated_at_ms",
+            params![destination, track_id, album_id, now],
+        )?;
+
+        // The bytes behind this output were just safely committed. Any
+        // previous projection therefore belongs to the old bytes, even when
+        // the destination path itself did not change.
+        transaction.execute(
+            "DELETE FROM analysis_results WHERE track_key=?1",
+            [&track_key],
+        )?;
+        transaction.execute(
+            "UPDATE tracks SET essentia_genre='', essentia_duration_seconds=NULL,
+                preferred_local_file_id=NULL,
+                measured_duration_seconds=NULL, effective_duration_seconds=NULL,
+                duration_source=NULL, measured_format=NULL, effective_format=NULL,
+                measured_bitrate_bps=NULL, effective_bitrate_bps=NULL,
+                measured_size_bytes=NULL, effective_size_bytes=NULL,
+                bpm=NULL, musical_key=NULL, scale=NULL,
+                integrated_loudness_lufs=NULL, loudness_range_lu=NULL,
+                energy=NULL, danceability=NULL, mood_json='[]', instrument_json='[]',
+                style_json='[]', discogs_mood_theme_json='[]',
+                discogs_approachability_json='{}', discogs_instrumentation_json='[]',
+                discogs_timbre_json='{}', discogs_danceability_json='{}',
+                drop_loudness_lufs=NULL, updated_at_ms=?1 WHERE track_key=?2",
+            params![now, track_key],
+        )?;
+        transaction.commit()?;
+        Ok(track_key)
     }
 
     /// Register one output only after its final safe commit has completed.
@@ -1398,20 +1666,10 @@ impl W4djLibrary {
     }
 
     pub fn readable_local_files(&self) -> W4djResult<Vec<CatalogLocalFile>> {
-        let files = self.catalog.readable_local_files()?;
-        let connection = self.catalog.connection();
-        Ok(files
-            .into_iter()
-            .filter(|file| {
-                connection
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM w4dj_track_meta WHERE track_key=?1 AND status='available')",
-                        [&file.track_key],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>())
+        // The local-file rows are the lightweight index.  Do not consult the
+        // legacy availability state machine here; a selected path is checked
+        // only when the caller actually reads/analyzes/exports it.
+        Ok(self.catalog.readable_local_files()?)
     }
 
     /// Remove rows for W4DJ's own temporary/AppleDouble artifacts without
@@ -1491,7 +1749,6 @@ impl W4djLibrary {
              FROM w4dj_track_meta m
              JOIN tracks t ON t.track_key=m.track_key
              LEFT JOIN analysis_results ar ON ar.track_key=m.track_key
-             WHERE m.status='available'
              ORDER BY m.destination_path",
         )?;
         let rows = statement.query_map([], |row| {
@@ -2012,7 +2269,6 @@ fn validate_match_report(
     }
     let available = candidates
         .iter()
-        .filter(|candidate| candidate.status == "available" && candidate.readable)
         .map(|candidate| candidate.track_key.as_str())
         .collect::<std::collections::HashSet<_>>();
     let expected = playlist
@@ -2084,6 +2340,21 @@ fn normalize_path(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()
+}
+
+/// Normalize a path for the post-commit index without touching the
+/// filesystem.  Conversion candidates are absolute paths already; keeping
+/// this operation lexical is what makes lightweight registration safe during
+/// startup and avoids an implicit stat/canonicalize scan.
+fn normalize_index_path(path: &Path) -> String {
+    path.to_string_lossy().trim().to_string()
+}
+
+fn nonempty_identity(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn restore_dedupe_key(stored: &str, position: u64) -> String {
