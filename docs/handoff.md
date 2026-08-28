@@ -297,3 +297,11 @@ Final verification update: the 100-track pagination fixture passes, frontend ful
 网易云轻量 locator 使用路径、文件名和 stem 索引，扫描不再逐候选读取完整数据库，也不在开始时调用完整 `load_exact`。真实只读 T7 验收 `/Volumes/T7_1T/Neteast/test` 得到 1088/1088 候选与元数据事件，耗时 3.52 秒。自动化结果：Vitest 194/194、根 Rust 全量、Tauri 58/58、TypeScript、Vite、Tauri check、Tauri 严格 Clippy、fmt、diff-check 通过；根 all-targets 严格 Clippy 的 legacy dead_code 和 `duplicate_track_acceptance` map_identity 仍未处理。
 
 最新可验收产物：`/Users/mac2/Documents/W4DJ RKB/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/W4DJ RKB.app`（arm64，`3.2.0-beta.3`）。本轮未截图、未修改用户音频/数据库/分析 JSON，未提交或推送。若继续做人工验收，使用后台 `open -g`，只检查开始、关键阶段、结束三次；不要恢复反复截图轮询。
+
+## 2026-08-27 Discogs EffNet 资源去重
+
+App 内置包不再携带重复的旧 `discogs_effnet.{json,bin}`，只分发
+`discogs_effnet_embedding.{json,bin}`；旧 ID 仍保留在导入器和运行时回退路径中，用户手动导入的
+旧模型继续可用。离线生成脚本已停止复制旧副本，资源校验新增 canonical-only 断言和旧 ID 导入回归。
+
+最新 arm64 App 约 95.5 MiB（此前约 112.9 MiB），版本 `3.2.0-beta.3`。Tauri 64 项模型相关/应用测试、根 `cargo test --all`、fmt、Clippy（Tauri target）和 diff-check 已通过；未提交、未推送。

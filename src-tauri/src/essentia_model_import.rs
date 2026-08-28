@@ -1741,7 +1741,6 @@ mod tests {
             .join("resources")
             .join("essentia-models");
         for id in [
-            "discogs_effnet",
             "discogs_effnet_embedding",
             "genre_discogs400",
             "discogs_mood_theme",
@@ -1770,6 +1769,42 @@ mod tests {
                 assert_eq!(model_input_units(&value), identity.expected_input_width);
             }
         }
+    }
+
+    #[test]
+    fn bundled_discogs_resources_use_single_canonical_embedding_pair() {
+        let resources = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("essentia-models");
+        assert!(resources.join("discogs_effnet_embedding.json").is_file());
+        assert!(resources.join("discogs_effnet_embedding.bin").is_file());
+        assert!(!resources.join("discogs_effnet.json").exists());
+        assert!(!resources.join("discogs_effnet.bin").exists());
+        let embedding_json: Value = serde_json::from_slice(
+            &fs::read(resources.join("discogs_effnet_embedding.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            embedding_json["weightsManifest"][0]["paths"][0].as_str(),
+            Some("discogs_effnet_embedding.bin")
+        );
+    }
+
+    #[test]
+    fn legacy_discogs_embedding_identifier_remains_importable() {
+        let fixture = TestFixture::new("discogs_effnet");
+        write_model_pair(&fixture.input_dir, "discogs_effnet", Some(1280), "legacy");
+        let inputs = vec![
+            fixture.input_dir.join("discogs_effnet.json"),
+            fixture.input_dir.join("discogs_effnet.bin"),
+        ];
+        let report = import_model_paths(&inputs, fixture.models_path()).unwrap();
+        assert_eq!(report.installed_ids, ["discogs_effnet"]);
+        assert!(report.issues.is_empty());
+        assert!(installed_model_pair_is_valid(
+            fixture.models_path(),
+            "discogs_effnet"
+        ));
     }
 
     fn write_bundled_model_set(path: &Path, marker: &str) {

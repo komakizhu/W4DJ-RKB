@@ -29,6 +29,7 @@ use w4dj::dj_playlist::{
     ImportedDjPlaylist, ImportedDjPlaylistSummary, parse_w4dj_playlist, serialize_w4dj_playlist,
 };
 use w4dj::dj_playlist_match::DjPlaylistMatchReport;
+use w4dj::filename_policy::sanitize_filename_component;
 use w4dj::m3u8::{
     M3u8ExportSummary, ResolvedDjPlaylistTrack, build_relative_m3u8_with_summary,
     write_relative_m3u8_atomic,
@@ -3674,7 +3675,9 @@ fn open_external_url(url: String) -> Result<(), String> {
 
 fn external_url_is_allowed(url: &str) -> bool {
     const PROJECT_URL: &str = "https://github.com/komakizhu/W4DJ-RKB";
+    const DJ_CRATE_DIGGER_URL: &str = "https://github.com/komakizhu/dj-crate-digger-skill";
     url == PROJECT_URL
+        || url == DJ_CRATE_DIGGER_URL
         || url.starts_with("https://github.com/komakizhu/W4DJ-RKB/releases/")
         || url == ESSENTIA_MODELS_URL
 }
@@ -3811,9 +3814,172 @@ fn export_netease_playlist_text(path: String, text: String) -> Result<(), String
 #[serde(rename_all = "camelCase")]
 struct DjPlaylistM3u8ExportResult {
     path: String,
+    export_directory: String,
     matched_count: usize,
     total: usize,
+    copied_count: usize,
+    copy_audio: bool,
+    portable: bool,
     omitted: Vec<w4dj::m3u8::M3u8OmittedTrack>,
+}
+
+fn playlist_export_paths(
+    selected_path: &Path,
+    playlist_name: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let parent = selected_path
+        .parent()
+        .ok_or_else(|| "无法确定歌单导出目录".to_string())?;
+    let sanitized_name = sanitize_filename_component(playlist_name);
+    let folder_name = if sanitized_name.is_empty() {
+        "W4DJ 歌单".to_string()
+    } else {
+        sanitized_name
+    };
+    let export_directory = if parent
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(&folder_name))
+    {
+        parent.to_path_buf()
+    } else {
+        parent.join(&folder_name)
+    };
+    let playlist_path = export_directory.join(format!("{folder_name}.m3u8"));
+    Ok((export_directory, playlist_path))
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn unique_playlist_audio_target(
+    directory: &Path,
+    source_name: &std::ffi::OsStr,
+    occupied: &HashSet<PathBuf>,
+) -> PathBuf {
+    let initial = directory.join(source_name);
+    if !initial.exists() && !occupied.contains(&initial) {
+        return initial;
+    }
+    let stem = Path::new(source_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("track");
+    let extension = Path::new(source_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let mut index = 1usize;
+    loop {
+        let candidate = directory.join(format!("{stem} ({index}){extension}"));
+        if !candidate.exists() && !occupied.contains(&candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+#[cfg(unix)]
+fn set_portable_export_permissions(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("读取导出权限失败（{}）：{error}", path.display()))?
+        .permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("设置跨账户导出权限失败（{}）：{error}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_portable_export_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+fn validate_portable_playlist_export(
+    resolved: &[ResolvedDjPlaylistTrack],
+    export_directory: &Path,
+    contents: &str,
+) -> Result<(), String> {
+    for track in resolved {
+        if track.destination_path.parent() != Some(export_directory) {
+            return Err(format!(
+                "复制模式产生了歌单文件夹外的音频路径：{}",
+                track.destination_path.display()
+            ));
+        }
+        let metadata = fs::metadata(&track.destination_path)
+            .map_err(|error| format!("复制后的音频不可读（{}）：{error}", track.destination_path.display()))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(format!(
+                "复制后的音频不存在或为空：{}",
+                track.destination_path.display()
+            ));
+        }
+        fs::File::open(&track.destination_path)
+            .map_err(|error| format!("复制后的音频不可打开（{}）：{error}", track.destination_path.display()))?;
+    }
+
+    for line in contents.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let path = Path::new(line);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!("复制模式的 M3U8 包含歌单文件夹外路径：{line}"));
+        }
+    }
+    Ok(())
+}
+
+fn copy_playlist_audio_to_directory(
+    resolved: &mut [ResolvedDjPlaylistTrack],
+    directory: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut occupied = HashSet::new();
+    let mut created = Vec::new();
+    for track in resolved {
+        let source = track.destination_path.clone();
+        let source_name = source
+            .file_name()
+            .ok_or_else(|| format!("输出文件没有有效文件名：{}", source.display()))?;
+        let default_target = directory.join(source_name);
+        let target = if paths_refer_to_same_file(&source, &default_target) {
+            default_target
+        } else {
+            unique_playlist_audio_target(directory, source_name, &occupied)
+        };
+        if !paths_refer_to_same_file(&source, &target) {
+            if let Err(error) = fs::copy(&source, &target) {
+                for created_path in &created {
+                    let _ = fs::remove_file(created_path);
+                }
+                return Err(format!("复制音频失败（{}）：{error}", source.display()));
+            }
+            created.push(target.clone());
+        }
+        if let Err(error) = set_portable_export_permissions(&target, 0o644) {
+            for created_path in &created {
+                let _ = fs::remove_file(created_path);
+            }
+            return Err(error);
+        }
+        occupied.insert(target.clone());
+        track.destination_path = target;
+    }
+    Ok(created)
 }
 
 #[tauri::command]
@@ -3895,16 +4061,17 @@ fn export_imported_dj_playlist_m3u8(
     playlist_id: String,
     path: String,
     allow_partial: bool,
+    copy_audio: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DjPlaylistM3u8ExportResult, String> {
     if playlist_id.trim().is_empty() {
         return Err("DJ 歌单 ID 不能为空".to_string());
     }
-    let output = PathBuf::from(path);
-    if !output.is_absolute() {
+    let selected_path = PathBuf::from(path);
+    if !selected_path.is_absolute() {
         return Err("M3U8 导出路径必须是绝对路径".to_string());
     }
-    if output
+    if selected_path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_none_or(|extension| !extension.eq_ignore_ascii_case("m3u8"))
@@ -3917,6 +4084,13 @@ fn export_imported_dj_playlist_m3u8(
         .get_imported_dj_playlist(&playlist_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "找不到指定的 DJ 歌单".to_string())?;
+    let selected_parent = selected_path
+        .parent()
+        .ok_or_else(|| "无法确定歌单导出目录".to_string())?;
+    if !selected_parent.is_dir() {
+        return Err("歌单导出目录不存在".to_string());
+    }
+    let (export_directory, output) = playlist_export_paths(&selected_path, &playlist.name)?;
     let report = library
         .get_imported_dj_playlist_match_report(&playlist_id)
         .map_err(|error| error.to_string())?;
@@ -3938,14 +4112,79 @@ fn export_imported_dj_playlist_m3u8(
             })
         })
         .collect::<Vec<_>>();
+    let mut resolved = resolved;
+    let copy_audio = copy_audio.unwrap_or(false);
+    let created_export_directory = !export_directory.exists();
+    if created_export_directory {
+        fs::create_dir(&export_directory)
+            .map_err(|error| format!("创建歌单文件夹失败：{error}"))?;
+    } else if !export_directory.is_dir() {
+        return Err(format!(
+            "歌单文件夹路径已被文件占用：{}",
+            export_directory.display()
+        ));
+    }
+    if let Err(error) = set_portable_export_permissions(&export_directory, 0o755) {
+        if created_export_directory {
+            let _ = fs::remove_dir(&export_directory);
+        }
+        return Err(error);
+    }
+    let created_audio = if copy_audio {
+        match copy_playlist_audio_to_directory(&mut resolved, &export_directory) {
+            Ok(paths) => paths,
+            Err(error) => {
+                if created_export_directory {
+                    let _ = fs::remove_dir(&export_directory);
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let (contents, summary): (String, M3u8ExportSummary) =
-        build_relative_m3u8_with_summary(&playlist, &resolved, &output, allow_partial)
-            .map_err(|error| error.to_string())?;
-    write_relative_m3u8_atomic(&output, &contents).map_err(|error| error.to_string())?;
+        match build_relative_m3u8_with_summary(&playlist, &resolved, &output, allow_partial) {
+            Ok(result) => result,
+            Err(error) => {
+                for created_path in &created_audio {
+                    let _ = fs::remove_file(created_path);
+                }
+                if created_export_directory {
+                    let _ = fs::remove_dir(&export_directory);
+                }
+                return Err(error.to_string());
+            }
+        };
+    if copy_audio
+        && let Err(error) =
+            validate_portable_playlist_export(&resolved, &export_directory, &contents)
+    {
+        for created_path in &created_audio {
+            let _ = fs::remove_file(created_path);
+        }
+        if created_export_directory {
+            let _ = fs::remove_dir(&export_directory);
+        }
+        return Err(error);
+    }
+    if let Err(error) = write_relative_m3u8_atomic(&output, &contents) {
+        for created_path in &created_audio {
+            let _ = fs::remove_file(created_path);
+        }
+        if created_export_directory {
+            let _ = fs::remove_dir(&export_directory);
+        }
+        return Err(error.to_string());
+    }
     Ok(DjPlaylistM3u8ExportResult {
         path: output.to_string_lossy().into_owned(),
+        export_directory: export_directory.to_string_lossy().into_owned(),
         matched_count: summary.matched_count,
         total: summary.total,
+        copied_count: if copy_audio { resolved.len() } else { 0 },
+        copy_audio,
+        portable: copy_audio,
         omitted: summary.omitted,
     })
 }
@@ -7931,6 +8170,7 @@ mod tests {
     use w4dj::config::Mode;
     use w4dj::desktop::{DesktopController, DesktopState};
     use w4dj::history::{AnalysisReport, FailedFile, HistoryEntry, HistoryStatus};
+    use w4dj::m3u8::ResolvedDjPlaylistTrack;
     use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
     use w4dj::preview::{PreviewCandidate, PreviewIssue, SlotPreview, SyncPreview};
     use w4dj::task::TaskController;
@@ -8135,7 +8375,13 @@ mod tests {
     }
 
     #[test]
-    fn external_url_allowlist_includes_only_project_and_official_essentia_pages() {
+    fn external_url_allowlist_includes_project_dj_skill_and_official_essentia_pages() {
+        assert!(super::external_url_is_allowed(
+            "https://github.com/komakizhu/dj-crate-digger-skill"
+        ));
+        assert!(!super::external_url_is_allowed(
+            "https://github.com/komakizhu/dj-crate-digger-skill/evil"
+        ));
         assert!(super::external_url_is_allowed("https://essentia.upf.edu/models/"));
         assert!(!super::external_url_is_allowed(
             "https://essentia.upf.edu.evil.example/models/"
@@ -8950,5 +9196,178 @@ mod tests {
             w4dj::desktop::DesktopStatus::Completed
         );
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn copying_playlist_audio_keeps_duplicate_names_and_updates_m3u8_paths() {
+        let root = std::env::temp_dir().join(format!("w4dj-copy-audio-{}", super::unique_timestamp()));
+        let source_a = root.join("a");
+        let source_b = root.join("b");
+        let output = root.join("out");
+        fs::create_dir_all(&source_a).unwrap();
+        fs::create_dir_all(&source_b).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let source_a_path = source_a.join("Same.mp3");
+        let source_b_path = source_b.join("Same.mp3");
+        fs::write(&source_a_path, b"audio-a").unwrap();
+        fs::write(&source_b_path, b"audio-b").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&source_a_path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&source_b_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut resolved = vec![
+            ResolvedDjPlaylistTrack {
+                position: 1,
+                title: "A".into(),
+                artist_display: "Artist".into(),
+                duration_seconds: None,
+                destination_path: source_a_path.clone(),
+            },
+            ResolvedDjPlaylistTrack {
+                position: 2,
+                title: "B".into(),
+                artist_display: "Artist".into(),
+                duration_seconds: None,
+                destination_path: source_b_path.clone(),
+            },
+        ];
+
+        let created = super::copy_playlist_audio_to_directory(&mut resolved, &output).unwrap();
+
+        assert_eq!(created.len(), 2);
+        assert_eq!(resolved[0].destination_path.file_name().unwrap(), "Same.mp3");
+        assert_eq!(resolved[1].destination_path.file_name().unwrap(), "Same (1).mp3");
+        assert_eq!(fs::read(&resolved[0].destination_path).unwrap(), b"audio-a");
+        assert_eq!(fs::read(&resolved[1].destination_path).unwrap(), b"audio-b");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&resolved[0].destination_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+            assert_eq!(
+                fs::metadata(&resolved[1].destination_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+            assert_eq!(
+                fs::metadata(&source_a_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&source_b_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copied_playlist_paths_are_self_contained() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-portable-playlist-{}",
+            super::unique_timestamp()
+        ));
+        let export_directory = root.join("Playlist");
+        fs::create_dir_all(&export_directory).unwrap();
+        let audio = export_directory.join("Track.mp3");
+        fs::write(&audio, b"audio").unwrap();
+        let resolved = vec![ResolvedDjPlaylistTrack {
+            position: 1,
+            title: "Track".into(),
+            artist_display: "Artist".into(),
+            duration_seconds: None,
+            destination_path: audio,
+        }];
+
+        assert!(super::validate_portable_playlist_export(
+            &resolved,
+            &export_directory,
+            "#EXTM3U\n#EXTINF:-1,Artist - Track\nTrack.mp3"
+        )
+        .is_ok());
+        assert!(super::validate_portable_playlist_export(
+            &resolved,
+            &export_directory,
+            "#EXTM3U\n#EXTINF:-1,Artist - Track\n../Track.mp3"
+        )
+        .is_err());
+        assert!(super::validate_portable_playlist_export(
+            &resolved,
+            &export_directory,
+            "#EXTM3U\n#EXTINF:-1,Artist - Track\n/Users/mac/Music/Track.mp3"
+        )
+        .is_err());
+        let outside_audio = root.join("Outside.mp3");
+        fs::write(&outside_audio, b"outside").unwrap();
+        let outside = vec![ResolvedDjPlaylistTrack {
+            position: 1,
+            title: "Outside".into(),
+            artist_display: "Artist".into(),
+            duration_seconds: None,
+            destination_path: outside_audio,
+        }];
+        assert!(super::validate_portable_playlist_export(
+            &outside,
+            &export_directory,
+            "#EXTM3U\n#EXTINF:-1,Artist - Outside\nOutside.mp3"
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_playlist_directory_is_cross_account_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "w4dj-portable-directory-{}",
+            super::unique_timestamp()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+
+        super::set_portable_export_permissions(&directory, 0o755).unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let _ = fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn playlist_export_paths_use_the_playlist_name_as_the_folder_and_file_name() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-playlist-export-paths-{}",
+            super::unique_timestamp()
+        ));
+        let selected = root.join("ignored-name.m3u8");
+
+        let (directory, playlist_path) =
+            super::playlist_export_paths(&selected, "模拟 UK Bass 歌单").unwrap();
+
+        assert_eq!(directory, root.join("模拟 UK Bass 歌单"));
+        assert_eq!(
+            playlist_path,
+            root.join("模拟 UK Bass 歌单").join("模拟 UK Bass 歌单.m3u8")
+        );
+
+        let selected_inside_folder = playlist_path.clone();
+        let (same_directory, same_playlist_path) =
+            super::playlist_export_paths(&selected_inside_folder, "模拟 UK Bass 歌单").unwrap();
+        assert_eq!(same_directory, directory);
+        assert_eq!(same_playlist_path, playlist_path);
     }
 }

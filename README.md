@@ -1,195 +1,44 @@
 # W4DJ RKB
 
-如果我是 DJ 🎧
+[English version](README.en.md)
 
-![W4DJ RKB 使用界面](imgs/w4dj.png)
+## 中文
 
-W4DJ RKB 是一款面向 DJ 音乐库的桌面工具，用于整理和转换从网易云音乐、SoundCloud 等来源获得的音频文件，让它们更适合导入 Rekordbox，并在 Pioneer CDJ、XDJ 等设备上播放。
+面向 DJ 音乐库的本地整理、转换与音频分析工具。
 
-## 它解决什么问题？
+![W4DJ RKB 主程序界面](imgs/w4dj.png)
 
-从流媒体平台下载的音乐，常常存在以下问题：
+W4DJ RKB 基于并继续复刻开发自 [Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj)，保留原项目的本地扫描、增量同步和音频转换方向。
 
-- 网易云音乐的 `.ncm` 文件无法直接导入 DJ 软件；
-- 采样率过高的音频可能无法被部分 Pioneer 设备识别；
-- 转换后歌曲的标题、艺术家、专辑和封面容易丢失；
-- 手动逐首处理耗时，输出目录也不易维护。
+## 1. 产品主要功能
 
-W4DJ RKB 可以批量扫描下载目录，也可以直接处理单首歌曲；每个任务会将选择的输入来源同步到输出目录，并在处理过程中尽量保留原始元数据和封面。
+- **音频转换与同步**：支持 NCM、MP3、FLAC、WAV 等音频格式；将下载音乐清洗并转换为 Rekordbox 与 CDJ/XDJ 支持的线下播放格式。提供两个可独立设置来源和输出目录的插槽并支持拖入歌曲文件夹或单曲。
+- **一键导入 DJ Set**：导入[老炮DJ](https://github.com/komakizhu/dj-crate-digger-skill)生成的 `.w4dj` 歌单，生成二维码一键导入网易云歌单；DJ Set 经过 W4DJ 转换之后，导出 `.m3u8` 供 Rekordbox 使用。详见[具体操作指南](https://github.com/komakizhu/dj-crate-digger/blob/main/docs/w4dj/README.md)。
+- **元数据与封面**：尽量保留或恢复标题、艺术家、专辑、曲号、Genre、歌词和封面；网易云数据库只读，输出歌曲由独立的 `w4dj.sqlite3` 管理。
+- **界面与教程**：支持中文/英文和深色/浅色模式切换，并可随时重新打开使用教程。
+- **安全与可恢复**：支持跳过、覆盖和仅更新元数据；文件名规则会处理非法字符和冲突；输出先写临时文件并安全提交；转换历史、运行会话和手动错误报告分开保存。
+- **桌面体验**：macOS 原生 Tauri 界面，支持可视化进度；FFmpeg、分析模型和用户数据均在本地处理。
+- **歌曲库 Dashboard（开发中）**：集中查看已经转换的歌曲，了解哪些歌曲可以正常使用、哪些文件已经失效，并支持搜索、筛选、排序和批量清理。
+- **增强音频分析（开发中）**：自动为歌曲补充速度、调性、响度、能量、可舞性、Genre 和情绪等信息，并支持查看进度、取消和继续分析。
 
-## 主要功能
+## 2. 如何从老炮DJ Skill 导入歌单、准备网易云歌曲并导出 Rekordbox 播放列表
 
-### 双任务同步
+[老炮DJ](https://github.com/komakizhu/dj-crate-digger-skill)（DJ Crate Digger）负责选歌并生成 `.w4dj` 歌单文件，W4DJ RKB 接收这个文件，继续完成本地歌曲准备、转换和播放列表导出。`.w4dj` 只保存歌单名称、曲目顺序、官方歌名和艺人信息，不包含音频文件。
 
-可以同时配置两个独立任务，每个任务分别设置：
+完整流程是：[老炮DJ](https://github.com/komakizhu/dj-crate-digger-skill)生成 `.w4dj` → 导入 W4DJ RKB → 在网易云音乐创建歌单并下载歌曲 → W4DJ RKB 转换音频并导出 `.m3u8` → 导入 Rekordbox。
 
-- 歌曲文件夹或单曲文件；
-- 输出目录；
-- 任务状态和处理进度。
+[老炮DJ](https://github.com/komakizhu/dj-crate-digger-skill) 与 W4DJ RKB 的交接教程见[详细教程](https://github.com/komakizhu/dj-crate-digger/blob/main/docs/w4dj/README.md)。
 
-如果任务 2 没有单独设置输出目录，会自动使用任务 1 的输出目录。
+W4DJ RKB 不会替用户下载或获取版权音频；歌曲必须先通过合法渠道准备到本地。W4DJ RKB 的歌曲库以实际输出文件和 `w4dj.sqlite3` 为准。
 
-### 两种输出模式
+## 3. 许可证与项目来源
 
-| 模式 | 输出特点 | 适用场景 |
-| --- | --- | --- |
-| 兼容模式 | 最高输出 320kbps MP3 | 文件体积较小，适合通用播放 |
-| 无损模式 | 最高 24-bit / 48kHz，可选 WAV 或 AIFF | 适合 Rekordbox 与 Pioneer DJ 设备 |
+W4DJ RKB 自己编写的代码采用 **GNU AGPL-3.0-only**，完整条款见 [`LICENSE`](LICENSE)。该许可只适用于本项目原创代码；上游复刻部分、第三方依赖、随包模型和其他资源仍按各自原许可证执行。发布或再分发时，请同时遵守本项目及各依赖、模型的适用条款。
 
-原文件本身为有损格式时，工具不会虚假提升音质；输出会遵循源文件的实际质量。
+- **复刻与上游来源**：[Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj)。W4DJ RKB 保留该项目的来源说明，不替上游项目重新授予许可证。
+- **NCM 解密相关**：[anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump)、[iqiziqi/ncmdump.rs](https://github.com/iqiziqi/ncmdump.rs)。
+- **Essentia.js**：AGPL-3.0，[许可证文本](https://www.gnu.org/licenses/agpl-3.0.html)。
+- **TensorFlow.js**：Apache-2.0，[许可证文本](https://www.apache.org/licenses/LICENSE-2.0)。
+- **随包音频分析模型**：CC BY-NC-SA 4.0，[许可证文本](https://creativecommons.org/licenses/by-nc-sa/4.0/)。模型归属、转换说明和商业授权信息见 [`src-tauri/resources/essentia-models/NOTICE.md`](src-tauri/resources/essentia-models/NOTICE.md)。
 
-### 元数据与封面
-
-处理时会尽量保留或恢复：
-
-- 歌曲名称；
-- 艺术家和专辑信息；
-- 音频标签；
-- 专辑封面。
-
-### 桌面应用界面
-
-- macOS 原生桌面窗口；
-- 中文 / 英文界面切换；
-- 浅色 / 深色模式切换；
-- 可视化任务进度；
-- 支持拖放歌曲文件夹或单曲；
-- Rust 后端负责文件处理和同步。
-
-### 转换前确认
-
-点击“同时开始”后，软件会先扫描两个任务，并在转换前显示汇总确认窗口，包括：
-
-- 新增、已存在、将跳过和错误文件数量；
-- 预计输出大小；
-- 输入来源、输出目录和当前输出模式。
-
-确认后才会开始转换，方便在处理前发现目录或设置问题。
-
-### 转换历史与失败重试
-
-- 自动保存最近 50 次转换任务的时间、目录、统计和最终状态；
-- 查看每次任务的失败歌曲及错误原因；
-- 只重试失败歌曲，不重复处理已完成歌曲；
-- 将失败明细导出为 UTF-8 错误报告。
-
-### Essentia 自动分析与 Rekordbox 元数据
-
-Essentia.js 已内置在“加强模式”中。打开“加强模式”后，点击确认并开始转换，W4DJ 会在后台逐首分析待处理歌曲，并把结果直接写入输出音频；关闭时不会运行分析，也不改变普通转换流程：
-
-TensorFlow.js 和约 3.5 MB 的 MusiCNN/情绪/人声预训练资源均随桌面 App 打包，首次启动会安装缺失模型，不需要连接模型服务器。高级设置中的“恢复内置模型”可覆盖修复损坏的本地副本；“官网下载”和“导入模型”继续作为手动替换入口。宽类 Genre 由 MusiCNN 的 50 个 MSD 预训练标签投影得到，情绪与人声/器乐使用独立分类头。
-
-- BPM 和节拍位置；
-- Key、大小调和 Key 置信度；
-- EBU R128 Integrated Loudness（LUFS）与响度范围；
-- Energy 和 Danceability。
-
-其中 BPM 和 Key 使用标准音频标签，Rekordbox 导入音频后可以直接读取；节拍位置、响度、Energy、Danceability 和 Key 置信度同时写入 W4DJ 自定义标签与 Comment。不同版本的 Rekordbox 对自定义标签的显示方式可能不同，但不会影响标准 BPM/Key。
-
-加强模式的分析进度会显示在转换进度窗口中；某一首分析失败不会阻断整批转换，失败会进入本次转换记录。旧版 Rekordbox XML 导出接口仍保留用于兼容，但当前桌面界面不再提供独立的分析按钮。
-
-### 冲突与文件名策略
-
-输出文件已经存在时，可以选择：
-
-- 跳过现有文件；
-- 覆盖旧文件；
-- 高级选项：仅更新元数据，不重新编码音频。
-
-文件名可使用“标题 - 艺术家”“艺术家 - 标题”或保留原文件名。默认规则为“标题 - 艺术家”，并会自动清理跨平台非法字符和 Windows 保留名称。
-
-### 取消、恢复与磁盘保护
-
-- 支持取消单个任务或全部任务，当前歌曲会安全处理完再停止；
-- 暂停、取消或应用意外关闭后，可从转换历史继续未完成文件；
-- 转换进度会持续保存，重新打开应用后仍可恢复；
-- 转换前检查目标磁盘剩余空间，空间不足时阻止开始；
-- 错误会按文件损坏、格式不支持、FFmpeg、权限、磁盘空间和文件名问题分类；
-- 历史记录支持删除单条或全部清空，不会删除已经生成的音频。
-
-## 基本使用流程
-
-1. 打开 W4DJ RKB。
-2. 为任务 1 和任务 2 选择歌曲文件夹或单曲；也可以直接拖入任意来源框，软件会自动识别。
-3. 选择输出目录；两个任务可以共用一个目录。
-4. 选择输出模式：兼容模式或无损模式。
-5. 无损模式下选择 WAV 或 AIFF。
-6. 选择文件冲突策略和文件名规则。
-7. 点击“同时开始”。
-8. 在汇总确认窗口检查文件数量、预计大小和磁盘可用空间，点击“确认并开始转换”。
-9. 将输出目录导入 Rekordbox，或复制到 DJ 设备使用的存储介质。
-10. 如果打开“加强模式”，转换过程中 W4DJ 会自动分析歌曲并写入元数据；关闭时只进行普通转换。
-
-## 支持的平台
-
-| 来源 | 支持情况 | 说明 |
-| --- | --- | --- |
-| 网易云音乐 | ✅ | 支持 `.ncm` 文件解密与转换 |
-| SoundCloud | ✅ | 支持常见音频文件及采样率转换 |
-
-## 下载安装
-
-从 Releases 下载对应架构的安装包：
-
-- Apple Silicon：`W4DJ-RKB-macOS-Apple-Silicon-v3.2.0-beta.3.dmg`
-- Intel：`W4DJ-RKB-macOS-Intel-v3.2.0-beta.3.dmg`
-- Windows：`W4DJ-RKB-Windows-Installer-v3.2.0-beta.3-setup.exe`
-
-首次打开时，如果 macOS 提示应用无法验证：
-
-1. 打开“系统设置 → 隐私与安全性”；
-2. 找到被阻止的 W4DJ RKB；
-3. 点击“仍要打开”。
-
-也可以在终端中移除隔离属性：
-
-```bash
-xattr -cr "/Applications/W4DJ RKB.app"
-```
-
-## 从源码运行
-
-项目由 Rust、Tauri 和前端应用组成。需要安装 Rust、Node.js、npm 以及 Tauri 的系统依赖。
-
-```bash
-cd W4DJ-RKB/app
-npm install
-npm run build
-
-cd ../src-tauri
-cargo tauri dev
-```
-
-构建 macOS 安装包：
-
-```bash
-cd W4DJ-RKB/src-tauri
-cargo tauri build
-```
-
-## 项目结构
-
-```text
-W4DJ-RKB/
-├── app/              # 前端界面
-├── src/              # 音频同步与转换逻辑
-├── src-tauri/        # Tauri 桌面应用
-├── tests/             # Rust 测试
-├── config.toml       # 命令行配置
-└── imgs/              # 项目图片资源
-```
-
-## 免责声明
-
-本项目仅用于个人学习、研究和合法拥有的音频文件处理。请确认你拥有相关音乐文件的合法使用权，并遵守所在地的法律法规以及相关平台的服务条款。
-
-## 致谢
-
-- [Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj) —— 原始同步引擎
-- [anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump) —— NCM 解密实现
-- [iqiziqi/ncmdump.rs](https://github.com/iqiziqi/ncmdump.rs) —— Rust NCM 解密库
-- [MTG/essentia.js](https://github.com/MTG/essentia.js) —— 浏览器端音频分析引擎
-
-Essentia.js 使用 AGPL-3.0 授权。发布包含该分析模块的 W4DJ 安装包时，需要同时遵守其许可证义务；如果后续要做闭源商业分发，应改用 Essentia 的商业授权或采用独立分析服务。
-
-随包预训练模型由 Universitat Pompeu Fabra 的 Music Technology Group 提供，使用 CC BY-NC-SA 4.0；商业分发前需要另行取得 MTG 的商业许可。模型归属和许可链接随 App 保存在 `Resources/essentia-models/NOTICE.md`。
+本项目仅用于处理用户合法拥有或有权处理的音频。商业分发前，请分别确认 Essentia.js、预训练模型及其他依赖的授权范围。

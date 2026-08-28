@@ -176,6 +176,14 @@ fn writes_utf8_m3u8_atomically_and_rejects_wrong_path() {
         fs::read_to_string(&path).unwrap(),
         "#EXTM3U\n#EXTINF:-1,歌手 - 歌名\n音频.mp3"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
     assert!(matches!(
         write_relative_m3u8_atomic(&root.path().join("playlist.txt"), "#EXTM3U"),
         Err(M3u8Error::InvalidPath(_))

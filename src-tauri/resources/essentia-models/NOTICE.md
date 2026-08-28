@@ -19,7 +19,7 @@ Included resources:
 - `musicnn_embedding.*`: MSD MusiCNN TensorFlow.js model. W4DJ uses its 200-dimensional embedding and 50-tag outputs.
 - `mood_*.{json,bin}` and `voice_instrumental.{json,bin}`: official Essentia classification-head weights converted from the corresponding TensorFlow/ONNX exports into an equivalent TensorFlow.js graph layout. The weights are unchanged; filenames and graph serialization are normalized for W4DJ's local loader.
 - `emomusic.{json,bin}`, `muse.{json,bin}`, and `mirex.{json,bin}`: official Essentia emotion heads converted from ONNX and validated offline.
-- `discogs_effnet_embedding.{json,bin}`: official Discogs EffNet embedding model, accepting `[64,128,96]` mel patches and returning 1280-dimensional embeddings. The legacy `discogs_effnet.{json,bin}` pair is retained only for backward-compatible imports.
+- `discogs_effnet_embedding.{json,bin}`: official Discogs EffNet embedding model, accepting `[64,128,96]` mel patches and returning 1280-dimensional embeddings. The legacy `discogs_effnet.{json,bin}` identifier remains accepted for backward-compatible user imports, but is not bundled as a duplicate pair.
 - `discogs_mood_theme.{json,bin}`, `discogs_approachability.{json,bin}`, `discogs_instrumentation.{json,bin}`, `discogs_timbre.{json,bin}`, and `discogs_danceability.{json,bin}`: official Discogs EffNet classification heads operating on the shared 1280-dimensional embedding. Their outputs are stored in W4DJ namespaced metadata fields and are independent of the legacy scalar `W4DJ-Danceability` field.
 - `genre_discogs400.{json,bin}` and `genre_discogs400.labels.json`: official 400-class Discogs genre head and its class labels. Genre output remains a separate optional projection.
 

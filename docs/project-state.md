@@ -353,3 +353,14 @@ Final verification update: the 100-track QR pagination fixture now passes; the c
 真实只读验收使用 `/Volumes/T7_1T/Neteast/test`：1088 首候选、1088 个元数据事件，索引预览 3.52 秒；未修改源数据库、音频、`w4dj.sqlite3` 或分析 JSON。自动化通过：前端 Vitest 194/194、TypeScript、Vite、根 `cargo test --all`、Tauri 58/58、Tauri check、Tauri 严格 Clippy、Rust fmt 和 diff-check。根 all-targets 严格 Clippy 仍受工作树既有 legacy `dead_code` 与 `duplicate_track_acceptance` 的 `map_identity` 阻断；真实 GUI 点击取消、Windows/Rekordbox 和外置卷完整现场验收未执行。
 
 最新 arm64 App：`/Users/mac2/Documents/W4DJ RKB/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/W4DJ RKB.app`，Mach-O arm64，版本 `3.2.0-beta.3`。
+
+## 2026-08-27 Discogs EffNet 内置资源去重
+
+已移除 App 内置资源中的重复 `discogs_effnet.{json,bin}` 旧副本，只保留正式的
+`discogs_effnet_embedding.{json,bin}`。分析运行时本来就优先加载 canonical embedding，
+模型状态检查仍兼容旧 ID；导入器继续接受用户手动导入的旧模型，因此不会破坏既有用户模型。
+同时更新离线资源生成脚本、资源说明和校验测试，防止后续重新生成时再次复制旧副本。
+
+内置模型资源从约 47.3 MiB 降至约 29.9 MiB，arm64 App 从约 112.9 MiB 降至约 95.5 MiB。
+Tauri 资源校验 64 项（含旧 ID 导入兼容和 canonical-only 资源断言）、根 Rust 全量测试、
+格式检查与 diff-check 通过；版本保持 `3.2.0-beta.3`，未修改用户模型目录、音频或数据库。

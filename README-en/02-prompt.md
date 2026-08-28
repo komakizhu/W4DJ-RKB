@@ -1,0 +1,3 @@
+# Translation Prompt
+
+Rewrite the current Chinese W4DJ RKB README in natural, concise English for general DJ users. Preserve all Markdown structure, links, image paths, file names, product names, version numbers, and license identifiers. Keep the two features marked “开发中” clearly marked as “in development”. Translate “老炮DJ” to “DJ Crate Digger” and keep its Skill repository link. Do not add claims that are not present in the Chinese source. Keep the license scope distinction: AGPL-3.0-only applies only to original W4DJ RKB code; upstream code, dependencies, models, and other resources retain their own licenses.

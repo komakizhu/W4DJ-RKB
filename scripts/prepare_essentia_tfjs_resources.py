@@ -46,6 +46,10 @@ DISCOGS_HEADS = (
     ("discogs_effnet_embedding", "discogs_embedding", 1280, 1),
     ("genre_discogs400", "discogs_genre", 400, 0),
 )
+
+# The legacy identifier remains accepted by the runtime importer.  This name
+# is used here only to remove an exact duplicate left by older resource
+# preparation runs when an existing output directory is reused.
 LEGACY_DISCOGS_EMBEDDING_ID = "discogs_effnet"
 
 DISCOGS_EXTRA_HEADS = (
@@ -459,8 +463,6 @@ def validate_output_set(destination: Path) -> None:
     for model_id, output_name, units, _index in DISCOGS_HEADS:
         if (destination / f"{model_id}.json").is_file():
             validate_pair(destination, model_id, units, output_name)
-    if (destination / f"{LEGACY_DISCOGS_EMBEDDING_ID}.json").is_file():
-        validate_pair(destination, LEGACY_DISCOGS_EMBEDDING_ID, 1280, "discogs_embedding")
     for model_id, _source_name, output_name, units, input_width in DISCOGS_EXTRA_HEADS:
         if (destination / f"{model_id}.json").is_file():
             validate_pair(destination, model_id, units, output_name, input_width)
@@ -491,6 +493,27 @@ def normalize_discogs_pair(source: Path, destination: Path, model_id: str,
             with shard.open("rb") as input_file:
                 shutil.copyfileobj(input_file, output)
     validate_pair(destination, model_id, expected_units, output_name)
+
+
+def _normalise_legacy_embedding_json(value: object) -> object:
+    """Map the old duplicate's manifest filename to the canonical name."""
+    if isinstance(value, dict):
+        return {key: _normalise_legacy_embedding_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalise_legacy_embedding_json(item) for item in value]
+    if value == f"{LEGACY_DISCOGS_EMBEDDING_ID}.bin":
+        return "discogs_effnet_embedding.bin"
+    return value
+
+
+def legacy_embedding_json_matches_canonical(legacy: Path, canonical: Path) -> bool:
+    """Recognise an older exact duplicate whose only difference is its shard name."""
+    try:
+        legacy_value = json.loads(legacy.read_text(encoding="utf-8"))
+        canonical_value = json.loads(canonical.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return _normalise_legacy_embedding_json(legacy_value) == canonical_value
 
 
 def normalize_discogs_head(source: Path, destination: Path, model_id: str,
@@ -557,16 +580,6 @@ def main() -> None:
                     convert_head(source, staging, model_id, units, output_name)
         if args.discogs_embedding_dir:
             normalize_discogs_pair(args.discogs_embedding_dir, staging, *DISCOGS_HEADS[0])
-            # Keep the old identifier available for clients that have not yet
-            # adopted the explicit embedding-family name.
-            shutil.copyfile(
-                staging / "discogs_effnet_embedding.json",
-                staging / f"{LEGACY_DISCOGS_EMBEDDING_ID}.json",
-            )
-            shutil.copyfile(
-                staging / "discogs_effnet_embedding.bin",
-                staging / f"{LEGACY_DISCOGS_EMBEDDING_ID}.bin",
-            )
         if args.discogs_genre_dir:
             normalize_discogs_pair(args.discogs_genre_dir, staging, *DISCOGS_HEADS[1])
         if args.discogs_heads_dir:
@@ -579,6 +592,23 @@ def main() -> None:
                 )
         validate_output_set(staging)
         args.output.mkdir(parents=True, exist_ok=True)
+        canonical_json = staging / "discogs_effnet_embedding.json"
+        canonical_bin = staging / "discogs_effnet_embedding.bin"
+        legacy_json = args.output / f"{LEGACY_DISCOGS_EMBEDDING_ID}.json"
+        legacy_bin = args.output / f"{LEGACY_DISCOGS_EMBEDDING_ID}.bin"
+        # Do not remove a user-provided legacy model.  Only clean the old
+        # duplicate pair when both files are byte-for-byte copies of the new
+        # canonical pair.
+        if (
+            canonical_json.is_file()
+            and canonical_bin.is_file()
+            and legacy_json.is_file()
+            and legacy_bin.is_file()
+            and legacy_embedding_json_matches_canonical(legacy_json, canonical_json)
+            and legacy_bin.read_bytes() == canonical_bin.read_bytes()
+        ):
+            legacy_json.unlink()
+            legacy_bin.unlink()
         for staged_file in staging.iterdir():
             os.replace(staged_file, args.output / staged_file.name)
     finally:

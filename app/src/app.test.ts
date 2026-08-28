@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   bindApp,
   canReuseTrackAnalysis,
+  DJ_PLAYLIST_QR_CONCURRENCY,
   pickSourceWithPlatformDialog,
   humanizeError,
+  renderDjPlaylistQrPages,
   resolveDropTargetAt,
   renderApp,
   type AppHistoryEntry,
@@ -378,9 +380,10 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-action="import-dj-playlist"]')?.textContent).toContain('导入.w4dj');
     expect(root.querySelector('[data-role="dj-playlist-launcher"]')).not.toBeNull();
     expect(root.querySelector('[data-action="dj-playlist-open-import"]')?.textContent).toContain('导入.w4dj');
-    expect(root.querySelector('[data-action="dj-playlist-open-export"]')?.textContent).toContain('导出 m3u8');
+    expect(root.querySelector('[data-action="dj-playlist-open-export"]')?.textContent).toContain('导出播放列表');
     expect(root.querySelector('a[data-action="open-dj-crate-digger-link"]')?.getAttribute('href')).toBe('https://github.com/komakizhu/dj-crate-digger-skill');
-    expect(root.textContent).toContain('网易云-我的-三竖点-一键导入外部歌单-文字导入');
+    expect(root.querySelector('.dj-playlist-launcher-source')?.textContent).toContain('如何获得 .w4dj？使用这个老炮DJ Skill： dj-crate-digger');
+    expect(root.querySelector('.dj-playlist-launcher-instructions')?.textContent).toBe('1. 如何把歌单导入到网易云：导入 .w4dj 之后，扫描二维码，打开网易云-我的-三竖点-一键导入外部歌单-文字导入，粘贴结果即可导入歌单\n2. 如何把播放列表导入到Rekordbox：在 W4DJ RKB 进行成功转换之后，可以一键导出 m3u8。然后打开Rekordbox-文件-导入-导入播放列表');
   });
 
   it('opens the launcher before opening the .w4dj picker', async () => {
@@ -394,7 +397,7 @@ describe('renderApp', () => {
     await vi.waitFor(() => expect(pickW4djPlaylist).toHaveBeenCalledTimes(1));
   });
 
-  it('renders the DJ playlist import dialog, QR controls, and whole-window drop overlay', () => {
+  it('renders all playlist QR codes side by side without the removed controls', () => {
     const playlistState: DjPlaylistUiState = {
       visible: true,
       busy: false,
@@ -416,9 +419,13 @@ describe('renderApp', () => {
         }],
         warnings: [],
       },
-      pages: [{ index: 0, total: 1, trackCount: 1, byteLength: 28, firstPosition: 1, lastPosition: 1, text: 'Anchor Point - Ahmed Spins' }],
+      pages: [
+        { index: 0, total: 2, trackCount: 1, byteLength: 28, firstPosition: 1, lastPosition: 1, text: 'Anchor Point - Ahmed Spins' },
+        { index: 1, total: 2, trackCount: 1, byteLength: 29, firstPosition: 2, lastPosition: 2, text: 'Second Point - Ahmed Spins' },
+      ],
       pageIndex: 0,
-      qrDataUrl: 'data:image/png;base64,abc',
+      qrDataUrl: null,
+      qrDataUrls: ['data:image/png;base64,abc', 'data:image/png;base64,def'],
       qrRevision: 1,
       matchBusy: false,
       matchReport: null,
@@ -429,9 +436,43 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-action="import-dj-playlist"]')).not.toBeNull();
     expect(root.querySelector('[data-role="dj-playlist-dialog"]')).not.toBeNull();
     expect(root.querySelector('[data-role="dj-playlist-drop-overlay"]')).not.toBeNull();
-    expect(root.textContent).toContain('Anchor Point - Ahmed Spins');
-    expect(root.textContent).toContain('123456789012345678');
+    expect(root.querySelectorAll('.dj-playlist-qr-image img')).toHaveLength(2);
+    expect(root.querySelector('.dj-playlist-preview-list')).toBeNull();
+    expect(root.querySelector('.dj-playlist-qr-nav')).toBeNull();
+    expect(root.querySelector('.dj-playlist-match-panel')).toBeNull();
+    expect(root.querySelector('[data-action="dj-playlist-copy-all"]')).toBeNull();
+    expect(root.querySelector('[data-action="dj-playlist-export-w4dj"]')).toBeNull();
+    expect(root.textContent).not.toContain('Anchor Point - Ahmed Spins');
+    expect(root.textContent).not.toContain('123456789012345678');
   });
+
+  it('renders at most three playlist QR codes concurrently while preserving page order', async () => {
+    const pages = Array.from({ length: 8 }, (_, index) => ({
+      index,
+      total: 8,
+      trackCount: 1,
+      byteLength: 10,
+      firstPosition: index + 1,
+      lastPosition: index + 1,
+      text: `track-${index}`,
+    }));
+    let active = 0;
+    let peakActive = 0;
+    const renderQr = vi.fn(async (text: string) => {
+      active += 1;
+      peakActive = Math.max(peakActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+      return `qr:${text}`;
+    });
+
+    const result = await renderDjPlaylistQrPages(pages, renderQr);
+
+    expect(peakActive).toBe(DJ_PLAYLIST_QR_CONCURRENCY);
+    expect(renderQr).toHaveBeenCalledTimes(pages.length);
+    expect(result).toEqual(pages.map((page) => `qr:${page.text}`));
+  });
+
   it('shows a persisted recent-playlist action without exposing its source path', () => {
     const root = renderApp(makeViewState(), null, null, null, [], null, false, null, false, false, false, 0, undefined, null, false, null, null, undefined, null, null, null, null, null, null, [{
         playlistId: 'playlist-1',
@@ -442,9 +483,117 @@ describe('renderApp', () => {
         sourcePath: '/private/secret/playlist.w4dj',
       }]);
     expect(root.querySelector('[data-action="open-latest-dj-playlist"]')).not.toBeNull();
+    expect(root.querySelector('[data-action="open-latest-dj-playlist"]')?.textContent).toContain('导出播放列表');
     expect(root.textContent).not.toContain('/private/secret/playlist.w4dj');
   });
-  it('reloads the newest persisted playlist through the list/load services', async () => {
+  it('chooses a recent playlist and an audio-copy mode before exporting', async () => {
+    const root = document.createElement('div');
+    const playlist = {
+      playlistId: 'playlist-export',
+      formatVersion: 2,
+      name: 'Export playlist',
+      sourcePath: null,
+      importedAtMs: 3,
+      tracks: [{
+        position: 1,
+        title: 'Anchor Point',
+        artistDisplay: 'Ahmed Spins',
+        neteaseTrackId: null,
+        dedupeKey: 'anchor',
+        neteaseImportLine: 'Anchor Point - Ahmed Spins',
+      }],
+      warnings: [],
+    };
+    const listImportedDjPlaylists = vi.fn().mockResolvedValue([{
+      playlistId: 'playlist-export',
+      name: 'Export playlist',
+      trackCount: 1,
+      warningCount: 0,
+      importedAtMs: 3,
+      sourcePath: null,
+    }]);
+    const loadImportedDjPlaylist = vi.fn().mockResolvedValue(playlist);
+    const matchImportedDjPlaylist = vi.fn().mockResolvedValue({
+      playlistId: 'playlist-export',
+      total: 1,
+      matchedCount: 1,
+      ambiguousCount: 0,
+      unmatchedCount: 0,
+      missingCount: 0,
+      matches: [],
+    });
+    let resolveSaveFile: ((path: string | null) => void) | null = null;
+    const saveFile = vi.fn(() => new Promise<string | null>((resolve) => {
+      resolveSaveFile = resolve;
+    }));
+    let resolveExport: ((result: {
+      path: string;
+      exportDirectory: string;
+      matchedCount: number;
+      total: number;
+      copiedCount: number;
+      copyAudio: boolean;
+      portable: boolean;
+      omitted: never[];
+    }) => void) | null = null;
+    const exportImportedDjPlaylistM3u8 = vi.fn(() => new Promise((resolve) => {
+      resolveExport = resolve;
+    }));
+    const exportResult = {
+      path: '/tmp/Export playlist/Export playlist.m3u8',
+      exportDirectory: '/tmp/Export playlist',
+      matchedCount: 1,
+      total: 1,
+      copiedCount: 1,
+      copyAudio: true,
+      portable: true,
+      omitted: [],
+    };
+    bindApp(root, makeViewState(), makeMockServices({
+      listImportedDjPlaylists,
+      loadImportedDjPlaylist,
+      matchImportedDjPlaylist,
+      saveFile,
+      exportImportedDjPlaylistM3u8,
+    }));
+    await vi.waitFor(() => expect(root.querySelector('[data-action="open-latest-dj-playlist"]')).not.toBeNull());
+    (root.querySelector('[data-action="open-latest-dj-playlist"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-export-picker"]')).not.toBeNull());
+    (root.querySelector('[data-action="dj-playlist-select-recent"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-export-choice"]')).not.toBeNull());
+    const exportChoice = root.querySelector('[data-role="dj-playlist-export-choice"]') as HTMLElement;
+    expect(exportChoice.querySelector('h2')?.textContent).toBe('是否复制歌单中的音频？');
+    expect(exportChoice.querySelector('.dj-playlist-export-explanation')?.textContent).toContain(
+      '是，复制音频并导出：歌曲会复制到导出文件夹，歌单可独立使用，但会占用更多磁盘空间。',
+    );
+    expect(exportChoice.querySelector('.dj-playlist-export-explanation')?.textContent).toContain(
+      '否，仅导出歌单：不会复制歌曲。请勿移动或删除原音频，否则歌单可能无法播放。',
+    );
+    expect(exportChoice.querySelector('[data-action="dj-playlist-export-copy"]')?.textContent).toBe('是，复制音频并导出');
+    expect(exportChoice.querySelector('[data-action="dj-playlist-export-existing"]')?.textContent).toBe('否，仅导出歌单');
+    expect(exportImportedDjPlaylistM3u8).not.toHaveBeenCalled();
+    (root.querySelector('[data-action="dj-playlist-export-copy"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(saveFile).toHaveBeenCalledTimes(1));
+    const busyCopyButton = root.querySelector('[data-action="dj-playlist-export-copy"]') as HTMLButtonElement;
+    const busyExistingButton = root.querySelector('[data-action="dj-playlist-export-existing"]') as HTMLButtonElement;
+    expect(busyCopyButton.disabled).toBe(true);
+    expect(busyExistingButton.disabled).toBe(true);
+    busyCopyButton.click();
+    expect(saveFile).toHaveBeenCalledTimes(1);
+
+    resolveSaveFile?.('/tmp/export-playlist.m3u8');
+    await vi.waitFor(() => expect(exportImportedDjPlaylistM3u8).toHaveBeenCalledWith(
+      'playlist-export',
+      '/tmp/export-playlist.m3u8',
+      false,
+      true,
+    ));
+    (root.querySelector('[data-action="dj-playlist-export-copy"]') as HTMLButtonElement).click();
+    expect(exportImportedDjPlaylistM3u8).toHaveBeenCalledTimes(1);
+    resolveExport?.(exportResult);
+    await vi.waitFor(() => expect(root.textContent).toContain('已复制 1/1 首音频'));
+  });
+  it('loads a selected persisted playlist before showing export choices', async () => {
     const root = document.createElement('div');
     const listImportedDjPlaylists = vi.fn().mockResolvedValue([{
       playlistId: 'playlist-1',
@@ -470,12 +619,22 @@ describe('renderApp', () => {
       }],
       warnings: [],
     });
-    bindApp(root, makeViewState(), makeMockServices({ listImportedDjPlaylists, loadImportedDjPlaylist }));
+    const matchImportedDjPlaylist = vi.fn().mockResolvedValue({
+      playlistId: 'playlist-1',
+      total: 1,
+      matchedCount: 1,
+      ambiguousCount: 0,
+      unmatchedCount: 0,
+      missingCount: 0,
+      matches: [],
+    });
+    bindApp(root, makeViewState(), makeMockServices({ listImportedDjPlaylists, loadImportedDjPlaylist, matchImportedDjPlaylist }));
     await vi.waitFor(() => expect(root.querySelector('[data-action="open-latest-dj-playlist"]')).not.toBeNull());
     (root.querySelector('[data-action="open-latest-dj-playlist"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-export-picker"]')).not.toBeNull());
+    (root.querySelector('[data-action="dj-playlist-select-recent"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(loadImportedDjPlaylist).toHaveBeenCalledWith('playlist-1'));
-    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-dialog"]')?.textContent).toContain('Anchor Point'));
-    await vi.waitFor(() => expect(root.querySelector('.dj-playlist-qr-image img')).not.toBeNull());
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-export-choice"]')).not.toBeNull());
   });
   it('gives a single browser-dropped .w4dj file whole-window precedence', async () => {
     const root = document.createElement('div');
@@ -508,7 +667,7 @@ describe('renderApp', () => {
     Object.defineProperty(drop, 'dataTransfer', { value: { files: [file], getData: vi.fn().mockReturnValue('') } });
     root.dispatchEvent(drop);
     await vi.waitFor(() => expect(importW4djPlaylist).toHaveBeenCalledWith('/music/playlist.w4dj'));
-    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-dialog"]')?.textContent).toContain('Dropped Song'));
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-dialog"]')).not.toBeNull());
     await vi.waitFor(() => expect(root.querySelector('.dj-playlist-qr-image img')).not.toBeNull());
   });
   it('renders two independent sync slots and global controls', () => {
@@ -610,6 +769,12 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-action="select-netease-database"]')?.textContent)
       .not.toContain('/music/');
     expect(root.querySelector('[data-action="clear-netease-database"]')).not.toBeNull();
+    const neteaseToolbar = root.querySelector('[data-role="netease-source-toolbar"]');
+    const databaseStatus = root.querySelector('[data-role="netease-database-status"]');
+    expect(databaseStatus?.parentElement).toBe(neteaseToolbar);
+    expect(databaseStatus?.nextElementSibling).toBe(
+      neteaseToolbar?.querySelector('[data-role="netease-source-actions"]'),
+    );
   });
 
   it('puts enhanced analysis progress in the Task 1 slot footer', () => {
@@ -1017,7 +1182,9 @@ describe('renderApp', () => {
     const row = root.querySelector('[data-role="enhanced-mode-switch"]');
 
     expect(row?.getAttribute('data-feature-hidden')).toBe('true');
-    expect(row?.hasAttribute('hidden')).toBe(true);
+    expect(row?.hasAttribute('hidden')).toBe(false);
+    expect(row?.getAttribute('aria-hidden')).toBe('true');
+    expect(row?.hasAttribute('inert')).toBe(true);
     expect(row?.classList.contains('enhanced-mode-row-hidden')).toBe(true);
     expect(row?.querySelector('[data-enhanced-mode="on"]')).not.toBeNull();
   });
@@ -1208,8 +1375,11 @@ describe('renderApp', () => {
       true,
     );
 
-    expect(root.querySelector('[data-role="enhanced-mode-switch"]')?.hasAttribute('hidden'))
-      .toBe(true);
+    const enhancedModeRow = root.querySelector('[data-role="enhanced-mode-switch"]');
+    expect(enhancedModeRow?.hasAttribute('hidden')).toBe(false);
+    expect(enhancedModeRow?.getAttribute('aria-hidden')).toBe('true');
+    expect(enhancedModeRow?.hasAttribute('inert')).toBe(true);
+    expect(enhancedModeRow?.classList.contains('enhanced-mode-row-hidden')).toBe(true);
     expect(root.querySelector('.essentia-model-settings')).toBeNull();
     expect(root.querySelector('[data-action="clear-analysis-cache"]')).toBeNull();
     expect(root.querySelector('[data-action="clear-scan-cache"]')).toBeNull();

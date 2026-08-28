@@ -51,6 +51,26 @@ import {
 } from './dj-playlist';
 import { renderPlaintextQrDataUrl } from './qr-code';
 
+export const DJ_PLAYLIST_QR_CONCURRENCY = 3;
+
+export async function renderDjPlaylistQrPages(
+  pages: readonly NeteaseQrPage[],
+  renderQr: (text: string) => Promise<string> = renderPlaintextQrDataUrl,
+): Promise<string[]> {
+  const results = new Array<string>(pages.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(DJ_PLAYLIST_QR_CONCURRENCY, pages.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < pages.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await renderQr(pages[index].text);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export type NeteaseDiscoveryProgress = {
   status: 'running' | 'completed' | 'error';
   stage: 'locatingDatabase' | 'readingRecords' | 'checkingMusicFolder';
@@ -335,14 +355,21 @@ export type DjPlaylistMatchReport = {
 
 export type DjPlaylistM3u8ExportResult = {
   path: string;
+  exportDirectory: string;
   matchedCount: number;
   total: number;
+  copiedCount: number;
+  copyAudio: boolean;
+  portable: boolean;
   omitted: Array<{ position: number; reason: string }>;
 };
 
 export type DjPlaylistUiState = {
   visible: boolean;
   launcher?: boolean;
+  exportPicker?: boolean;
+  exportChoice?: boolean;
+  recentPlaylists?: ImportedDjPlaylistSummary[];
   busy: boolean;
   error: string | null;
   notice: string | null;
@@ -350,6 +377,7 @@ export type DjPlaylistUiState = {
   pages: NeteaseQrPage[];
   pageIndex: number;
   qrDataUrl: string | null;
+  qrDataUrls?: Array<string | null>;
   qrRevision: number;
   matchBusy: boolean;
   matchReport: DjPlaylistMatchReport | null;
@@ -585,7 +613,7 @@ export type AppServices = {
   loadImportedDjPlaylistMatches?: (playlistId: string) => Promise<DjPlaylistMatchReport>;
   setImportedDjPlaylistMatch?: (playlistId: string, position: number, trackKey: string) => Promise<DjPlaylistMatchReport>;
   clearImportedDjPlaylistMatch?: (playlistId: string, position: number) => Promise<DjPlaylistMatchReport>;
-  exportImportedDjPlaylistM3u8?: (playlistId: string, path: string, allowPartial: boolean) => Promise<DjPlaylistM3u8ExportResult>;
+  exportImportedDjPlaylistM3u8?: (playlistId: string, path: string, allowPartial: boolean, copyAudio?: boolean) => Promise<DjPlaylistM3u8ExportResult>;
 };
 
 export type EssentiaModelStatus = {
@@ -858,13 +886,23 @@ const translations = {
     analysisCancel: '取消分析',
     scanClose: '关闭',
     importDjPlaylist: '导入.w4dj',
-    openLatestDjPlaylist: '打开最近歌单',
+    openLatestDjPlaylist: '导出播放列表',
     djPlaylistDialogTitle: 'DJ 歌单',
-    djPlaylistSource: 'W4DJ 歌单来源：',
-    djPlaylistSourceLink: 'dj-crate-digger skill（GitHub）',
+    djPlaylistSource: '如何获得 .w4dj？使用这个老炮DJ Skill：',
+    djPlaylistSourceLink: 'dj-crate-digger',
     djPlaylistImportButton: '导入.w4dj',
-    djPlaylistExportButton: '导出 m3u8',
-    djPlaylistInstructions: '导入 .w4dj 之后，可以扫描二维码，在网易云-我的-三竖点-一键导入外部歌单-文字导入，粘贴结果。即可导入歌单；在 W4DJ RKB 进行成功转换之后，可以一键导出 m3u8。',
+    djPlaylistExportButton: '导出播放列表',
+    djPlaylistChooseRecent: '选择最近歌单',
+    djPlaylistCopyAudioTitle: '是否复制歌单中的音频？',
+    djPlaylistCopyAudio: '是，复制音频并导出',
+    djPlaylistUseExistingAudio: '否，仅导出歌单',
+    djPlaylistCopyAudioExplanation: '是，复制音频并导出：歌曲会复制到导出文件夹，歌单可独立使用，但会占用更多磁盘空间。',
+    djPlaylistUseExistingAudioExplanation: '否，仅导出歌单：不会复制歌曲。请勿移动或删除原音频，否则歌单可能无法播放。',
+    djPlaylistExportPreparing: '正在准备播放列表…',
+    djPlaylistExportCopied: '已复制 {copied}/{matched} 首音频',
+    djPlaylistExportReferenced: '未复制音频，仅导出歌单',
+    djPlaylistExportPortableError: '复制导出未生成完整的跨账户歌单，请重新导出。',
+    djPlaylistInstructions: '1. 如何把歌单导入到网易云：导入 .w4dj 之后，扫描二维码，打开网易云-我的-三竖点-一键导入外部歌单-文字导入，粘贴结果即可导入歌单\n2. 如何把播放列表导入到Rekordbox：在 W4DJ RKB 进行成功转换之后，可以一键导出 m3u8。然后打开Rekordbox-文件-导入-导入播放列表',
     djPlaylistDrop: '松开导入 DJ 歌单',
     djPlaylistImporting: '正在导入 DJ 歌单…',
     djPlaylistTracks: '首歌曲',
@@ -1067,13 +1105,23 @@ const translations = {
     analysisCancel: 'Cancel analysis',
     scanClose: 'Close',
     importDjPlaylist: 'Import .w4dj',
-    openLatestDjPlaylist: 'Open recent playlist',
+    openLatestDjPlaylist: 'Export playlist',
     djPlaylistDialogTitle: 'DJ playlist',
-    djPlaylistSource: 'W4DJ playlist source:',
-    djPlaylistSourceLink: 'dj-crate-digger skill (GitHub)',
+    djPlaylistSource: 'How to get .w4dj? Use this veteran DJ Skill:',
+    djPlaylistSourceLink: 'dj-crate-digger',
     djPlaylistImportButton: 'Import .w4dj',
-    djPlaylistExportButton: 'Export m3u8',
-    djPlaylistInstructions: 'After importing a .w4dj playlist, scan the QR code and use NetEase Cloud Music → My → ⋮ → Import external playlist → Text import, then paste the result. After a successful conversion in W4DJ RKB, export an m3u8 with one click.',
+    djPlaylistExportButton: 'Export playlist',
+    djPlaylistChooseRecent: 'Choose a recent playlist',
+    djPlaylistCopyAudioTitle: 'Copy audio files with the playlist?',
+    djPlaylistCopyAudio: 'Yes, copy audio and export',
+    djPlaylistUseExistingAudio: 'No, export playlist only',
+    djPlaylistCopyAudioExplanation: 'Yes, copy audio and export: Songs will be copied to the export folder so the playlist can be used independently, but this uses more disk space.',
+    djPlaylistUseExistingAudioExplanation: 'No, export playlist only: Songs will not be copied. Do not move or delete the original audio, or the playlist may stop playing.',
+    djPlaylistExportPreparing: 'Preparing playlist…',
+    djPlaylistExportCopied: 'Copied {copied}/{matched} audio files',
+    djPlaylistExportReferenced: 'Playlist exported without copying audio',
+    djPlaylistExportPortableError: 'The copied export is not a complete cross-account playlist. Please export it again.',
+    djPlaylistInstructions: '1. Import a playlist into NetEase Cloud Music: import the .w4dj file, scan the QR code, open NetEase Cloud Music → My → ⋮ → Import external playlist → Text import, then paste the result.\n2. Import the playlist into Rekordbox: after a successful conversion in W4DJ RKB, export the m3u8, then open Rekordbox → File → Import → Import playlist.',
     djPlaylistDrop: 'Drop to import DJ playlist',
     djPlaylistImporting: 'Importing DJ playlist…',
     djPlaylistTracks: 'tracks',
@@ -1427,7 +1475,7 @@ const defaultServices: AppServices = {
     const selected = await open({
       directory: false,
       multiple: false,
-      title: '导入 DJ 歌单',
+      title: '导入.w4dj',
       filters: [{ name: 'W4DJ playlist', extensions: ['w4dj'] }],
     });
     return typeof selected === 'string' ? selected : null;
@@ -1444,11 +1492,12 @@ const defaultServices: AppServices = {
     invoke<DjPlaylistMatchReport>('set_imported_dj_playlist_match', { playlistId, position, trackKey }),
   clearImportedDjPlaylistMatch: (playlistId, position) =>
     invoke<DjPlaylistMatchReport>('clear_imported_dj_playlist_match', { playlistId, position }),
-  exportImportedDjPlaylistM3u8: (playlistId, path, allowPartial) =>
+  exportImportedDjPlaylistM3u8: (playlistId, path, allowPartial, copyAudio = false) =>
     invoke<DjPlaylistM3u8ExportResult>('export_imported_dj_playlist_m3u8', {
       playlistId,
       path,
       allowPartial,
+      copyAudio,
     }),
 };
 
@@ -1590,7 +1639,8 @@ export function renderApp(
             data-role="enhanced-mode-switch"
             data-selected-enhanced-mode="${state.enhancedMode ? 'on' : 'off'}"
             data-feature-hidden="${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? 'false' : 'true'}"
-            ${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? '' : 'hidden'}
+            aria-hidden="${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? 'false' : 'true'}"
+            ${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? '' : 'inert'}
             aria-label="${t('enhancedAnalysis', state.lang)}"
           >
             <button
@@ -1791,6 +1841,41 @@ function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguag
     ? `<div class="dj-playlist-drop-overlay" data-role="dj-playlist-drop-overlay" aria-live="polite"><div>${t('djPlaylistDrop', lang)}</div></div>`
     : '';
   if (!state.visible) return overlay;
+  if (state.exportPicker) {
+    const recent = state.recentPlaylists || [];
+    return `${overlay}
+      <div class="dj-playlist-modal" data-role="dj-playlist-export-picker" role="dialog" aria-modal="true" aria-label="${t('djPlaylistChooseRecent', lang)}">
+        <div class="dj-playlist-dialog dj-playlist-export-picker-dialog">
+          <header class="dj-playlist-head">
+            <div><p class="panel-kicker">W4DJ RKB</p><h2>${t('djPlaylistChooseRecent', lang)}</h2></div>
+            <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
+          </header>
+          <div class="dj-playlist-recent-list">${recent.map((summary) => `<button type="button" class="dj-playlist-recent-item" data-action="dj-playlist-select-recent" data-playlist-id="${escapeHtml(summary.playlistId)}"><strong>${escapeHtml(summary.name)}</strong><span>${summary.trackCount} ${t('djPlaylistTracks', lang)}</span></button>`).join('')}</div>
+        </div>
+      </div>`;
+  }
+  if (state.exportChoice) {
+    const playlistName = state.playlist?.name || t('djPlaylistDialogTitle', lang);
+    const report = state.matchReport;
+    return `${overlay}
+      <div class="dj-playlist-modal" data-role="dj-playlist-export-choice" role="dialog" aria-modal="true" aria-label="${t('djPlaylistCopyAudioTitle', lang)}">
+        <div class="dj-playlist-dialog dj-playlist-export-choice-dialog">
+          <header class="dj-playlist-head">
+            <div><p class="panel-kicker">W4DJ RKB</p><h2>${t('djPlaylistCopyAudioTitle', lang)}</h2></div>
+            <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
+          </header>
+          <p class="dj-playlist-export-name">${escapeHtml(playlistName)}${report ? ` · ${report.matchedCount}/${report.total}` : ''}</p>
+          <ul class="dj-playlist-export-explanation">
+            <li>${t('djPlaylistCopyAudioExplanation', lang)}</li>
+            <li>${t('djPlaylistUseExistingAudioExplanation', lang)}</li>
+          </ul>
+          <div class="dj-playlist-export-choice-actions">
+            <button type="button" class="global-action" data-action="dj-playlist-export-copy" ${state.exportBusy ? 'disabled' : ''}>${t('djPlaylistCopyAudio', lang)}</button>
+            <button type="button" class="secondary-action" data-action="dj-playlist-export-existing" ${state.exportBusy ? 'disabled' : ''}>${t('djPlaylistUseExistingAudio', lang)}</button>
+          </div>
+        </div>
+      </div>`;
+  }
   if (state.launcher) {
     return `${overlay}
       <div class="dj-playlist-modal" data-role="dj-playlist-launcher" role="dialog" aria-modal="true" aria-label="${t('djPlaylistDialogTitle', lang)}">
@@ -1804,22 +1889,12 @@ function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguag
             <button type="button" class="global-action dj-playlist-launcher-button" data-action="dj-playlist-open-import">${t('djPlaylistImportButton', lang)}</button>
             <button type="button" class="global-action dj-playlist-launcher-button" data-action="dj-playlist-open-export">${t('djPlaylistExportButton', lang)}</button>
           </div>
-          <p class="dj-playlist-launcher-instructions">${t('djPlaylistInstructions', lang)}</p>
+          <p class="dj-playlist-launcher-instructions">${escapeHtml(t('djPlaylistInstructions', lang))}</p>
         </div>
       </div>`;
   }
   const playlist = state.playlist;
-  const page = state.pages[state.pageIndex] || null;
-  const report = state.matchReport;
-  const matchKindLabel = (kind: DjPlaylistTrackMatch['kind']) => {
-    if (kind === 'neteaseTrackId') return lang === 'zh' ? '网易云 ID 精确匹配' : 'NetEase ID exact match';
-    if (kind === 'uniqueTitleArtistFallback') return lang === 'zh' ? '标题+歌手唯一回退' : 'Unique title + artist fallback';
-    if (kind === 'ambiguous') return lang === 'zh' ? '需要确认（候选有歧义）' : 'Needs confirmation (ambiguous)';
-    if (kind === 'manual') return lang === 'zh' ? '手动确认' : 'Manual confirmation';
-    if (kind === 'missing') return lang === 'zh' ? '输出已失效' : 'Output unavailable';
-    return lang === 'zh' ? '未匹配' : 'Unmatched';
-  };
-  const pageText = page?.text || '';
+  const qrDataUrls = state.qrDataUrls || (state.qrDataUrl ? [state.qrDataUrl] : []);
   return `${overlay}
     <div class="dj-playlist-modal" data-role="dj-playlist-dialog" role="dialog" aria-modal="true" aria-label="${t('djPlaylistDialogTitle', lang)}">
       <div class="dj-playlist-dialog">
@@ -1830,34 +1905,12 @@ function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguag
         ${state.busy ? `<p class="dj-playlist-loading">${t('djPlaylistImporting', lang)}</p>` : ''}
         ${state.error ? `<p class="library-error" role="alert">${escapeHtml(state.error)}</p>` : ''}
         ${playlist ? `
-          <p class="dj-playlist-summary">${playlist.tracks.length} ${t('djPlaylistTracks', lang)} · ${playlist.warnings.length} ${t('djPlaylistSkipped', lang)}</p>
-          <div class="dj-playlist-preview-list">${playlist.tracks.slice(0, 12).map((track) => `<div><span>${track.position}.</span> ${escapeHtml(track.neteaseImportLine)}${track.neteaseTrackId ? ` <code title="NetEase track ID">ID ${escapeHtml(track.neteaseTrackId)}</code>` : ''}</div>`).join('')}${playlist.tracks.length > 12 ? '<div>…</div>' : ''}</div>
           <section class="dj-playlist-qr-panel">
-            <div class="dj-playlist-qr-meta">
-              <strong>${page ? djPlaylistText('djPlaylistPage', lang, { current: page.index + 1, total: page.total }) : '—'}</strong>
-              ${page ? `<span>${djPlaylistText('djPlaylistBytes', lang, { tracks: page.trackCount, bytes: page.byteLength })}</span>` : ''}
-            </div>
-            <div class="dj-playlist-qr-image">${state.qrDataUrl && page ? `<img src="${state.qrDataUrl}" alt="${escapeHtml(djPlaylistText('djPlaylistPage', lang, { current: page.index + 1, total: page.total }))}">` : '<span>QR…</span>'}</div>
-            <div class="dj-playlist-qr-nav">
-              <button type="button" class="secondary-action" data-action="dj-playlist-prev" ${state.pageIndex <= 0 || !page ? 'disabled' : ''}>${t('djPlaylistPrevious', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-next" ${state.pageIndex >= state.pages.length - 1 || !page ? 'disabled' : ''}>${t('djPlaylistNext', lang)}</button>
-            </div>
-            <pre class="dj-playlist-plaintext">${escapeHtml(pageText)}</pre>
-            <div class="dj-playlist-actions">
-              <button type="button" class="secondary-action" data-action="dj-playlist-copy-page" ${page ? '' : 'disabled'}>${t('djPlaylistCopyPage', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-copy-all">${t('djPlaylistCopyAll', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-export-txt">${t('djPlaylistExportTxt', lang)}</button>
-              <button type="button" class="secondary-action" data-action="dj-playlist-export-w4dj">${lang === 'zh' ? '导出 W4DJ v2' : 'Export W4DJ v2'}</button>
-            </div>
-          </section>
-          <section class="dj-playlist-match-panel">
-            <div class="dj-playlist-match-head"><strong>${report ? djPlaylistText('djPlaylistMatched', lang, { matched: report.matchedCount, total: report.total }) : t('djPlaylistMatchExport', lang)}</strong><button type="button" class="secondary-action" data-action="dj-playlist-match" ${state.matchBusy ? 'disabled' : ''}>${state.matchBusy ? '…' : t('djPlaylistMatchExport', lang)}</button></div>
+            <div class="dj-playlist-qr-grid">${state.pages.map((page, index) => {
+              const qrDataUrl = qrDataUrls[index];
+              return `<div class="dj-playlist-qr-image">${qrDataUrl ? `<img src="${qrDataUrl}" alt="${escapeHtml(djPlaylistText('djPlaylistPage', lang, { current: index + 1, total: state.pages.length }))}">` : '<span>QR…</span>'}</div>`;
+            }).join('')}</div>
             ${state.notice ? `<p class="dj-playlist-notice">${escapeHtml(state.notice)}</p>` : ''}
-            ${report ? `<div class="dj-playlist-match-list">${report.matches.map((row) => `<article class="dj-playlist-match-row"><div><strong>${row.position}. ${escapeHtml(row.title)}</strong><small>${escapeHtml(row.artistDisplay)} · ${escapeHtml(matchKindLabel(row.kind))}${row.neteaseTrackId ? ` · ID ${escapeHtml(row.neteaseTrackId)}` : ''}</small><small>${escapeHtml(row.reason)}</small></div>${row.status === 'matched' ? '<span class="dj-playlist-match-ok">✓</span>' : `<div class="dj-playlist-candidates">${row.candidates.slice(0, 4).map((candidate) => `<button type="button" class="secondary-action" data-action="dj-playlist-set-match" data-position="${row.position}" data-track-key="${escapeHtml(candidate.trackKey)}">${escapeHtml(candidate.destinationFilename)}</button>`).join('')} ${row.manual ? `<button type="button" class="secondary-action" data-action="dj-playlist-clear-match" data-position="${row.position}">×</button>` : ''}</div>`}</article>`).join('')}</div>` : ''}
-            <div class="dj-playlist-match-actions">
-              <button type="button" class="global-action" data-action="dj-playlist-export-m3u8" ${!report || report.matchedCount !== report.total || state.exportBusy ? 'disabled' : ''}>${state.exportBusy ? '…' : t('djPlaylistExportM3u8', lang)}</button>
-              ${report && report.matchedCount < report.total ? `<button type="button" class="secondary-action" data-action="dj-playlist-export-partial" ${state.exportBusy ? 'disabled' : ''}>${t('djPlaylistPartialExport', lang)}</button>` : ''}
-            </div>
           </section>
         ` : ''}
       </div>
@@ -2097,26 +2150,28 @@ function renderSyncSlot(
           <div class="path-field-heading">
             <span>${t('sourceLabel', state.lang)}</span>
             ${slotIndex === 0
-              ? `<div class="netease-source-actions" data-role="netease-source-actions">
-                  <button type="button" class="netease-scan-button" data-action="scan-local-netease" data-slot="0" ${neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
-                    ${icon('refresh')}
-                    <span>${neteaseScanLabel}</span>
-                  </button>
-                  <button type="button" class="netease-scan-button netease-database-button" data-action="select-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''} title="${escapeHtml(manualDatabasePath || t('selectNeteaseDatabase', state.lang))}">
-                    ${icon('folder')}
-                    <span>${escapeHtml(databaseFileName || t('selectNeteaseDatabase', state.lang))}</span>
-                  </button>
-                  ${manualDatabasePath
-                    ? `<button type="button" class="netease-scan-button netease-database-clear" data-action="clear-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
-                        <span>${t('clearNeteaseDatabase', state.lang)}</span>
-                      </button>`
+              ? `<div class="netease-source-toolbar" data-role="netease-source-toolbar">
+                  ${databaseMessage
+                    ? `<small class="netease-database-status${neteaseMetadataDatabase?.error ? ' is-error' : ''}" data-role="netease-database-status" title="${escapeHtml(databaseMessage)}">${escapeHtml(databaseMessage)}</small>`
                     : ''}
+                  <div class="netease-source-actions" data-role="netease-source-actions">
+                    <button type="button" class="netease-scan-button" data-action="scan-local-netease" data-slot="0" ${neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
+                      ${icon('refresh')}
+                      <span>${neteaseScanLabel}</span>
+                    </button>
+                    <button type="button" class="netease-scan-button netease-database-button" data-action="select-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''} title="${escapeHtml(manualDatabasePath || t('selectNeteaseDatabase', state.lang))}">
+                      ${icon('folder')}
+                      <span>${escapeHtml(databaseFileName || t('selectNeteaseDatabase', state.lang))}</span>
+                    </button>
+                    ${manualDatabasePath
+                      ? `<button type="button" class="netease-scan-button netease-database-clear" data-action="clear-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
+                          <span>${t('clearNeteaseDatabase', state.lang)}</span>
+                        </button>`
+                      : ''}
+                  </div>
                 </div>`
               : ''}
           </div>
-          ${slotIndex === 0 && databaseMessage
-            ? `<small class="netease-database-status${neteaseMetadataDatabase?.error ? ' is-error' : ''}" data-role="netease-database-status">${escapeHtml(databaseMessage)}</small>`
-            : ''}
           <div class="path-control source-path-control">
             <button type="button" class="path-button" data-action="pick-source" data-slot="${slotIndex}">
               ${icon('folder')}
@@ -2315,6 +2370,7 @@ export function bindApp(
     error: null,
   };
   let djPlaylistState: DjPlaylistUiState | null = null;
+  let djPlaylistExportInFlight = false;
   let importedDjPlaylistSummaries: ImportedDjPlaylistSummary[] = [];
 
   const loadAnalysisCache = async () => {
@@ -3839,16 +3895,21 @@ export function bindApp(
     return `${safe}.${extension}`;
   };
 
-  const refreshDjPlaylistQr = async () => {
+  const refreshDjPlaylistQrs = async () => {
     const current = djPlaylistState;
-    if (!current?.visible || !current.pages[current.pageIndex]) return;
+    if (!current?.visible || current.pages.length === 0) return;
     const revision = current.qrRevision + 1;
-    djPlaylistState = { ...current, qrRevision: revision, qrDataUrl: null };
+    djPlaylistState = {
+      ...current,
+      qrRevision: revision,
+      qrDataUrl: null,
+      qrDataUrls: current.pages.map(() => null),
+    };
     render();
     try {
-      const qrDataUrl = await renderPlaintextQrDataUrl(current.pages[current.pageIndex].text);
+      const qrDataUrls = await renderDjPlaylistQrPages(current.pages);
       if (djPlaylistState?.visible && djPlaylistState.qrRevision === revision) {
-        djPlaylistState = { ...djPlaylistState, qrDataUrl };
+        djPlaylistState = { ...djPlaylistState, qrDataUrls };
         render();
       }
     } catch (error) {
@@ -3878,7 +3939,7 @@ export function bindApp(
       dropActive: false,
     };
     render();
-    void refreshDjPlaylistQr();
+    void refreshDjPlaylistQrs();
   };
 
   const openDjPlaylistLauncher = () => {
@@ -3908,47 +3969,6 @@ export function bindApp(
       render();
     } catch (error) {
       console.warn('Failed to load imported DJ playlists:', error);
-    }
-  };
-
-  const openLatestDjPlaylist = async () => {
-    const summary = importedDjPlaylistSummaries[0];
-    if (!summary || !services.loadImportedDjPlaylist) return;
-    djPlaylistState = {
-      visible: true,
-      launcher: false,
-      busy: true,
-      error: null,
-      notice: null,
-      playlist: null,
-      pages: [],
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: null,
-      exportBusy: false,
-      dropActive: false,
-    };
-    render();
-    try {
-      const playlist = await services.loadImportedDjPlaylist(summary.playlistId);
-      let report: DjPlaylistMatchReport | null = null;
-      if (services.loadImportedDjPlaylistMatches) {
-        try {
-          report = await services.loadImportedDjPlaylistMatches(summary.playlistId);
-        } catch {
-          // A playlist can be persisted before its first matching pass.
-        }
-      }
-      showDjPlaylist(playlist, report);
-    } catch (error) {
-      djPlaylistState = {
-        ...djPlaylistState!,
-        busy: false,
-        error: error instanceof Error ? error.message : String(error),
-      };
-      render();
     }
   };
 
@@ -3992,11 +4012,7 @@ export function bindApp(
   };
 
   const openDjPlaylistExport = async () => {
-    if (!djPlaylistState?.playlist && importedDjPlaylistSummaries.length > 0) {
-      await openLatestDjPlaylist();
-    }
-    const playlist = djPlaylistState?.playlist;
-    if (!playlist) {
+    if (importedDjPlaylistSummaries.length === 0) {
       djPlaylistState = {
         ...(djPlaylistState || {
           visible: true,
@@ -4015,16 +4031,89 @@ export function bindApp(
         }),
         visible: true,
         launcher: true,
+        exportPicker: false,
+        exportChoice: false,
         notice: state.lang === 'zh' ? '请先导入 .w4dj 歌单。' : 'Import a .w4dj playlist first.',
       };
       render();
       return;
     }
-    if (djPlaylistState?.matchReport?.matchedCount === djPlaylistState.matchReport.total) {
-      await exportDjPlaylistM3u8(false);
-      return;
+    djPlaylistState = {
+      visible: true,
+      launcher: false,
+      exportPicker: true,
+      exportChoice: false,
+      recentPlaylists: importedDjPlaylistSummaries,
+      busy: false,
+      error: null,
+      notice: null,
+      playlist: null,
+      pages: [],
+      pageIndex: 0,
+      qrDataUrl: null,
+      qrRevision: 0,
+      matchBusy: false,
+      matchReport: null,
+      exportBusy: false,
+      dropActive: false,
+    };
+    render();
+  };
+
+  const selectRecentDjPlaylistForExport = async (playlistId: string) => {
+    if (!services.loadImportedDjPlaylist || !services.matchImportedDjPlaylist) return;
+    djPlaylistState = {
+      ...(djPlaylistState || {
+        visible: true,
+        busy: false,
+        error: null,
+        notice: null,
+        playlist: null,
+        pages: [],
+        pageIndex: 0,
+        qrDataUrl: null,
+        qrRevision: 0,
+        matchBusy: false,
+        matchReport: null,
+        exportBusy: false,
+        dropActive: false,
+      }),
+      visible: true,
+      launcher: false,
+      exportPicker: false,
+      exportChoice: false,
+      busy: true,
+      error: null,
+      playlist: null,
+      pages: [],
+      qrDataUrls: [],
+    };
+    render();
+    try {
+      const playlist = await services.loadImportedDjPlaylist(playlistId);
+      const report = await services.matchImportedDjPlaylist(playlistId);
+      if (report.matchedCount !== report.total || report.total === 0) {
+        throw new Error(`歌单仍有 ${report.total - report.matchedCount} 首歌曲无法在两个输出目录中找到`);
+      }
+      djPlaylistState = {
+        ...djPlaylistState!,
+        busy: false,
+        exportChoice: true,
+        playlist,
+        matchReport: report,
+        pages: [],
+        qrDataUrl: null,
+        qrDataUrls: [],
+      };
+      render();
+    } catch (error) {
+      djPlaylistState = {
+        ...djPlaylistState!,
+        busy: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      render();
     }
-    await matchDjPlaylist();
   };
 
   const exportDjPlaylistTxt = async () => {
@@ -4066,28 +4155,49 @@ export function bindApp(
     }
   };
 
-  const exportDjPlaylistM3u8 = async (allowPartial: boolean) => {
+  const exportDjPlaylistM3u8 = async (allowPartial: boolean, copyAudio = false) => {
     const playlist = djPlaylistState?.playlist;
-    if (!playlist || !services.exportImportedDjPlaylistM3u8) return;
+    if (!playlist || !services.exportImportedDjPlaylistM3u8 || djPlaylistExportInFlight) return;
     if (allowPartial && djPlaylistState?.matchReport) {
       const omitted = djPlaylistState.matchReport.total - djPlaylistState.matchReport.matchedCount;
       if (omitted > 0 && !window.confirm(djPlaylistText('djPlaylistPartialConfirm', state.lang, { count: omitted }))) return;
     }
+    djPlaylistExportInFlight = true;
+    djPlaylistState = { ...djPlaylistState!, exportBusy: true, error: null };
+    render();
     try {
       const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
       const path = await saveFile({
         defaultPath: sanitizedDjPlaylistName(playlist.name, 'm3u8'),
-        title: '导出 M3U8',
+        title: t('djPlaylistExportButton', state.lang),
       });
       if (typeof path !== 'string') return;
-      djPlaylistState = { ...djPlaylistState!, exportBusy: true, error: null };
-      render();
-      const result = await services.exportImportedDjPlaylistM3u8(playlist.playlistId, path, allowPartial);
-      djPlaylistState = { ...djPlaylistState!, exportBusy: false, notice: `${t('djPlaylistExportSuccess', state.lang)}：${result.path}` };
+      const result = await services.exportImportedDjPlaylistM3u8(playlist.playlistId, path, allowPartial, copyAudio);
+      if (copyAudio && (!result.copyAudio || !result.portable || result.copiedCount !== result.matchedCount)) {
+        throw new Error(t('djPlaylistExportPortableError', state.lang));
+      }
+      const exportDetail = copyAudio
+        ? djPlaylistText('djPlaylistExportCopied', state.lang, {
+          copied: result.copiedCount,
+          matched: result.matchedCount,
+        })
+        : t('djPlaylistExportReferenced', state.lang);
+      djPlaylistState = {
+        ...djPlaylistState!,
+        exportBusy: false,
+        exportChoice: false,
+        notice: `${exportDetail}\n${t('djPlaylistExportSuccess', state.lang)}：${result.path}`,
+      };
       render();
     } catch (error) {
-      djPlaylistState = { ...djPlaylistState!, exportBusy: false, error: error instanceof Error ? error.message : String(error) };
+      djPlaylistState = { ...djPlaylistState!, error: error instanceof Error ? error.message : String(error) };
       render();
+    } finally {
+      djPlaylistExportInFlight = false;
+      if (djPlaylistState?.exportBusy) {
+        djPlaylistState = { ...djPlaylistState, exportBusy: false };
+        render();
+      }
     }
   };
 
@@ -5343,7 +5453,23 @@ export function bindApp(
     }
 
     if (action === 'open-latest-dj-playlist') {
-      void openLatestDjPlaylist();
+      void openDjPlaylistExport();
+      return;
+    }
+
+    if (action === 'dj-playlist-select-recent') {
+      const playlistId = button.dataset.playlistId;
+      if (playlistId) void selectRecentDjPlaylistForExport(playlistId);
+      return;
+    }
+
+    if (action === 'dj-playlist-export-copy') {
+      void exportDjPlaylistM3u8(false, true);
+      return;
+    }
+
+    if (action === 'dj-playlist-export-existing') {
+      void exportDjPlaylistM3u8(false, false);
       return;
     }
 
@@ -5360,7 +5486,7 @@ export function bindApp(
         if (pageIndex !== djPlaylistState.pageIndex) {
           djPlaylistState = { ...djPlaylistState, pageIndex };
           render();
-          void refreshDjPlaylistQr();
+          void refreshDjPlaylistQrs();
         }
       }
       return;

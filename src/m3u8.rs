@@ -8,6 +8,8 @@ use crate::dj_playlist::ImportedDjPlaylist;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,6 +206,12 @@ pub fn write_relative_m3u8_atomic(path: &Path, contents: &str) -> Result<(), M3u
         .tempfile_in(parent)?;
     temporary.write_all(contents.as_bytes())?;
     temporary.flush()?;
+    #[cfg(unix)]
+    {
+        let mut permissions = temporary.as_file().metadata()?.permissions();
+        permissions.set_mode(0o644);
+        temporary.as_file().set_permissions(permissions)?;
+    }
     temporary.as_file().sync_all()?;
     let temporary_path = temporary.into_temp_path();
     fs::rename(&temporary_path, path)?;
