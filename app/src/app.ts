@@ -147,6 +147,10 @@ const ONBOARDING_STEP_COUNT = 5;
 // ready to return; the Rust analysis backend remains available throughout.
 const ENHANCED_ANALYSIS_FEATURES_VISIBLE = false;
 
+// Cache cleanup is a safe maintenance action and remains available even while
+// the enhanced-analysis controls are hidden from the conversion rail.
+const ANALYSIS_CACHE_CLEAR_VISIBLE = true;
+
 // Keep the song-library backend and state intact while its user-facing entry
 // point remains hidden during the current stability/product rollout.
 const SONG_LIBRARY_FEATURE_VISIBLE = false;
@@ -266,6 +270,21 @@ export type AppSyncPreview = {
   warnings: AppPreviewIssue[];
   available_space_bytes: number | null;
   disk_space_sufficient: boolean | null;
+  input_count?: number;
+  output_duplicate_count?: number;
+  action_kind?: 'skip' | 'overwrite' | 'rename' | 'update_metadata' | string;
+  action_count?: number;
+  database_directory?: string | null;
+  detail_items?: AppPreviewDetailItem[];
+};
+
+export type AppPreviewDetailItem = {
+  name: string;
+  source_path: string;
+  destination_path?: string | null;
+  existing_output?: boolean;
+  classification: 'new' | 'duplicate' | 'skip' | 'overwrite' | 'update_metadata' | 'rename' | 'error' | string;
+  reason?: string | null;
 };
 
 export type AppPreview = {
@@ -477,7 +496,10 @@ export type AppHistoryEntry = {
 export type AppPreviewModalState = {
   previews: AppPreview[];
   retryOf: string | null;
+  detail?: { slotIndex: SyncSlotIndex; kind: PreviewDetailKind } | null;
 };
+
+export type PreviewDetailKind = 'input' | 'duplicates' | 'action' | 'errors';
 
 export type AppScanProgress = {
   status: AppScanStatus;
@@ -713,6 +735,14 @@ const translations = {
     sourceKicker: '歌曲文件夹或单曲（网易云、SoundCloud 等）',
     destKicker: '任务 1 / 任务 2 独立运行，窗口较小时可滚动',
     sourceLabel: '歌曲文件夹或单曲',
+    neteaseSituationLabel: '情况',
+    neteaseStatusLoading: '正在读取网易云状态…',
+    neteaseIndexNotReady: '网易云轻量索引未就绪，转换前会按需准备',
+    neteaseIndexBuilding: '正在建立网易云轻量索引',
+    neteaseIndexReady: '网易云轻量索引已就绪',
+    neteaseIndexCancelling: '正在取消网易云轻量索引…',
+    neteaseIndexCancelled: '网易云轻量索引已取消',
+    neteaseIndexError: '网易云轻量索引失败',
     scanLocalNetease: '扫描本地网易云文件夹',
     selectNeteaseDatabase: '选择网易云数据库',
     clearNeteaseDatabase: '恢复自动定位',
@@ -771,6 +801,11 @@ const translations = {
     newFiles: '新增文件',
     existingFiles: '已存在',
     willSkip: '将跳过',
+    inputTracks: '输入曲目',
+    outputDuplicates: '输出重复曲目',
+    willOverwrite: '将覆盖',
+    willUpdateMetadata: '将更新元数据',
+    willRename: '将重命名',
     errorFiles: '错误文件',
     duplicateDisambiguated: '同名歌曲共：{count}首，已按专辑区分并写入文件名',
     estimatedOutput: '预计输出',
@@ -800,6 +835,11 @@ const translations = {
     artistTitle: '歌手 - 歌曲名',
     originalName: '保留原文件名',
     availableSpace: '可用空间',
+    databasePath: '数据库目录',
+    previewDetails: '查看明细',
+    previewDetailClose: '关闭明细',
+    openFile: '打开文件',
+    noDetailItems: '没有符合条件的曲目',
     insufficientSpace: '磁盘空间不足，无法开始转换',
     cancelTask: '取消任务',
     resumeTasks: '继续未完成任务',
@@ -877,6 +917,7 @@ const translations = {
     scanChecking: '正在检查转换条件',
     scanAnalyzing: '正在分析歌曲并写入元数据',
     scanCompleted: '扫描完成',
+    scanSucceeded: '扫描成功',
     scanCancelled: '扫描已取消',
     scanError: '扫描失败',
     scanCurrentFile: '当前文件',
@@ -932,6 +973,14 @@ const translations = {
     sourceKicker: 'Music folders or tracks (NetEase, SoundCloud, etc.)',
     destKicker: 'Task 1 and Task 2 run independently. Scroll when the window is short.',
     sourceLabel: 'Music Folder or Track',
+    neteaseSituationLabel: 'Status',
+    neteaseStatusLoading: 'Reading NetEase status…',
+    neteaseIndexNotReady: 'NetEase lightweight index is not ready; it will be prepared when needed',
+    neteaseIndexBuilding: 'Building NetEase lightweight index',
+    neteaseIndexReady: 'NetEase lightweight index is ready',
+    neteaseIndexCancelling: 'Cancelling NetEase lightweight index…',
+    neteaseIndexCancelled: 'NetEase lightweight index cancelled',
+    neteaseIndexError: 'NetEase lightweight index failed',
     scanLocalNetease: 'Scan local NetEase folder',
     selectNeteaseDatabase: 'Choose NetEase database',
     clearNeteaseDatabase: 'Use automatic location',
@@ -990,6 +1039,11 @@ const translations = {
     newFiles: 'New files',
     existingFiles: 'Already exists',
     willSkip: 'Will skip',
+    inputTracks: 'Input tracks',
+    outputDuplicates: 'Duplicate outputs',
+    willOverwrite: 'Will overwrite',
+    willUpdateMetadata: 'Will update metadata',
+    willRename: 'Will rename',
     errorFiles: 'Errors',
     duplicateDisambiguated: 'Duplicate songs: {count}; separated by album and written into filenames',
     estimatedOutput: 'Estimated output',
@@ -1019,6 +1073,11 @@ const translations = {
     artistTitle: 'Artist - Title',
     originalName: 'Keep original filename',
     availableSpace: 'Available space',
+    databasePath: 'Database directory',
+    previewDetails: 'View details',
+    previewDetailClose: 'Close details',
+    openFile: 'Open file',
+    noDetailItems: 'No matching tracks',
     insufficientSpace: 'Not enough disk space to start',
     cancelTask: 'Cancel task',
     resumeTasks: 'Resume unfinished tasks',
@@ -1096,6 +1155,7 @@ const translations = {
     scanChecking: 'Checking conversion conditions',
     scanAnalyzing: 'Analyzing tracks and writing metadata',
     scanCompleted: 'Scan complete',
+    scanSucceeded: 'Scan succeeded',
     scanCancelled: 'Scan cancelled',
     scanError: 'Scan failed',
     scanCurrentFile: 'Current file',
@@ -1148,6 +1208,87 @@ const translations = {
 
 function t(key: keyof typeof translations.zh, lang: AppLanguage): string {
   return translations[lang][key];
+}
+
+export type NeteaseSituationTone = 'neutral' | 'running' | 'success' | 'warning' | 'error';
+
+export type NeteaseSituation = {
+  message: string;
+  tone: NeteaseSituationTone;
+};
+
+/**
+ * Resolve the one-line Task 1 NetEase status without coupling the toolbar to
+ * any particular backend command.  The backend may be unavailable during the
+ * first render, so loading is intentionally a first-class state.
+ */
+export function resolveNeteaseSituation(
+  database: NeteaseMetadataDatabaseUiState | undefined,
+  lang: AppLanguage,
+): NeteaseSituation {
+  const status = database?.status;
+  if (!database || !status) {
+    return { message: t('neteaseStatusLoading', lang), tone: 'running' };
+  }
+
+  if (database.error) {
+    return { message: database.error, tone: 'error' };
+  }
+
+  const notReadyWarning = status.warning
+    && (status.warning.includes('未就绪') || status.warning.includes('not ready'));
+  if (status.warning && !notReadyWarning) {
+    // Other warnings (for example a stale manual database) remain visibly
+    // distinct and take precedence over ordinary cache progress.
+    return { message: status.warning, tone: 'warning' };
+  }
+
+  const cacheStatus = status.cacheStatus;
+  if (database.busy || cacheStatus === 'building' || cacheStatus === 'cancelling') {
+    const message = database.message
+      || (cacheStatus === 'cancelling'
+        ? t('neteaseIndexCancelling', lang)
+        : t('neteaseIndexBuilding', lang));
+    return {
+      message,
+      tone: 'running',
+    };
+  }
+
+  if (cacheStatus === 'cancelled') {
+    return { message: database.message || t('neteaseIndexCancelled', lang), tone: 'warning' };
+  }
+
+  if (cacheStatus === 'error') {
+    return {
+      message: database.error || database.message || t('neteaseIndexError', lang),
+      tone: 'error',
+    };
+  }
+
+  if (notReadyWarning) {
+    return { message: status.warning!, tone: 'neutral' };
+  }
+
+  if (status.source === 'manual' && status.manualPath) {
+    return { message: t('neteaseDatabaseSelected', lang), tone: 'success' };
+  }
+
+  if (status.source === 'automatic' && (cacheStatus === 'ready' || status.loaded)) {
+    const count = status.cachedRecordCount ?? status.recordCount;
+    const suffix = count > 0 ? ` · ${count} ${lang === 'zh' ? '条' : count === 1 ? 'record' : 'records'}` : '';
+    return { message: `${t('neteaseIndexReady', lang)}${suffix}`, tone: 'success' };
+  }
+
+  if (status.source === 'unavailable') {
+    return { message: t('neteaseDatabaseUnavailable', lang), tone: 'warning' };
+  }
+
+  if (database.message) {
+    return { message: database.message, tone: 'neutral' };
+  }
+
+  return { message: t('neteaseIndexNotReady', lang), tone: 'neutral' };
 }
 
 export function humanizeError(
@@ -1545,6 +1686,7 @@ export function renderApp(
   }
   const isRunning = state.slots.some((slot) => slot.status === 'running');
   const scanRunning = scanProgress?.status === 'running' || scanProgress?.status === 'cancelling';
+  const scanVisible = Boolean(scanProgress && scanProgress.status !== 'idle');
   const scanCancelling = scanProgress?.status === 'cancelling';
   const analysisRunning = analysisState.status === 'running';
   const analysisResumeAvailable = analysisState.status === 'cancelled'
@@ -1716,7 +1858,7 @@ export function renderApp(
             0,
             onboardingTarget === 'source' || onboardingTarget === 'destination' ? onboardingTarget : null,
             scanProgress?.tasks?.find((task) => task.slot_index === 0),
-            scanRunning,
+            scanVisible,
             neteaseDiscoveryProgress,
             libraryRefreshProgress,
             neteaseDiscoveryInFlight,
@@ -1728,7 +1870,7 @@ export function renderApp(
             1,
             null,
             scanProgress?.tasks?.find((task) => task.slot_index === 1),
-            scanRunning,
+            scanVisible,
             null,
             null,
             false,
@@ -1767,6 +1909,9 @@ function renderPreviewModal(
     (item) => item.preview.disk_space_sufficient !== false,
   );
   const canConfirm = hasEnoughSpace && (processableCount > 0 || previewHasRetryErrors(modal));
+  const detailPreview = modal.detail
+    ? modal.previews.find((item) => item.slot_index === modal.detail?.slotIndex)
+    : undefined;
   return `
     <div class="preview-modal" data-role="preview-modal" role="dialog" aria-modal="true" aria-label="${t('previewTitle', lang)}">
       <div class="preview-dialog">
@@ -1780,6 +1925,7 @@ function renderPreviewModal(
         <div class="preview-cards">
           ${modal.previews.map((item) => renderPreviewCard(item, lang)).join('')}
         </div>
+        ${detailPreview && modal.detail ? renderPreviewDetailDialog(detailPreview, modal.detail.kind, lang) : ''}
         ${canConfirm ? '' : `<p class="preview-empty">${t('noProcessableFiles', lang)}</p>`}
         <footer class="preview-actions">
           <button type="button" class="secondary-action" data-action="cancel-preview" ${busy ? 'disabled' : ''}>${t('cancel', lang)}</button>
@@ -1790,9 +1936,99 @@ function renderPreviewModal(
   `;
 }
 
+function previewActionKind(item: AppPreview): string {
+  return item.preview.action_kind || item.conflict_strategy;
+}
+
+function previewActionLabel(item: AppPreview, lang: AppLanguage): string {
+  switch (previewActionKind(item)) {
+    case 'overwrite': return t('willOverwrite', lang);
+    case 'update_metadata': return t('willUpdateMetadata', lang);
+    case 'rename': return t('willRename', lang);
+    default: return t('willSkip', lang);
+  }
+}
+
+function previewActionCount(item: AppPreview): number {
+  if (item.preview.action_count != null) return item.preview.action_count;
+  switch (item.conflict_strategy) {
+    case 'overwrite': return item.preview.existing_count;
+    case 'rename': return item.preview.new_count;
+    case 'update_metadata': return item.preview.candidates.filter((candidate) => candidate.operation === 'update_metadata').length;
+    default: return item.preview.skipped_count;
+  }
+}
+
+function previewDetailItems(item: AppPreview, kind: PreviewDetailKind): AppPreviewDetailItem[] {
+  const source = item.preview.detail_items || [];
+  const fallback = [
+    ...item.preview.candidates.map((candidate) => ({
+      name: candidate.name,
+      source_path: candidate.source_path,
+      destination_path: candidate.destination_path,
+      existing_output: false,
+      classification: candidate.operation === 'update_metadata' ? 'update_metadata' : 'new',
+      reason: null,
+    })),
+    ...item.preview.skipped.map((issue) => ({
+      name: issue.path.split(/[\\/]/).pop() || issue.path,
+      source_path: issue.path,
+      destination_path: null,
+      existing_output: item.conflict_strategy === 'skip',
+      classification: 'skip',
+      reason: issue.message,
+    })),
+    ...item.preview.errors.map((issue) => ({
+      name: issue.path.split(/[\\/]/).pop() || issue.path,
+      source_path: issue.path,
+      destination_path: null,
+      existing_output: false,
+      classification: 'error',
+      reason: issue.message,
+    })),
+  ] satisfies AppPreviewDetailItem[];
+  const items = source.length > 0 ? source : fallback;
+  const action = previewActionKind(item);
+  return items
+    .filter((detail) => {
+      if (kind === 'input') return true;
+      if (kind === 'duplicates') return detail.existing_output === true;
+      if (kind === 'errors') return detail.classification === 'error';
+      if (action === 'overwrite') return detail.classification === 'overwrite';
+      if (action === 'update_metadata') return detail.classification === 'update_metadata';
+      if (action === 'rename') return detail.classification === 'rename';
+      return detail.classification === 'skip';
+    })
+    .sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+function renderPreviewDetailDialog(item: AppPreview, kind: PreviewDetailKind, lang: AppLanguage): string {
+  const items = previewDetailItems(item, kind);
+  return `
+    <div class="preview-detail-dialog" data-role="preview-detail-dialog" role="dialog" aria-modal="true">
+      <header class="preview-detail-head">
+        <h3>${escapeHtml(kind === 'input' ? t('inputTracks', lang) : kind === 'duplicates' ? t('outputDuplicates', lang) : kind === 'errors' ? t('errorFiles', lang) : previewActionLabel(item, lang))}</h3>
+        <button type="button" class="secondary-action" data-action="close-preview-detail">${t('previewDetailClose', lang)}</button>
+      </header>
+      ${items.length === 0
+        ? `<p class="preview-empty">${t('noDetailItems', lang)}</p>`
+        : `<ol class="preview-detail-list">${items.map((detail) => {
+          const target = detail.destination_path && (detail.existing_output || detail.classification === 'overwrite' || detail.classification === 'update_metadata')
+            ? detail.destination_path
+            : detail.source_path;
+          const openTarget = detail.destination_path && (detail.existing_output || detail.classification === 'overwrite' || detail.classification === 'update_metadata') ? 'destination' : 'source';
+          return `<li><button type="button" class="preview-detail-open" data-action="open-preview-file" data-open-target="${openTarget}" data-path="${escapeHtml(target)}" title="${t('openFile', lang)}">${icon('open')}</button><span>${escapeHtml(detail.name)}</span>${detail.reason ? `<small>${escapeHtml(humanizeError(detail.reason, lang))}</small>` : ''}</li>`;
+        }).join('')}</ol>`}
+    </div>
+  `;
+}
+
 function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
   const preview = item.preview;
   const disambiguatedCount = preview.candidates.filter((candidate) => Boolean(candidate.disambiguation_reason)).length;
+  const inputCount = preview.input_count ?? preview.new_count + preview.skipped_count + preview.error_count;
+  const duplicateCount = preview.output_duplicate_count ?? preview.existing_count;
+  const actionCount = previewActionCount(item);
   const issues = [
     ...preview.errors.map(
       (issue) => `<li>${escapeHtml(issue.path)}：${escapeHtml(humanizeError(issue.message, lang))}</li>`,
@@ -1808,18 +2044,21 @@ function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
           <p class="panel-kicker">${t('syncSlot', lang)} ${item.slot_index + 1}</p>
           <h3>${modeLabel(item.mode, lang)}${item.mode === 'lossless' ? ` · ${(item.lossless_format || 'wav').toUpperCase()}` : ''}</h3>
         </div>
-          <div class="preview-estimate"><span>${t('estimatedOutput', lang)}</span><strong>${formatBytes(preview.estimated_output_bytes, lang)}</strong></div>
+          <div class="preview-card-head-meta">
+            <span class="preview-batch-label">${escapeHtml(previewActionLabel(item, lang))}</span>
+            <div class="preview-estimate-column"><div class="preview-estimate"><span>${t('estimatedOutput', lang)}</span><strong>${formatBytes(preview.estimated_output_bytes, lang)}</strong></div>${preview.available_space_bytes == null ? '' : `<div class="preview-available-space"><span>${t('availableSpace', lang)}</span><strong>${formatBytes(preview.available_space_bytes, lang)}</strong></div>`}</div>
+          </div>
       </header>
       <dl class="preview-stats">
-        <div><dt>${t('newFiles', lang)}</dt><dd>${preview.new_count}</dd></div>
-        <div><dt>${t('existingFiles', lang)}</dt><dd>${preview.existing_count}</dd></div>
-        <div><dt>${t('willSkip', lang)}</dt><dd>${preview.skipped_count}</dd></div>
-        <div><dt>${t('errorFiles', lang)}</dt><dd class="preview-error-count">${preview.error_count}</dd></div>
+        <button type="button" class="preview-stat" data-action="preview-detail" data-slot="${item.slot_index}" data-detail-kind="input"><dt>${t('inputTracks', lang)}</dt><dd>${inputCount}</dd></button>
+        <button type="button" class="preview-stat" data-action="preview-detail" data-slot="${item.slot_index}" data-detail-kind="duplicates"><dt>${t('outputDuplicates', lang)}</dt><dd>${duplicateCount}</dd></button>
+        <button type="button" class="preview-stat preview-stat-action" data-action="preview-detail" data-slot="${item.slot_index}" data-detail-kind="action"><dt>${previewActionLabel(item, lang)}</dt><dd>${actionCount}</dd></button>
+        <button type="button" class="preview-stat" data-action="preview-detail" data-slot="${item.slot_index}" data-detail-kind="errors"><dt>${t('errorFiles', lang)}</dt><dd class="preview-error-count">${preview.error_count}</dd></button>
       </dl>
       <div class="preview-paths">
         <p><span>${t('sourcePath', lang)}</span>${escapeHtml(preview.source_directory)}</p>
         <p><span>${t('destinationPath', lang)}</span>${escapeHtml(preview.destination_directory)}</p>
-        ${preview.available_space_bytes == null ? '' : `<p><span>${t('availableSpace', lang)}</span>${formatBytes(preview.available_space_bytes, lang)}</p>`}
+        ${preview.database_directory ? `<p><span>${t('databasePath', lang)}</span>${escapeHtml(preview.database_directory)}</p>` : ''}
       </div>
       ${preview.disk_space_sufficient === false ? `<p class="disk-space-error">${t('insufficientSpace', lang)}</p>` : ''}
       ${disambiguatedCount > 0 ? `<p class="preview-warning">${t('duplicateDisambiguated', lang).replace('{count}', String(disambiguatedCount))}</p>` : ''}
@@ -2002,11 +2241,18 @@ function renderSyncSlot(
   const taskScanActive = scanActive && Boolean(scanTask);
   const sourcePhase = scanTask?.phase === 'scanning_source';
   const metadataPhase = scanTask?.phase === 'matching_metadata';
+  const preparingPhase = scanTask?.phase === 'preparing';
+  const completedPhase = scanTask?.phase === 'completed';
+  const cancelledOrErrorPhase = scanTask?.phase === 'cancelled' || scanTask?.phase === 'error';
   const phaseProcessed = scanTask
     ? sourcePhase
       ? scanTask.source_processed ?? scanTask.processed
+      : preparingPhase
+        ? scanTask.processed
       : metadataPhase
         ? scanTask.metadata_processed ?? scanTask.processed
+        : completedPhase || cancelledOrErrorPhase
+          ? scanTask.source_processed ?? scanTask.processed
         : scanTask.destination_processed ?? scanTask.processed
     : 0;
   const phaseTotal = scanTask
@@ -2014,10 +2260,16 @@ function renderSyncSlot(
       ? scanTask.source_total !== undefined
         ? scanTask.source_total
         : scanTask.total > 0 ? scanTask.total : null
+      : preparingPhase
+        ? scanTask.total > 0 ? scanTask.total : null
       : metadataPhase
         ? scanTask.metadata_total !== undefined
           ? scanTask.metadata_total
           : scanTask.source_total !== undefined
+            ? scanTask.source_total
+            : scanTask.total > 0 ? scanTask.total : null
+        : completedPhase || cancelledOrErrorPhase
+          ? scanTask.source_total !== undefined
             ? scanTask.source_total
             : scanTask.total > 0 ? scanTask.total : null
         : scanTask.destination_total !== undefined
@@ -2078,8 +2330,8 @@ function renderSyncSlot(
     && !neteaseDiscoveryActive;
   const scanProgressText = taskScanActive && scanTask
     ? renderedPhaseTotal == null
-      ? `${scanPhaseLabel(scanTask.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
-      : `${scanPhaseLabel(scanTask.phase, state.lang)} ${phaseProcessed}/${renderedPhaseTotal}`
+      ? `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(scanTask.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
+      : `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(scanTask.phase, state.lang)} ${phaseProcessed}/${renderedPhaseTotal}`
     : null;
   const displayedProgressText = (analysisIsActive ? analysisProgressText : null)
     || scanProgressText
@@ -2109,7 +2361,9 @@ function renderSyncSlot(
     && !conversionProgressActive
     && scanProgressText === null
     && Boolean(neteaseProgress && neteaseProgressTotal == null);
-  const displayedSlotStatus = taskScanActive ? 'running' : slot.status;
+  const displayedSlotStatus = taskScanActive && !completedPhase && !cancelledOrErrorPhase
+    ? 'running'
+    : slot.status;
   const neteaseScanActive = neteaseDiscoveryInFlight || neteaseDiscoveryActive || neteaseRefreshActive;
   const neteaseScanLabel = neteaseScanActive
     ? t('scanLocalNeteaseRunning', state.lang)
@@ -2121,13 +2375,7 @@ function renderSyncSlot(
     ? manualDatabasePath.split(/[\\/]/).filter(Boolean).pop() || manualDatabasePath
     : null;
   const databaseBusy = neteaseMetadataDatabase?.busy === true;
-  const databaseMessage = neteaseMetadataDatabase?.error
-    || neteaseMetadataDatabase?.status?.warning
-    || neteaseMetadataDatabase?.message
-    || (manualDatabasePath ? t('neteaseDatabaseSelected', state.lang) : null)
-    || (neteaseMetadataDatabase?.status?.source === 'unavailable'
-      ? t('neteaseDatabaseUnavailable', state.lang)
-      : null);
+  const neteaseSituation = resolveNeteaseSituation(neteaseMetadataDatabase, state.lang);
   const progressCopy = showingAnalysisProgress
     ? `<span class="status-copy progress-copy analysis-progress-copy" data-role="analysis-message">
         <span class="analysis-progress-summary" data-role="analysis-summary">${escapeHtml(analysisProgressSummary || '')}</span>
@@ -2151,9 +2399,12 @@ function renderSyncSlot(
             <span>${t('sourceLabel', state.lang)}</span>
             ${slotIndex === 0
               ? `<div class="netease-source-toolbar" data-role="netease-source-toolbar">
-                  ${databaseMessage
-                    ? `<small class="netease-database-status${neteaseMetadataDatabase?.error ? ' is-error' : ''}" data-role="netease-database-status" title="${escapeHtml(databaseMessage)}">${escapeHtml(databaseMessage)}</small>`
-                    : ''}
+                  <div class="netease-database-status${neteaseSituation.tone === 'error' ? ' is-error' : ''}" data-role="netease-database-status" title="${escapeHtml(neteaseSituation.message)}">
+                    <div class="netease-situation netease-situation--${neteaseSituation.tone}" data-role="netease-situation" data-tone="${neteaseSituation.tone}" title="${escapeHtml(neteaseSituation.message)}">
+                      <span class="netease-situation-label">${t('neteaseSituationLabel', state.lang)}</span>
+                      <span class="netease-situation-value" data-role="netease-situation-value">${escapeHtml(neteaseSituation.message)}</span>
+                    </div>
+                  </div>
                   <div class="netease-source-actions" data-role="netease-source-actions">
                     <button type="button" class="netease-scan-button" data-action="scan-local-netease" data-slot="0" ${neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
                       ${icon('refresh')}
@@ -2472,6 +2723,25 @@ export function bindApp(
     });
   };
 
+  const updateNeteaseSituationDom = (): boolean => {
+    const situation = root.querySelector<HTMLElement>('[data-role="netease-situation"]');
+    const value = situation?.querySelector<HTMLElement>('[data-role="netease-situation-value"]');
+    if (!situation || !value) {
+      return false;
+    }
+    const resolved = resolveNeteaseSituation(neteaseMetadataDatabase, state.lang);
+    situation.dataset.tone = resolved.tone;
+    situation.className = `netease-situation netease-situation--${resolved.tone}`;
+    situation.title = resolved.message;
+    value.textContent = resolved.message;
+    const container = situation.closest<HTMLElement>('[data-role="netease-database-status"]');
+    if (container) {
+      container.title = resolved.message;
+      container.classList.toggle('is-error', resolved.tone === 'error');
+    }
+    return true;
+  };
+
   const updateAnalysisProgressDom = () => {
     const analysisSlot = analysisState.slotIndex === null
       ? null
@@ -2532,20 +2802,30 @@ export function bindApp(
       }
       const sourcePhase = task.phase === 'scanning_source';
       const metadataPhase = task.phase === 'matching_metadata';
+      const preparingPhase = task.phase === 'preparing';
+      const completedPhase = task.phase === 'completed' || task.phase === 'cancelled' || task.phase === 'error';
       const processed = sourcePhase
         ? task.source_processed ?? task.processed
+        : preparingPhase
+          ? task.processed
         : metadataPhase
           ? task.metadata_processed ?? task.processed
+          : completedPhase
+            ? task.source_processed ?? task.processed
           : task.destination_processed ?? task.processed;
       const total = sourcePhase
         ? task.source_total ?? (task.total > 0 ? task.total : null)
+        : preparingPhase
+          ? (task.total > 0 ? task.total : null)
         : metadataPhase
           ? task.metadata_total ?? task.source_total ?? (task.total > 0 ? task.total : null)
+          : completedPhase
+            ? task.source_total ?? (task.total > 0 ? task.total : null)
           : task.destination_total ?? (task.total > 0 ? task.total : null);
       const renderedTotal = total != null && processed <= total ? total : null;
       const progressText = renderedTotal == null
-        ? `${scanPhaseLabel(task.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${processed} 项` : `${processed} scanned`}`
-        : `${scanPhaseLabel(task.phase, state.lang)} ${processed}/${renderedTotal}`;
+        ? `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(task.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${processed} 项` : `${processed} scanned`}`
+        : `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(task.phase, state.lang)} ${processed}/${renderedTotal}`;
       messageElement.textContent = progressText;
       const percent = renderedTotal && renderedTotal > 0
         ? Math.min(100, Math.round((processed / renderedTotal) * 100))
@@ -2897,7 +3177,6 @@ export function bindApp(
 
     try {
       const previews = await services.loadScanResult();
-      scanProgress = null;
       if (state.conversionMode === 'scan_then_convert') {
         previewModal = { previews, retryOf: null };
         pendingGlobalAction = null;
@@ -2906,6 +3185,9 @@ export function bindApp(
       }
 
       previewBusy = true;
+      // Starting conversion is the next explicit operation, so the completed
+      // scan snapshot no longer competes with conversion progress.
+      scanProgress = null;
       const batchId = createAnalysisBatchId();
       const shouldAnalyze = state.enhancedMode;
       render();
@@ -2980,6 +3262,21 @@ export function bindApp(
       total: 0,
       current_file: '',
       message: t('scanPreparing', state.lang),
+      tasks: state.slots
+        .map((slot, slotIndex) => ({
+          slot_index: slotIndex as SyncSlotIndex,
+          phase: 'preparing' as AppScanPhase,
+          processed: 0,
+          total: 0,
+          source_processed: 0,
+          source_total: null,
+          destination_processed: 0,
+          destination_total: null,
+          metadata_processed: 0,
+          metadata_total: null,
+          current_file: '',
+        }))
+        .filter((_, slotIndex) => state.slots[slotIndex].sourceDirectory.trim().length > 0),
     };
     neteaseMetadataCachePreparing = Boolean(services.prepareNeteaseMetadataCache);
     render();
@@ -3002,12 +3299,36 @@ export function bindApp(
         }
         try {
           let cacheProgress = await services.prepareNeteaseMetadataCache();
+          const applyCacheProgressToScan = (progress: NeteaseMetadataCacheProgress) => {
+            if (!scanProgress || !['running', 'cancelling'].includes(scanProgress.status)) return;
+            const nextTask = scanProgress.tasks?.map((task) => task.slot_index === 0
+              ? {
+                ...task,
+                phase: 'preparing' as AppScanPhase,
+                processed: progress.processed,
+                total: progress.total ?? 0,
+                current_file: progress.currentItem,
+              }
+              : task);
+            scanProgress = {
+              ...scanProgress,
+              phase: 'preparing',
+              processed: progress.processed,
+              total: progress.total ?? 0,
+              current_file: progress.currentItem,
+              message: progress.message || t('scanPreparing', state.lang),
+              tasks: nextTask,
+            };
+            if (!updateScanProgressDom(scanProgress)) render();
+          };
+          applyCacheProgressToScan(cacheProgress);
           while (
             services.loadNeteaseMetadataCacheStatus
             && (cacheProgress.status === 'building' || cacheProgress.status === 'cancelling')
           ) {
             await new Promise((resolve) => setTimeout(resolve, 100));
             cacheProgress = await services.loadNeteaseMetadataCacheStatus();
+            applyCacheProgressToScan(cacheProgress);
           }
           if (cacheProgress.status === 'error' || cacheProgress.status === 'cancelled') {
             console.warn('NetEase metadata cache was not prepared:', cacheProgress.message);
@@ -5783,6 +6104,35 @@ export function bindApp(
       return;
     }
 
+    if (action === 'preview-detail') {
+      if (!previewModal) return;
+      const detailSlot = parseSlotIndex(button.dataset.slot);
+      const kind = button.dataset.detailKind as PreviewDetailKind | undefined;
+      if (detailSlot !== null && kind) {
+        previewModal = { ...previewModal, detail: { slotIndex: detailSlot, kind } };
+        render();
+      }
+      return;
+    }
+
+    if (action === 'close-preview-detail') {
+      if (previewModal) {
+        previewModal = { ...previewModal, detail: null };
+        render();
+      }
+      return;
+    }
+
+    if (action === 'open-preview-file') {
+      const path = button.dataset.path;
+      if (path) {
+        void (button.dataset.openTarget === 'destination'
+          ? services.openDestination(path)
+          : services.openSource(path));
+      }
+      return;
+    }
+
     if (action === 'cancel-scan') {
       void cancelScanFlow();
       return;
@@ -6460,7 +6810,29 @@ export function bindApp(
 
   if (services.listenNeteaseMetadataCacheProgress) {
     void services.listenNeteaseMetadataCacheProgress((progress) => {
+      if (scanProgress && ['running', 'cancelling'].includes(scanProgress.status)) {
+        const tasks = scanProgress.tasks?.map((task) => task.slot_index === 0
+          ? {
+            ...task,
+            phase: 'preparing' as AppScanPhase,
+            processed: progress.processed,
+            total: progress.total ?? 0,
+            current_file: progress.currentItem,
+          }
+          : task);
+        scanProgress = {
+          ...scanProgress,
+          phase: 'preparing',
+          processed: progress.processed,
+          total: progress.total ?? 0,
+          current_file: progress.currentItem,
+          message: progress.message || t('scanPreparing', state.lang),
+          tasks,
+        };
+        if (!updateScanProgressDom(scanProgress)) render();
+      }
       const status = neteaseMetadataDatabase.status;
+      const wasBusy = neteaseMetadataDatabase.busy;
       neteaseMetadataDatabase = {
         ...neteaseMetadataDatabase,
         status: status
@@ -6474,7 +6846,14 @@ export function bindApp(
         message: progress.message || neteaseMetadataDatabase.message,
         error: progress.error,
       };
-      render();
+      // Keep the task card and focused controls stable during frequent cache
+      // progress events.  Re-render only when button affordances or terminal
+      // state change; the situation value itself is updated in place.
+      const needsStructuralRender = wasBusy !== neteaseMetadataDatabase.busy
+        || !['building', 'cancelling'].includes(progress.status);
+      if (needsStructuralRender || !updateNeteaseSituationDom()) {
+        render();
+      }
     }).catch((error) => console.warn('Failed to subscribe to NetEase metadata cache progress:', error));
   }
 
@@ -6650,6 +7029,13 @@ function renderOutputSettings(
               </button>
             </div>
           </div>
+        ` : ''}
+        ${ANALYSIS_CACHE_CLEAR_VISIBLE ? `
+          <button type="button" class="secondary-action enhanced-cache-clear" data-action="clear-analysis-cache">
+            ${t('clearEnhancedCache', state.lang)}
+          </button>
+        ` : ''}
+        ${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? `
           <button type="button" class="secondary-action scan-cache-clear" data-action="clear-scan-cache">
             ${t('clearScanCache', state.lang)}
           </button>

@@ -37,7 +37,7 @@ const SOURCE_ENTRY_KEY_SEPARATOR: char = '\u{1f}';
 /// Return the presentation name from a source-scan key. The suffix is an
 /// internal collision discriminator and must never become an output filename
 /// or metadata field.
-pub(crate) fn source_entry_name(value: &str) -> &str {
+pub fn source_entry_name(value: &str) -> &str {
     value
         .split_once(SOURCE_ENTRY_KEY_SEPARATOR)
         .map(|(name, _)| name)
@@ -3723,6 +3723,28 @@ pub(crate) fn target_output_path_with_policy(
         FilenameNormalizationPolicy::SoundCloud => sanitize_filename_component(name_stem),
     };
     Path::new(dest_folder).join(format!("{}.{}", stem, output_extension))
+}
+
+/// Compute the final output path using the same policy as the converter.  It
+/// is intentionally a pure planning helper apart from the required NCM header
+/// read; callers use it after a successful commit to register that one known
+/// output instead of scanning the destination directory.
+pub fn planned_output_path_with_policy(
+    dest_folder: &str,
+    name_stem: &str,
+    source_path: &Path,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    filename_policy: FilenameNormalizationPolicy,
+) -> io::Result<PathBuf> {
+    let source_format = effective_source_extension(source_path);
+    let output_policy = resolve_output_policy(mode, lossless_format, &source_format);
+    Ok(target_output_path_with_policy(
+        dest_folder,
+        name_stem,
+        output_policy.output_extension,
+        filename_policy,
+    ))
 }
 
 pub(crate) fn effective_source_extension(source_path: &Path) -> String {

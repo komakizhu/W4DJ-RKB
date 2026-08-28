@@ -81,20 +81,20 @@ struct IdentityKey {
     artists: Vec<String>,
 }
 
-/// Match the imported order against currently available output candidates.
+/// Match the imported order against output candidates in the W4DJ index.
 /// A candidate is consumed only after an automatic exact match, so one output
 /// cannot satisfy two imported rows in the same report.
 pub fn match_imported_playlist(
     playlist: &ImportedDjPlaylist,
     candidates: &[DjOutputCandidate],
 ) -> DjPlaylistMatchReport {
-    let available = candidates
-        .iter()
-        .filter(|candidate| candidate.status == "available" && candidate.readable)
-        .collect::<Vec<_>>();
+    // Do not filter on the legacy `status`/`readable` hints here.  The index
+    // is authoritative for identity and the M3U8 exporter validates only the
+    // paths selected by this report, avoiding a full-library filesystem scan.
+    let indexed = candidates.iter().collect::<Vec<_>>();
     let mut by_identity: HashMap<IdentityKey, Vec<&DjOutputCandidate>> = HashMap::new();
     let mut by_netease_id: HashMap<&str, Vec<&DjOutputCandidate>> = HashMap::new();
-    for candidate in &available {
+    for candidate in &indexed {
         by_identity
             .entry(identity_key(&candidate.title, &candidate.artist_display))
             .or_default()
@@ -130,7 +130,7 @@ pub fn match_imported_playlist(
         }
         exact.sort_by(|left, right| left.track_key.cmp(&right.track_key));
 
-        let suggestions = suggestions_for(track, &available, &used);
+        let suggestions = suggestions_for(track, &indexed, &used);
         let row = if exact.len() == 1 {
             let candidate = exact[0];
             if track.netease_track_id.is_none() {
