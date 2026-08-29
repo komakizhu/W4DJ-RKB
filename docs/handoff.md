@@ -37,7 +37,7 @@
 - 歌曲库维护补充：歌曲行右键可“重新定位文件”（保留原分析结果）或“移除记录”（只改 W4DJ SQLite）；搜索栏右侧的“清除所有失效文件”需勾选二次确认，且不删除音乐文件、网易云数据库或分析缓存。
 - Task 9：列顺序/隐藏、列宽持久化、Shift 多列排序优先级、动态操作符、250ms 防抖和查询竞态防护已完成。
 - Task 10：增强模式下可从 Dashboard 单独分析可读歌曲，复用分析缓存并支持取消；不调用转换和转换历史，完成后只刷新 Catalog 投影。
-- 运行会话记录与错误报告：每个任务仍在本机 Downloads/W4DJ-runtime-sessions 下保留 session、候选、预检/转换/分析/模型/回写事件和逐槽摘要，但这些内部记录不会自动生成错误报告。转换历史中的“导出错误报告”按钮由用户手动选择路径，生成 UTF-8 文本并把导出路径回写到对应历史记录；不上传任何数据。
+- 运行会话记录与错误报告：每个任务在本机应用数据目录的 W4DJ-runtime-sessions 下保留 session、候选、预检/转换/分析/模型/回写事件和逐槽摘要；这些内部记录不会写入 Downloads，也不会自动生成错误报告。转换历史中的“导出错误报告”按钮由用户手动选择路径，生成 UTF-8 文本并把导出路径回写到对应历史记录；不上传任何数据。
 - Danceability 展示补充：新增 `app/src/danceability-rating.ts`，固定 S 曲线把原始值转换为 1–10 可见等级；原始 Essentia 值、SQLite/JSON、查询/排序和 Energy 不变。Joe Fight 约 1.1535 显示 6/10，缺失/非有限值显示 `—`，前端锚点和边界测试已覆盖。
 - Energy 展示补充：新增 `app/src/energy-rating.ts`，按校准计划的九个 RMS² 边界显示十级星标与 `N/10`；tooltip 保留 `Essentia RMS² raw`，原始 Energy 继续用于 SQLite/JSON、筛选、排序和音频标签，Energy 筛选项仍明确使用原始数值。Danceability 与 Energy 使用独立标度。
 - 增强分析卡顿修复：主线程只保留 Web Audio 解码/重采样和 MusiCNN 输入准备；新增 `analysis.worker.ts`、`analysis-worker-client.ts` 与协议模块，将同步 Essentia/WASM、MusiCNN 帧计算和 TensorFlow.js 推理移出 UI 线程。Worker 消息按 `jobId/requestId` 路由，取消立即 `terminate()`，高频进度只更新分析状态节点，不重建整棵应用 DOM。分析候选现在按 `AppPreview.slot_index` 分组，`AppAnalysisState.slotIndex` 路由到来源任务槽，任务 2 不再覆盖任务 1 的进度。增强分析结果按歌曲立即写回输出文件、W4DJ SQLite、兼容缓存和历史报告；批次中断后已完成歌曲保留，运行会话报告按歌曲累积，剩余候选可通过恢复入口继续。
@@ -345,3 +345,53 @@ Vite 构建通过。未提交、未推送、未发布。
 自动化：前端 app.test.ts 126/126、TypeScript、Vite、Tauri check、根 Rust 测试和格式检查通过。尚未在用户真实 1173 首目录执行现场扫描/覆盖转换，也未执行 GUI 文件打开验收。主工作树未被修改；未改版本号、未提交、未推送。
 
 最终验收补充：独立 worktree 前端 Vitest 14 文件/209 项、TypeScript、Vite、根 Rust 全量、Tauri check、严格 Tauri Clippy、fmt 和 diff-check 均通过。最新 arm64 App 为 `/private/tmp/w4dj-task1-scan-preview-worktree/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/W4DJ RKB.app`（`3.2.0-beta.3`，约 95 MB）。主工作树未修改，未 commit、push、merge 或 release；真实 1173 首现场扫描/覆盖转换/文件打开链接仍待用户环境。
+
+## 2026-08-29 扫描本地网易云文件夹后台化（已实施）
+
+任务 1 的扫描命令现为立即返回 + 后台 worker。标准目录命中后先填入来源框，后台统计歌曲；否则只读查询支持网易云表的路径/目录字段，找到第一个存在的音乐根目录即停止，不解析完整记录。事件新增可选 discoveryId，阶段为 checkingKnownFolders、locatingDatabase、queryingPaths、checkingMusicFolder，支持 cancelling/cancelled/error 终态。
+
+前端提供 10 秒后的手动选择和取消入口，手动选择先取消扫描，旧 discoveryId 事件会被忽略。前端全量 Vitest 202 项、TypeScript、Vite、Rust 全量测试、Tauri check、严格 Clippy、fmt 和 diff-check 已通过；最新版 arm64 App 已通过 `open -g` 后台启动验收。后续队列任务为仅按 effectivePath 调整“选择网易云数据库”可见文案。版本仍为 `3.2.0-beta.3`，未提交或推送。
+
+## 2026-08-29 输出扫描隐藏文件与歌曲库快照（当前交接点）
+
+已在共享工作树增量实现隐藏路径过滤、点号输出名保护、输出扫描实时计数、按输出根 reconcile 以及“清除歌曲库与分析缓存”。成功扫描才写入 W4DJ SQLite；取消、失败或无权限不改变既有库。兼容 JSON 仅在成功扫描后清理参与根中已经消失的 destination 记录，扫描缓存和历史不受影响。
+
+自动化已通过：Rust 库 118/118、Tauri 103/103、前端 210/210、TypeScript、Vite、cargo check、fmt、diff-check。尚未完成 Windows/macOS Hidden 标志真实人工验收和 1,190 首真实目录现场验收。继续操作时保留脏工作树，不修改版本 `3.2.0-beta.3`，不 commit/push/merge/release。
+
+## 2026-08-29 任务 1 来源解绑与网易云状态布局（当前交接点）
+
+已实现任务 1 清空来源时取消网易云发现/索引、清除手动数据库路径、关闭绑定并持久化；普通来源选择不重绑，主动扫描或有效手动数据库选择重新绑定。绑定状态使用向后兼容偏好字段，未绑定时不自动定位数据库，轻量索引保留。
+
+网易云状态现在位于任务 1 进度条右侧，运行显示阶段/processed/total，完成显示“索引已就绪”，未绑定显示“未选择数据库”。“清除歌曲库与分析缓存”调用歌曲库清理命令，增强缓存 action 保持隐藏独立入口。前端全量 211/211、Rust 118/118、Tauri 103/103、TypeScript、Vite、fmt、check、严格 Tauri Clippy、diff-check 和 arm64 App 构建通过。Windows/macOS Hidden 实际标志、真实用户目录和 GUI 现场验收仍待执行。
+
+普通 App 转换的内部运行会话改存应用数据目录的 `W4DJ-runtime-sessions`，不再落入 Downloads；错误报告保持手动导出，不会自动生成。
+
+## 2026-08-29 报告导出路径复核
+
+普通转换只在应用数据目录写入内部运行会话和全局日志，不会自动调用报告导出，也不会向 Downloads 创建错误报告。报告只能在历史或关于页由用户选择保存路径后手动生成。前端语义化 UI action 通过非阻塞日志命令进入全局 RuntimeJournal。最新 arm64 App 于 18:56:07 重建，并用 `open -g` 后台启动/退出复核；启动期间 Downloads 未新增报告文件。
+
+## 2026-08-29 Task 1 网易云权威元数据与改编者语义
+
+任务 1 的输出路径现在在预览冲突判断前使用只读网易云身份（Title、Artist、Album、track ID、album ID）；`Original` 保留源 basename，其他文件名规则按数据库身份排列。转换和后续元数据/封面/增强分析写回共享批次 resolver，仅补缺失字段且不重新命名。任务 2 保持源文件策略，不能被网易云数据库驱动。Mass Destruction 的全角引号、多歌手和 NCM 派生语义已有回归覆盖。
+
+1,192 个真实历史路径已用 T7 只读数据库快照完成全量分类：NCM 1,093、FLAC 72、MP3 27；1,191 首唯一匹配，`Truth or Dare (1).ncm` 因数据库同时存在两个不同 track ID/专辑而保持歧义，117 首归入 Remix/Edit/Version 语义。逐曲报告位于 `/private/tmp/w4dj-task1-1192-acceptance-newer.json`，数据库大小和 mtime 前后不变。合法临时 MP3/FLAC/WAV/AIFF 按三类各三首共 12 首全部通过 ffprobe；Mass Destruction 合法 FLAC + 临时只读数据库标签回写/复读通过。未使用空文件，未写用户原始音频或数据库。
+
+最新版 arm64 App 已于 2026-08-29 20:13:56 CST 编译，版本 `3.2.0-beta.3`，约 96 MB，Mach-O arm64。
+
+## 2026-08-29 输出扫描歌曲库 UNIQUE 冲突修复
+
+侧会话报告的 `UNIQUE constraint failed: w4dj_track_meta.destination_path` 已用回归测试精确复现并修复。`reconcile_output_roots` 在事务外先完整构造所有参与 root 的规范化快照，事务内按 destination 复用已有 `source:/netease:` 身份；新文件才创建 output 身份，消失文件级联清理，未参与 root 不动，任一 root 失败则整批回滚。
+
+size+mtime 同时相等才保留分析；变化或旧指纹缺失会清除 SQLite/兼容 JSON 旧分析并重置 `notAnalyzed`。同步失败被归属到受影响任务卡，保留“扫描成功 x/x”，同行红字显示“歌曲库同步失败”，右上角为“失败”，不会进入转换确认或在全局区域泄露技术错误。详细 root、destination 列表和错误链只进入 RuntimeJournal，供用户手动导出。
+
+真实 `/Users/mac2/Music/test` 6 首已在用户库只读备份上完成两轮验收：首轮恰好 6 条、无 destination 重复、保留 6 个旧 track key；第二轮相同快照不失效任何分析。真实数据库 size/mtime 未改变。临时回归覆盖空目录、替换文件、未参与 root 和多 root 原子回滚。
+
+最新版 arm64 App 已于 2026-08-29 21:07:39 CST 构建，版本 `3.2.0-beta.3`，约 96 MB。
+
+## 2026-08-29 统一运行日志与双层报告（实现完成，当前交接点）
+
+共享工作树已实现统一本地 RuntimeJournal 与两种手动 JSON 报告。日志目录为应用数据目录下的 `W4DJ-runtime-journal`，采用有界非阻塞队列、独立写入线程、进度合并、1000 条补偿区及 30 天/200 MB 轮转；启动异常 marker 会产生 `previous_run_interrupted`，不扫描旧 runtime-session 目录。转换运行会话后台事件也会同步到全局日志，报告导出前刷新队列。`export_run_report` 汇总单条转换历史、内部会话及同 operationId 的全局事件；`export_full_runtime_report` 流式导出日志、健康状态和补偿区，均通过临时文件原子替换，不自动生成或写入 Downloads。
+
+前端转换历史只保留“导出本次运行报告”按钮；关于页新增“导出完整运行报告”。用户取消保存对话框不会调用后端。旧 `export_history_error_report`/`export_runtime_session` 命令暂留兼容但不再有可见入口。HistoryEntry 的 `operationId` 为可选字段，旧 history.json 可读取。
+
+已验证前端 12 文件/203 项、Rust 120 项、Tauri 103 项、TypeScript、Vite、cargo check、fmt、diff-check，以及根库与 Tauri 严格 all-targets Clippy。`pnpm --dir app test -- --run` 被本机 `ERR_PNPM_IGNORED_BUILDS` 安全策略阻断，但同一依赖树直接运行 Vitest 已全部通过；RuntimeJournal 压力/轮转单元测试 4 项通过。通过 `open -g` 完成异常重启/正常退出验收：强制终止后出现 `previous_run_interrupted`，正常退出写入 `app_stopped` 并清除 active marker。最新 arm64 App 构建于 2026-08-29 18:41:42。接手者仍需在可用环境补做真实扫描→转换→增强分析链路验收；保持版本 `3.2.0-beta.3`，不 commit/push/merge/release。

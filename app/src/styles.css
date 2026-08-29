@@ -1150,6 +1150,52 @@ h1 {
   padding-top: 0;
 }
 
+.slot-progress-copy-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.slot-progress-copy-line .progress-copy {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-sync-error {
+  flex: 0 0 auto;
+  color: var(--danger, #c7483e);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.slot-progress-row {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+.slot-progress-row.has-netease-status {
+  padding-top: 14px;
+}
+
+.slot-progress-row .progress-track {
+  width: 100%;
+  min-width: 0;
+}
+
+.slot-progress-row .netease-database-status {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+
 .status-copy {
   color: var(--muted);
   font-variant-numeric: tabular-nums;

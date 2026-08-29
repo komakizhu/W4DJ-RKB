@@ -409,3 +409,59 @@ Vitest 198/198、TypeScript、Vite 构建和 arm64 App 体积/路径核对通过
 独立 worktree 的 app.test.ts 为 126/126，TypeScript、Vite、Tauri check 和根 Rust 基线测试通过。真实 1173 首扫描、覆盖模式转换、数据库目录实际值和文件打开链接仍待用户环境验收；主工作树未被修改。
 
 独立 worktree 最终验收：前端 Vitest 14 文件/209 项、TypeScript、Vite、根 Rust 全量测试、Tauri check、严格 Tauri Clippy、fmt、diff-check 均通过。最新 arm64 App 位于 `/private/tmp/w4dj-task1-scan-preview-worktree/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/W4DJ RKB.app`，版本 `3.2.0-beta.3`，包体约 95 MB。真实 1173 首目录现场扫描和 GUI 文件打开仍待用户环境。
+
+## 2026-08-29 扫描本地网易云文件夹后台化
+
+任务 1 的网易云目录发现改为后台单例 worker：命中标准目录时命令立即返回并先填入任务 1，随后异步统计音频文件；没有标准目录时仅只读检查数据库 schema 和路径字段，停止在第一个实际存在的音乐根目录，不加载完整歌曲记录、歌词或封面。进度事件携带 discoveryId，支持阶段切换、协作式取消、重复取消幂等和终态事件。
+
+前端按 discoveryId 忽略迟到事件，超过 10 秒显示手动选择和取消入口，手动选择会先取消后台发现且不会被旧事件覆盖。Dashboard 数据源仍是 W4DJ 独立歌曲库。前端全量 Vitest 12 文件/202 项、TypeScript、Vite、Rust 全量测试、Tauri check、严格 Tauri Clippy、fmt 和 diff-check 已通过。最新版 arm64 App 已用 `open -g` 后台启动验收，版本仍为 `3.2.0-beta.3`；真实 10,955 条数据库的最小路径查询和辅助功能 GUI 操作仍需用户环境验收。
+
+## 2026-08-29 输出扫描隐藏文件与歌曲库快照
+
+扫描入口现统一使用 root-aware 隐藏路径规则：任一文件名/目录名以点开头、macOS Hidden、Windows Hidden、`.w4dj-*` 和 AppleDouble 均不会进入来源、输出、重复判断、转换候选或歌曲库。为避免 macOS `/var` 系统标志误判，系统临时 `.tmp*` 测试夹具和 `/var` 挂载标志不作为用户 Hidden 属性。任务 1 PreserveSource 只对最终点开头 stem 前缀 `_`，其他源字符和标签保持。
+
+输出扫描现在逐项报告正常歌曲的输入/输出分母，完成扫描后按参与的输出根以事务同步 `w4dj.sqlite3` 快照；仍存在路径保留分析，消失路径及关联分析删除，空根清空，取消/失败不写库。清理入口改为清除歌曲库与分析缓存，保留音频、转换历史、歌单、偏好和 scan-cache。
+
+验证：Rust 库 118/118、Tauri 103/103、前端 210/210、TypeScript、Vite、cargo check、fmt 和 diff-check 通过。Windows Hidden、macOS Hidden 标记及真实 1,190 首现场验收尚未执行；版本保持 `3.2.0-beta.3`，未提交或推送。
+
+## 2026-08-29 任务 1 来源解绑与网易云状态布局
+
+任务 1 清空来源现在会协作式取消网易云目录发现和轻量索引，清除手动数据库路径并持久化 `neteaseDatabaseBound=false`；普通来源选择不会重新绑定。显式扫描本地网易云文件夹或手动选择有效数据库会重新开启绑定，旧偏好缺少该字段时默认保持原有自动绑定行为。解绑状态跨 reload/重启保持，轻量索引文件不删除。
+
+网易云状态已从来源工具栏移到任务 1 进度条右侧：运行中显示阶段和计数，完成显示“索引已就绪”，解绑显示“未选择数据库”。侧栏可见清理入口统一为“清除歌曲库与分析缓存”，调用 `clear_library_catalog_cache`；增强模式缓存保留独立隐藏 action。前端 211/211、Tauri 103/103、Rust 全量、TypeScript、Vite、fmt、check、严格 Tauri Clippy 和 diff-check 均通过，arm64 App 已重编译。真实 Windows/macOS 标志与用户目录现场验收仍待执行。
+
+## 2026-08-29 统一运行日志与双层报告（实现完成，当前交接点）
+
+共享工作树已加入 `src/runtime_journal.rs`。RuntimeJournal 在应用数据目录维护按日 JSONL，通过容量受限的 sync_channel 与独立 writer 非阻塞写入；进度事件拥塞时合并，关键事件进入最多 1000 条的内存补偿区，并按 30 天/200 MB 清理旧日志。启动写入 `app_started`，已有 active marker 时追加 `previous_run_interrupted`；日志不包含音频、封面二进制、歌词正文、数据库记录正文或凭据。
+
+新增 Tauri 命令 `export_run_report(id,path)` 和 `export_full_runtime_report(path)`，均只在用户手动选择路径后生成结构化 JSON，先写临时文件再原子替换。历史卡片只显示“导出本次运行报告”，关于页显示“导出完整运行报告”；旧 TXT/运行会话命令仍兼容保留但不再由界面暴露。HistoryEntry 增加可选 `operationId`，来源选择、扫描、转换后台会话、网易云定位/数据库候选、取消、清理和前端运行事件已接入全局日志；报告导出前会刷新已入队事件。
+
+本轮验证：前端 Vitest 12 文件/203 项、根 Rust 全量 120 项、Tauri 103 项、TypeScript、Vite、cargo check、fmt 和 diff-check 通过；根库与 Tauri 严格 all-targets Clippy 通过。`pnpm --dir app test -- --run` 被本机 `ERR_PNPM_IGNORED_BUILDS` 安全策略阻断，但同一依赖树直接运行 Vitest 已全部通过。RuntimeJournal 压力/轮转单元测试 4 项通过。通过 `open -g` 完成异常重启/正常退出验收：强制终止后出现 `previous_run_interrupted`，正常退出写入 `app_stopped` 并清除 active marker。最新 arm64 App 构建于 2026-08-29 18:41:42。真实扫描→转换→增强分析链路以及 Windows/Rekordbox 仍需应用级现场验收。
+
+## 2026-08-29 运行会话路径修正
+
+普通 App 转换的内部运行会话现在写入应用数据目录的 `W4DJ-runtime-sessions`，不再写入 Downloads。错误报告仍仅在用户手动点击导出并选择路径后生成。
+
+## 2026-08-29 报告导出路径复核
+
+普通转换不会自动调用报告导出，也不会向 Downloads 创建错误报告；报告动作均先由用户选择保存位置后执行。前端语义化 UI action 现在通过非阻塞日志命令写入全局 RuntimeJournal。最新 arm64 App 于 18:56:07 重新构建，并用 `open -g` 后台启动/退出烟测；Downloads 未出现新的报告文件。
+
+## 2026-08-29 Task 1 网易云权威元数据与改编者语义（当前状态）
+
+任务 1 预览在冲突判断前解析只读网易云身份，数据库 Title/Artist/Album、track ID 和 album ID 作为权威身份；`Original` 规则保留源 basename，其他规则才按数据库身份排列。转换、仅更新元数据、封面恢复和增强分析共享同一批次 resolver，仅补齐缺失标签，写回阶段不会再次改名。任务 2 继续使用源文件/既有 SoundCloud 清洗策略，不受网易云数据库驱动。
+
+Mass Destruction 的全角引号与多歌手匹配、轻量 locator、无匹配/歧义回退和任务槽隔离已有回归覆盖。1,192 个真实历史路径已使用 T7 只读数据库快照完成全量文件名/身份分类：1,191 首唯一匹配，唯一未解析的 `Truth or Dare (1).ncm` 在数据库中有两个不同 track ID/专辑，正确保持歧义；117 首识别为 Remix/Edit/Version 语义。数据库大小和 mtime 前后不变，逐曲 JSON 位于 `/private/tmp/w4dj-task1-1192-acceptance-newer.json`。
+
+合法临时 MP3、FLAC、WAV、AIFF 按单艺人、多人艺人和 Remix 三类各生成三首，12/12 通过 ffprobe；合法 FLAC 配合临时只读 SQLite 已验证 Mass Destruction 的网易云身份、标签写入和复读且源文件未改变。该验收明确区分真实文件名/NCM 派生语义层与合法临时容器层，没有使用空文件，也没有修改用户原始音频或数据库。
+
+最新版 arm64 App 已于 2026-08-29 20:13:56 CST 重新编译，版本保持 `3.2.0-beta.3`，约 96 MB，Mach-O arm64。
+
+## 2026-08-29 输出扫描歌曲库 UNIQUE 冲突
+
+已修复主动输出扫描同步时的 `w4dj_track_meta.destination_path` 唯一约束失败。根因是转换登记已用 `source:/netease:` track key 占有目标路径，而旧 reconciliation 又固定构造 `output:<path>`。新实现先在事务外完整形成所有参与 root 的规范化文件快照，再用一个事务按目标路径复用既有身份；只有新文件创建 output 身份，消失文件及关联分析被删除，未参与 root 不变。
+
+文件指纹固定为 size+mtime：两者均未变化时保留分析，任一变化或旧指纹缺失时清除 SQLite 与兼容 JSON 的旧分析并回到 `notAnalyzed`。任一参与 root 枚举/校验/同步失败时整批不提交。任务槽 DTO 使用安全的 `library_sync_failed` 代码，UI 显示“扫描成功 x/x”加红色“歌曲库同步失败”和“失败”状态；SQLite 错误、路径、旧/新身份只进入 RuntimeJournal/手动报告。
+
+真实 `/Users/mac2/Music/test` 的 6 首已在用户 SQLite 的只读备份上验收：同步后该 root 恰好 6 条、destination 无重复、6 个旧身份均保留；第二次相同快照 `invalidatedPaths=[]`。用户数据库 size/mtime 前后相同。临时目录回归还覆盖空 root、部分替换、指纹变化、未参与 root 和两槽原子回滚。
+
+包含该修复的最新版 arm64 App 已于 2026-08-29 21:07:39 CST 构建，版本保持 `3.2.0-beta.3`，约 96 MB。

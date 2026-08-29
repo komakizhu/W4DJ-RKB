@@ -72,8 +72,9 @@ export async function renderDjPlaylistQrPages(
 }
 
 export type NeteaseDiscoveryProgress = {
-  status: 'running' | 'completed' | 'error';
-  stage: 'locatingDatabase' | 'readingRecords' | 'checkingMusicFolder';
+  discoveryId?: string;
+  status: 'running' | 'cancelling' | 'completed' | 'cancelled' | 'error';
+  stage: 'checkingKnownFolders' | 'locatingDatabase' | 'queryingPaths' | 'readingRecords' | 'checkingMusicFolder';
   processed: number;
   total: number | null;
   currentItem: string;
@@ -83,6 +84,7 @@ export type NeteaseDiscoveryProgress = {
 };
 
 export type NeteaseMetadataDatabaseStatus = {
+  bound?: boolean;
   manualPath: string | null;
   effectivePath: string | null;
   source: 'manual' | 'automatic' | 'unavailable';
@@ -468,6 +470,7 @@ export type AppAnalysisSummary = {
 export type AppHistoryEntry = {
   id: string;
   batch_id: string;
+  operation_id?: string | null;
   slot_index: number;
   started_at: string;
   finished_at: string;
@@ -523,6 +526,7 @@ export type AppScanTaskProgress = {
   metadata_processed?: number;
   metadata_total?: number | null;
   current_file: string;
+  error?: string | null;
 };
 
 export type AppServices = {
@@ -564,13 +568,19 @@ export type AppServices = {
   loadIncompleteAnalysisRun?: () => Promise<ResumableAnalysis | null>;
   claimAnalysisRun?: (batchId: string, attemptId: string) => Promise<boolean>;
   retryHistoryFailures: (id: string) => Promise<AppPreview>;
-  exportHistoryErrorReport: (id: string, path: string) => Promise<void>;
-  exportRuntimeSession: (id: string, path: string) => Promise<void>;
+  exportHistoryErrorReport?: (id: string, path: string) => Promise<void>;
+  exportRuntimeSession?: (id: string, path: string) => Promise<void>;
+  exportRunReport?: (id: string, path: string) => Promise<void>;
+  exportFullRuntimeReport?: (path: string) => Promise<void>;
   saveFile?: (options: SaveFileOptions) => Promise<string | null>;
   recordRuntimeSessionEvent?: (
     batchId: string,
     event: string,
     details: Record<string, unknown>,
+  ) => Promise<void>;
+  recordGlobalEvent?: (
+    event: string,
+    details?: Record<string, unknown>,
   ) => Promise<void>;
   finalizeAnalysisSession?: (batchId: string) => Promise<void>;
   deleteHistoryEntry: (id: string) => Promise<void>;
@@ -598,6 +608,7 @@ export type AppServices = {
   createAnalysisWorker?: () => AnalysisWorkerSession;
   loadLibraryStatus?: () => Promise<LibraryStatus>;
   locateNeteaseLibrary?: (force?: boolean) => Promise<LibraryStatus['netease']>;
+  cancelNeteaseDiscovery?: () => Promise<NeteaseDiscoveryProgress>;
   refreshLibraryCatalog?: () => Promise<LibraryRefreshProgress>;
   cancelLibraryRefresh?: () => Promise<LibraryRefreshProgress>;
   loadNeteaseMetadataDatabaseStatus?: () => Promise<NeteaseMetadataDatabaseStatus>;
@@ -608,6 +619,7 @@ export type AppServices = {
   clearNeteaseMetadataDatabase?: () => Promise<NeteaseMetadataDatabaseStatus>;
   selectNeteaseDatabaseFallback?: (path: string) => Promise<LibraryStatus>;
   clearNeteaseDatabaseFallback?: () => Promise<LibraryStatus>;
+  unbindNeteaseDatabase?: () => Promise<LibraryStatus>;
   pickNeteaseDatabase?: () => Promise<string | null>;
   listenLibraryRefreshProgress?: (handler: (progress: LibraryRefreshProgress) => void) => Promise<UnlistenFn>;
   listenNeteaseDiscoveryProgress?: (handler: (progress: NeteaseDiscoveryProgress) => void) => Promise<UnlistenFn>;
@@ -744,6 +756,7 @@ const translations = {
     neteaseIndexError: '读取错误',
     scanLocalNetease: '扫描本地网易云文件夹',
     selectNeteaseDatabase: '选择网易云数据库',
+    changeNeteaseDatabase: '点击更换数据库',
     clearNeteaseDatabase: '恢复自动定位',
     neteaseDatabaseSelected: '数据库已选',
     neteaseDatabaseUnavailable: '无数据库',
@@ -751,6 +764,8 @@ const translations = {
     scanLocalNeteaseFallback: '手动选择文件夹',
     scanLocalNeteaseNotFound: '未能自动找到网易云音乐文件夹，请手动选择',
     scanLocalNeteaseSelected: '已选择网易云音乐文件夹',
+    scanLocalNeteaseCancel: '取消扫描',
+    scanLocalNeteaseTimeout: '扫描时间较长，可手动选择文件夹',
     destLabel: '输出目录',
     clearSource: '清空输入来源',
     clearDestination: '清空输出目录',
@@ -816,10 +831,16 @@ const translations = {
     retryFailures: '重试失败项目',
     exportSession: '导出错误报告',
     exportRuntimeSession: '导出运行会话记录',
+    exportRunReport: '导出本次运行报告',
+    exportFullRuntimeReport: '导出完整运行报告',
     exportReportSuccess: '错误报告已导出',
     exportReportFailed: '错误报告导出失败',
     exportRuntimeSuccess: '运行会话记录已导出',
     exportRuntimeFailed: '运行会话记录导出失败',
+    exportRunReportSuccess: '本次运行报告已导出',
+    exportRunReportFailed: '本次运行报告导出失败',
+    exportFullRuntimeSuccess: '完整运行报告已导出',
+    exportFullRuntimeFailed: '完整运行报告导出失败',
     reportPath: '错误报告位置',
     completedCount: '完成',
     failedCount: '失败',
@@ -842,7 +863,6 @@ const translations = {
     insufficientSpace: '磁盘空间不足，无法开始转换',
     cancelTask: '取消任务',
     resumeTasks: '继续未完成任务',
-    resumeAnalysis: '继续未完成分析',
     deleteHistory: '删除记录',
     clearHistory: '清空历史',
     historyLoadError: '转换历史读取失败，原记录未被覆盖。请检查历史文件后再重试。',
@@ -895,9 +915,9 @@ const translations = {
     analysisComplete: '已保存 {count} 首分析结果，可导入 Rekordbox。',
     analysisPartial: '完成 {done}/{total} 首，{failed} 首失败。',
     analysisNoResults: '没有成功的分析结果。',
-    clearAnalysisCache: '清除分析缓存',
-    clearAnalysisCacheConfirm: '确定清除已保存的音乐分析缓存吗？不会删除音频文件或转换历史。',
-    analysisCacheCleared: '音乐分析缓存已清除。',
+    clearAnalysisCache: '清除歌曲库与分析缓存',
+    clearAnalysisCacheConfirm: '确定清除歌曲库与分析缓存吗？不会删除音频文件、转换历史、歌单或扫描缓存。',
+    analysisCacheCleared: '歌曲库与分析缓存已清除。',
     clearEnhancedCache: '清除增强模式缓存',
     clearEnhancedCacheConfirm: '确定清除增强模式缓存吗？不会删除音频文件、扫描缓存或已下载模型。',
     enhancedCacheCleared: '增强模式缓存已清除。',
@@ -981,6 +1001,7 @@ const translations = {
     neteaseIndexError: 'Read error',
     scanLocalNetease: 'Scan local NetEase folder',
     selectNeteaseDatabase: 'Choose NetEase database',
+    changeNeteaseDatabase: 'Change database',
     clearNeteaseDatabase: 'Use automatic location',
     neteaseDatabaseSelected: 'Database selected',
     neteaseDatabaseUnavailable: 'No database',
@@ -988,6 +1009,8 @@ const translations = {
     scanLocalNeteaseFallback: 'Choose folder manually',
     scanLocalNeteaseNotFound: 'Could not auto-locate a NetEase music folder. Choose one manually.',
     scanLocalNeteaseSelected: 'NetEase music folder selected',
+    scanLocalNeteaseCancel: 'Cancel scan',
+    scanLocalNeteaseTimeout: 'This is taking a while. Choose a folder manually.',
     destLabel: 'Output Folder',
     clearSource: 'Clear input source',
     clearDestination: 'Clear output folder',
@@ -1053,10 +1076,16 @@ const translations = {
     retryFailures: 'Retry failed files',
     exportSession: 'Export error report',
     exportRuntimeSession: 'Export runtime session',
+    exportRunReport: 'Export run report',
+    exportFullRuntimeReport: 'Export full runtime report',
     exportReportSuccess: 'Error report exported',
     exportReportFailed: 'Error report export failed',
     exportRuntimeSuccess: 'Runtime session exported',
     exportRuntimeFailed: 'Runtime session export failed',
+    exportRunReportSuccess: 'Run report exported',
+    exportRunReportFailed: 'Run report export failed',
+    exportFullRuntimeSuccess: 'Full runtime report exported',
+    exportFullRuntimeFailed: 'Full runtime report export failed',
     reportPath: 'Error report path',
     completedCount: 'Completed',
     failedCount: 'Failed',
@@ -1079,7 +1108,6 @@ const translations = {
     insufficientSpace: 'Not enough disk space to start',
     cancelTask: 'Cancel task',
     resumeTasks: 'Resume unfinished tasks',
-    resumeAnalysis: 'Resume unfinished analysis',
     deleteHistory: 'Delete entry',
     clearHistory: 'Clear history',
     historyLoadError: 'Conversion history could not be read. Existing records were not overwritten. Check the history file and try again.',
@@ -1132,9 +1160,9 @@ const translations = {
     analysisComplete: '{count} results saved. Ready for Rekordbox.',
     analysisPartial: 'Completed {done}/{total}; {failed} failed.',
     analysisNoResults: 'No analysis result was completed.',
-    clearAnalysisCache: 'Clear analysis cache',
-    clearAnalysisCacheConfirm: 'Clear the saved music analysis cache? Audio files and conversion history will not be deleted.',
-    analysisCacheCleared: 'Music analysis cache cleared.',
+    clearAnalysisCache: 'Clear library and analysis cache',
+    clearAnalysisCacheConfirm: 'Clear the W4DJ library and analysis cache? Audio files, conversion history, playlists, and scan cache will be kept.',
+    analysisCacheCleared: 'W4DJ library and analysis cache cleared.',
     clearEnhancedCache: 'Clear enhanced-mode cache',
     clearEnhancedCacheConfirm: 'Clear enhanced-mode cache? Audio files, scan cache, and downloaded models will not be deleted.',
     enhancedCacheCleared: 'Enhanced-mode cache cleared.',
@@ -1230,6 +1258,10 @@ export function resolveNeteaseSituation(
     return { message: t('neteaseStatusLoading', lang), tone: 'running' };
   }
 
+  if (status.bound === false) {
+    return { message: lang === 'zh' ? '未选择数据库' : 'No database selected', tone: 'neutral' };
+  }
+
   if (database.error) {
     return { message: t('neteaseIndexError', lang), detail: database.error, tone: 'error' };
   }
@@ -1291,6 +1323,15 @@ export function resolveNeteaseSituation(
   }
 
   return { message: t('neteaseIndexNotReady', lang), tone: 'neutral' };
+}
+
+export function resolveNeteaseDatabaseLinkLabel(
+  status: NeteaseMetadataDatabaseStatus | null | undefined,
+  lang: AppLanguage,
+): string {
+  return status?.effectivePath?.trim()
+    ? t('changeNeteaseDatabase', lang)
+    : t('selectNeteaseDatabase', lang);
 }
 
 export function humanizeError(
@@ -1521,9 +1562,15 @@ const defaultServices: AppServices = {
     invoke<void>('export_history_error_report', { id, path }),
   exportRuntimeSession: (id, path) =>
     invoke<void>('export_runtime_session', { id, path }),
+  exportRunReport: (id, path) =>
+    invoke<void>('export_run_report', { id, path }),
+  exportFullRuntimeReport: (path) =>
+    invoke<void>('export_full_runtime_report', { path }),
   saveFile: (options) => save(options),
   recordRuntimeSessionEvent: (batchId, event, details) =>
     invoke<void>('record_runtime_session_event', { batchId, event, details }),
+  recordGlobalEvent: (event, details) =>
+    invoke<void>('record_global_journal_event', { event, details }),
   finalizeAnalysisSession: (batchId) =>
     invoke<void>('finalize_analysis_session', { batchId }),
   deleteHistoryEntry: (id) => invoke<void>('delete_history_entry_command', { id }),
@@ -1554,6 +1601,7 @@ const defaultServices: AppServices = {
   loadLibraryStatus: () => invoke<LibraryStatus>('load_library_status'),
   locateNeteaseLibrary: (force = false) =>
     invoke<LibraryStatus['netease']>('locate_netease_library', { force }),
+  cancelNeteaseDiscovery: () => invoke<NeteaseDiscoveryProgress>('cancel_netease_discovery'),
   refreshLibraryCatalog: () => invoke<LibraryRefreshProgress>('refresh_library_catalog'),
   cancelLibraryRefresh: () => invoke<LibraryRefreshProgress>('cancel_library_refresh'),
   loadNeteaseMetadataDatabaseStatus: () =>
@@ -1570,6 +1618,7 @@ const defaultServices: AppServices = {
     invoke<NeteaseMetadataDatabaseStatus>('clear_netease_metadata_database'),
   selectNeteaseDatabaseFallback: (path) => invoke<LibraryStatus>('select_netease_database_fallback', { path }),
   clearNeteaseDatabaseFallback: () => invoke<LibraryStatus>('clear_netease_database_fallback'),
+  unbindNeteaseDatabase: () => invoke<LibraryStatus>('unbind_netease_database'),
   pickNeteaseDatabase: async () => {
     const selected = await open({
       directory: false,
@@ -1675,6 +1724,7 @@ export function renderApp(
   },
   djPlaylistState: DjPlaylistUiState | null = null,
   importedDjPlaylistSummaries: ImportedDjPlaylistSummary[] = [],
+  neteaseDiscoveryManualFallbackVisible = false,
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -1689,10 +1739,9 @@ export function renderApp(
   const isRunning = state.slots.some((slot) => slot.status === 'running');
   const scanRunning = scanProgress?.status === 'running' || scanProgress?.status === 'cancelling';
   const scanVisible = Boolean(scanProgress && scanProgress.status !== 'idle');
+  const librarySyncTaskError = scanProgress?.tasks?.some((task) => task.error === 'library_sync_failed') === true;
   const scanCancelling = scanProgress?.status === 'cancelling';
   const analysisRunning = analysisState.status === 'running';
-  const analysisResumeAvailable = analysisState.status === 'cancelled'
-    && analysisState.resumeAvailable === true;
   const conversionRunning = isRunning && !scanRunning && !analysisRunning;
   const hasCancelled = state.slots.some((slot) => slot.status === 'cancelled');
   const configuredTasks = state.slots.filter((slot) => slot.sourceDirectory.trim()).length;
@@ -1834,15 +1883,12 @@ export function renderApp(
                   ? t('analysisCancel', state.lang)
                   : conversionRunning
                     ? t('conversionCancel', state.lang)
-                    : hasCancelled && !analysisResumeAvailable ? t('resumeTasks', state.lang) : t('startAll', state.lang)}
+                    : hasCancelled ? t('resumeTasks', state.lang) : t('startAll', state.lang)}
             </button>
-            ${analysisResumeAvailable && !scanRunning && !analysisRunning && !conversionRunning && pendingAction === null
-              ? `<button type="button" class="secondary-action analysis-resume-action" data-action="resume-analysis">${t('resumeAnalysis', state.lang)}</button>`
-              : ''}
-            ${!conversionRunning && scanProgress && (scanProgress.status === 'error' || scanProgress.status === 'cancelled' || scanProgress.status === 'cancelling')
+            ${!conversionRunning && !librarySyncTaskError && scanProgress && (scanProgress.status === 'error' || scanProgress.status === 'cancelled' || scanProgress.status === 'cancelling')
               ? `<small class="global-stage-message" data-role="scan-message">${escapeHtml(scanProgress.message || scanPhaseLabel(scanProgress.phase, state.lang))}</small>`
-                : !conversionRunning && neteaseDiscoveryProgress?.status === 'running'
-                    ? `<small class="global-stage-message" data-role="netease-discovery-progress">${escapeHtml(neteaseDiscoveryProgress.message)} ${neteaseDiscoveryProgress.processed}${neteaseDiscoveryProgress.total == null ? '' : `/${neteaseDiscoveryProgress.total}`}</small>`
+                : !conversionRunning && ['running', 'cancelling'].includes(neteaseDiscoveryProgress?.status || '')
+                    ? `<small class="global-stage-message" data-role="netease-discovery-progress">${escapeHtml(neteaseDiscoveryProgress?.message || '')} ${neteaseDiscoveryProgress?.processed || 0}${neteaseDiscoveryProgress?.total == null ? '' : `/${neteaseDiscoveryProgress.total}`}</small>`
                     : !conversionRunning && neteaseDiscoveryProgress?.status === 'error'
                       ? `<small class="global-stage-message library-error" data-role="netease-discovery-progress">${escapeHtml(neteaseDiscoveryProgress.error || neteaseDiscoveryProgress.message)}</small>`
                   : ''}
@@ -1864,6 +1910,7 @@ export function renderApp(
             neteaseDiscoveryProgress,
             libraryRefreshProgress,
             neteaseDiscoveryInFlight,
+            neteaseDiscoveryManualFallbackVisible,
             analysisState,
             neteaseMetadataDatabase,
           )}
@@ -1875,6 +1922,7 @@ export function renderApp(
             scanVisible,
             null,
             null,
+            false,
             false,
             analysisState,
             undefined,
@@ -1922,7 +1970,6 @@ function renderPreviewModal(
             <p class="panel-kicker">W4DJ RKB</p>
             <h2>${t('previewTitle', lang)}</h2>
           </div>
-          <span class="preview-batch-label">${modal.retryOf ? t('retryFailures', lang) : t('startAll', lang)}</span>
         </header>
         <div class="preview-cards">
           ${modal.previews.map((item) => renderPreviewCard(item, lang)).join('')}
@@ -2047,7 +2094,6 @@ function renderPreviewCard(item: AppPreview, lang: AppLanguage): string {
           <h3>${modeLabel(item.mode, lang)}${item.mode === 'lossless' ? ` · ${(item.lossless_format || 'wav').toUpperCase()}` : ''}</h3>
         </div>
           <div class="preview-card-head-meta">
-            <span class="preview-batch-label">${escapeHtml(previewActionLabel(item, lang))}</span>
             <div class="preview-estimate-column"><div class="preview-estimate"><span>${t('estimatedOutput', lang)}</span><strong>${formatBytes(preview.estimated_output_bytes, lang)}</strong></div>${preview.available_space_bytes == null ? '' : `<div class="preview-available-space"><span>${t('availableSpace', lang)}</span><strong>${formatBytes(preview.available_space_bytes, lang)}</strong></div>`}</div>
           </div>
       </header>
@@ -2211,12 +2257,10 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
       <p class="history-output">${escapeHtml(entry.destination_directory)}</p>
       <p class="history-conversion-summary">${lang === 'zh' ? '转换' : 'Conversion'}：${entry.completed_count}/${entry.new_count} · ${entry.failed_count} ${t('failedCount', lang)} · ${entry.pending_files.length} ${t('pendingCount', lang)}</p>
       <p class="history-analysis-summary" data-analysis-status="${escapeHtml(analysis?.status || 'notRequested')}">${escapeHtml(analysisSummary)}</p>
-      ${entry.report_path ? `<p class="history-report-path">${t('reportPath', lang)}：${escapeHtml(entry.report_path)}</p>` : ''}
       ${failures ? `<details class="history-failures"><summary>${entry.failed_count} ${t('failedCount', lang)}</summary><ul>${failures}</ul></details>` : ''}
       <footer class="history-entry-actions">
         ${entry.failed_count > 0 || pendingFiles.length > 0 ? `<button type="button" class="secondary-action" data-action="retry-history" data-history-id="${escapeHtml(entry.id)}">${pendingFiles.length > 0 ? t('resumeTasks', lang) : t('retryFailures', lang)}</button>` : ''}
-        <button type="button" class="secondary-action" data-action="export-error-report" data-history-id="${escapeHtml(entry.id)}">${t('exportSession', lang)}</button>
-        <button type="button" class="secondary-action" data-action="export-runtime-session" data-history-id="${escapeHtml(entry.id)}">${t('exportRuntimeSession', lang)}</button>
+        <button type="button" class="secondary-action" data-action="export-run-report" data-history-id="${escapeHtml(entry.id)}">${t('exportRunReport', lang)}</button>
         <button type="button" class="secondary-action history-delete" data-action="delete-history" data-history-id="${escapeHtml(entry.id)}">${t('deleteHistory', lang)}</button>
       </footer>
     </article>
@@ -2232,6 +2276,7 @@ function renderSyncSlot(
   neteaseDiscoveryProgress: NeteaseDiscoveryProgress | null = null,
   libraryRefreshProgress: LibraryRefreshProgress | null = null,
   neteaseDiscoveryInFlight = false,
+  neteaseDiscoveryManualFallbackVisible = false,
   analysisState: AppAnalysisState = defaultAnalysisState,
   neteaseMetadataDatabase: NeteaseMetadataDatabaseUiState | undefined = undefined,
 ): string {
@@ -2246,6 +2291,7 @@ function renderSyncSlot(
   const preparingPhase = scanTask?.phase === 'preparing';
   const completedPhase = scanTask?.phase === 'completed';
   const cancelledOrErrorPhase = scanTask?.phase === 'cancelled' || scanTask?.phase === 'error';
+  const librarySyncFailed = scanTask?.error === 'library_sync_failed';
   const phaseProcessed = scanTask
     ? sourcePhase
       ? scanTask.source_processed ?? scanTask.processed
@@ -2288,7 +2334,7 @@ function renderSyncSlot(
     ? Math.min(100, Math.round((phaseProcessed / renderedPhaseTotal) * 100))
     : 0;
   const neteaseRefreshActive = slotIndex === 0 && isLibraryRefreshActive(libraryRefreshProgress);
-  const neteaseDiscoveryActive = slotIndex === 0 && neteaseDiscoveryProgress?.status === 'running';
+  const neteaseDiscoveryActive = slotIndex === 0 && ['running', 'cancelling'].includes(neteaseDiscoveryProgress?.status || '');
   const neteaseDiscoveryFailed = slotIndex === 0 && neteaseDiscoveryProgress?.status === 'error';
   const neteaseRefreshVisible = slotIndex === 0 && libraryRefreshProgress?.status !== undefined && libraryRefreshProgress.status !== 'idle';
   const neteaseDiscoveryVisible = slotIndex === 0 && neteaseDiscoveryProgress?.status !== undefined;
@@ -2331,9 +2377,13 @@ function renderSyncSlot(
     && !neteaseRefreshActive
     && !neteaseDiscoveryActive;
   const scanProgressText = taskScanActive && scanTask
-    ? renderedPhaseTotal == null
-      ? `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(scanTask.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
-      : `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(scanTask.phase, state.lang)} ${phaseProcessed}/${renderedPhaseTotal}`
+    ? librarySyncFailed
+      ? renderedPhaseTotal == null
+        ? `${t('scanSucceeded', state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
+        : `${t('scanSucceeded', state.lang)} ${phaseProcessed}/${renderedPhaseTotal}`
+      : renderedPhaseTotal == null
+      ? `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanTask.phase === 'scanning_destination' ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(scanTask.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
+      : `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanTask.phase === 'scanning_destination' ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(scanTask.phase, state.lang)} ${phaseProcessed}/${renderedPhaseTotal}${scanTask.phase === 'scanning_destination' && state.lang === 'zh' ? ' 首' : ''}`
     : null;
   const displayedProgressText = (analysisIsActive ? analysisProgressText : null)
     || scanProgressText
@@ -2363,19 +2413,24 @@ function renderSyncSlot(
     && !conversionProgressActive
     && scanProgressText === null
     && Boolean(neteaseProgress && neteaseProgressTotal == null);
-  const displayedSlotStatus = taskScanActive && !completedPhase && !cancelledOrErrorPhase
-    ? 'running'
-    : slot.status;
+  const displayedSlotStatus = scanTask?.phase === 'error'
+    ? 'error'
+    : scanTask?.phase === 'cancelled'
+      ? 'cancelled'
+      : taskScanActive && !completedPhase && !cancelledOrErrorPhase
+        ? 'running'
+        : slot.status;
+  const displayedSlotStatusLabel = librarySyncFailed
+    ? (state.lang === 'zh' ? '失败' : 'Failed')
+    : statusLabel(displayedSlotStatus, state.lang);
   const neteaseScanActive = neteaseDiscoveryInFlight || neteaseDiscoveryActive || neteaseRefreshActive;
   const neteaseScanLabel = neteaseScanActive
-    ? t('scanLocalNeteaseRunning', state.lang)
+    ? (neteaseDiscoveryManualFallbackVisible ? t('scanLocalNeteaseFallback', state.lang) : t('scanLocalNeteaseRunning', state.lang))
     : neteaseDiscoveryFailed
       ? t('scanLocalNeteaseFallback', state.lang)
       : t('scanLocalNetease', state.lang);
   const manualDatabasePath = neteaseMetadataDatabase?.status?.manualPath || null;
-  const databaseFileName = manualDatabasePath
-    ? manualDatabasePath.split(/[\\/]/).filter(Boolean).pop() || manualDatabasePath
-    : null;
+  const databaseLinkLabel = resolveNeteaseDatabaseLinkLabel(neteaseMetadataDatabase?.status, state.lang);
   const databaseBusy = neteaseMetadataDatabase?.busy === true;
   const neteaseSituation = resolveNeteaseSituation(neteaseMetadataDatabase, state.lang);
   const progressCopy = showingAnalysisProgress
@@ -2384,6 +2439,9 @@ function renderSyncSlot(
         <span class="analysis-progress-current" data-role="analysis-current">${escapeHtml(analysisState.currentItem || '')}</span>
       </span>`
     : `<span class="status-copy progress-copy ${isNumericProgress ? 'progress-copy--numeric' : ''}" data-role="slot-progress-message">${escapeHtml(displayedProgressText)}</span>`;
+  const progressLine = librarySyncFailed
+    ? `<div class="slot-progress-copy-line">${progressCopy}<span class="library-sync-error" data-role="library-sync-error">${state.lang === 'zh' ? '歌曲库同步失败' : 'Library sync failed'}</span></div>`
+    : progressCopy;
   return `
     <article class="sync-slot-card" data-role="sync-slot" data-slot="${slotIndex}" data-status="${displayedSlotStatus}">
       <header class="sync-slot-head">
@@ -2391,7 +2449,7 @@ function renderSyncSlot(
           <h2>${t('syncSlot', state.lang)} ${slotNumber}</h2>
         </div>
         <div class="slot-head-actions">
-          <span class="slot-status" data-status="${displayedSlotStatus}">${statusLabel(displayedSlotStatus, state.lang)}</span>
+          <span class="slot-status" data-status="${displayedSlotStatus}">${displayedSlotStatusLabel}</span>
         </div>
       </header>
 
@@ -2401,19 +2459,17 @@ function renderSyncSlot(
             <span>${t('sourceLabel', state.lang)}</span>
             ${slotIndex === 0
               ? `<div class="netease-source-toolbar" data-role="netease-source-toolbar">
-                  <div class="netease-database-status${neteaseSituation.tone === 'error' ? ' is-error' : ''}" data-role="netease-database-status" title="${escapeHtml(neteaseSituation.detail || neteaseSituation.message)}">
-                    <div class="netease-situation netease-situation--${neteaseSituation.tone}" data-role="netease-situation" data-tone="${neteaseSituation.tone}" title="${escapeHtml(neteaseSituation.detail || neteaseSituation.message)}">
-                      <span class="netease-situation-value" data-role="netease-situation-value">${escapeHtml(neteaseSituation.message)}</span>
-                    </div>
-                  </div>
                   <div class="netease-source-actions" data-role="netease-source-actions">
-                    <button type="button" class="netease-scan-button" data-action="scan-local-netease" data-slot="0" ${neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
+                    <button type="button" class="netease-scan-button" data-action="scan-local-netease" data-slot="0" ${neteaseScanActive && !neteaseDiscoveryManualFallbackVisible ? 'disabled aria-busy="true"' : ''}>
                       ${icon('refresh')}
                       <span>${neteaseScanLabel}</span>
                     </button>
-                    <button type="button" class="netease-scan-button netease-database-button" data-action="select-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''} title="${escapeHtml(manualDatabasePath || t('selectNeteaseDatabase', state.lang))}">
+                    ${neteaseDiscoveryManualFallbackVisible && neteaseScanActive
+                      ? `<button type="button" class="netease-scan-button netease-discovery-cancel" data-action="cancel-netease-discovery" data-slot="0">${t('scanLocalNeteaseCancel', state.lang)}</button>`
+                      : ''}
+                    <button type="button" class="netease-scan-button netease-database-button" data-action="select-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''} title="${escapeHtml(databaseLinkLabel)}">
                       ${icon('folder')}
-                      <span>${escapeHtml(databaseFileName || t('selectNeteaseDatabase', state.lang))}</span>
+                      <span>${escapeHtml(databaseLinkLabel)}</span>
                     </button>
                     ${manualDatabasePath
                       ? `<button type="button" class="netease-scan-button netease-database-clear" data-action="clear-netease-database" data-slot="0" ${databaseBusy || neteaseScanActive ? 'disabled aria-busy="true"' : ''}>
@@ -2467,9 +2523,18 @@ function renderSyncSlot(
       </div>
 
       <footer class="slot-status-strip">
-        ${showProgressText ? progressCopy : ''}
-        <div class="progress-track" aria-hidden="true">
-          <div class="progress-fill${indeterminateProgress || scanProgressIndeterminate ? ' is-indeterminate' : ''}"${showingAnalysisProgress ? ' data-role="analysis-progress"' : ' data-role="slot-progress"'} style="width: ${displayedProgressPercent}%"></div>
+        ${showProgressText ? progressLine : ''}
+        <div class="slot-progress-row${slotIndex === 0 ? ' has-netease-status' : ''}">
+          <div class="progress-track" aria-hidden="true">
+            <div class="progress-fill${indeterminateProgress || scanProgressIndeterminate ? ' is-indeterminate' : ''}"${showingAnalysisProgress ? ' data-role="analysis-progress"' : ' data-role="slot-progress"'} style="width: ${displayedProgressPercent}%"></div>
+          </div>
+          ${slotIndex === 0
+            ? `<div class="netease-database-status${neteaseSituation.tone === 'error' ? ' is-error' : ''}" data-role="netease-database-status" title="${escapeHtml(neteaseSituation.detail || neteaseSituation.message)}">
+                <div class="netease-situation netease-situation--${neteaseSituation.tone}" data-role="netease-situation" data-tone="${neteaseSituation.tone}" title="${escapeHtml(neteaseSituation.detail || neteaseSituation.message)}">
+                  <span class="netease-situation-value" data-role="netease-situation-value">${escapeHtml(neteaseSituation.message)}</span>
+                </div>
+              </div>`
+            : ''}
         </div>
       </footer>
     </article>
@@ -2598,7 +2663,6 @@ export function bindApp(
     }
   };
   let analysisRunActive = false;
-  let resumeAnalysisRequested = false;
   let libraryState: LibraryDashboardState | null = null;
   let librarySearchTimer: ReturnType<typeof setTimeout> | null = null;
   let librarySearchComposing = false;
@@ -2615,6 +2679,9 @@ export function bindApp(
   let neteaseDiscoveryProgress: NeteaseDiscoveryProgress | null = null;
   let libraryRefreshProgress: LibraryRefreshProgress | null = null;
   let neteaseDiscoveryInFlight = false;
+  let neteaseDiscoveryManualFallbackVisible = false;
+  let neteaseDiscoveryTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let neteaseDiscoveryId: string | null = null;
   let neteaseMetadataDatabase: NeteaseMetadataDatabaseUiState = {
     status: null,
     busy: false,
@@ -2692,6 +2759,7 @@ export function bindApp(
         neteaseMetadataDatabase,
         djPlaylistState,
         importedDjPlaylistSummaries,
+        neteaseDiscoveryManualFallbackVisible,
       ),
     );
 
@@ -2802,6 +2870,7 @@ export function bindApp(
         continue;
       }
       const sourcePhase = task.phase === 'scanning_source';
+      const destinationPhase = task.phase === 'scanning_destination';
       const metadataPhase = task.phase === 'matching_metadata';
       const preparingPhase = task.phase === 'preparing';
       const completedPhase = task.phase === 'completed' || task.phase === 'cancelled' || task.phase === 'error';
@@ -2825,8 +2894,8 @@ export function bindApp(
           : task.destination_total ?? (task.total > 0 ? task.total : null);
       const renderedTotal = total != null && processed <= total ? total : null;
       const progressText = renderedTotal == null
-        ? `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(task.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${processed} 项` : `${processed} scanned`}`
-        : `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : scanPhaseLabel(task.phase, state.lang)} ${processed}/${renderedTotal}`;
+        ? `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : destinationPhase ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(task.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${processed} 项` : `${processed} scanned`}`
+        : `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : destinationPhase ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(task.phase, state.lang)} ${processed}/${renderedTotal}${destinationPhase && state.lang === 'zh' ? ' 首' : ''}`;
       messageElement.textContent = progressText;
       const percent = renderedTotal && renderedTotal > 0
         ? Math.min(100, Math.round((processed / renderedTotal) * 100))
@@ -3435,32 +3504,6 @@ export function bindApp(
     render();
   };
 
-  const resumeAnalysisFlow = () => {
-    const pending = resumableAnalysis;
-    if (analysisState.status !== 'cancelled' || !pending || analysisRunActive) {
-      if (analysisState.status === 'cancelled' && pending && analysisRunActive) {
-        // The cancel button renders the resumable action immediately, while
-        // the current candidate still unwinds its async I/O. Remember the
-        // click and start it from the cancellation finalizer instead of
-        // creating a timer that could outlive the view.
-        resumeAnalysisRequested = true;
-      }
-      return;
-    }
-    resumeAnalysisRequested = false;
-    analysisCancelRequested = false;
-    analysisState = {
-      ...analysisState,
-      status: 'running',
-      message: t('scanAnalyzing', state.lang),
-      currentItem: '',
-      stage: 'preparing',
-      resumeAvailable: false,
-    };
-    render();
-    void runPostConversionAnalysis(pending.batchId, pending.previews);
-  };
-
   const confirmPreview = async () => {
     if (!previewModal) {
       return;
@@ -3520,21 +3563,38 @@ export function bindApp(
     }
   };
 
-  const exportHistoryErrorReport = async (id: string) => {
+  const exportRunReport = async (id: string) => {
     try {
       const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
       const path = await saveFile({
-        defaultPath: `W4DJ-error-report-${id}.txt`,
-        title: state.lang === 'zh' ? '保存错误报告' : 'Save error report',
+        defaultPath: `W4DJ-run-report-${id}.json`,
+        title: state.lang === 'zh' ? '保存本次运行报告' : 'Save run report',
       });
-      if (typeof path === 'string') {
-        await services.exportHistoryErrorReport(id, path);
+      if (typeof path === 'string' && services.exportRunReport) {
+        await services.exportRunReport(id, path);
         await refreshHistory();
-        window.alert(`${t('exportReportSuccess', state.lang)}：${path}`);
+        window.alert(`${t('exportRunReportSuccess', state.lang)}：${path}`);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      window.alert(`${t('exportReportFailed', state.lang)}：${message}`);
+      window.alert(`${t('exportRunReportFailed', state.lang)}：${message}`);
+    }
+  };
+
+  const exportFullRuntimeReport = async () => {
+    try {
+      const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
+      const path = await saveFile({
+        defaultPath: `W4DJ-full-runtime-report-${Date.now()}.json`,
+        title: state.lang === 'zh' ? '保存完整运行报告' : 'Save full runtime report',
+      });
+      if (typeof path === 'string' && services.exportFullRuntimeReport) {
+        await services.exportFullRuntimeReport(path);
+        window.alert(`${t('exportFullRuntimeSuccess', state.lang)}：${path}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      window.alert(`${t('exportFullRuntimeFailed', state.lang)}：${message}`);
     }
   };
 
@@ -3545,7 +3605,7 @@ export function bindApp(
         defaultPath: `W4DJ-runtime-session-${id}.json`,
         title: state.lang === 'zh' ? '保存运行会话记录' : 'Save runtime session',
       });
-      if (typeof path === 'string') {
+      if (typeof path === 'string' && services.exportRuntimeSession) {
         await services.exportRuntimeSession(id, path);
         window.alert(`${t('exportRuntimeSuccess', state.lang)}：${path}`);
       }
@@ -4107,18 +4167,22 @@ export function bindApp(
   };
 
   const clearLibraryCache = async () => {
-    if (!libraryState || !services.clearLibraryCatalogCache) return;
+    if (!services.clearLibraryCatalogCache) return;
     if (!window.confirm(state.lang === 'zh'
-      ? '确定清除 W4DJ 分析歌曲库吗？音乐文件、扫描缓存和增强分析缓存不会被删除。'
-      : 'Clear the W4DJ analysis library? Audio files, scan cache and analysis cache will stay intact.')) {
+      ? '确定清除歌曲库与分析缓存吗？音乐文件、转换历史、歌单和扫描缓存不会被删除。'
+      : 'Clear the W4DJ library and analysis cache? Audio files, conversion history, playlists, and scan cache will stay intact.')) {
       return;
     }
     try {
       await services.clearLibraryCatalogCache();
-      libraryState = { ...libraryState, page: null, status: null, detail: null, error: null };
+      if (libraryState) {
+        libraryState = { ...libraryState, page: null, status: null, detail: null, error: null };
+      }
       render();
     } catch (error) {
-      libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
+      if (libraryState) {
+        libraryState = { ...libraryState, error: error instanceof Error ? error.message : String(error) };
+      }
       render();
     }
   };
@@ -4554,7 +4618,14 @@ export function bindApp(
   };
 
   const scanLocalNeteaseFolder = async () => {
-    if (neteaseDiscoveryInFlight) return;
+    if (neteaseDiscoveryInFlight && !neteaseDiscoveryManualFallbackVisible) return;
+
+    const clearDiscoveryTimer = () => {
+      if (neteaseDiscoveryTimeoutTimer) {
+        clearTimeout(neteaseDiscoveryTimeoutTimer);
+        neteaseDiscoveryTimeoutTimer = null;
+      }
+    };
 
     const finishDiscovery = (progress: NeteaseDiscoveryProgress) => {
       neteaseDiscoveryProgress = progress;
@@ -4569,10 +4640,15 @@ export function bindApp(
       }
     };
 
-    if (neteaseDiscoveryProgress?.status === 'error') {
+    if (neteaseDiscoveryProgress?.status === 'error' || neteaseDiscoveryManualFallbackVisible) {
       neteaseDiscoveryInFlight = true;
       render();
       try {
+        if (services.cancelNeteaseDiscovery && neteaseDiscoveryProgress?.status === 'running') {
+          await services.cancelNeteaseDiscovery();
+        }
+        clearDiscoveryTimer();
+        neteaseDiscoveryId = null;
         await desktopStateHydration;
         const path = await services.pickSource(0);
         if (!path) {
@@ -4604,6 +4680,7 @@ export function bindApp(
         render();
       } finally {
         neteaseDiscoveryInFlight = false;
+        neteaseDiscoveryManualFallbackVisible = false;
         render();
       }
       return;
@@ -4612,7 +4689,7 @@ export function bindApp(
     neteaseDiscoveryInFlight = true;
     neteaseDiscoveryProgress = {
       status: 'running',
-      stage: 'locatingDatabase',
+      stage: 'checkingKnownFolders',
       processed: 0,
       total: null,
       currentItem: '',
@@ -4621,50 +4698,43 @@ export function bindApp(
       error: null,
     };
     render();
+    clearDiscoveryTimer();
+    neteaseDiscoveryTimeoutTimer = setTimeout(() => {
+      if (neteaseDiscoveryInFlight && neteaseDiscoveryProgress?.status === 'running') {
+        neteaseDiscoveryManualFallbackVisible = true;
+        neteaseDiscoveryProgress = {
+          ...neteaseDiscoveryProgress,
+          message: t('scanLocalNeteaseTimeout', state.lang),
+        };
+        render();
+      }
+    }, 10_000);
     try {
       await desktopStateHydration;
       const discovery = services.locateNeteaseLibrary
         ? await services.locateNeteaseLibrary(true)
         : null;
       const path = discovery?.musicFolder?.trim();
-      if (!path) {
-        const message = t('scanLocalNeteaseNotFound', state.lang);
-        finishDiscovery({
-          status: 'error',
-          stage: 'checkingMusicFolder',
-          processed: discovery?.localFileCount || 0,
-          total: discovery?.localFileCount || null,
-          currentItem: '',
-          message,
-          suggestion: discovery,
-          error: message,
-        });
-        return;
-      }
-      applyDesktopState(await services.selectSourceDirectory(0, path));
-      if ((discovery?.localFileCount || 0) > 0) {
-        finishDiscovery({
-          status: 'completed',
-          stage: 'checkingMusicFolder',
-          processed: discovery?.localFileCount || 0,
-          total: discovery?.localFileCount || null,
-          currentItem: '',
-          message: `${t('scanLocalNeteaseSelected', state.lang)} ${discovery?.localFileCount || 0}`,
-          suggestion: discovery,
-          error: null,
-        });
-      } else {
-        neteaseDiscoveryProgress = {
-          status: 'running',
-          stage: 'checkingMusicFolder',
-          processed: 0,
-          total: null,
-          currentItem: '',
-          message: t('scanLocalNeteaseSelected', state.lang),
-          suggestion: discovery,
-          error: null,
-        };
-        render();
+      if (path) {
+        neteaseDiscoveryId = neteaseDiscoveryProgress?.discoveryId || neteaseDiscoveryId;
+        applyDesktopState(await services.selectSourceDirectory(0, path));
+        if ((discovery?.localFileCount || 0) > 0) {
+          neteaseDiscoveryInFlight = false;
+          neteaseDiscoveryManualFallbackVisible = false;
+          if (neteaseDiscoveryTimeoutTimer) clearTimeout(neteaseDiscoveryTimeoutTimer);
+          neteaseDiscoveryTimeoutTimer = null;
+          finishDiscovery({
+            discoveryId: neteaseDiscoveryId || undefined,
+            status: 'completed',
+            stage: 'checkingMusicFolder',
+            processed: discovery?.localFileCount || 0,
+            total: discovery?.localFileCount || null,
+            currentItem: '',
+            message: `${t('scanLocalNeteaseSelected', state.lang)} ${discovery?.localFileCount || 0}`,
+            suggestion: discovery,
+            error: null,
+          });
+        }
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -4679,9 +4749,8 @@ export function bindApp(
         suggestion: null,
         error: `${message}：${detail}`,
       };
-      render();
-    } finally {
       neteaseDiscoveryInFlight = false;
+      neteaseDiscoveryManualFallbackVisible = true;
       render();
     }
   };
@@ -4878,14 +4947,8 @@ export function bindApp(
         workerJobId: '',
         resumeAvailable: resumableAnalysis !== null,
       };
-      // Make the resumable action usable as soon as the cancelled state is
-      // rendered; the outer finally also performs this assignment for normal
-      // exits, but the button can be clicked before that microtask runs.
       analysisRunActive = false;
       render();
-      if (resumeAnalysisRequested) {
-        setTimeout(() => resumeAnalysisFlow(), 0);
-      }
       return { analyses: results, failures, cancelled: true };
     };
     try {
@@ -5726,6 +5789,19 @@ export function bindApp(
       return;
     }
 
+    if (action && services.recordGlobalEvent) {
+      void services.recordGlobalEvent('ui_action', {
+        action,
+        slotIndex,
+        mode,
+        format,
+        conversionMode,
+        enhancedMode,
+      }).catch((error) => {
+        console.warn('Failed to record UI action:', error);
+      });
+    }
+
     if (action === 'toggle-lang') {
       state = { ...state, lang: state.lang === 'zh' ? 'en' : 'zh' };
       localStorage.setItem('w4dj_lang', state.lang);
@@ -6089,6 +6165,11 @@ export function bindApp(
       return;
     }
 
+    if (action === 'export-full-runtime-report') {
+      void exportFullRuntimeReport();
+      return;
+    }
+
     if (action === 'open-release-page') {
       const url = button.dataset.url;
       if (url) {
@@ -6161,18 +6242,10 @@ export function bindApp(
       return;
     }
 
-    if (action === 'export-error-report') {
+    if (action === 'export-run-report') {
       const historyId = button.dataset.historyId;
       if (historyId) {
-        void exportHistoryErrorReport(historyId);
-      }
-      return;
-    }
-
-    if (action === 'export-runtime-session') {
-      const historyId = button.dataset.historyId;
-      if (historyId) {
-        void exportRuntimeSession(historyId);
+        void exportRunReport(historyId);
       }
       return;
     }
@@ -6191,6 +6264,11 @@ export function bindApp(
     }
 
     if (action === 'clear-analysis-cache') {
+      void clearLibraryCache();
+      return;
+    }
+
+    if (action === 'clear-enhanced-cache') {
       void clearEnhancedCache();
       return;
     }
@@ -6202,6 +6280,13 @@ export function bindApp(
 
     if (action === 'scan-local-netease') {
       void scanLocalNeteaseFolder();
+      return;
+    }
+
+    if (action === 'cancel-netease-discovery') {
+      if (services.cancelNeteaseDiscovery) {
+        void services.cancelNeteaseDiscovery().catch((error) => console.warn('Failed to cancel NetEase discovery:', error));
+      }
       return;
     }
 
@@ -6227,11 +6312,6 @@ export function bindApp(
 
     if (action === 'cancel-analysis') {
       cancelAnalysisFlow();
-      return;
-    }
-
-    if (action === 'resume-analysis') {
-      resumeAnalysisFlow();
       return;
     }
 
@@ -6790,12 +6870,34 @@ export function bindApp(
 
   if (services.listenNeteaseDiscoveryProgress) {
     void services.listenNeteaseDiscoveryProgress((progress) => {
+      if (progress.discoveryId && neteaseDiscoveryId && progress.discoveryId !== neteaseDiscoveryId) {
+        return;
+      }
+      if (progress.discoveryId && !neteaseDiscoveryId) {
+        neteaseDiscoveryId = progress.discoveryId;
+      }
       neteaseDiscoveryProgress = progress;
       if (progress.status === 'running') {
         if (!updateNeteaseDiscoveryProgressDom(progress)) {
           render();
         }
         return;
+      }
+      if (progress.status === 'completed' && progress.suggestion?.musicFolder) {
+        const path = progress.suggestion.musicFolder.trim();
+        if (path) {
+          void services.selectSourceDirectory(0, path).then(applyDesktopState).catch((error) => {
+            console.warn('Failed to apply discovered NetEase folder:', error);
+          });
+        }
+      }
+      if (progress.status === 'completed' || progress.status === 'cancelled' || progress.status === 'error' || progress.status === 'cancelling') {
+        neteaseDiscoveryInFlight = progress.status === 'cancelling';
+        if (progress.status === 'error') neteaseDiscoveryManualFallbackVisible = true;
+        if (progress.status !== 'cancelling') {
+          if (neteaseDiscoveryTimeoutTimer) clearTimeout(neteaseDiscoveryTimeoutTimer);
+          neteaseDiscoveryTimeoutTimer = null;
+        }
       }
       if (progress.status === 'completed') {
         setTimeout(() => {
@@ -6868,8 +6970,8 @@ export function bindApp(
       status: 'cancelled',
       total: resumableTotal,
       stage: 'cancelled',
-      message: state.lang === 'zh' ? '上次增强分析未完成，可继续' : 'The previous enhanced analysis was interrupted; resume it',
-      resumeAvailable: true,
+      message: state.lang === 'zh' ? '上次增强分析未完成' : 'The previous enhanced analysis was interrupted',
+      resumeAvailable: false,
     };
   }
 
@@ -6902,9 +7004,9 @@ export function bindApp(
           stage: run.analysis?.currentStage ?? 'cancelled',
           workerJobId: run.analysis?.workerJobId ?? '',
           message: state.lang === 'zh'
-            ? '上次增强分析未完成，可继续'
-            : 'The previous enhanced analysis was interrupted; resume it',
-          resumeAvailable: true,
+            ? '上次增强分析未完成'
+            : 'The previous enhanced analysis was interrupted',
+          resumeAvailable: false,
         };
         render();
       })
@@ -7024,16 +7126,11 @@ function renderOutputSettings(
           <div class="essentia-model-settings">
             <span class="essentia-model-title">${t('essentiaModelsTitle', state.lang)}</span>
             <small>${modelsReady ? t('essentiaModelsReady', state.lang) : t('essentiaModelsMissing', state.lang)}</small>
-            <div class="essentia-model-actions">
-              <button type="button" class="secondary-action enhanced-cache-clear" data-action="clear-analysis-cache">
-                ${t('clearEnhancedCache', state.lang)}
-              </button>
-            </div>
           </div>
         ` : ''}
         ${ANALYSIS_CACHE_CLEAR_VISIBLE ? `
-          <button type="button" class="secondary-action enhanced-cache-clear" data-action="clear-analysis-cache">
-            ${t('clearEnhancedCache', state.lang)}
+          <button type="button" class="secondary-action analysis-cache-clear" data-action="clear-analysis-cache">
+            ${t('clearAnalysisCache', state.lang)}
           </button>
         ` : ''}
         ${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? `
@@ -7063,6 +7160,7 @@ function renderAboutModal(info: AppInfo | null, update: AppUpdateCheck | null, l
         <div class="about-links">
           <button type="button" class="about-link" data-action="open-project-home" data-url="${escapeHtml(info.project_url)}">${t('projectHome', lang)}</button>
           <button type="button" class="about-link" data-action="check-updates">${t('checkUpdates', lang)}</button>
+          <button type="button" class="about-link" data-action="export-full-runtime-report">${t('exportFullRuntimeReport', lang)}</button>
         </div>
         ${update ? `<p class="about-update">${update.update_available ? t('updateAvailable', lang).replace('{version}', escapeHtml(update.latest_version)) : t('alreadyLatest', lang)}${update.update_available ? ` <button type="button" class="about-link" data-action="open-release-page" data-url="${escapeHtml(update.release_url)}">${t('viewRelease', lang)}</button>` : ''}</p>` : ''}
         <button type="button" class="global-action" data-action="close-about">${t('close', lang)}</button>

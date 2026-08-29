@@ -154,10 +154,7 @@ fn stone_kold_duplicate_tracks_convert_to_distinct_outputs_with_metadata() {
             )
         })
         .collect::<HashMap<_, _>>();
-    let source_files = source_files
-        .iter()
-        .map(|(name, info)| (name, info))
-        .collect::<HashMap<_, _>>();
+    let source_files = source_files.iter().collect::<HashMap<_, _>>();
     let task = TaskController::running(candidates.len());
     let mut failures = Vec::new();
     let snapshot =

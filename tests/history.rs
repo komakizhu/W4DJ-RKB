@@ -12,6 +12,7 @@ fn test_entry(index: usize) -> HistoryEntry {
     HistoryEntry {
         id: format!("history-{index}"),
         batch_id: format!("batch-{index}"),
+        operation_id: None,
         slot_index: 0,
         started_at: format!("2026-07-14T00:{index:02}:00Z"),
         finished_at: format!("2026-07-14T00:{index:02}:01Z"),

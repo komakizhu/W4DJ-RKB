@@ -21,6 +21,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         filename_rule: FilenameRule::ArtistTitle,
         netease_filename_format: Default::default(),
         netease_database_path: Some(String::from("/music/sqlite_storage.sqlite3")),
+        netease_database_bound: false,
         concurrency_limit: 4,
     };
 
@@ -41,6 +42,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         loaded.netease_database_path.as_deref(),
         Some("/music/sqlite_storage.sqlite3")
     );
+    assert!(!loaded.netease_database_bound);
     assert_eq!(loaded.concurrency_limit, 4);
 }
 

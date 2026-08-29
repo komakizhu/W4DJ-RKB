@@ -21,6 +21,7 @@ use crate::media_probe::probe_local_audio;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +29,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 pub const W4DJ_SCHEMA_VERSION: i64 = 2;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputReconcileSummary {
+    pub invalidated_paths: Vec<PathBuf>,
+    pub removed_paths: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1601,6 +1608,187 @@ impl W4djLibrary {
         Ok(())
     }
 
+    /// Reconcile one or more scanned output roots with the files that were
+    /// actually observed on disk.  Existing rows (and their analysis) are
+    /// retained when the destination path remains present; rows that
+    /// disappeared from a participating root are removed atomically together
+    /// with their analysis projection.  Roots not included in `roots` are
+    /// deliberately untouched.
+    pub fn reconcile_output_roots(
+        &mut self,
+        roots: &[(usize, PathBuf, Vec<PathBuf>)],
+    ) -> W4djResult<OutputReconcileSummary> {
+        let mut snapshots = Vec::with_capacity(roots.len());
+        for (slot_index, root_path, paths) in roots {
+            let root = normalize_path(root_path);
+            if root.is_empty() {
+                continue;
+            }
+            let mut destinations = HashSet::with_capacity(paths.len());
+            let mut files = Vec::with_capacity(paths.len());
+            for path in paths {
+                let metadata = fs::metadata(path).map_err(|error| {
+                    W4djLibraryError::Invalid(format!("输出文件无法登记：{error}"))
+                })?;
+                if !metadata.is_file() || metadata.len() == 0 {
+                    return Err(W4djLibraryError::Invalid(
+                        "输出扫描发现无效音频文件".to_string(),
+                    ));
+                }
+                let destination = normalize_path(path);
+                if !destinations.insert(destination.clone()) {
+                    continue;
+                }
+                files.push(ScannedOutputFile {
+                    destination,
+                    title: path
+                        .file_stem()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string()),
+                    size_bytes: metadata.len().min(i64::MAX as u64) as i64,
+                    modified_at_ms: modified_at_ms(&metadata),
+                    measured_format: path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_ascii_lowercase),
+                });
+            }
+            snapshots.push(ScannedOutputRoot {
+                slot_index: *slot_index,
+                root,
+                destinations,
+                files,
+            });
+        }
+
+        let transaction = self.catalog.connection_mut().transaction()?;
+        let now = now_ms();
+        let mut summary = OutputReconcileSummary::default();
+        for snapshot in snapshots {
+            transaction.execute(
+                "INSERT INTO output_roots(root_path,first_seen_at_ms,last_seen_at_ms)
+                 VALUES (?1,?2,?2)
+                 ON CONFLICT(root_path) DO UPDATE SET last_seen_at_ms=excluded.last_seen_at_ms",
+                params![snapshot.root, now],
+            )?;
+            transaction.execute(
+                "INSERT INTO slot_output_roots(slot_index,root_path,applied_at_ms)
+                 VALUES (?1,?2,?3)
+                 ON CONFLICT(slot_index) DO UPDATE SET root_path=excluded.root_path, applied_at_ms=excluded.applied_at_ms",
+                params![snapshot.slot_index as i64, snapshot.root, now],
+            )?;
+
+            for file in snapshot.files {
+                let existing_key = transaction
+                    .query_row(
+                        "SELECT track_key FROM w4dj_track_meta WHERE destination_path=?1 LIMIT 1",
+                        [&file.destination],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let previous_fingerprint = if let Some(track_key) = existing_key.as_deref() {
+                    transaction
+                        .query_row(
+                            "SELECT size_bytes,modified_at_ms FROM local_files
+                             WHERE track_key=?1 AND path=?2 LIMIT 1",
+                            params![track_key, file.destination],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                        )
+                        .optional()?
+                } else {
+                    None
+                };
+                let fingerprint_unchanged =
+                    previous_fingerprint.is_some_and(|(size_bytes, modified_at_ms)| {
+                        size_bytes == file.size_bytes
+                            && modified_at_ms.is_some()
+                            && modified_at_ms == file.modified_at_ms
+                    });
+                let track_key = existing_key
+                    .clone()
+                    .unwrap_or_else(|| format!("output:{}", file.destination));
+                transaction.execute(
+                    "INSERT INTO tracks(track_key,title,artist_list_json,local_status,updated_at_ms)
+                     VALUES (?1,?2,'[]','available',?3)
+                     ON CONFLICT(track_key) DO UPDATE SET local_status='available',updated_at_ms=excluded.updated_at_ms",
+                    params![track_key, file.title, now],
+                )?;
+                transaction.execute(
+                    "INSERT INTO local_files(track_key,path,size_bytes,modified_at_ms,measured_format,readable,probe_error)
+                     VALUES (?1,?2,?3,?4,?5,1,NULL)
+                     ON CONFLICT(path) DO UPDATE SET track_key=excluded.track_key,
+                        size_bytes=excluded.size_bytes,modified_at_ms=excluded.modified_at_ms,
+                        measured_format=excluded.measured_format,readable=1,probe_error=NULL",
+                    params![
+                        track_key,
+                        file.destination,
+                        file.size_bytes,
+                        file.modified_at_ms,
+                        file.measured_format,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO w4dj_track_meta(
+                        track_key,source_path,destination_path,slot_index,output_root,status,
+                        analysis_status,analysis_error,created_at_ms,updated_at_ms
+                     ) VALUES (?1,NULL,?2,?3,?4,'available','notAnalyzed',NULL,?5,?5)
+                     ON CONFLICT(track_key) DO UPDATE SET destination_path=excluded.destination_path,
+                        slot_index=excluded.slot_index,output_root=excluded.output_root,
+                        status='available',updated_at_ms=excluded.updated_at_ms",
+                    params![
+                        track_key,
+                        file.destination,
+                        snapshot.slot_index as i64,
+                        snapshot.root,
+                        now
+                    ],
+                )?;
+                if existing_key.is_some() && !fingerprint_unchanged {
+                    invalidate_analysis_projection(&transaction, &track_key, now)?;
+                    summary
+                        .invalidated_paths
+                        .push(PathBuf::from(&file.destination));
+                }
+            }
+
+            let stale = {
+                let mut statement = transaction.prepare(
+                    "SELECT track_key,destination_path FROM w4dj_track_meta WHERE output_root=?1",
+                )?;
+                statement
+                    .query_map([snapshot.root.as_str()], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (track_key, destination) in stale {
+                if !snapshot.destinations.contains(&destination) {
+                    transaction.execute(
+                        "DELETE FROM w4dj_output_identities WHERE destination_path=?1",
+                        [&destination],
+                    )?;
+                    transaction.execute("DELETE FROM tracks WHERE track_key=?1", [&track_key])?;
+                    summary.removed_paths.push(PathBuf::from(destination));
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    /// Remove all output-owned tracks and analyses while leaving imported
+    /// playlists, history, preferences and source scan caches untouched.
+    pub fn clear_output_library(&mut self) -> W4djResult<()> {
+        let transaction = self.catalog.connection_mut().transaction()?;
+        transaction.execute("DELETE FROM w4dj_output_identities", [])?;
+        transaction.execute("DELETE FROM tracks WHERE EXISTS (SELECT 1 FROM w4dj_track_meta WHERE w4dj_track_meta.track_key=tracks.track_key)", [])?;
+        transaction.execute("DELETE FROM w4dj_track_meta", [])?;
+        transaction.execute("DELETE FROM slot_output_roots", [])?;
+        transaction.execute("DELETE FROM output_roots", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn query(&self, query: &LibraryQuery) -> W4djResult<LibraryPage> {
         Ok(self.catalog.query_with_extra_predicate(
             query,
@@ -1921,6 +2109,23 @@ struct ManifestRow {
     duration_seconds: Option<f64>,
     analysis_status: Option<String>,
     analysis_json: Option<String>,
+}
+
+#[derive(Debug)]
+struct ScannedOutputFile {
+    destination: String,
+    title: String,
+    size_bytes: i64,
+    modified_at_ms: Option<i64>,
+    measured_format: Option<String>,
+}
+
+#[derive(Debug)]
+struct ScannedOutputRoot {
+    slot_index: usize,
+    root: String,
+    destinations: HashSet<String>,
+    files: Vec<ScannedOutputFile>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2370,6 +2575,42 @@ fn modified_at_ms(metadata: &fs::Metadata) -> Option<i64> {
         .map(|value| value.as_millis().min(i64::MAX as u128) as i64)
 }
 
+fn invalidate_analysis_projection(
+    transaction: &rusqlite::Transaction<'_>,
+    track_key: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "DELETE FROM analysis_results WHERE track_key=?1",
+        [track_key],
+    )?;
+    transaction.execute(
+        "UPDATE local_files SET measured_bitrate_bps=NULL, measured_duration_seconds=NULL,
+            sample_rate_hz=NULL, channels=NULL WHERE track_key=?1",
+        [track_key],
+    )?;
+    transaction.execute(
+        "UPDATE w4dj_track_meta SET analysis_status='notAnalyzed', analysis_error=NULL,
+            measured_duration_seconds=NULL, updated_at_ms=?1 WHERE track_key=?2",
+        params![now, track_key],
+    )?;
+    transaction.execute(
+        "UPDATE tracks SET essentia_genre='', essentia_duration_seconds=NULL,
+            preferred_local_file_id=NULL, measured_duration_seconds=NULL,
+            effective_duration_seconds=NULL, duration_source=NULL, measured_format=NULL,
+            effective_format=NULL, measured_bitrate_bps=NULL, effective_bitrate_bps=NULL,
+            measured_size_bytes=NULL, effective_size_bytes=NULL, bpm=NULL,
+            musical_key=NULL, scale=NULL, integrated_loudness_lufs=NULL,
+            loudness_range_lu=NULL, energy=NULL, danceability=NULL, mood_json='[]',
+            instrument_json='[]', style_json='[]', discogs_mood_theme_json='[]',
+            discogs_approachability_json='{}', discogs_instrumentation_json='[]',
+            discogs_timbre_json='{}', discogs_danceability_json='{}',
+            drop_loudness_lufs=NULL, updated_at_ms=?1 WHERE track_key=?2",
+        params![now, track_key],
+    )?;
+    Ok(())
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2402,6 +2643,7 @@ mod tests {
     use super::{AnalysisStatus, W4djLibrary, is_audio_path, normalize_path};
     use crate::analysis::{HighLevelAnalysis, TrackAnalysis};
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -2491,6 +2733,192 @@ mod tests {
         assert_eq!(AnalysisStatus::NotAnalyzed.as_str(), "notAnalyzed");
         assert_eq!(AnalysisStatus::Completed.as_str(), "completed");
         assert_eq!(AnalysisStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn reconcile_output_roots_keeps_present_rows_and_removes_missing_rows() {
+        let directory = tempdir().unwrap();
+        let output_root = directory.path().join("out");
+        fs::create_dir_all(&output_root).unwrap();
+        let kept = output_root.join("kept.mp3");
+        let removed = output_root.join("removed.mp3");
+        let added = output_root.join("added.mp3");
+        for path in [&kept, &removed, &added] {
+            fs::write(path, b"audio").unwrap();
+        }
+        let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+        library
+            .upsert_output_file(0, &output_root, None, &kept)
+            .unwrap();
+        library
+            .upsert_output_file(0, &output_root, None, &removed)
+            .unwrap();
+        library
+            .reconcile_output_roots(&[(0, output_root.clone(), vec![kept.clone(), added.clone()])])
+            .unwrap();
+        assert_eq!(library.stats().unwrap().total, 2);
+        assert!(
+            library
+                .track_detail(&format!("output:{}", normalize_path(&kept)))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            library
+                .track_detail(&format!("output:{}", normalize_path(&removed)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            library
+                .track_detail(&format!("output:{}", normalize_path(&added)))
+                .unwrap()
+                .is_some()
+        );
+        library.clear_output_library().unwrap();
+        assert_eq!(library.stats().unwrap().total, 0);
+        assert!(kept.is_file() && added.is_file());
+    }
+
+    #[test]
+    fn reconcile_output_roots_reuses_the_existing_destination_identity() {
+        let directory = tempdir().unwrap();
+        let output_root = directory.path().join("out");
+        fs::create_dir_all(&output_root).unwrap();
+        let source = directory.path().join("source.ncm");
+        let output = output_root.join("song.mp3");
+        fs::write(&output, b"audio").unwrap();
+        let output = fs::canonicalize(output).unwrap();
+        let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+        let original_key = library
+            .upsert_lightweight_output(0, Some(&source), &output, None, None, "Song", "Artist")
+            .unwrap();
+        assert!(original_key.starts_with("source:"));
+
+        library
+            .reconcile_output_roots(&[(0, output_root, vec![output.clone()])])
+            .unwrap();
+
+        assert_eq!(library.stats().unwrap().total, 1);
+        assert!(library.track_detail(&original_key).unwrap().is_some());
+        assert!(
+            library
+                .track_detail(&format!("output:{}", normalize_path(&output)))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_output_roots_invalidates_analysis_only_when_fingerprint_changes() {
+        let directory = tempdir().unwrap();
+        let output_root = directory.path().join("out");
+        fs::create_dir_all(&output_root).unwrap();
+        let output = output_root.join("song.mp3");
+        fs::write(&output, b"audio").unwrap();
+        let output = fs::canonicalize(output).unwrap();
+        let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+        library
+            .upsert_output_file(0, &output_root, None, &output)
+            .unwrap();
+        library
+            .mark_analysis_failed_for_destination(&output, "fixture failure")
+            .unwrap();
+
+        library
+            .reconcile_output_roots(&[(0, output_root.clone(), vec![output.clone()])])
+            .unwrap();
+        assert_eq!(library.stats().unwrap().analysis_failed, 1);
+
+        fs::write(&output, b"replacement audio").unwrap();
+        let summary = library
+            .reconcile_output_roots(&[(0, output_root, vec![output])])
+            .unwrap();
+        assert_eq!(summary.invalidated_paths.len(), 1);
+        let stats = library.stats().unwrap();
+        assert_eq!(stats.analysis_failed, 0);
+        assert_eq!(stats.not_analyzed, 1);
+    }
+
+    #[test]
+    fn reconcile_output_roots_rolls_back_all_roots_when_one_snapshot_is_invalid() {
+        let directory = tempdir().unwrap();
+        let first_root = directory.path().join("first");
+        let second_root = directory.path().join("second");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let first_old = first_root.join("old.mp3");
+        let first_new = first_root.join("new.mp3");
+        let second = second_root.join("invalid.mp3");
+        fs::write(&first_old, b"audio").unwrap();
+        fs::write(&first_new, b"audio").unwrap();
+        fs::write(&second, b"").unwrap();
+        let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+        library
+            .upsert_output_file(0, &first_root, None, &first_old)
+            .unwrap();
+
+        assert!(
+            library
+                .reconcile_output_roots(&[
+                    (0, first_root, vec![first_new.clone()]),
+                    (1, second_root, vec![second]),
+                ])
+                .is_err()
+        );
+        assert_eq!(library.stats().unwrap().total, 1);
+        assert!(
+            library
+                .track_detail(&format!("output:{}", normalize_path(&first_old)))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            library
+                .track_detail(&format!("output:{}", normalize_path(&first_new)))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconcile_output_roots_leaves_unparticipating_roots_and_analysis_unchanged() {
+        let directory = tempdir().unwrap();
+        let participating_root = directory.path().join("participating");
+        let untouched_root = directory.path().join("untouched");
+        fs::create_dir_all(&participating_root).unwrap();
+        fs::create_dir_all(&untouched_root).unwrap();
+        let removed = participating_root.join("removed.mp3");
+        let untouched = untouched_root.join("untouched.mp3");
+        fs::write(&removed, b"audio").unwrap();
+        fs::write(&untouched, b"audio").unwrap();
+        let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+        library
+            .upsert_output_file(0, &participating_root, None, &removed)
+            .unwrap();
+        library
+            .upsert_output_file(1, &untouched_root, None, &untouched)
+            .unwrap();
+        library
+            .mark_analysis_failed_for_destination(&untouched, "fixture failure")
+            .unwrap();
+
+        let summary = library
+            .reconcile_output_roots(&[(0, participating_root, Vec::new())])
+            .unwrap();
+        assert_eq!(
+            summary.removed_paths,
+            vec![PathBuf::from(normalize_path(&removed))]
+        );
+        let stats = library.stats().unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.analysis_failed, 1);
+        assert!(
+            library
+                .track_detail(&format!("output:{}", normalize_path(&untouched)))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

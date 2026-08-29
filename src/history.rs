@@ -112,6 +112,8 @@ pub struct PendingFile {
 pub struct HistoryEntry {
     pub id: String,
     pub batch_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     pub slot_index: usize,
     pub started_at: String,
     pub finished_at: String,
@@ -1365,6 +1367,7 @@ mod tests {
         HistoryEntry {
             id: String::from("history-1"),
             batch_id: String::from("batch-1"),
+            operation_id: None,
             slot_index: 0,
             started_at: String::from("2026-08-06 12:00"),
             finished_at: String::from("2026-08-06 12:01"),

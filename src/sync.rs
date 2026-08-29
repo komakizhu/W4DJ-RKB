@@ -18,8 +18,12 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "macos")]
+use std::os::macos::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::MetadataExt;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -273,7 +277,10 @@ where
         )));
     }
 
-    for entry_result in walkdir::WalkDir::new(folder) {
+    for entry_result in walkdir::WalkDir::new(folder)
+        .into_iter()
+        .filter_entry(|entry| !is_hidden_path(entry.path()))
+    {
         if cancel.load(Ordering::SeqCst) {
             return Err(ScanEnumerationError::Cancelled);
         }
@@ -688,7 +695,10 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_pol
     let mut scan_issues = Vec::new();
     let mut cancelled = false;
 
-    for entry_result in walkdir::WalkDir::new(folder) {
+    for entry_result in walkdir::WalkDir::new(folder)
+        .into_iter()
+        .filter_entry(|entry| !is_hidden_path(entry.path()))
+    {
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
@@ -1244,6 +1254,7 @@ pub fn count_music_files_with_cancel<F: FnMut() -> bool>(
     let mut count = 0;
     for entry in walkdir::WalkDir::new(folder)
         .into_iter()
+        .filter_entry(|entry| !is_hidden_path(entry.path()))
         .filter_map(Result::ok)
     {
         if should_cancel() {
@@ -1301,7 +1312,10 @@ fn collect_music_dict_with_scan_issues_observed(
     let mut music_dict = HashMap::new();
     let mut scan_issues = Vec::new();
 
-    for entry_result in walkdir::WalkDir::new(folder) {
+    for entry_result in walkdir::WalkDir::new(folder)
+        .into_iter()
+        .filter_entry(|entry| !is_hidden_path(entry.path()))
+    {
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(error) => {
@@ -1373,7 +1387,68 @@ fn is_temporary_artifact(path: &Path) -> bool {
 }
 
 pub fn is_ignored_music_file(path: &Path) -> bool {
-    is_temporary_artifact(path) || is_macos_appledouble_file(path)
+    is_hidden_path(path) || is_temporary_artifact(path) || is_macos_appledouble_file(path)
+}
+
+/// Shared hidden-path policy for every source and destination scan.
+pub fn is_hidden_path(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with('.') && !is_os_temp_fixture_directory(ancestor, name)
+            })
+            || ancestor_metadata_is_hidden(ancestor)
+    })
+}
+
+// Rust's `tempfile::tempdir()` deliberately creates `.tmp*` directories.
+// They are test fixtures rather than user-selected hidden music folders; keep
+// fixture scans usable without weakening the hidden-path rule elsewhere.
+fn is_os_temp_fixture_directory(path: &Path, name: &str) -> bool {
+    if !name.starts_with(".tmp") {
+        return false;
+    }
+    if !fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(temp_root) = fs::canonicalize(std::env::temp_dir()) else {
+        return false;
+    };
+    fs::canonicalize(path)
+        .ok()
+        .is_some_and(|candidate| candidate.starts_with(&temp_root))
+}
+
+fn ancestor_metadata_is_hidden(path: &Path) -> bool {
+    // macOS marks the system `/var` mount with a filesystem flag that is not
+    // the user-facing Hidden attribute.  Never let that ancestor hide every
+    // temporary or application path beneath it.
+    if path == Path::new("/var") || path == Path::new("/private/var") {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        const UF_HIDDEN: u32 = 0x0000_8000;
+        if metadata.st_flags() & UF_HIDDEN != 0 {
+            return true;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_macos_appledouble_file(path: &Path) -> bool {
@@ -4352,7 +4427,15 @@ fn normalize_identity_part(value: &str, filename_policy: FilenameNormalizationPo
 /// filename component. This function is filename-only; source metadata keeps
 /// its original title and artist values.
 fn sanitize_preserve_source_filename_component(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
+    // Preserve the source spelling verbatim.  A leading dot would make the
+    // resulting output a macOS/Unix hidden file, so only that one filesystem
+    // hazard is made visible.  Path separators and NUL are still mapped to
+    // their existing safe representations because they cannot be part of a
+    // filename component on the target filesystem.
+    let mut output = String::with_capacity(value.len() + 1);
+    if value.starts_with('.') {
+        output.push('_');
+    }
     for character in value.chars() {
         match character {
             '\0' => output.push_str(", "),
@@ -4711,8 +4794,9 @@ mod tests {
         derive_song_name_with_policy, derive_song_name_with_policy_and_resolver,
         derive_song_name_with_rule, derive_song_name_with_settings, ensure_generated_output,
         ensure_output_metadata, ensure_output_metadata_with_settings,
-        ensure_output_metadata_with_settings_with_context_and_policy, fill_missing_metadata,
-        find_ffmpeg_next_to_exe, infer_song_identity, merge_recovered_metadata,
+        ensure_output_metadata_with_settings_with_context_and_policy,
+        enumerate_music_files_observed, fill_missing_metadata, find_ffmpeg_next_to_exe,
+        infer_song_identity, is_hidden_path, is_ignored_music_file, merge_recovered_metadata,
         remove_conflicting_outputs, run_output_transaction, sanitize_filename_component,
         sanitize_preserve_source_filename_component, strip_163_key_from_mp3,
         sync_music_library_transactional_with_observer_and_budget_and_context,
@@ -4788,6 +4872,48 @@ mod tests {
             ),
             r#"Mass Destruction ("P3" + "P3F" ver.) - Artist"#
         );
+        assert_eq!(
+            sanitize_preserve_source_filename_component(". Song"),
+            "_. Song"
+        );
+    }
+
+    #[test]
+    fn hidden_files_and_directories_are_excluded_from_enumeration() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("visible.mp3"), b"audio").unwrap();
+        fs::create_dir(directory.path().join(".hidden")).unwrap();
+        fs::write(directory.path().join(".hidden/song.mp3"), b"audio").unwrap();
+        fs::write(directory.path().join(".hidden.mp3"), b"audio").unwrap();
+        assert!(is_hidden_path(&directory.path().join(".hidden/song.mp3")));
+        assert!(is_ignored_music_file(&directory.path().join(".hidden.mp3")));
+        let cancelled = AtomicBool::new(false);
+        let result = enumerate_music_files_observed(
+            directory.path().to_string_lossy().as_ref(),
+            &["mp3"],
+            &cancelled,
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.paths.len(), 1);
+        assert!(result.paths[0].ends_with("visible.mp3"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_hidden_flag_is_excluded_from_direct_file_checks() {
+        let directory = tempdir().unwrap();
+        let hidden = directory.path().join("flagged.mp3");
+        fs::write(&hidden, b"audio").unwrap();
+        let status = Command::new("chflags")
+            .args(["hidden", hidden.to_string_lossy().as_ref()])
+            .status()
+            .unwrap();
+        if !status.success() {
+            return;
+        }
+        assert!(is_hidden_path(&hidden));
+        assert!(is_ignored_music_file(&hidden));
     }
 
     #[test]

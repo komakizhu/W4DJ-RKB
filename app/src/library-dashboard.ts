@@ -140,6 +140,7 @@ export type LibraryStatus = {
   analyzedTrackCount?: number;
   netease: NeteaseDiscovery;
   manualDatabasePath: string | null;
+  neteaseDatabaseBound?: boolean;
   refresh: LibraryRefreshProgress;
   databaseWarning: string | null;
   totalTrackCount?: number;

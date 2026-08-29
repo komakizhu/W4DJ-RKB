@@ -24,6 +24,10 @@ pub fn normalize_concurrency_limit(value: f64, fallback: u8) -> u8 {
         .clamp(MIN_CONCURRENCY_LIMIT as f64, MAX_CONCURRENCY_LIMIT as f64) as u8
 }
 
+fn default_netease_database_bound() -> bool {
+    true
+}
+
 fn deserialize_concurrency_limit<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -75,6 +79,8 @@ pub struct AppPreferences {
     pub netease_filename_format: NeteaseFilenameFormat,
     #[serde(default)]
     pub netease_database_path: Option<String>,
+    #[serde(default = "default_netease_database_bound")]
+    pub netease_database_bound: bool,
     #[serde(
         default = "default_concurrency_limit",
         deserialize_with = "deserialize_concurrency_limit"
@@ -105,6 +111,7 @@ impl Default for AppPreferences {
             filename_rule: FilenameRule::default(),
             netease_filename_format: NeteaseFilenameFormat::default(),
             netease_database_path: None,
+            netease_database_bound: true,
             concurrency_limit: default_concurrency_limit(),
         }
     }
@@ -128,6 +135,7 @@ impl AppPreferences {
             filename_rule: FilenameRule::default(),
             netease_filename_format: NeteaseFilenameFormat::default(),
             netease_database_path: None,
+            netease_database_bound: true,
             concurrency_limit: default_concurrency_limit(),
         }
     }
@@ -165,6 +173,7 @@ fn parse_preferences(contents: &str) -> io::Result<AppPreferences> {
         filename_rule: FilenameRule::default(),
         netease_filename_format: NeteaseFilenameFormat::default(),
         netease_database_path: None,
+        netease_database_bound: true,
         concurrency_limit: default_concurrency_limit(),
     })
 }

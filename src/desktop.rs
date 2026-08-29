@@ -91,6 +91,7 @@ impl DesktopState {
             filename_rule,
             netease_filename_format,
             netease_database_path: _,
+            netease_database_bound: _,
             concurrency_limit,
         } = preferences;
 
@@ -124,6 +125,7 @@ impl DesktopState {
             filename_rule: self.filename_rule,
             netease_filename_format: self.netease_filename_format,
             netease_database_path: None,
+            netease_database_bound: true,
             concurrency_limit: self.concurrency_limit,
         }
     }
@@ -148,6 +150,7 @@ impl DesktopController {
             filename_rule,
             netease_filename_format,
             netease_database_path: _,
+            netease_database_bound: _,
             concurrency_limit,
         } = preferences;
 

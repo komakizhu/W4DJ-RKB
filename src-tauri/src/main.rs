@@ -45,16 +45,18 @@ use w4dj::library_query::{LibraryPage, LibraryQuery};
 use w4dj::w4dj_library::{
     EmotionEvaluationManifest, W4djLibrary, write_emotion_evaluation_manifest,
 };
+use w4dj::runtime_journal::RuntimeJournal;
 use w4dj::netease_library::{
     CatalogBuildError, NeteaseDiscovery,
     build_catalog_snapshot_incremental_observed, discover_netease_library,
     discover_netease_library_for_refresh, discover_netease_library_from_database,
     discover_netease_library_from_database_for_refresh, count_audio_files,
-    discover_netease_library_from_database_observed, discover_netease_library_observed,
-    count_audio_files_observed,
+    count_audio_files_observed_cancellable,
+    derive_netease_music_folder_from_database_observed, known_netease_music_folder,
+    NeteasePathLookupError,
 };
 use w4dj::netease::{
-    NeteaseMetadataResolver, database_fingerprint_view,
+    NeteaseMetadataResolver, database_candidates, database_fingerprint_view,
     load_locators_from_db_observed, locate_supported_database,
 };
 use w4dj::netease_cache::{self, CacheState};
@@ -118,6 +120,8 @@ struct AppState {
     test_monitors: Arc<Mutex<HashMap<String, Arc<TestMonitor>>>>,
     concurrency_budget: Arc<Mutex<Arc<GlobalConcurrencyBudget>>>,
     ffmpeg_registry: Arc<w4dj::sync::ActiveFfmpegRegistry>,
+    journal: Arc<Mutex<Option<RuntimeJournal>>>,
+    analysis_active: AtomicBool,
     headless_config: Option<HeadlessAcceptanceConfig>,
 }
 
@@ -135,6 +139,7 @@ struct HeadlessAcceptanceConfig {
 struct LibraryState {
     catalog_path: Mutex<PathBuf>,
     manual_database_path: Mutex<Option<PathBuf>>,
+    netease_database_bound: AtomicBool,
     metadata_cache: Mutex<NeteaseMetadataCacheProgress>,
     metadata_cache_cancel: AtomicBool,
     metadata_cache_build_lock: Mutex<()>,
@@ -145,6 +150,15 @@ struct LibraryState {
     invalid_scan: Mutex<InvalidScanProgress>,
     invalid_scan_cancel: AtomicBool,
     invalid_scan_worker: Mutex<Option<thread::JoinHandle<()>>>,
+    netease_discovery: Mutex<NeteaseDiscoveryRuntime>,
+    netease_discovery_cancel: AtomicBool,
+    netease_discovery_worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NeteaseDiscoveryRuntime {
+    discovery_id: Option<String>,
+    status: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -180,6 +194,8 @@ impl Default for NeteaseMetadataCacheProgress {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NeteaseDiscoveryProgressEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery_id: Option<String>,
     status: String,
     stage: String,
     processed: usize,
@@ -222,15 +238,28 @@ struct TestMonitor {
     session: Arc<Mutex<TestMonitorSession>>,
     analysis_reports: Arc<Mutex<Vec<AnalysisReport>>>,
     remaining_jobs: Arc<AtomicUsize>,
+    journal: Arc<Mutex<Option<RuntimeJournal>>>,
 }
 
 impl TestMonitor {
+    #[cfg(test)]
     fn new(
         root: &Path,
         batch_id: &str,
         settings: serde_json::Value,
         previews: &[SlotPreview],
         job_count: usize,
+    ) -> io::Result<Self> {
+        Self::new_with_journal(root, batch_id, settings, previews, job_count, None)
+    }
+
+    fn new_with_journal(
+        root: &Path,
+        batch_id: &str,
+        settings: serde_json::Value,
+        previews: &[SlotPreview],
+        job_count: usize,
+        journal: Option<RuntimeJournal>,
     ) -> io::Result<Self> {
         let session_id = format!(
             "{}-{}",
@@ -267,6 +296,7 @@ impl TestMonitor {
             session: Arc::new(Mutex::new(session)),
             analysis_reports: Arc::new(Mutex::new(Vec::new())),
             remaining_jobs: Arc::new(AtomicUsize::new(job_count)),
+            journal: Arc::new(Mutex::new(journal)),
         };
         monitor.write_session_file()?;
         let total = previews
@@ -310,7 +340,7 @@ impl TestMonitor {
         )?;
         fs::write(
             monitor.session_dir.join("README.md"),
-            "# W4DJ 运行会话记录\n\n此目录由应用自动生成，仅保存在本机下载目录，不会上传。它用于保留本次任务的内部运行轨迹，不会自动导出错误报告。\n\n- `candidates.json`：本次任务的输入与计划输出。\n- `events.jsonl`：按时间追加的预检、转换、分析和回写事件。\n- `summary-slot-*.json`：每个任务结束后的完整转换历史、错误和元数据诊断。\n- `analysis-reports.json`：增强分析和分析元数据回写结果。\n- `session.json`：本次运行的设置、状态和任务汇总。\n\n需要报告时，请在转换历史中手动点击“导出错误报告”，选择保存位置后生成 UTF-8 文本文件。路径和元数据诊断可能包含本机文件信息，请分享给开发者前自行确认。\n",
+            "# W4DJ 运行会话记录\n\n此目录由应用自动生成，仅保存在本机应用数据目录，不会上传，也不会自动导出错误报告到 Downloads。它用于保留本次任务的内部运行轨迹。\n\n- `candidates.json`：本次任务的输入与计划输出。\n- `events.jsonl`：按时间追加的预检、转换、分析和回写事件。\n- `summary-slot-*.json`：每个任务结束后的完整转换历史、错误和元数据诊断。\n- `analysis-reports.json`：增强分析和分析元数据回写结果。\n- `session.json`：本次运行的设置、状态和任务汇总。\n\n需要报告时，请在转换历史中手动点击“导出本次运行报告”，或在“关于”中点击“导出完整运行报告”，选择保存位置后生成结构化 JSON 文件。路径和元数据诊断可能包含本机文件信息，请分享给开发者前自行确认。\n",
         )?;
         monitor.record_event("session_started", serde_json::json!({
             "session_directory": monitor.session_dir.display().to_string(),
@@ -358,7 +388,14 @@ impl TestMonitor {
             })),
             analysis_reports: Arc::new(Mutex::new(Vec::new())),
             remaining_jobs: Arc::new(AtomicUsize::new(0)),
+            journal: Arc::new(Mutex::new(None)),
         })
+    }
+
+    fn attach_journal(&self, journal: Option<RuntimeJournal>) {
+        if let Ok(mut slot) = self.journal.lock() {
+            *slot = journal;
+        }
     }
 
     fn record_event(&self, event: &str, details: serde_json::Value) {
@@ -377,8 +414,42 @@ impl TestMonitor {
                 .open(&self.events_path)
             {
                 let _ = writeln!(file, "{line}");
-            }
+        }
         self.update_analysis_state(&record);
+        let journal = self
+            .journal
+            .lock()
+            .ok()
+            .and_then(|journal| journal.clone());
+        let operation_id = self
+            .session
+            .lock()
+            .ok()
+            .map(|session| session.batch_id.clone())
+            .filter(|batch_id| !batch_id.trim().is_empty());
+        if let Some(journal) = journal {
+            let details = record
+                .get("details")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let status = details
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let error = details
+                .get("error")
+                .or_else(|| details.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            journal.record_event(
+                event.to_string(),
+                operation_id,
+                Some("runtime-session".to_string()),
+                status,
+                details,
+                error,
+            );
+        }
     }
 
     /// Keep a small, atomically replaced state snapshot alongside the append
@@ -798,14 +869,6 @@ fn monitor_file_snapshot(path: &Path) -> serde_json::Value {
     }
 }
 
-fn default_download_directory() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .map(|home| home.join("Downloads"))
-        .unwrap_or_else(|| PathBuf::from("Downloads"))
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ScanStatus {
@@ -855,6 +918,8 @@ struct ScanTaskProgress {
     metadata_processed: usize,
     metadata_total: Option<usize>,
     current_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 impl Default for ScanProgress {
@@ -913,7 +978,11 @@ struct ScanJob {
     scan_cache_path: PathBuf,
     concurrency_budget: Arc<GlobalConcurrencyBudget>,
     metadata_resolver: Arc<NeteaseMetadataResolver>,
+    library_path: PathBuf,
+    analysis_path: PathBuf,
     tasks: Vec<(usize, String, String)>,
+    operation_id: String,
+    journal: Option<RuntimeJournal>,
 }
 
 #[derive(serde::Serialize)]
@@ -967,6 +1036,7 @@ struct LibraryStatus {
     /// W4DJ analysis projection instead of this field.
     netease: NeteaseDiscovery,
     manual_database_path: Option<String>,
+    netease_database_bound: bool,
     refresh: LibraryRefreshProgress,
     database_warning: Option<String>,
     total_track_count: u64,
@@ -989,6 +1059,7 @@ enum NeteaseMetadataDatabaseSource {
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct NeteaseMetadataDatabaseStatus {
+    bound: bool,
     manual_path: Option<String>,
     effective_path: Option<String>,
     source: NeteaseMetadataDatabaseSource,
@@ -1097,6 +1168,7 @@ impl LibraryState {
         Self {
             catalog_path: Mutex::new(PathBuf::new()),
             manual_database_path: Mutex::new(None),
+            netease_database_bound: AtomicBool::new(true),
             metadata_cache: Mutex::new(NeteaseMetadataCacheProgress::default()),
             metadata_cache_cancel: AtomicBool::new(false),
             metadata_cache_build_lock: Mutex::new(()),
@@ -1107,6 +1179,9 @@ impl LibraryState {
             invalid_scan: Mutex::new(InvalidScanProgress::default()),
             invalid_scan_cancel: AtomicBool::new(false),
             invalid_scan_worker: Mutex::new(None),
+            netease_discovery: Mutex::new(NeteaseDiscoveryRuntime::default()),
+            netease_discovery_cancel: AtomicBool::new(false),
+            netease_discovery_worker: Mutex::new(None),
         }
     }
 }
@@ -1728,7 +1803,21 @@ fn select_source_directory(
         controller.select_source_directory(slot_index, path)?;
         controller.state().clone()
     };
-    persist_preferences(&state);
+    let source_cleared = slot_index == 0 && snapshot.slots[0].source_directory.trim().is_empty();
+    if source_cleared {
+        unbind_netease_database_binding(state.inner())?;
+    } else {
+        persist_preferences(&state);
+    }
+    record_global_event(
+        state.inner(),
+        "source_selected",
+        None,
+        Some("configuration".to_string()),
+        Some("completed".to_string()),
+        serde_json::json!({"slotIndex": slot_index, "path": snapshot.slots[slot_index].source_directory.clone()}),
+        None,
+    );
     Ok(snapshot)
 }
 
@@ -1744,6 +1833,15 @@ fn select_destination_directory(
         controller.state().clone()
     };
     persist_preferences(&state);
+    record_global_event(
+        state.inner(),
+        "destination_selected",
+        None,
+        Some("configuration".to_string()),
+        Some("completed".to_string()),
+        serde_json::json!({"slotIndex": slot_index, "path": snapshot.slots[slot_index].destination_directory.clone()}),
+        None,
+    );
     Ok(snapshot)
 }
 
@@ -2419,7 +2517,19 @@ fn clear_scan_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
         .lock()
         .expect("scan cache path lock poisoned")
         .clone();
-    clear_scan_cache_file(&path).map_err(|error| format!("清除扫描缓存失败：{error}"))
+    let result = clear_scan_cache_file(&path).map_err(|error| format!("清除扫描缓存失败：{error}"));
+    if result.is_ok() {
+        record_global_event(
+            state.inner(),
+            "scan_cache_cleared",
+            None,
+            Some("scan-cache".to_string()),
+            Some("completed".to_string()),
+            serde_json::json!({"path": path}),
+            None,
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -2477,6 +2587,18 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
             tasks,
         )
     };
+    let library_path = library_catalog_path(&state);
+    let scan_operation_id = format!("scan-{}", unique_timestamp());
+    record_global_event(
+        state.inner(),
+        "scan_started",
+        Some(scan_operation_id.clone()),
+        Some("scan".to_string()),
+        Some("running".to_string()),
+        serde_json::json!({"taskCount": tasks.len()}),
+        None,
+    );
+    let analysis_path = current_analysis_path(&state);
     let concurrency_budget = concurrency_budget_snapshot(&state);
     let metadata_resolver = Arc::clone(&conversion_metadata_context(state.inner()).netease);
 
@@ -2507,6 +2629,7 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
                     metadata_processed: 0,
                     metadata_total: None,
                     current_file: String::new(),
+                    error: None,
                 })
                 .collect(),
         };
@@ -2525,7 +2648,11 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         scan_cache_path,
         concurrency_budget,
         metadata_resolver,
+        library_path,
+        analysis_path,
         tasks,
+        operation_id: scan_operation_id,
+        journal: runtime_journal(state.inner()),
     };
     thread::spawn(move || run_scan_task(progress, scan_cancel, scan_result, job));
 
@@ -2548,7 +2675,11 @@ fn run_scan_task(
         scan_cache_path,
         concurrency_budget,
         metadata_resolver,
+        library_path,
+        analysis_path,
         tasks,
+        operation_id,
+        journal,
     } = job;
     let mut scan_cache = load_scan_cache(&scan_cache_path).unwrap_or_else(|_| ScanCache::empty());
     if scan_cancel.load(Ordering::SeqCst) {
@@ -2561,10 +2692,16 @@ fn run_scan_task(
         state.message = "正在枚举输入和输出文件".to_string();
     });
     let mut previews = Vec::with_capacity(tasks.len());
+    let mut scanned_outputs: HashMap<String, (usize, Vec<PathBuf>)> = HashMap::new();
     for (slot_index, source, destination) in tasks {
         if scan_cancel.load(Ordering::SeqCst) {
             finish_scan_cancelled(&progress, &scan_result);
             return;
+        }
+        if !destination.trim().is_empty() {
+            scanned_outputs
+                .entry(destination.clone())
+                .or_insert_with(|| (slot_index, Vec::new()));
         }
 
         // Establish denominators before worker processing starts. The walk
@@ -2627,7 +2764,7 @@ fn run_scan_task(
                     .unwrap_or_else(|| path.display().to_string());
                 state.message = match phase {
                     ScanPhase::Source => "正在扫描输入目录".to_string(),
-                    ScanPhase::Destination => "正在扫描输出目录".to_string(),
+                    ScanPhase::Destination => "正在检查输出歌曲".to_string(),
                     ScanPhase::Metadata => "正在匹配网易云元数据".to_string(),
                 };
                 if let Some(task) = state
@@ -2643,6 +2780,11 @@ fn run_scan_task(
                         ScanPhase::Destination => {
                             task.destination_processed =
                                 task.destination_processed.saturating_add(1);
+                            scanned_outputs
+                                .entry(destination.clone())
+                                .or_insert_with(|| (slot_index, Vec::new()))
+                                .1
+                                .push(path.to_path_buf());
                         }
                         ScanPhase::Metadata => {
                             if task.metadata_total.is_none() {
@@ -2773,6 +2915,61 @@ fn run_scan_task(
         return;
     }
 
+    // A completed output scan is the authoritative snapshot for the roots
+    // that participated in this scan.  Reconcile only after every task has
+    // succeeded so cancellation/errors leave the previous W4DJ index intact.
+    let roots = scanned_outputs
+        .into_iter()
+        .map(|(root, (slot_index, paths))| (slot_index, PathBuf::from(root), paths))
+        .collect::<Vec<_>>();
+    if !roots.is_empty() {
+        let reconcile_result = open_w4dj_library(&library_path)
+            .and_then(|(mut library, _)| {
+                library
+                    .reconcile_output_roots(&roots)
+                    .map_err(|error| error.to_string())
+            });
+        let reconcile_summary = match reconcile_result {
+            Ok(summary) => summary,
+            Err(error) => {
+            let affected_slots = roots
+                .iter()
+                .map(|(slot_index, _, _)| *slot_index)
+                .collect::<Vec<_>>();
+            if let Some(journal) = journal {
+                journal.record_event(
+                    "library_snapshot_sync_failed",
+                    Some(operation_id),
+                    Some("librarySnapshot".to_string()),
+                    Some("error".to_string()),
+                    serde_json::json!({
+                        "slots": roots.iter().map(|(slot_index, root, paths)| serde_json::json!({
+                            "slotIndex": slot_index,
+                            "root": root,
+                            "destinationPaths": paths,
+                        })).collect::<Vec<_>>(),
+                        "errorChain": error,
+                    }),
+                    Some(error),
+                );
+            }
+            finish_library_sync_error(&progress, &scan_result, &affected_slots);
+            return;
+            }
+        };
+        if let Err(error) = prune_analysis_entries_for_scanned_roots(
+            &analysis_path,
+            &roots,
+            &reconcile_summary.invalidated_paths,
+        ) {
+            // The SQLite snapshot is already committed and remains the
+            // authoritative source.  Keep the scan successful while making
+            // a best-effort compatibility JSON cleanup; a later analysis
+            // export can repair a transient filesystem error.
+            eprintln!("Failed to prune stale analysis cache entries: {error}");
+        }
+    }
+
     {
         let mut result = scan_result.lock().expect("scan result lock poisoned");
         *result = Some(previews);
@@ -2783,6 +2980,45 @@ fn run_scan_task(
         state.current_file.clear();
         state.message = "扫描成功".to_string();
     });
+}
+
+fn prune_analysis_entries_for_scanned_roots(
+    analysis_path: &Path,
+    roots: &[(usize, PathBuf, Vec<PathBuf>)],
+    invalidated_paths: &[PathBuf],
+) -> Result<(), String> {
+    let existing = load_analysis_file(analysis_path)?;
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let root_paths = roots
+        .iter()
+        .map(|(_, root, _)| fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
+    let desired = roots
+        .iter()
+        .flat_map(|(_, _, paths)| paths.iter())
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect::<HashSet<_>>();
+    let invalidated = invalidated_paths
+        .iter()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect::<HashSet<_>>();
+    let filtered = existing
+        .iter()
+        .filter(|entry| {
+            let path = Path::new(&entry.path);
+            let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            !invalidated.contains(&canonical)
+                && (!root_paths.iter().any(|root| canonical.starts_with(root))
+                    || desired.contains(&canonical))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.len() != existing.len() {
+        save_analysis_file(analysis_path, &filtered)?;
+    }
+    Ok(())
 }
 
 fn count_scan_files(
@@ -2851,6 +3087,27 @@ fn finish_scan_error(
         state.phase = ScanProgressPhase::Error;
         state.current_file.clear();
         state.message = message;
+    });
+}
+
+fn finish_library_sync_error(
+    progress: &Arc<Mutex<ScanProgress>>,
+    result: &Arc<Mutex<Option<Vec<SlotPreview>>>>,
+    affected_slots: &[usize],
+) {
+    *result.lock().expect("scan result lock poisoned") = None;
+    update_scan_progress(progress, |state| {
+        state.status = ScanStatus::Error;
+        state.phase = ScanProgressPhase::Error;
+        state.current_file.clear();
+        state.message = "歌曲库同步失败".to_string();
+        for task in &mut state.tasks {
+            if affected_slots.contains(&task.slot_index) {
+                task.phase = ScanProgressPhase::Error;
+                task.error = Some("library_sync_failed".to_string());
+                task.current_file.clear();
+            }
+        }
     });
 }
 
@@ -2960,6 +3217,15 @@ fn start_confirmed_sync(
     let batch_id = batch_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("batch-{}", unique_timestamp()));
+    record_global_event(
+        state.inner(),
+        "conversion_started",
+        Some(batch_id.clone()),
+        Some("conversion".to_string()),
+        Some("running".to_string()),
+        serde_json::json!({"slotCount": previews.len()}),
+        None,
+    );
     let history_path = state
         .history_path
         .lock()
@@ -3161,12 +3427,13 @@ fn start_confirmed_sync(
             .lock()
             .expect("test monitor path lock poisoned")
             .clone();
-        match TestMonitor::new(
+        match TestMonitor::new_with_journal(
             &root,
             &batch_id,
             monitor_settings,
             &monitor_previews,
             jobs.len(),
+            runtime_journal(state.inner()),
         ) {
             Ok(monitor) => Some(Arc::new(monitor)),
             Err(error) => {
@@ -4228,6 +4495,51 @@ fn manual_netease_database_path(state: &AppState) -> Option<PathBuf> {
         .clone()
 }
 
+fn netease_database_bound(state: &AppState) -> bool {
+    state.library.netease_database_bound.load(Ordering::SeqCst)
+}
+
+fn library_netease_database_bound(library: &LibraryState) -> bool {
+    library.netease_database_bound.load(Ordering::SeqCst)
+}
+
+fn unbind_netease_database_binding(state: &AppState) -> Result<(), String> {
+    state.library.netease_discovery_cancel.store(true, Ordering::SeqCst);
+    state.library.metadata_cache_cancel.store(true, Ordering::SeqCst);
+    if let Ok(mut runtime) = state.library.netease_discovery.lock()
+        && matches!(runtime.status.as_str(), "running" | "cancelling")
+    {
+        runtime.status = "cancelling".to_string();
+    }
+    let previous_path = manual_netease_database_path(state);
+    let previous_bound = netease_database_bound(state);
+    {
+        let mut path = state
+            .library
+            .manual_database_path
+            .lock()
+            .map_err(|_| "manual database path lock poisoned".to_string())?;
+        *path = None;
+    }
+    state
+        .library
+        .netease_database_bound
+        .store(false, Ordering::SeqCst);
+    if let Err(error) = persist_preferences_checked(state) {
+        *state
+            .library
+            .manual_database_path
+            .lock()
+            .map_err(|_| "manual database path lock poisoned".to_string())? = previous_path;
+        state
+            .library
+            .netease_database_bound
+            .store(previous_bound, Ordering::SeqCst);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn netease_metadata_cache_path(state: &AppState) -> PathBuf {
     state
         .library
@@ -4333,6 +4645,7 @@ fn ensure_metadata_cache_ready(state: &AppState) -> Result<(), String> {
 }
 
 fn resolve_netease_metadata_database_status(
+    bound: bool,
     manual_path: Option<&Path>,
     cache_path: &Path,
 ) -> Result<(NeteaseMetadataDatabaseStatus, NeteaseMetadataResolver), String> {
@@ -4348,7 +4661,11 @@ fn resolve_netease_metadata_database_status(
             manual.display()
         ));
     }
-    let effective_path = locate_supported_database(manual_path);
+    let effective_path = if bound {
+        locate_supported_database(manual_path)
+    } else {
+        None
+    };
     let cache_summary = if let Some(path) = effective_path.as_deref() {
         let fingerprint = database_fingerprint_view(path);
         netease_cache::read_summary(cache_path, Some(path), Some(&fingerprint))
@@ -4386,6 +4703,7 @@ fn resolve_netease_metadata_database_status(
         NeteaseMetadataDatabaseSource::Unavailable
     };
     let status = NeteaseMetadataDatabaseStatus {
+        bound,
         manual_path: manual_path.map(|path| path.display().to_string()),
         effective_path: effective_path
             .as_ref()
@@ -4422,6 +4740,7 @@ fn persist_preferences_checked(state: &AppState) -> Result<(), String> {
         .map_err(|_| "manual database path lock poisoned".to_string())?
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
+    preferences.netease_database_bound = netease_database_bound(state);
 
     let preferences_path = state
         .preferences_path
@@ -4471,6 +4790,11 @@ fn ensure_netease_database_not_busy(state: &AppState) -> Result<(), String> {
 }
 
 fn conversion_metadata_context(state: &AppState) -> Arc<ConversionMetadataContext> {
+    if !netease_database_bound(state) {
+        return Arc::new(ConversionMetadataContext {
+            netease: Arc::new(NeteaseMetadataResolver::default()),
+        });
+    }
     let preferred = manual_netease_database_path(state);
     // This is the first conversion/scan boundary, not app startup. Prepare
     // the small locator snapshot here if the user has not explicitly done so;
@@ -4660,6 +4984,11 @@ fn run_library_refresh(
     task_one_source: Option<&Path>,
     analysis_path: &Path,
 ) -> Result<LibraryRefreshSummary, LibraryRefreshRunError> {
+    if !library_netease_database_bound(state) {
+        return Err(LibraryRefreshRunError::Failed(
+            "网易云数据库未绑定，请先扫描本地网易云文件夹或选择数据库".to_string(),
+        ));
+    }
     set_library_stage(app, state, LibraryRefreshStage::LocatingDatabase, "正在定位网易云数据库");
     if state.cancel.load(Ordering::SeqCst) {
         return Err(LibraryRefreshRunError::Cancelled);
@@ -4811,6 +5140,7 @@ fn load_library_status(state: tauri::State<'_, AppState>) -> Result<LibraryStatu
             local_file_count: 0,
         },
         manual_database_path: manual_path.map(|path| path.display().to_string()),
+        netease_database_bound: netease_database_bound(&state),
         refresh: library_progress_snapshot(&state),
         database_warning,
         total_track_count: stats.total,
@@ -4855,164 +5185,275 @@ fn locate_netease_library(
     state: tauri::State<'_, AppState>,
     force: Option<bool>,
 ) -> NeteaseDiscovery {
-    let force = force.unwrap_or(false);
-    let emit = |event: NeteaseDiscoveryProgressEvent| {
-        let _ = app.emit("netease-discovery-progress", event);
-    };
-    emit(NeteaseDiscoveryProgressEvent {
-        status: "running".to_string(),
-        stage: "locatingDatabase".to_string(),
-        processed: 0,
-        total: None,
-        current_item: String::new(),
-        message: "正在查找网易云数据库".to_string(),
-        suggestion: None,
-        error: None,
-    });
-    let manual_path = manual_netease_database_path(&state);
-    let task_one_source = (!force)
-        .then(|| task_one_music_directory(&state))
-        .flatten();
-    let (mut discovery, warning) = if let Some(path) = manual_path.as_deref() {
-        match discover_netease_library_from_database_observed(path, false, |progress| {
-            emit(NeteaseDiscoveryProgressEvent {
-                status: "running".to_string(),
-                stage: progress.stage.to_string(),
-                processed: progress.processed,
-                total: progress.total,
-                current_item: progress.current_item,
-                message: progress.message,
-                suggestion: None,
-                error: None,
-            });
-        }) {
-            Ok(discovery) => (discovery, None),
-            Err(error) => (
-                discover_netease_library_observed(false, |progress| {
-                    emit(NeteaseDiscoveryProgressEvent {
-                        status: "running".to_string(),
-                        stage: progress.stage.to_string(),
-                        processed: progress.processed,
-                        total: progress.total,
-                        current_item: progress.current_item,
-                        message: progress.message,
-                        suggestion: None,
-                        error: None,
-                    });
-                }),
-                Some(format!("保存的网易云数据库不可用：{error}，已尝试自动定位")),
-            ),
+    let _force = force.unwrap_or(false);
+    let library = Arc::clone(&state.library);
+    library.netease_database_bound.store(true, Ordering::SeqCst);
+    if let Err(error) = persist_preferences_checked(state.inner()) {
+        eprintln!("Failed to persist NetEase binding: {error}");
+    }
+    {
+        let runtime = library
+            .netease_discovery
+            .lock()
+            .expect("netease discovery lock poisoned");
+        if matches!(runtime.status.as_str(), "running" | "cancelling") {
+            return NeteaseDiscovery {
+                database_path: None,
+                music_folder: None,
+                record_count: 0,
+                local_file_count: 0,
+            };
         }
-    } else {
-        (
-            discover_netease_library_observed(false, |progress| {
-                emit(NeteaseDiscoveryProgressEvent {
-                    status: "running".to_string(),
-                    stage: progress.stage.to_string(),
-                    processed: progress.processed,
-                    total: progress.total,
-                    current_item: progress.current_item,
-                    message: progress.message,
-                    suggestion: None,
-                    error: None,
-                });
-            }),
+    }
+    library.netease_discovery_cancel.store(false, Ordering::SeqCst);
+    if let Ok(mut worker) = library.netease_discovery_worker.lock() {
+        worker.take();
+    }
+    let discovery_id = format!("discovery-{}", unique_timestamp());
+    record_global_event(
+        state.inner(),
+        "netease_discovery_started",
+        Some(discovery_id.clone()),
+        Some("locatingDatabase".to_string()),
+        Some("running".to_string()),
+        serde_json::json!({"force": _force}),
+        None,
+    );
+    if let Ok(mut runtime) = library.netease_discovery.lock() {
+        runtime.discovery_id = Some(discovery_id.clone());
+        runtime.status = "running".to_string();
+    }
+    let emit = |status: &str,
+                stage: &str,
+                processed: usize,
+                total: Option<usize>,
+                current_item: &str,
+                message: &str,
+                suggestion: Option<NeteaseDiscovery>,
+                error: Option<String>| {
+        let _ = app.emit(
+            "netease-discovery-progress",
+            NeteaseDiscoveryProgressEvent {
+                discovery_id: Some(discovery_id.clone()),
+                status: status.to_string(),
+                stage: stage.to_string(),
+                processed,
+                total,
+                current_item: current_item.to_string(),
+                message: message.to_string(),
+                suggestion,
+                error,
+            },
+        );
+    };
+    emit(
+        "running",
+        "checkingKnownFolders",
+        0,
+        None,
+        "",
+        "正在检查网易云音乐目录",
+        None,
+        None,
+    );
+
+    if let Some(folder) = known_netease_music_folder() {
+        let discovery = NeteaseDiscovery {
+            database_path: None,
+            music_folder: Some(folder.clone()),
+            record_count: 0,
+            local_file_count: 0,
+        };
+        emit(
+            "running",
+            "checkingMusicFolder",
+            0,
             None,
+            "",
+            "已找到网易云音乐目录，正在统计歌曲",
+            Some(discovery.clone()),
+            None,
+        );
+        let app_for_worker = app.clone();
+        let library_for_worker = Arc::clone(&library);
+        let journal_for_worker = runtime_journal(state.inner());
+        let id_for_worker = discovery_id.clone();
+        let discovery_for_worker = discovery.clone();
+        let handle = thread::spawn(move || {
+            let mut last_emit = Instant::now() - Duration::from_millis(100);
+            let result = count_audio_files_observed_cancellable(
+                &folder,
+                || library_for_worker.netease_discovery_cancel.load(Ordering::SeqCst),
+                |processed, path| {
+                    if last_emit.elapsed() >= Duration::from_millis(100) {
+                        last_emit = Instant::now();
+                        let _ = app_for_worker.emit(
+                            "netease-discovery-progress",
+                            NeteaseDiscoveryProgressEvent {
+                                discovery_id: Some(id_for_worker.clone()),
+                                status: "running".to_string(),
+                                stage: "checkingMusicFolder".to_string(),
+                                processed,
+                                total: None,
+                                current_item: path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default(),
+                                message: "正在统计网易云音乐目录".to_string(),
+                                suggestion: None,
+                                error: None,
+                            },
+                        );
+                    }
+                },
+            );
+            match result {
+                Ok(count) => {
+                    if let Some(journal) = journal_for_worker.as_ref() {
+                        journal.record_event("netease_discovery_completed", Some(id_for_worker.clone()), Some("checkingMusicFolder".to_string()), Some("completed".to_string()), serde_json::json!({"localFileCount": count}), None);
+                    }
+                    let mut completed = discovery_for_worker;
+                    completed.local_file_count = count;
+                    if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() {
+                        runtime.status = "completed".to_string();
+                    }
+                    let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent {
+                        discovery_id: Some(id_for_worker), status: "completed".to_string(), stage: "checkingMusicFolder".to_string(),
+                        processed: count, total: Some(count), current_item: String::new(), message: "网易云目录发现完成".to_string(), suggestion: Some(completed), error: None,
+                    });
+                }
+                Err(NeteasePathLookupError::Cancelled) => {
+                    if let Some(journal) = journal_for_worker.as_ref() { journal.record_event("netease_discovery_cancelled", Some(id_for_worker.clone()), Some("checkingMusicFolder".to_string()), Some("cancelled".to_string()), serde_json::Value::Null, None); }
+                    if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "cancelled".to_string(); }
+                    let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent {
+                        discovery_id: Some(id_for_worker), status: "cancelled".to_string(), stage: "checkingMusicFolder".to_string(), processed: 0, total: None, current_item: String::new(), message: "网易云目录扫描已取消".to_string(), suggestion: None, error: None,
+                    });
+                }
+                Err(NeteasePathLookupError::Failed(error)) => {
+                    if let Some(journal) = journal_for_worker.as_ref() { journal.record_event("netease_discovery_error", Some(id_for_worker.clone()), Some("checkingMusicFolder".to_string()), Some("error".to_string()), serde_json::Value::Null, Some(error.clone())); }
+                    if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "error".to_string(); }
+                    let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent {
+                        discovery_id: Some(id_for_worker), status: "error".to_string(), stage: "checkingMusicFolder".to_string(), processed: 0, total: None, current_item: String::new(), message: "网易云目录扫描失败".to_string(), suggestion: None, error: Some(error),
+                    });
+                }
+            }
+        });
+        if let Ok(mut worker) = library.netease_discovery_worker.lock() {
+            *worker = Some(handle);
+        }
+        return discovery;
+    }
+
+    // No conventional directory exists.  Keep the command responsive and do
+    // only schema/path-column work in this worker; full rows are never loaded.
+    let manual_path = manual_netease_database_path(&state);
+    let app_for_worker = app.clone();
+    let library_for_worker = Arc::clone(&library);
+    let journal_for_worker = runtime_journal(state.inner());
+    let id_for_worker = discovery_id.clone();
+    let handle = thread::spawn(move || {
+        let candidates = manual_path.clone().into_iter().chain(database_candidates()).collect::<Vec<_>>();
+        let mut selected = None;
+        let mut warning = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            if library_for_worker.netease_discovery_cancel.load(Ordering::SeqCst) {
+                if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "cancelled".to_string(); }
+                let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "cancelled".to_string(), stage: "locatingDatabase".to_string(), processed: index, total: Some(candidates.len()), current_item: String::new(), message: "网易云目录扫描已取消".to_string(), suggestion: None, error: None });
+                return;
+            }
+            let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker.clone()), status: "running".to_string(), stage: "locatingDatabase".to_string(), processed: index, total: Some(candidates.len()), current_item: String::new(), message: "正在定位网易云数据库".to_string(), suggestion: None, error: None });
+            if let Some(journal) = journal_for_worker.as_ref() { journal.record_event("netease_database_candidate", Some(id_for_worker.clone()), Some("locatingDatabase".to_string()), Some("running".to_string()), serde_json::json!({"candidatePath": candidate.display().to_string(), "index": index}), None); }
+            match w4dj::netease::probe_netease_database(candidate) {
+                Ok(summary) if summary.supported => { if let Some(journal) = journal_for_worker.as_ref() { journal.record_event("netease_database_schema_supported", Some(id_for_worker.clone()), Some("locatingDatabase".to_string()), Some("completed".to_string()), serde_json::json!({"path": summary.path.display().to_string(), "recordCount": summary.record_count}), None); } selected = Some(summary); break; }
+                Ok(_) => { if manual_path.as_deref() == Some(candidate.as_path()) { warning = Some("保存的网易云数据库 schema 不受支持，已尝试自动定位".to_string()); } }
+                Err(error) => {
+                    if let Some(journal) = journal_for_worker.as_ref() {
+                        journal.record_event(
+                            "netease_database_probe_error",
+                            Some(id_for_worker.clone()),
+                            Some("locatingDatabase".to_string()),
+                            Some("error".to_string()),
+                            serde_json::json!({"candidatePath": candidate.display().to_string()}),
+                            Some(error.to_string()),
+                        );
+                    }
+                    if manual_path.as_deref() == Some(candidate.as_path()) {
+                        warning = Some(format!("保存的网易云数据库不可用：{error}，已尝试自动定位"));
+                    }
+                }
+            }
+        }
+        let Some(summary) = selected else {
+            if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "error".to_string(); }
+            let message = warning.unwrap_or_else(|| "未找到网易云本地数据库或音乐目录".to_string());
+            let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "error".to_string(), stage: "locatingDatabase".to_string(), processed: 0, total: None, current_item: String::new(), message: message.clone(), suggestion: None, error: Some(message) });
+            return;
+        };
+        let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker.clone()), status: "running".to_string(), stage: "queryingPaths".to_string(), processed: 0, total: Some(summary.record_count), current_item: String::new(), message: "正在读取网易云音乐目录字段".to_string(), suggestion: None, error: None });
+        let mut last_path_emit = Instant::now() - Duration::from_millis(100);
+        let folder = match derive_netease_music_folder_from_database_observed(&summary.path, || library_for_worker.netease_discovery_cancel.load(Ordering::SeqCst), |processed, total| {
+            if last_path_emit.elapsed() >= Duration::from_millis(100) || processed == total {
+                last_path_emit = Instant::now();
+                let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker.clone()), status: "running".to_string(), stage: "queryingPaths".to_string(), processed, total: Some(total), current_item: String::new(), message: "正在读取网易云音乐目录字段".to_string(), suggestion: None, error: None });
+            }
+        }) {
+            Ok(Some(folder)) => folder,
+            Ok(None) => { if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "error".to_string(); } let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "error".to_string(), stage: "checkingMusicFolder".to_string(), processed: 0, total: None, current_item: String::new(), message: "数据库中未找到本机网易云音乐目录".to_string(), suggestion: None, error: Some("数据库中未找到本机网易云音乐目录".to_string()) }); return; }
+            Err(NeteasePathLookupError::Cancelled) => { if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "cancelled".to_string(); } let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "cancelled".to_string(), stage: "queryingPaths".to_string(), processed: 0, total: None, current_item: String::new(), message: "网易云目录扫描已取消".to_string(), suggestion: None, error: None }); return; }
+            Err(NeteasePathLookupError::Failed(error)) => { if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "error".to_string(); } let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "error".to_string(), stage: "queryingPaths".to_string(), processed: 0, total: None, current_item: String::new(), message: error.clone(), suggestion: None, error: Some(error) }); return; }
+        };
+        let mut discovery = NeteaseDiscovery { database_path: Some(summary.path), music_folder: Some(folder.clone()), record_count: summary.record_count, local_file_count: 0 };
+        let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker.clone()), status: "running".to_string(), stage: "checkingMusicFolder".to_string(), processed: 0, total: None, current_item: String::new(), message: "正在统计网易云音乐目录".to_string(), suggestion: Some(discovery.clone()), error: warning.clone() });
+        match count_audio_files_observed_cancellable(&folder, || library_for_worker.netease_discovery_cancel.load(Ordering::SeqCst), |_, _| {}) {
+            Ok(count) => { discovery.local_file_count = count; if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "completed".to_string(); } let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "completed".to_string(), stage: "checkingMusicFolder".to_string(), processed: count, total: Some(count), current_item: String::new(), message: "网易云目录发现完成".to_string(), suggestion: Some(discovery), error: None }); }
+            Err(NeteasePathLookupError::Cancelled) => { if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "cancelled".to_string(); } let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "cancelled".to_string(), stage: "checkingMusicFolder".to_string(), processed: 0, total: None, current_item: String::new(), message: "网易云目录扫描已取消".to_string(), suggestion: None, error: None }); }
+            Err(NeteasePathLookupError::Failed(error)) => { if let Ok(mut runtime) = library_for_worker.netease_discovery.lock() { runtime.status = "error".to_string(); } let _ = app_for_worker.emit("netease-discovery-progress", NeteaseDiscoveryProgressEvent { discovery_id: Some(id_for_worker), status: "error".to_string(), stage: "checkingMusicFolder".to_string(), processed: 0, total: None, current_item: String::new(), message: error.clone(), suggestion: Some(discovery), error: Some(error) }); }
+        }
+    });
+    if let Ok(mut worker) = library.netease_discovery_worker.lock() { *worker = Some(handle); }
+    NeteaseDiscovery { database_path: None, music_folder: None, record_count: 0, local_file_count: 0 }
+}
+
+#[tauri::command]
+fn cancel_netease_discovery(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> NeteaseDiscoveryProgressEvent {
+    let library = &state.library;
+    let (discovery_id, status) = {
+        let mut runtime = library.netease_discovery.lock().expect("netease discovery lock poisoned");
+        if matches!(runtime.status.as_str(), "running" | "cancelling") {
+            library.netease_discovery_cancel.store(true, Ordering::SeqCst);
+            runtime.status = "cancelling".to_string();
+        }
+        (
+            runtime.discovery_id.clone(),
+            if runtime.status.is_empty() {
+                "cancelled".to_string()
+            } else {
+                runtime.status.clone()
+            },
         )
     };
-    if let Some(task_one_source) = task_one_source.clone() {
-        discovery.music_folder = Some(task_one_source);
-    }
-    let discovery_ok = discovery.database_path.is_some();
-    if !discovery_ok {
-        emit(NeteaseDiscoveryProgressEvent {
-            status: "error".to_string(),
-            stage: "checkingMusicFolder".to_string(),
-            processed: 0,
-            total: None,
-            current_item: String::new(),
-            message: warning.clone().unwrap_or_else(|| {
-                "未找到网易云本地数据库，请选择来源或在歌曲库中手动选择数据库".to_string()
-            }),
-            suggestion: Some(discovery.clone()),
-            error: Some(warning.unwrap_or_else(|| "未找到网易云本地数据库".to_string())),
-        });
-        return discovery;
-    }
-
-    let should_count = discovery.music_folder.as_deref().is_some_and(|folder| {
-        if let Some(current) = task_one_source.as_deref() {
-            w4dj::scan_cache::normalize_path(folder) != w4dj::scan_cache::normalize_path(current)
-        } else {
-            true
-        }
-    });
-
-    if !should_count {
-        emit(NeteaseDiscoveryProgressEvent {
-            status: "completed".to_string(),
-            stage: "checkingMusicFolder".to_string(),
-            processed: 0,
-            total: Some(0),
-            current_item: String::new(),
-            message: warning.unwrap_or_else(|| "网易云库发现完成".to_string()),
-            suggestion: Some(discovery.clone()),
-            error: None,
-        });
-        return discovery;
-    }
-
-    emit(NeteaseDiscoveryProgressEvent {
-        status: "running".to_string(),
+    let event = NeteaseDiscoveryProgressEvent {
+        discovery_id,
+        status,
         stage: "checkingMusicFolder".to_string(),
         processed: 0,
         total: None,
         current_item: String::new(),
-        message: "正在检查音乐目录".to_string(),
-        suggestion: Some(discovery.clone()),
+        message: "正在取消网易云目录扫描".to_string(),
+        suggestion: None,
         error: None,
-    });
-    if let Some(folder) = discovery.music_folder.clone() {
-        let app = app.clone();
-        let warning = warning.clone();
-        let suggestion = discovery.clone();
-        thread::spawn(move || {
-            let count = count_audio_files_observed(&folder, |processed, path| {
-                let _ = app.emit(
-                    "netease-discovery-progress",
-                    NeteaseDiscoveryProgressEvent {
-                        status: "running".to_string(),
-                        stage: "checkingMusicFolder".to_string(),
-                        processed,
-                        total: None,
-                        current_item: path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        message: "正在检查音乐目录".to_string(),
-                        suggestion: None,
-                        error: None,
-                    },
-                );
-            });
-            let mut completed = suggestion;
-            completed.local_file_count = count;
-            let _ = app.emit(
-                "netease-discovery-progress",
-                NeteaseDiscoveryProgressEvent {
-                    status: "completed".to_string(),
-                    stage: "checkingMusicFolder".to_string(),
-                    processed: count,
-                    total: Some(count),
-                    current_item: String::new(),
-                    message: warning.unwrap_or_else(|| "网易云库发现完成".to_string()),
-                    suggestion: Some(completed),
-                    error: None,
-                },
-            );
-        });
-    }
-    discovery
+    };
+    record_global_event(
+        state.inner(),
+        "netease_discovery_cancel_requested",
+        event.discovery_id.clone(),
+        Some(event.stage.clone()),
+        Some(event.status.clone()),
+        serde_json::Value::Null,
+        None,
+    );
+    let _ = app.emit("netease-discovery-progress", event.clone());
+    event
 }
 
 fn try_start_library_refresh(
@@ -5078,6 +5519,15 @@ fn refresh_library_catalog(
     };
     let refresh_id = format!("library-{}", unique_timestamp());
     let initial = try_start_library_refresh(&state.library, refresh_id.clone())?;
+    record_global_event(
+        state.inner(),
+        "library_refresh_started",
+        Some(refresh_id.clone()),
+        Some("locatingDatabase".to_string()),
+        Some("running".to_string()),
+        serde_json::Value::Null,
+        None,
+    );
     emit_library_progress(&app, &initial);
     if let Some(worker) = state
         .library
@@ -5178,6 +5628,12 @@ fn select_netease_database_fallback(
     NeteaseMetadataResolver::load_exact(&database_path)
         .map_err(|error| format!("所选网易云数据库无效：{error}"))?;
     set_manual_netease_database_path(state.inner(), Some(database_path))?;
+    state
+        .inner()
+        .library
+        .netease_database_bound
+        .store(true, Ordering::SeqCst);
+    persist_preferences_checked(state.inner())?;
     load_library_status(state)
 }
 
@@ -5191,12 +5647,21 @@ fn clear_netease_database_fallback(
 }
 
 #[tauri::command]
+fn unbind_netease_database(
+    state: tauri::State<'_, AppState>,
+) -> Result<LibraryStatus, String> {
+    ensure_netease_database_not_busy(state.inner())?;
+    unbind_netease_database_binding(state.inner())?;
+    load_library_status(state)
+}
+
+#[tauri::command]
 fn load_netease_metadata_database_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<NeteaseMetadataDatabaseStatus, String> {
     let manual_path = manual_netease_database_path(state.inner());
     let cache_path = netease_metadata_cache_path(state.inner());
-    resolve_netease_metadata_database_status(manual_path.as_deref(), &cache_path)
+    resolve_netease_metadata_database_status(netease_database_bound(state.inner()), manual_path.as_deref(), &cache_path)
         .map(|(status, _)| status)
 }
 
@@ -5215,6 +5680,8 @@ fn select_netease_metadata_database(
         return Err("所选网易云数据库无效：schema 不受支持".to_string());
     }
     set_manual_netease_database_path(state.inner(), Some(database_path))?;
+    state.inner().library.netease_database_bound.store(true, Ordering::SeqCst);
+    persist_preferences_checked(state.inner())?;
     load_netease_metadata_database_status(state)
 }
 
@@ -5258,6 +5725,9 @@ fn prepare_netease_metadata_cache(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<NeteaseMetadataCacheProgress, String> {
+    if !netease_database_bound(state.inner()) {
+        return Err("网易云数据库未绑定".to_string());
+    }
     {
         let progress = state
             .library
@@ -5753,26 +6223,46 @@ fn is_image_bytes(bytes: &[u8]) -> bool {
 #[tauri::command]
 fn clear_library_catalog_cache(state: tauri::State<'_, AppState>) -> Result<(), String> {
     if matches!(library_progress_snapshot(&state).status, LibraryRefreshStatus::Running | LibraryRefreshStatus::Cancelling) {
-        return Err("歌曲库正在更新，暂时不能清除索引".to_string());
+        return Err("歌曲库正在更新，暂时不能清除歌曲库与分析缓存".to_string());
     }
     if invalid_scan_is_active(&state) {
-        return Err("失效歌曲正在扫描，暂时不能清除索引".to_string());
+        return Err("失效歌曲正在扫描，暂时不能清除歌曲库与分析缓存".to_string());
+    }
+    if state.ffmpeg_registry.active_count() > 0 {
+        return Err("转换或音频处理正在进行，暂时不能清除歌曲库与分析缓存".to_string());
+    }
+    if state.analysis_active.load(Ordering::SeqCst) {
+        return Err("增强分析正在进行，暂时不能清除歌曲库与分析缓存".to_string());
     }
     let path = library_catalog_path(&state);
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    for candidate in [
-        path.clone(),
-        PathBuf::from(format!("{}-wal", path.display())),
-        PathBuf::from(format!("{}-shm", path.display())),
-    ] {
-        match fs::remove_file(candidate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("清除歌曲库缓存失败：{error}")),
-        }
+    let analysis_path = current_analysis_path(&state);
+    let _guard = state
+        .history_write_lock
+        .lock()
+        .expect("history write lock poisoned");
+    let previous_analysis = load_analysis_file(&analysis_path)?;
+    clear_analysis_file(&analysis_path)?;
+    let (mut library, _) = open_w4dj_library(&path)
+        .map_err(|error| {
+            let _ = save_analysis_file(&analysis_path, &previous_analysis);
+            format!("打开 W4DJ 歌曲库失败：{error}")
+        })?;
+    if let Err(error) = library.clear_output_library() {
+        let _ = save_analysis_file(&analysis_path, &previous_analysis);
+        return Err(format!("清除歌曲库失败：{error}"));
     }
+    record_global_event(
+        state.inner(),
+        "library_cache_cleared",
+        None,
+        Some("library".to_string()),
+        Some("completed".to_string()),
+        serde_json::Value::Null,
+        None,
+    );
     Ok(())
 }
 
@@ -6182,6 +6672,126 @@ fn build_runtime_session_export(
     })
 }
 
+#[tauri::command]
+fn export_run_report(
+    id: String,
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("请指定本次运行报告保存位置".to_string());
+    }
+    let history_path = state
+        .history_path
+        .lock()
+        .map_err(|_| "历史记录锁损坏".to_string())?
+        .clone();
+    let entries = load_history_file(&history_path)
+        .map_err(|error| format!("无法读取转换历史：{error}"))?;
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| "找不到对应的转换历史".to_string())?;
+    let monitor_root = state
+        .test_monitor_path
+        .lock()
+        .map_err(|_| "运行会话路径锁损坏".to_string())?
+        .clone();
+    let session_dir = resolve_runtime_session_dir(&monitor_root, &entry);
+    let operation_id = entry
+        .operation_id
+        .as_deref()
+        .unwrap_or(&entry.batch_id)
+        .to_string();
+    record_global_event(
+        state.inner(),
+        "run_report_export_started",
+        Some(operation_id.clone()),
+        Some("report".to_string()),
+        Some("running".to_string()),
+        serde_json::json!({"historyId": id, "path": path}),
+        None,
+    );
+    let mut payload = build_runtime_session_export(&entry, session_dir.as_deref());
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("reportType".into(), serde_json::json!("run"));
+        object.insert(
+            "operationId".into(),
+            serde_json::json!(entry.operation_id.clone().unwrap_or_else(|| entry.batch_id.clone())),
+        );
+        if let Some(journal) = runtime_journal(state.inner()) {
+            let events = journal
+                .events_snapshot()
+                .into_iter()
+                .filter(|event| event.operation_id.as_deref() == Some(operation_id.as_str()))
+                .collect::<Vec<_>>();
+            object.insert("globalJournal".into(), serde_json::json!(events));
+        }
+    }
+    let temporary = Path::new(&path).with_extension(format!("json.tmp-{}", std::process::id()));
+    if let Some(parent) = temporary.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建本次运行报告目录失败：{error}"))?;
+    }
+    let result = (|| {
+        let mut file = fs::File::create(&temporary)
+            .map_err(|error| format!("创建本次运行报告失败：{error}"))?;
+        serde_json::to_writer_pretty(&mut file, &payload)
+            .map_err(|error| format!("本次运行报告序列化失败：{error}"))?;
+        file.write_all(b"\n")
+            .map_err(|error| format!("写入本次运行报告失败：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("同步本次运行报告失败：{error}"))?;
+        fs::rename(&temporary, Path::new(&path))
+            .map_err(|error| format!("保存本次运行报告失败：{error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    if result.is_ok() {
+        record_global_event(
+            state.inner(),
+            "run_report_exported",
+            Some(operation_id),
+            Some("report".to_string()),
+            Some("completed".to_string()),
+            serde_json::json!({"path": path}),
+            None,
+        );
+    }
+    result
+}
+
+#[tauri::command]
+fn export_full_runtime_report(
+    path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("请指定完整运行报告保存位置".to_string());
+    }
+    let journal = runtime_journal(state.inner()).ok_or_else(|| "运行日志尚未初始化".to_string())?;
+    journal.record_event(
+        "full_runtime_report_export_started",
+        None,
+        Some("report".to_string()),
+        Some("running".to_string()),
+        serde_json::json!({"path": path}),
+        None,
+    );
+    journal
+        .export_full_report(Path::new(&path))
+        .map_err(|error| format!("完整运行报告保存失败：{error}"))?;
+    journal.record_event(
+        "full_runtime_report_exported",
+        None,
+        Some("report".to_string()),
+        Some("completed".to_string()),
+        serde_json::json!({"path": path}),
+        None,
+    );
+    Ok(())
+}
+
 /// Return the in-memory monitor for a batch, reopening its durable session
 /// after an application restart when necessary. Keeping the recovered monitor
 /// in the map also serializes concurrent event appends and state snapshots.
@@ -6208,6 +6818,7 @@ fn runtime_monitor_for_batch(
         .and_then(|directory| TestMonitor::from_existing(directory).ok())
         .map(Arc::new);
     if let Some(monitor) = monitor.as_ref() {
+        monitor.attach_journal(runtime_journal(state));
         monitors.insert(batch_id.to_string(), Arc::clone(monitor));
     }
     monitor
@@ -6225,7 +6836,20 @@ fn record_runtime_session_event(
     }
     let monitor = runtime_monitor_for_batch(&state, &batch_id);
     if let Some(monitor) = monitor {
-        monitor.record_event(&event, details);
+        monitor.record_event(&event, details.clone());
+    } else {
+        // Library-only analysis has no TestMonitor. Keep those events in the
+        // global journal directly; conversion-backed sessions are forwarded
+        // by TestMonitor::record_event to avoid duplicate entries.
+        record_global_event(
+            state.inner(),
+            event,
+            Some(batch_id),
+            Some("runtime-session".to_string()),
+            None,
+            details,
+            None,
+        );
     }
     Ok(())
 }
@@ -6237,12 +6861,16 @@ fn claim_analysis_run(
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
     let monitor = runtime_monitor_for_batch(&state, &batch_id);
-    match monitor {
+    let result = match monitor {
         Some(monitor) => monitor.claim_analysis_run(&attempt_id).map(|()| true),
         // Library-only analysis has no conversion monitor. It still uses the
         // same per-song Worker lifecycle, but there is no shared run to claim.
         None => Ok(true),
+    };
+    if result == Ok(true) {
+        state.analysis_active.store(true, Ordering::SeqCst);
     }
+    result
 }
 
 #[tauri::command]
@@ -6258,6 +6886,7 @@ fn finalize_analysis_session(
         .lock()
         .expect("runtime session map lock poisoned")
         .remove(&batch_id);
+    state.analysis_active.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -6537,6 +7166,8 @@ fn main() {
                 GlobalConcurrencyBudget::new(w4dj::concurrency::DEFAULT_CONCURRENCY_LIMIT),
             ))),
             ffmpeg_registry: Arc::new(w4dj::sync::ActiveFfmpegRegistry::new()),
+            journal: Arc::new(Mutex::new(None)),
+            analysis_active: AtomicBool::new(false),
             headless_config: headless_config.clone(),
         })
         .plugin(tauri_plugin_dialog::init())
@@ -6571,10 +7202,13 @@ fn main() {
             load_incomplete_analysis_run,
             retry_history_failures,
             record_runtime_session_event,
+            record_global_journal_event,
             claim_analysis_run,
             finalize_analysis_session,
             export_runtime_session,
             export_history_error_report,
+            export_run_report,
+            export_full_runtime_report,
             delete_history_entry_command,
             clear_history_command,
             app_info,
@@ -6597,10 +7231,12 @@ fn main() {
             export_rekordbox_xml,
             load_library_status,
             locate_netease_library,
+            cancel_netease_discovery,
             refresh_library_catalog,
             cancel_library_refresh,
             select_netease_database_fallback,
             clear_netease_database_fallback,
+            unbind_netease_database,
             load_netease_metadata_database_status,
             select_netease_metadata_database,
             clear_netease_metadata_database,
@@ -6683,8 +7319,9 @@ fn main() {
             let startup_library_path = w4dj_library_path.clone();
             let test_monitor_path = app
                 .path()
-                .download_dir()
-                .unwrap_or_else(|_| default_download_directory())
+                .app_data_dir()
+                .or_else(|_| app.path().app_config_dir())
+                .expect("failed to resolve application data directory")
                 .join(RUNTIME_SESSION_DIRECTORY);
 
             {
@@ -6759,6 +7396,48 @@ fn main() {
                 *path_guard = test_monitor_path;
             }
 
+            // Start the global journal before any user-triggered command can
+            // run.  It is separate from per-conversion runtime sessions and
+            // never writes into Downloads.
+            let journal_root = app
+                .path()
+                .app_data_dir()
+                .or_else(|_| app.path().app_config_dir())
+                .expect("failed to resolve runtime journal directory")
+                .join("W4DJ-runtime-journal");
+            match RuntimeJournal::start(&journal_root) {
+                Ok((journal, previous_interrupted)) => {
+                    let state = app.state::<AppState>();
+                    if let Ok(mut slot) = state.journal.lock() {
+                        *slot = Some(journal.clone());
+                    }
+                    journal.record_event(
+                        "app_started",
+                        None,
+                        Some("startup".to_string()),
+                        Some("running".to_string()),
+                        serde_json::json!({
+                            "appVersion": env!("CARGO_PKG_VERSION"),
+                            "previousRunInterrupted": previous_interrupted,
+                        }),
+                        None,
+                    );
+                    if previous_interrupted {
+                        journal.record_event(
+                            "previous_run_interrupted",
+                            None,
+                            Some("startup".to_string()),
+                            Some("interrupted".to_string()),
+                            serde_json::Value::Null,
+                            None,
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Failed to initialize runtime journal: {error}");
+                }
+            }
+
             {
                 let mut preferences = load_preferences(&preferences_path)
                     .unwrap_or_else(|_| AppPreferences::default());
@@ -6772,6 +7451,10 @@ fn main() {
                     .netease_database_path
                     .clone()
                     .map(PathBuf::from);
+                state
+                    .library
+                    .netease_database_bound
+                    .store(preferences.netease_database_bound, Ordering::SeqCst);
                 let mut controller = state.controller.lock().expect("desktop lock poisoned");
                 controller.apply_preferences(preferences);
                 let limit = controller.state().concurrency_limit as usize;
@@ -6800,14 +7483,76 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run W4DJ desktop shell");
+        .build(tauri::generate_context!())
+        .expect("failed to build W4DJ desktop shell")
+        .run(|app_handle: &tauri::AppHandle<tauri::Wry>, event| {
+            if matches!(event, tauri::RunEvent::Exit)
+                && let Some(journal) = runtime_journal(&app_handle.state::<AppState>())
+            {
+                journal.record_event(
+                    "app_stopped",
+                    None,
+                    Some("shutdown".to_string()),
+                    Some("completed".to_string()),
+                    serde_json::Value::Null,
+                    None,
+                );
+                journal.mark_clean_shutdown();
+            }
+        });
 }
 
 fn persist_preferences(state: &tauri::State<'_, AppState>) {
     if let Err(error) = persist_preferences_checked(state.inner()) {
         eprintln!("Failed to save preferences: {error}");
     }
+}
+
+fn runtime_journal(state: &AppState) -> Option<RuntimeJournal> {
+    state
+        .journal
+        .lock()
+        .ok()
+        .and_then(|journal| journal.clone())
+}
+
+fn record_global_event(
+    state: &AppState,
+    event: impl Into<String>,
+    operation_id: Option<String>,
+    stage: Option<String>,
+    status: Option<String>,
+    details: serde_json::Value,
+    error: Option<String>,
+) {
+    if let Some(journal) = runtime_journal(state) {
+        journal.record_event(event, operation_id, stage, status, details, error);
+    }
+}
+
+/// Record a small semantic UI action in the global journal.  The command is
+/// intentionally fire-and-forget from the frontend: RuntimeJournal::record
+/// uses try_send and never performs file I/O on the WebView thread.
+#[tauri::command]
+fn record_global_journal_event(
+    event: String,
+    details: Option<serde_json::Value>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let event = event.trim();
+    if event.is_empty() {
+        return Err("日志事件名称不能为空".to_string());
+    }
+    record_global_event(
+        state.inner(),
+        event.to_string(),
+        None,
+        Some("ui".to_string()),
+        Some("completed".to_string()),
+        details.unwrap_or(serde_json::Value::Null),
+        None,
+    );
+    Ok(())
 }
 
 fn apply_analysis_for_candidate_to_path(
@@ -6938,6 +7683,7 @@ fn run_confirmed_sync_task(
     let recovery_entry = Arc::new(Mutex::new(HistoryEntry {
         id: history_id,
         batch_id: job.batch_id.clone(),
+        operation_id: Some(job.batch_id.clone()),
         slot_index: job.slot_index,
         started_at: started_at.clone(),
         finished_at: started_at.clone(),
@@ -7371,7 +8117,8 @@ fn run_confirmed_sync_task(
     };
     let history_entry = HistoryEntry {
         id: format!("{}-slot{}", job.batch_id, job.slot_index + 1),
-        batch_id: job.batch_id,
+        batch_id: job.batch_id.clone(),
+        operation_id: Some(job.batch_id.clone()),
         slot_index: job.slot_index,
         started_at,
         finished_at,
@@ -8112,6 +8859,7 @@ mod tests {
     use super::LibraryRefreshStage;
     use super::LibraryRefreshStatus;
     use super::LibraryState;
+    use super::NeteaseDiscoveryRuntime;
     use super::InvalidScanProgress;
     use super::ScanProgress;
     use super::ScanProgressPhase;
@@ -8127,7 +8875,9 @@ mod tests {
     use super::collect_processable_previews;
     use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
+    use super::finish_library_sync_error;
     use super::persist_history_before_terminal_state;
+    use super::prune_analysis_entries_for_scanned_roots;
     use super::validate_destination_directory;
     use super::validate_scan_previews;
     use super::validate_source_input;
@@ -8318,7 +9068,7 @@ mod tests {
             summary: None,
             error: None,
         };
-        let value = serde_json::to_value(progress).unwrap();
+        let value = serde_json::to_value(&progress).unwrap();
         assert_eq!(value["refreshId"], "library-1");
         assert_eq!(value["currentItem"], "Song.mp3");
         assert_eq!(value["status"], "running");
@@ -8346,19 +9096,120 @@ mod tests {
                 metadata_processed: 7,
                 metadata_total: Some(1088),
                 current_file: "Song.mp3".into(),
+                error: None,
             }],
         };
 
-        let value = serde_json::to_value(progress).unwrap();
+        let value = serde_json::to_value(&progress).unwrap();
         assert_eq!(value["status"], "cancelling");
         assert_eq!(value["phase"], "matching_metadata");
         assert_eq!(value["tasks"][0]["metadata_processed"], 7);
         assert_eq!(value["tasks"][0]["metadata_total"], 1088);
+        assert!(value["tasks"][0].get("error").is_none());
+
+        let mut failed = progress;
+        failed.tasks[0].phase = ScanProgressPhase::Error;
+        failed.tasks[0].error = Some("library_sync_failed".into());
+        let value = serde_json::to_value(failed).unwrap();
+        assert_eq!(value["tasks"][0]["error"], "library_sync_failed");
+    }
+
+    #[test]
+    fn library_sync_failure_marks_only_affected_task_cards_with_a_safe_error_code() {
+        let progress = Arc::new(Mutex::new(ScanProgress {
+            status: ScanStatus::Running,
+            phase: ScanProgressPhase::Completed,
+            processed: 12,
+            total: 12,
+            current_file: String::new(),
+            message: "扫描成功".into(),
+            tasks: vec![0, 1]
+                .into_iter()
+                .map(|slot_index| ScanTaskProgress {
+                    slot_index,
+                    phase: ScanProgressPhase::Completed,
+                    processed: 6,
+                    total: 6,
+                    source_processed: 6,
+                    source_total: Some(6),
+                    destination_processed: 6,
+                    destination_total: Some(6),
+                    metadata_processed: 6,
+                    metadata_total: Some(6),
+                    current_file: String::new(),
+                    error: None,
+                })
+                .collect(),
+        }));
+        let result = Arc::new(Mutex::new(Some(Vec::<SlotPreview>::new())));
+
+        finish_library_sync_error(&progress, &result, &[1]);
+
+        let progress = progress.lock().unwrap();
+        assert!(matches!(progress.status, ScanStatus::Error));
+        assert_eq!(progress.message, "歌曲库同步失败");
+        assert!(progress.tasks[0].error.is_none());
+        assert_eq!(progress.tasks[1].error.as_deref(), Some("library_sync_failed"));
+        assert!(matches!(progress.tasks[1].phase, ScanProgressPhase::Error));
+        assert!(result.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn changed_snapshot_path_is_removed_from_the_compatibility_analysis_json() {
+        let directory = std::env::temp_dir().join(format!(
+            "w4dj-prune-analysis-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = directory.join("out");
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("song.mp3");
+        fs::write(&output, b"audio").unwrap();
+        let analysis_path = directory.join("track-analysis.json");
+        fs::write(
+            &analysis_path,
+            serde_json::to_vec(&serde_json::json!([{
+                "path": output,
+                "title": "Song",
+                "artist": "Artist",
+                "album": "",
+                "durationSeconds": 1.0,
+                "bpm": 120.0,
+                "key": "C",
+                "scale": "major",
+                "keyStrength": null,
+                "integratedLoudnessLufs": -10.0,
+                "loudnessRangeLu": null,
+                "energy": 0.5,
+                "danceability": 1.0,
+                "beatPositions": [],
+                "analyzedAt": "2026-08-29T00:00:00Z",
+                "analyzer": "Essentia.js",
+                "analysisVersion": "0.2.0"
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        prune_analysis_entries_for_scanned_roots(
+            &analysis_path,
+            &[(0, root, vec![output.clone()])],
+            &[output],
+        )
+        .unwrap();
+
+        let entries: serde_json::Value =
+            serde_json::from_slice(&fs::read(&analysis_path).unwrap()).unwrap();
+        assert_eq!(entries, serde_json::json!([]));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn netease_metadata_database_status_uses_camel_case() {
         let value = serde_json::to_value(NeteaseMetadataDatabaseStatus {
+            bound: true,
             manual_path: Some("/music/db.sqlite3".into()),
             effective_path: Some("/music/db.sqlite3".into()),
             source: NeteaseMetadataDatabaseSource::Manual,
@@ -8380,6 +9231,7 @@ mod tests {
         let missing = Path::new("/definitely/missing/sqlite_storage.sqlite3");
         let (status, resolver) =
             super::resolve_netease_metadata_database_status(
+                true,
                 Some(missing),
                 Path::new("/definitely/missing/library-dashboard.sqlite3"),
             )
@@ -8526,6 +9378,7 @@ mod tests {
         let state = LibraryState {
             catalog_path: Mutex::new(PathBuf::new()),
             manual_database_path: Mutex::new(None),
+            netease_database_bound: AtomicBool::new(true),
             metadata_cache: Mutex::new(NeteaseMetadataCacheProgress::default()),
             metadata_cache_cancel: AtomicBool::new(false),
             metadata_cache_build_lock: Mutex::new(()),
@@ -8546,6 +9399,9 @@ mod tests {
             invalid_scan: Mutex::new(InvalidScanProgress::default()),
             invalid_scan_cancel: AtomicBool::new(false),
             invalid_scan_worker: Mutex::new(None),
+            netease_discovery: Mutex::new(NeteaseDiscoveryRuntime::default()),
+            netease_discovery_cancel: AtomicBool::new(false),
+            netease_discovery_worker: Mutex::new(None),
         };
 
         let initial = try_start_library_refresh(&state, "library-test".to_string()).unwrap();
@@ -8785,6 +9641,7 @@ mod tests {
         let entry = HistoryEntry {
             id: "history-export".into(),
             batch_id: "batch/export".into(),
+            operation_id: Some("batch/export".into()),
             slot_index: 0,
             started_at: "2026-08-20 00:00:00 UTC".into(),
             finished_at: "2026-08-20 00:00:01 UTC".into(),
@@ -8892,6 +9749,7 @@ mod tests {
         let entry = HistoryEntry {
             id: "history-manual-report".into(),
             batch_id: "batch-manual-report".into(),
+            operation_id: Some("batch-manual-report".into()),
             slot_index: 0,
             started_at: "2026-08-20 00:00:00 UTC".into(),
             finished_at: "2026-08-20 00:00:01 UTC".into(),
@@ -9174,6 +10032,7 @@ mod tests {
         let entry = HistoryEntry {
             id: "batch-history-order-slot1".into(),
             batch_id: "batch-history-order".into(),
+            operation_id: Some("batch-history-order".into()),
             slot_index: 0,
             started_at: "2026-08-20 06:00:00 UTC".into(),
             finished_at: "2026-08-20 06:00:01 UTC".into(),

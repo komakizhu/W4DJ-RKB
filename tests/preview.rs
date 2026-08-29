@@ -939,6 +939,7 @@ fn retry_preview_restores_pending_files_saved_before_app_exit() {
     let entry = HistoryEntry {
         id: "history-pending".into(),
         batch_id: "batch-pending".into(),
+        operation_id: None,
         slot_index: 0,
         started_at: "1".into(),
         finished_at: "1".into(),
@@ -993,6 +994,7 @@ fn retry_preview_ignores_old_macos_appledouble_failures_and_pending_files() {
     let entry = HistoryEntry {
         id: "history-appledouble".into(),
         batch_id: "batch-appledouble".into(),
+        operation_id: None,
         slot_index: 0,
         started_at: "1".into(),
         finished_at: "1".into(),

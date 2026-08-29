@@ -349,7 +349,7 @@ fn get_music_dict_ignores_macos_appledouble_sidecars() {
 }
 
 #[test]
-fn get_music_dict_keeps_non_appledouble_track_with_dot_underscore_name() {
+fn get_music_dict_ignores_dot_underscore_track_even_without_appledouble_magic() {
     let temp_dir = std::env::temp_dir().join(format!(
         "w4dj-sync-policy-dot-underscore-track-{}",
         std::process::id()
@@ -361,8 +361,7 @@ fn get_music_dict_keeps_non_appledouble_track_with_dot_underscore_name() {
 
     let dict = sync::get_music_dict(temp_dir.to_str().unwrap());
 
-    assert_eq!(dict.len(), 1);
-    assert!(dict.values().any(|(_, path)| path == &source_path));
+    assert!(dict.is_empty());
 
     let _ = fs::remove_dir_all(temp_dir);
 }

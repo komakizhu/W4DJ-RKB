@@ -18,6 +18,7 @@ pub mod netease_cache;
 pub mod netease_library;
 pub mod preferences;
 pub mod preview;
+pub mod runtime_journal;
 pub mod scan_cache;
 pub mod sync;
 pub mod task;

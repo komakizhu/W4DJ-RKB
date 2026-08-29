@@ -9,6 +9,7 @@ use crate::netease::{
     NeteaseDatabaseSummary, NeteaseRecord, choose_record, database_candidates,
     load_records_from_db, load_records_from_db_observed, probe_netease_database,
 };
+use rusqlite::{Connection, OpenFlags};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,180 @@ pub struct NeteaseDiscovery {
     pub music_folder: Option<PathBuf>,
     pub record_count: usize,
     pub local_file_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NeteasePathLookupError {
+    Cancelled,
+    Failed(String),
+}
+
+impl std::fmt::Display for NeteasePathLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("网易云目录发现已取消"),
+            Self::Failed(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for NeteasePathLookupError {}
+
+/// Resolve the conventional NetEase music directory without opening a
+/// database.  This is intentionally the first discovery step so a known local
+/// folder can be returned to the UI immediately.
+pub fn known_netease_music_folder() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("W4DJ_NETEASE_MUSIC_DIR").map(PathBuf::from)
+        && path.is_dir()
+    {
+        return Some(path);
+    }
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    [
+        home.join("Music/网易云音乐"),
+        home.join("Music/NetEase CloudMusic"),
+        home.join("Music/Netease Cloud Music"),
+    ]
+    .into_iter()
+    .find(|path| path.is_dir())
+}
+
+/// Read only the path-bearing columns from supported NetEase tables and stop
+/// as soon as an existing music root is found. No record JSON, lyrics, cover,
+/// or complete metadata row is materialized.
+pub fn derive_netease_music_folder_from_database_observed<Cancel, Observe>(
+    database_path: &Path,
+    mut is_cancelled: Cancel,
+    mut observe: Observe,
+) -> Result<Option<PathBuf>, NeteasePathLookupError>
+where
+    Cancel: FnMut() -> bool,
+    Observe: FnMut(usize, usize),
+{
+    let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| {
+        NeteasePathLookupError::Failed(format!("无法只读打开网易云数据库：{error}"))
+    })?;
+    let mut tables = Vec::new();
+    for table in ["track", "web_track", "web_offline_track", "web_cloud_track"] {
+        if is_cancelled() {
+            return Err(NeteasePathLookupError::Cancelled);
+        }
+        let exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                NeteasePathLookupError::Failed(format!("无法读取网易云数据库表结构：{error}"))
+            })?
+            != 0;
+        if exists {
+            tables.push(table);
+        }
+    }
+
+    let mut processed = 0usize;
+    for table in tables {
+        let columns = connection
+            .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            })
+            .map_err(|error| {
+                NeteasePathLookupError::Failed(format!("无法读取网易云路径字段：{error}"))
+            })?;
+        let has = |name: &str| {
+            columns
+                .iter()
+                .any(|column| column.eq_ignore_ascii_case(name))
+        };
+        let path_column = ["file", "librarypath", "relative_path"]
+            .into_iter()
+            .find(|name| has(name));
+        let directory_column = ["dir", "parentdir"].into_iter().find(|name| has(name));
+        let Some(path_column) = path_column else {
+            continue;
+        };
+        let path_expr = format!("COALESCE(\"{path_column}\", '')");
+        let directory_expr = directory_column
+            .map(|column| format!("COALESCE(\"{column}\", '')"))
+            .unwrap_or_else(|| "''".to_string());
+        let total = connection
+            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or_default()
+            .max(0) as usize;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {path_expr}, {directory_expr} FROM \"{table}\""
+            ))
+            .map_err(|error| {
+                NeteasePathLookupError::Failed(format!("无法读取网易云目录字段：{error}"))
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                NeteasePathLookupError::Failed(format!("无法遍历网易云目录字段：{error}"))
+            })?;
+        for row in rows {
+            if is_cancelled() {
+                return Err(NeteasePathLookupError::Cancelled);
+            }
+            let (path, directory) = row.map_err(|error| {
+                NeteasePathLookupError::Failed(format!("无法读取网易云目录字段：{error}"))
+            })?;
+            processed += 1;
+            observe(processed, total);
+            if let Some(root) = existing_netease_root(&path, &directory) {
+                return Ok(Some(root));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn existing_netease_root(path_value: &str, directory: &str) -> Option<PathBuf> {
+    let combined = if path_value.trim().is_empty() {
+        directory.to_string()
+    } else if directory.trim().is_empty() {
+        path_value.to_string()
+    } else {
+        let path = Path::new(path_value);
+        if path.is_absolute() {
+            path_value.to_string()
+        } else {
+            Path::new(directory)
+                .join(path)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let mut candidate = PathBuf::from(combined.replace('\\', "/"));
+    if candidate.is_file() {
+        candidate.pop();
+    }
+    let components = candidate.components().collect::<Vec<_>>();
+    components
+        .iter()
+        .rposition(|component| {
+            let name = component.as_os_str().to_string_lossy();
+            name == "网易云音乐"
+                || name.eq_ignore_ascii_case("NetEase CloudMusic")
+                || name.eq_ignore_ascii_case("Netease Cloud Music")
+        })
+        .map(|index| components[..=index].iter().collect::<PathBuf>())
+        .filter(|root| root.is_dir())
+        .or_else(|| candidate.is_dir().then_some(candidate))
 }
 
 pub fn discover_netease_library() -> NeteaseDiscovery {
@@ -473,19 +648,7 @@ where
 }
 
 fn candidate_music_folder(database_path: &Path, records: &[NeteaseRecord]) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("W4DJ_NETEASE_MUSIC_DIR").map(PathBuf::from)
-        && path.is_dir()
-    {
-        return Some(path);
-    }
-
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let known = [
-        home.join("Music/网易云音乐"),
-        home.join("Music/NetEase CloudMusic"),
-        home.join("Music/Netease Cloud Music"),
-    ];
-    if let Some(path) = known.into_iter().find(|path| path.is_dir()) {
+    if let Some(path) = known_netease_music_folder() {
         return Some(path);
     }
 
@@ -532,6 +695,35 @@ where
         observe(count, entry.path());
     }
     count
+}
+
+/// Count audio files while allowing a background discovery worker to stop
+/// cooperatively.  The callback receives the number of files seen and the
+/// current filename; no full metadata is loaded during this pass.
+pub fn count_audio_files_observed_cancellable<Cancel, Observe>(
+    root: &Path,
+    mut is_cancelled: Cancel,
+    mut observe: Observe,
+) -> Result<usize, NeteasePathLookupError>
+where
+    Cancel: FnMut() -> bool,
+    Observe: FnMut(usize, &Path),
+{
+    let mut count = 0usize;
+    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        if is_cancelled() {
+            return Err(NeteasePathLookupError::Cancelled);
+        }
+        let entry = entry.map_err(|error| {
+            NeteasePathLookupError::Failed(format!("无法检查网易云音乐目录：{error}"))
+        })?;
+        if !entry.file_type().is_file() || !is_audio_file(entry.path()) {
+            continue;
+        }
+        count += 1;
+        observe(count, entry.path());
+    }
+    Ok(count)
 }
 
 fn collect_audio_files(root: &Path) -> Vec<PathBuf> {

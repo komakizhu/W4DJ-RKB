@@ -8,6 +8,7 @@ import {
   renderDjPlaylistQrPages,
   resolveDropTargetAt,
   resolveNeteaseSituation,
+  resolveNeteaseDatabaseLinkLabel,
   renderApp,
   type AppHistoryEntry,
   type AppLosslessFormat,
@@ -282,6 +283,8 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   retryHistoryFailures: vi.fn().mockResolvedValue(makePreview(0)),
   exportHistoryErrorReport: vi.fn().mockResolvedValue(undefined),
   exportRuntimeSession: vi.fn().mockResolvedValue(undefined),
+  exportRunReport: vi.fn().mockResolvedValue(undefined),
+  exportFullRuntimeReport: vi.fn().mockResolvedValue(undefined),
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
@@ -720,6 +723,8 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-action="scan-local-netease"]')?.textContent).toContain('扫描本地网易云文件夹');
     const progress = root.querySelector('[data-slot="0"] .progress-fill') as HTMLElement;
     expect(progress.style.width).toBe('38%');
+    expect(root.querySelector('[data-slot="0"] .slot-progress-row')?.classList.contains('has-netease-status')).toBe(true);
+    expect(root.querySelector('[data-slot="0"] .progress-track')?.getAttribute('style')).toBeNull();
     expect(root.querySelector('[data-slot="0"] .progress-copy')?.textContent).toContain('Song.mp3');
   });
 
@@ -766,7 +771,7 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-slot="1"] [data-action="select-netease-database"]')).toBeNull();
     expect(root.querySelector('[data-action="scan-local-netease"]')).not.toBeNull();
     expect(root.querySelector('[data-action="select-netease-database"]')?.textContent)
-      .toContain('sqlite_storage.sqlite3');
+      .toContain('点击更换数据库');
     expect(root.querySelector('[data-action="select-netease-database"]')?.textContent)
       .not.toContain('/music/');
     expect(root.querySelector('[data-action="clear-netease-database"]')).not.toBeNull();
@@ -777,10 +782,8 @@ describe('renderApp', () => {
     expect(situation?.querySelector('[data-role="netease-situation-value"]')?.textContent)
       .toBe('数据库已选');
     expect(situation?.getAttribute('data-tone')).toBe('success');
-    expect(databaseStatus?.parentElement).toBe(neteaseToolbar);
-    expect(databaseStatus?.nextElementSibling).toBe(
-      neteaseToolbar?.querySelector('[data-role="netease-source-actions"]'),
-    );
+    expect(databaseStatus?.parentElement?.classList.contains('slot-progress-row')).toBe(true);
+    expect(neteaseToolbar?.querySelector('[data-role="netease-database-status"]')).toBeNull();
   });
 
   it('resolves compact NetEase status text while retaining diagnostic details', () => {
@@ -847,6 +850,48 @@ describe('renderApp', () => {
       message: null,
       error: 'schema 不受支持',
     }, 'zh')).toEqual({ message: '读取错误', detail: 'schema 不受支持', tone: 'error' });
+  });
+
+  it('shows database choose/change text from effectivePath only', () => {
+    expect(resolveNeteaseDatabaseLinkLabel(null, 'zh')).toBe('选择网易云数据库');
+    expect(resolveNeteaseDatabaseLinkLabel({
+      manualPath: '/old.sqlite3', effectivePath: null, source: 'unavailable', loaded: false,
+      recordCount: 0, warning: null,
+    }, 'en')).toBe('Choose NetEase database');
+    expect(resolveNeteaseDatabaseLinkLabel({
+      manualPath: null, effectivePath: '/auto/sqlite_storage.sqlite3', source: 'automatic', loaded: true,
+      recordCount: 1, warning: null,
+    }, 'zh')).toBe('点击更换数据库');
+    expect(resolveNeteaseDatabaseLinkLabel({
+      manualPath: '/manual.sqlite3', effectivePath: '/manual.sqlite3', source: 'manual', loaded: true,
+      recordCount: 1, warning: null,
+    }, 'en')).toBe('Change database');
+  });
+
+  it('shows an explicit unbound state after Task 1 source is cleared', () => {
+    expect(resolveNeteaseSituation({
+      status: {
+        bound: false,
+        manualPath: null,
+        effectivePath: null,
+        source: 'unavailable',
+        loaded: false,
+        recordCount: 0,
+        warning: null,
+      },
+      busy: false,
+      message: null,
+      error: null,
+    }, 'zh')).toEqual({ message: '未选择数据库', tone: 'neutral' });
+    expect(resolveNeteaseDatabaseLinkLabel({
+      bound: false,
+      manualPath: '/stale.sqlite3',
+      effectivePath: null,
+      source: 'unavailable',
+      loaded: false,
+      recordCount: 0,
+      warning: null,
+    }, 'en')).toBe('Choose NetEase database');
   });
 
   it('puts enhanced analysis progress in the Task 1 slot footer', () => {
@@ -1758,16 +1803,31 @@ describe('bindApp', () => {
       localFileCount: 0,
     });
     const selectSourceDirectory = vi.fn().mockResolvedValue(makeDesktopState());
+    let emitProgress: ((progress: NeteaseDiscoveryProgress) => void) | null = null;
     const services = makeMockServices({
       pickSource,
       locateNeteaseLibrary: locate,
       selectSourceDirectory,
+      listenNeteaseDiscoveryProgress: vi.fn().mockImplementation(async (handler) => {
+        emitProgress = handler;
+        return () => undefined;
+      }),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
     (root.querySelector('[data-action="scan-local-netease"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(locate).toHaveBeenCalledWith(true));
+    emitProgress?.({
+      status: 'error',
+      stage: 'locatingDatabase',
+      processed: 0,
+      total: null,
+      currentItem: '',
+      message: '未能自动找到',
+      suggestion: null,
+      error: '未能自动找到',
+    });
     await vi.waitFor(() => expect(root.querySelector('[data-role="netease-discovery-progress"]')?.textContent).toContain('未能自动找到'));
     expect(pickSource).not.toHaveBeenCalled();
     expect(root.querySelector('[data-action="scan-local-netease"]')?.textContent).toContain('手动选择文件夹');
@@ -2291,7 +2351,7 @@ describe('bindApp', () => {
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
     await vi.waitFor(() => expect(root.querySelector('[data-action="select-netease-database"]')?.textContent)
-      .toContain('old.sqlite3'));
+      .toContain('点击更换数据库'));
 
     (root.querySelector('[data-action="select-netease-database"]') as HTMLButtonElement).click();
     await Promise.resolve();
@@ -2300,7 +2360,7 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="select-netease-database"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(selectNeteaseMetadataDatabase).toHaveBeenCalledWith('/music/invalid.sqlite3'));
     expect(root.querySelector('[data-action="select-netease-database"]')?.textContent)
-      .toContain('old.sqlite3');
+      .toContain('点击更换数据库');
     expect(root.querySelector('[data-role="netease-database-status"]')?.textContent)
       .toContain('读取错误');
     expect(root.querySelector('[data-role="netease-database-status"]')?.getAttribute('title'))
@@ -3099,6 +3159,8 @@ describe('bindApp', () => {
     expect(root.textContent).toContain('输入曲目');
     expect(root.textContent).toContain('输出重复曲目');
     expect(root.textContent).toContain('将覆盖');
+    expect(root.querySelector('[data-role="preview-modal"] .preview-head .preview-batch-label')).toBeNull();
+    expect(root.querySelector('[data-role="preview-modal"] .preview-card-head-meta > .preview-batch-label')).toBeNull();
     (root.querySelector('[data-action="preview-detail"][data-detail-kind="input"]') as HTMLButtonElement).click();
     const rows = root.querySelectorAll('[data-role="preview-detail-dialog"] li');
     expect(rows).toHaveLength(2);
@@ -3134,6 +3196,82 @@ describe('bindApp', () => {
     );
     expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
       .toContain('扫描成功 1173/1173');
+  });
+
+  it('attributes a library snapshot failure to the task card without exposing SQLite details', () => {
+    const root = renderApp(
+      makeViewState(), null, null, null, [], null, false, null, false, false, false, 0, undefined,
+      {
+        status: 'error',
+        phase: 'error',
+        processed: 6,
+        total: 6,
+        current_file: '',
+        message: '歌曲库同步失败：SQLite UNIQUE constraint failed at /music/out/song.mp3',
+        tasks: [{
+          slot_index: 0,
+          phase: 'error',
+          processed: 6,
+          total: 6,
+          source_processed: 6,
+          source_total: 6,
+          destination_processed: 6,
+          destination_total: 6,
+          metadata_processed: 6,
+          metadata_total: 6,
+          current_file: '',
+          error: 'library_sync_failed',
+        }],
+      } as AppScanProgress,
+    );
+    const slot = root.querySelector('[data-role="sync-slot"][data-slot="0"]');
+    expect(slot?.querySelector('[data-role="slot-progress-message"]')?.textContent)
+      .toContain('扫描成功 6/6');
+    expect(slot?.querySelector('[data-role="library-sync-error"]')?.textContent)
+      .toBe('歌曲库同步失败');
+    expect(slot?.querySelector('.slot-status')?.textContent).toContain('失败');
+    expect(root.querySelector('[data-role="scan-message"]')).toBeNull();
+    expect(root.textContent).not.toContain('SQLite');
+    expect(root.textContent).not.toContain('/music/out/song.mp3');
+  });
+
+  it('does not open conversion confirmation after a library snapshot failure', async () => {
+    const services = makeMockServices({
+      startScan: vi.fn().mockResolvedValue({
+        status: 'error',
+        phase: 'error',
+        processed: 6,
+        total: 6,
+        current_file: '',
+        message: '歌曲库同步失败',
+        tasks: [{
+          slot_index: 0,
+          phase: 'error',
+          processed: 6,
+          total: 6,
+          source_processed: 6,
+          source_total: 6,
+          destination_processed: 6,
+          destination_total: 6,
+          metadata_processed: 6,
+          metadata_total: 6,
+          current_file: '',
+          error: 'library_sync_failed',
+        }],
+      } satisfies AppScanProgress),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="library-sync-error"]')?.textContent)
+        .toContain('歌曲库同步失败');
+    });
+    expect(services.loadScanResult).not.toHaveBeenCalled();
+    expect(services.startConfirmedSync).not.toHaveBeenCalled();
+    expect(root.querySelector('[data-role="preview-modal"]')).toBeNull();
   });
 
   it('shows scan progress immediately and only confirms after the scan completes', async () => {
@@ -3486,7 +3624,7 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="cancel-analysis"]') as HTMLButtonElement).click();
 
     expect(root.querySelector('[data-role="analysis-message"]')?.textContent).toContain('已取消');
-    expect(root.querySelector('[data-action="resume-analysis"]')).not.toBeNull();
+    expect(root.querySelector('[data-action="resume-analysis"]')).toBeNull();
     expect(analysisWorker.terminate).toHaveBeenCalledTimes(1);
     readDeferred.resolve([]);
     await vi.waitFor(() => expect(services.applyTrackAnalysisResults).not.toHaveBeenCalled());
@@ -3509,7 +3647,7 @@ describe('bindApp', () => {
 
     await vi.waitFor(() => {
       expect(root.querySelector('[data-action="start-all"]')).not.toBeNull();
-      expect(root.querySelector('[data-action="resume-analysis"]')).not.toBeNull();
+      expect(root.querySelector('[data-action="resume-analysis"]')).toBeNull();
     });
     expect(root.querySelector('.global-action')?.textContent).toContain('开始');
 
@@ -3517,44 +3655,7 @@ describe('bindApp', () => {
     await vi.waitFor(() => expect(services.startScan).toHaveBeenCalledTimes(1));
   });
 
-  it('resumes a cancelled analysis batch without starting a new scan', async () => {
-    const readDeferred = createDeferred<number[]>();
-    const firstWorker = makeMockAnalysisWorker();
-    const secondWorker = makeMockAnalysisWorker();
-    const createAnalysisWorker = vi.fn()
-      .mockReturnValueOnce(firstWorker)
-      .mockReturnValueOnce(secondWorker);
-    const services = makeMockServices({
-      loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState({
-        conversion_mode: 'direct',
-        enhanced_mode: true,
-      })),
-      loadScanResult: vi.fn().mockResolvedValue([makePreview(0)]),
-      readAudioFile: vi.fn()
-        .mockReturnValueOnce(readDeferred.promise)
-        .mockResolvedValue([]),
-      createAnalysisWorker,
-    });
-    const root = document.createElement('div');
-    bindApp(root, makeViewState({
-      conversionMode: 'direct',
-      enhancedMode: true,
-    }), services);
-
-    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(root.querySelector('[data-action="cancel-analysis"]')).not.toBeNull());
-    (root.querySelector('[data-action="cancel-analysis"]') as HTMLButtonElement).click();
-    readDeferred.resolve([]);
-    await vi.waitFor(() => expect(root.querySelector('[data-action="resume-analysis"]')).not.toBeNull());
-
-    (root.querySelector('[data-action="resume-analysis"]') as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(createAnalysisWorker).toHaveBeenCalledTimes(2));
-    expect(services.startScan).toHaveBeenCalledTimes(1);
-    expect(firstWorker.terminate).toHaveBeenCalled();
-    expect(secondWorker.start).toHaveBeenCalledTimes(1);
-  });
-
-  it('restores the resumable analysis entry after a WebView reload', async () => {
+  it('does not restore a visible unfinished-analysis action after a WebView reload', async () => {
     const readDeferred = createDeferred<number[]>();
     const analysisWorker = makeMockAnalysisWorker();
     const services = makeMockServices({
@@ -3573,11 +3674,13 @@ describe('bindApp', () => {
     await vi.waitFor(() => expect(firstRoot.querySelector('[data-action="cancel-analysis"]')).not.toBeNull());
     (firstRoot.querySelector('[data-action="cancel-analysis"]') as HTMLButtonElement).click();
     readDeferred.resolve([]);
-    await vi.waitFor(() => expect(firstRoot.querySelector('[data-action="resume-analysis"]')).not.toBeNull());
+    await vi.waitFor(() => expect(firstRoot.querySelector('[data-role="analysis-message"]')?.textContent).toContain('已取消'));
+    expect(firstRoot.querySelector('[data-action="resume-analysis"]')).toBeNull();
 
     const reloadedRoot = document.createElement('div');
     bindApp(reloadedRoot, makeViewState({ conversionMode: 'direct', enhancedMode: true }), services);
-    await vi.waitFor(() => expect(reloadedRoot.querySelector('[data-action="resume-analysis"]')).not.toBeNull());
+    await vi.waitFor(() => expect(reloadedRoot.querySelector('[data-action="start-all"]')).not.toBeNull());
+    expect(reloadedRoot.querySelector('[data-action="resume-analysis"]')).toBeNull();
   });
 
   it('loads the analysis cache at startup and does not reload it for each scan', async () => {
@@ -3811,8 +3914,8 @@ describe('bindApp', () => {
 
     await vi.waitFor(() => {
       expect(root.querySelector('[data-role="history"]')?.textContent).toContain('重试失败项目');
-      expect(root.querySelector('[data-action="export-error-report"]')?.textContent)
-        .toContain('导出错误报告');
+      expect(root.querySelector('[data-action="export-run-report"]')?.textContent)
+        .toContain('导出本次运行报告');
     });
     (root.querySelector('[data-action="retry-history"]') as HTMLButtonElement).click();
 
@@ -3862,49 +3965,49 @@ describe('bindApp', () => {
     bindApp(root, makeViewState(), services);
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-action="export-error-report"]')?.textContent)
-        .toContain('导出错误报告');
+      expect(root.querySelector('[data-action="export-run-report"]')?.textContent)
+        .toContain('导出本次运行报告');
     });
   });
 
-  it('manually exports an error report and refreshes the saved history path', async () => {
-    const saveFile = vi.fn().mockResolvedValue('/tmp/W4DJ-error-report-history-1.txt');
-    const exportHistoryErrorReport = vi.fn().mockResolvedValue(undefined);
+  it('manually exports a run report after choosing a path', async () => {
+    const saveFile = vi.fn().mockResolvedValue('/tmp/W4DJ-run-report-history-1.json');
+    const exportRunReport = vi.fn().mockResolvedValue(undefined);
     const loadHistory = vi.fn().mockResolvedValue([makeHistoryEntry()]);
     const alert = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
-    const services = makeMockServices({ saveFile, exportHistoryErrorReport, loadHistory });
+    const services = makeMockServices({ saveFile, exportRunReport, loadHistory });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-action="export-error-report"]')).not.toBeNull();
+      expect(root.querySelector('[data-action="export-run-report"]')).not.toBeNull();
     });
-    (root.querySelector('[data-action="export-error-report"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="export-run-report"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
       expect(saveFile).toHaveBeenCalledWith({
-        defaultPath: 'W4DJ-error-report-history-1.txt',
-        title: '保存错误报告',
+        defaultPath: 'W4DJ-run-report-history-1.json',
+        title: '保存本次运行报告',
       });
-      expect(exportHistoryErrorReport).toHaveBeenCalledWith(
+      expect(exportRunReport).toHaveBeenCalledWith(
         'history-1',
-        '/tmp/W4DJ-error-report-history-1.txt',
+        '/tmp/W4DJ-run-report-history-1.json',
       );
       expect(loadHistory.mock.calls.length).toBeGreaterThanOrEqual(2);
       expect(alert).toHaveBeenCalledWith(
-        '错误报告已导出：/tmp/W4DJ-error-report-history-1.txt',
+        '本次运行报告已导出：/tmp/W4DJ-run-report-history-1.json',
       );
     });
     alert.mockRestore();
   });
 
-  it('manually exports the runtime session through a separate save dialog', async () => {
-    const saveFile = vi.fn().mockResolvedValue('/tmp/W4DJ-runtime-history-1.json');
-    const exportRuntimeSession = vi.fn().mockResolvedValue(undefined);
+  it('exports a full runtime report from About through a save dialog', async () => {
+    const saveFile = vi.fn().mockResolvedValue('/tmp/W4DJ-full-runtime-report.json');
+    const exportFullRuntimeReport = vi.fn().mockResolvedValue(undefined);
     const alert = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
     const services = makeMockServices({
       saveFile,
-      exportRuntimeSession,
+      exportFullRuntimeReport,
       loadHistory: vi.fn().mockResolvedValue([makeHistoryEntry({
         analysis: {
           status: 'partial',
@@ -3920,63 +4023,61 @@ describe('bindApp', () => {
     bindApp(root, makeViewState(), services);
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-action="export-runtime-session"]')).not.toBeNull();
+      (root.querySelector('[data-action="open-about"]') as HTMLButtonElement).click();
+      expect(root.querySelector('[data-action="export-full-runtime-report"]')).not.toBeNull();
       expect(root.querySelector('.history-analysis-summary')?.textContent).toContain('超时 1');
     });
-    (root.querySelector('[data-action="export-runtime-session"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="export-full-runtime-report"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
       expect(saveFile).toHaveBeenCalledWith({
-        defaultPath: 'W4DJ-runtime-session-history-1.json',
-        title: '保存运行会话记录',
+        defaultPath: expect.stringMatching(/^W4DJ-full-runtime-report-\d+\.json$/),
+        title: '保存完整运行报告',
       });
-      expect(exportRuntimeSession).toHaveBeenCalledWith(
-        'history-1',
-        '/tmp/W4DJ-runtime-history-1.json',
-      );
+      expect(exportFullRuntimeReport).toHaveBeenCalledWith('/tmp/W4DJ-full-runtime-report.json');
     });
     alert.mockRestore();
   });
 
   it('does not call the exporter when the save dialog is cancelled', async () => {
     const saveFile = vi.fn().mockResolvedValue(null);
-    const exportHistoryErrorReport = vi.fn().mockResolvedValue(undefined);
+    const exportRunReport = vi.fn().mockResolvedValue(undefined);
     const services = makeMockServices({
       saveFile,
-      exportHistoryErrorReport,
+      exportRunReport,
       loadHistory: vi.fn().mockResolvedValue([makeHistoryEntry()]),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-action="export-error-report"]')).not.toBeNull();
+      expect(root.querySelector('[data-action="export-run-report"]')).not.toBeNull();
     });
-    (root.querySelector('[data-action="export-error-report"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="export-run-report"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => expect(saveFile).toHaveBeenCalled());
-    expect(exportHistoryErrorReport).not.toHaveBeenCalled();
+    expect(exportRunReport).not.toHaveBeenCalled();
   });
 
   it('reports a manual export failure without changing conversion slot state', async () => {
-    const saveFile = vi.fn().mockResolvedValue('/tmp/report.txt');
-    const exportHistoryErrorReport = vi.fn().mockRejectedValue(new Error('disk is full'));
+    const saveFile = vi.fn().mockResolvedValue('/tmp/report.json');
+    const exportRunReport = vi.fn().mockRejectedValue(new Error('disk is full'));
     const alert = vi.spyOn(window, 'alert').mockImplementation(() => undefined);
     const services = makeMockServices({
       saveFile,
-      exportHistoryErrorReport,
+      exportRunReport,
       loadHistory: vi.fn().mockResolvedValue([makeHistoryEntry()]),
     });
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-action="export-error-report"]')).not.toBeNull();
+      expect(root.querySelector('[data-action="export-run-report"]')).not.toBeNull();
     });
-    (root.querySelector('[data-action="export-error-report"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="export-run-report"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(alert).toHaveBeenCalledWith('错误报告导出失败：disk is full');
+      expect(alert).toHaveBeenCalledWith('本次运行报告导出失败：disk is full');
     });
     expect(root.querySelector('[data-role="sync-slot"][data-slot="0"]')?.getAttribute('data-status'))
       .not.toBe('error');
