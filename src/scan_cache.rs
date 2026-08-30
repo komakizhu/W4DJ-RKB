@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCAN_CACHE_SCHEMA_VERSION: u32 = 2;
+pub const SCAN_CACHE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanCache {
@@ -66,6 +66,22 @@ impl ScanCache {
         self.entries.retain(|_, entry| {
             let entry_root = normalize_path(Path::new(&entry.source_root));
             entry_root != root || Path::new(&entry.source_path).exists()
+        });
+    }
+
+    /// Remove entries below a root using the paths already collected by the
+    /// current scan. This keeps the fast path free of a second existence/stat
+    /// pass over every cached source.
+    pub fn remove_missing_sources_from_snapshot(
+        &mut self,
+        normalized_source_root: &Path,
+        observed_paths: &HashSet<String>,
+    ) {
+        let root = normalized_source_root.to_string_lossy();
+        self.entries.retain(|key, entry| {
+            let same_root = entry.source_root == root
+                || normalize_path(Path::new(&entry.source_root)) == normalized_source_root;
+            !same_root || observed_paths.contains(key)
         });
     }
 }
@@ -155,9 +171,44 @@ pub fn can_reuse_entry_normalized(
     size_bytes: u64,
     modified_at_ms: Option<u64>,
 ) -> bool {
-    normalize_path(Path::new(&entry.source_path)) == normalized_source_path
-        && normalize_path(Path::new(&entry.source_root)) == normalized_source_root
-        && normalize_path(Path::new(&entry.output_directory)) == normalized_output_directory
+    let source = normalized_source_path.to_string_lossy();
+    let root = normalized_source_root.to_string_lossy();
+    let output = normalized_output_directory.to_string_lossy();
+    (entry.source_path == source
+        || normalize_path(Path::new(&entry.source_path)) == normalized_source_path)
+        && (entry.source_root == root
+            || normalize_path(Path::new(&entry.source_root)) == normalized_source_root)
+        && (entry.output_directory == output
+            || normalize_path(Path::new(&entry.output_directory)) == normalized_output_directory)
+        && entry.filename_rule == filename_rule
+        && entry.netease_filename_format == netease_filename_format
+        && entry.filename_policy == filename_policy
+        && entry.size_bytes == size_bytes
+        && entry.modified_at_ms == modified_at_ms
+}
+
+/// Fast-scan cache predicate for the value the cache actually owns: the
+/// filename derivation.  The output directory is deliberately not part of
+/// this identity because changing an output root must not force the same
+/// source filename to be parsed again.  The older `can_reuse_entry*` APIs keep
+/// their stricter output-directory semantics for compatibility callers.
+#[allow(clippy::too_many_arguments)]
+pub fn can_reuse_derived_name_entry_normalized(
+    entry: &ScanCacheEntry,
+    normalized_source_path: &Path,
+    normalized_source_root: &Path,
+    filename_rule: &str,
+    netease_filename_format: &str,
+    filename_policy: &str,
+    size_bytes: u64,
+    modified_at_ms: Option<u64>,
+) -> bool {
+    let source = normalized_source_path.to_string_lossy();
+    let root = normalized_source_root.to_string_lossy();
+    (entry.source_path == source
+        || normalize_path(Path::new(&entry.source_path)) == normalized_source_path)
+        && (entry.source_root == root
+            || normalize_path(Path::new(&entry.source_root)) == normalized_source_root)
         && entry.filename_rule == filename_rule
         && entry.netease_filename_format == netease_filename_format
         && entry.filename_policy == filename_policy
@@ -271,6 +322,27 @@ mod tests {
             directory.path(),
             &output,
             "artist_title",
+            "title_artist",
+            "soundcloud",
+            3,
+            modified_at_ms(&source),
+        ));
+    }
+
+    #[test]
+    fn derived_name_reuse_is_independent_of_output_root() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("song.mp3");
+        fs::write(&source, b"abc").unwrap();
+        let cached = entry(directory.path(), &directory.path().join("out-a"), &source);
+        let normalized_source = normalize_path(&source);
+        let normalized_root = normalize_path(directory.path());
+
+        assert!(can_reuse_derived_name_entry_normalized(
+            &cached,
+            &normalized_source,
+            &normalized_root,
+            "title_artist",
             "title_artist",
             "soundcloud",
             3,

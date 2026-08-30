@@ -268,6 +268,7 @@ pub struct NeteaseMetadataResolver {
     records: Arc<Vec<NeteaseRecord>>,
     locators: Arc<Vec<NeteaseTrackLocator>>,
     locator_index: Arc<LocatorIndex>,
+    recovery_cache: Arc<Mutex<HashMap<String, MetadataRecovery>>>,
     database_loaded: bool,
     warning: Option<String>,
 }
@@ -279,6 +280,7 @@ impl Default for NeteaseMetadataResolver {
             records: Arc::new(Vec::new()),
             locators: Arc::new(Vec::new()),
             locator_index: Arc::new(LocatorIndex::default()),
+            recovery_cache: Arc::new(Mutex::new(HashMap::new())),
             database_loaded: false,
             warning: None,
         }
@@ -324,6 +326,7 @@ impl NeteaseMetadataResolver {
             records,
             locators: Arc::new(Vec::new()),
             locator_index: Arc::new(LocatorIndex::default()),
+            recovery_cache: Arc::new(Mutex::new(HashMap::new())),
             database_loaded: true,
             warning: None,
         })
@@ -377,6 +380,7 @@ impl NeteaseMetadataResolver {
                 records: Arc::new(Vec::new()),
                 locators: Arc::new(Vec::new()),
                 locator_index: Arc::new(LocatorIndex::default()),
+                recovery_cache: Arc::new(Mutex::new(HashMap::new())),
                 database_loaded: false,
                 warning: warning.clone(),
             },
@@ -418,6 +422,7 @@ impl NeteaseMetadataResolver {
             records: Arc::new(Vec::new()),
             locators: Arc::new(locators),
             locator_index,
+            recovery_cache: Arc::new(Mutex::new(HashMap::new())),
             database_loaded: true,
             warning,
         }
@@ -567,6 +572,20 @@ impl NeteaseMetadataResolver {
     }
 
     pub(crate) fn recover(&self, source_path: &Path) -> MetadataRecovery {
+        let cache_key = source_path.to_string_lossy().into_owned();
+        if let Ok(cache) = self.recovery_cache.lock()
+            && let Some(recovery) = cache.get(&cache_key)
+        {
+            return recovery.clone();
+        }
+        let recovery = self.recover_uncached(source_path);
+        if let Ok(mut cache) = self.recovery_cache.lock() {
+            cache.insert(cache_key, recovery.clone());
+        }
+        recovery
+    }
+
+    fn recover_uncached(&self, source_path: &Path) -> MetadataRecovery {
         if self.records.is_empty() && !self.locators.is_empty() {
             let never_cancelled = AtomicBool::new(false);
             let Some(locator) = choose_locator_with_method_cancellable(

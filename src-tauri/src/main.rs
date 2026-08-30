@@ -44,7 +44,8 @@ use w4dj::library_catalog::{CatalogLocalFile, CatalogSourceRecord, LibraryCatalo
 use w4dj::library_query::{LibraryPage, LibraryQuery};
 use w4dj::media_probe::probe_local_audio;
 use w4dj::w4dj_library::{
-    EmotionEvaluationManifest, W4djLibrary, write_emotion_evaluation_manifest,
+    CommittedOutputBinding, CommittedOutputFacts, EmotionEvaluationManifest, OutputFileSnapshot,
+    W4djLibrary, write_emotion_evaluation_manifest,
 };
 use w4dj::runtime_journal::RuntimeJournal;
 use w4dj::netease_library::{
@@ -64,10 +65,9 @@ use w4dj::netease_cache::{self, CacheState};
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
     PreviewCandidate, PreviewIssue, PreviewOperation, SlotPreview, SyncPreview,
-    attach_netease_identities,
     build_retry_preview,
-    build_sync_preview_with_settings_and_netease_observed_with_policy_and_resolver,
-    build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy_and_resolver,
+    build_sync_preview_with_settings_and_netease_observed_with_policy,
+    build_sync_preview_with_snapshots_and_bindings,
     is_recovered_single_source,
 };
 use w4dj::scan_cache::{ScanCache, clear_scan_cache as clear_scan_cache_file, load_scan_cache, save_scan_cache_atomic};
@@ -84,7 +84,9 @@ use w4dj::sync::{
     remove_replaced_output,
     planned_output_path_with_policy,
     validate_track_analysis_metadata,
-    ScanEnumerationError, ScanPhase, enumerate_music_files_observed,
+    MusicScanIssue, ScanEnumerationError, ScanPhase, ScannedFileSnapshot,
+    enumerate_music_files_observed,
+    filename_rule_cache_key, netease_filename_format_cache_key,
 };
 
 mod essentia_model_import;
@@ -918,6 +920,10 @@ struct ScanTaskProgress {
     destination_total: Option<usize>,
     metadata_processed: usize,
     metadata_total: Option<usize>,
+    #[serde(default)]
+    reused_count: usize,
+    #[serde(default)]
+    incremental_count: usize,
     current_file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -942,6 +948,7 @@ struct ConfirmedSyncJob {
     slot_index: usize,
     source: String,
     destination: String,
+    conversion_mode: ConversionMode,
     mode: Mode,
     lossless_format: Option<LosslessFormat>,
     conflict_strategy: ConflictStrategy,
@@ -978,12 +985,12 @@ struct ScanJob {
     netease_filename_format: NeteaseFilenameFormat,
     scan_cache_path: PathBuf,
     concurrency_budget: Arc<GlobalConcurrencyBudget>,
-    metadata_resolver: Arc<NeteaseMetadataResolver>,
     library_path: PathBuf,
     analysis_path: PathBuf,
     tasks: Vec<(usize, String, String)>,
     operation_id: String,
     journal: Option<RuntimeJournal>,
+    committed_bindings: HashMap<String, CommittedOutputBinding>,
 }
 
 #[derive(serde::Serialize)]
@@ -2373,6 +2380,13 @@ fn cancel_sync(
 ) -> Result<DesktopState, String> {
     let mut controller = state.controller.lock().expect("desktop lock poisoned");
     controller.cancel_sync(slot_index)?;
+    // If a confirmed batch is still preparing the shared NetEase index,
+    // interrupt that preparation as well. The coordinator will skip this
+    // slot and never start another song for it.
+    state
+        .library
+        .metadata_cache_cancel
+        .store(true, Ordering::SeqCst);
     Ok(controller.state().clone())
 }
 
@@ -2450,6 +2464,10 @@ fn pause_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, Str
 fn cancel_all_sync(state: tauri::State<'_, AppState>) -> Result<DesktopState, String> {
     let mut controller = state.controller.lock().expect("desktop lock poisoned");
     controller.cancel_all_running()?;
+    state
+        .library
+        .metadata_cache_cancel
+        .store(true, Ordering::SeqCst);
     Ok(controller.state().clone())
 }
 
@@ -2489,11 +2507,10 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
         return Err(String::from("请至少选择一个歌曲文件夹或单曲"));
     }
 
-    let metadata_context = conversion_metadata_context(state.inner());
     let mut previews = slots
         .into_iter()
         .map(|(slot_index, source, destination)| {
-            let mut preview = build_sync_preview_with_settings_and_netease_observed_with_policy_and_resolver(
+            let preview = build_sync_preview_with_settings_and_netease_observed_with_policy(
                 &source,
                 &destination,
                 mode,
@@ -2503,16 +2520,9 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
                 netease_filename_format,
                 filename_normalization_policy_for_slot(slot_index),
                 None,
-                metadata_context.netease.as_ref(),
             )
             .map_err(|error| format!("预检失败：{error}"))?
             .ok_or_else(|| "预检被取消".to_string())?;
-        if matches!(
-            filename_normalization_policy_for_slot(slot_index),
-            FilenameNormalizationPolicy::PreserveSource
-        ) {
-            attach_netease_identities(&mut preview, metadata_context.netease.as_ref());
-        }
             Ok(SlotPreview {
                 slot_index,
                 mode,
@@ -2669,8 +2679,13 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
     );
     let analysis_path = current_analysis_path(&state);
     let concurrency_budget = concurrency_budget_snapshot(&state);
-    let metadata_resolver = Arc::clone(&conversion_metadata_context(state.inner()).netease);
-
+    let committed_bindings = W4djLibrary::open(&library_path)
+        .ok()
+        .and_then(|library| library.committed_output_bindings().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|binding| (binding.source_path.clone(), binding))
+        .collect::<HashMap<_, _>>();
     state.scan_cancel.store(false, Ordering::SeqCst);
     {
         let mut result = state.scan_result.lock().expect("scan result lock poisoned");
@@ -2698,6 +2713,8 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
                     metadata_processed: 0,
                     metadata_total: None,
                     current_file: String::new(),
+                    reused_count: 0,
+                    incremental_count: 0,
                     error: None,
                 })
                 .collect(),
@@ -2716,12 +2733,12 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         netease_filename_format,
         scan_cache_path,
         concurrency_budget,
-        metadata_resolver,
         library_path,
         analysis_path,
         tasks,
         operation_id: scan_operation_id,
         journal: runtime_journal(state.inner()),
+        committed_bindings,
     };
     thread::spawn(move || run_scan_task(progress, scan_cancel, scan_result, job));
 
@@ -2743,12 +2760,12 @@ fn run_scan_task(
         netease_filename_format,
         scan_cache_path,
         concurrency_budget,
-        metadata_resolver,
         library_path,
         analysis_path,
         tasks,
         operation_id,
         journal,
+        committed_bindings,
     } = job;
     let mut scan_cache = load_scan_cache(&scan_cache_path).unwrap_or_else(|_| ScanCache::empty());
     if scan_cancel.load(Ordering::SeqCst) {
@@ -2761,62 +2778,142 @@ fn run_scan_task(
         state.message = "正在枚举输入和输出文件".to_string();
     });
     let mut previews = Vec::with_capacity(tasks.len());
-    let mut scanned_outputs: HashMap<String, (usize, Vec<PathBuf>)> = HashMap::new();
+    let mut scanned_outputs: HashMap<String, (usize, Vec<OutputFileSnapshot>)> = HashMap::new();
+    let mut root_snapshots: HashMap<String, Vec<ScannedFileSnapshot>> = HashMap::new();
+    let mut root_issues: HashMap<String, Vec<MusicScanIssue>> = HashMap::new();
+    let mut normalized_roots: HashMap<String, String> = HashMap::new();
+    let mut normalize_root = |raw: &str| {
+        normalized_roots
+            .entry(raw.to_string())
+            .or_insert_with(|| {
+                w4dj::scan_cache::normalize_path(Path::new(raw))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .clone()
+    };
     for (slot_index, source, destination) in tasks {
         if scan_cancel.load(Ordering::SeqCst) {
             finish_scan_cancelled(&progress, &scan_result);
             return;
         }
-        if !destination.trim().is_empty() {
-            scanned_outputs
-                .entry(destination.clone())
-                .or_insert_with(|| (slot_index, Vec::new()));
+        let source_root_key = normalize_root(&source);
+        let source_snapshots = if let Some(existing) = root_snapshots.get(&source_root_key) {
+            existing.clone()
+        } else {
+            match enumerate_music_files_observed(
+                &source,
+                w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
+                &scan_cancel,
+                |_, _, _| {},
+            ) {
+                Ok(enumerated) => {
+                    let snapshots = enumerated.snapshots;
+                    root_issues.insert(source_root_key.clone(), enumerated.issues);
+                    root_snapshots.insert(source_root_key.clone(), snapshots.clone());
+                    snapshots
+                }
+                Err(error) => {
+                    finish_scan_error(&progress, &scan_result, format!("扫描失败：{error}"));
+                    return;
+                }
+            }
+        };
+        let destination_root_key = if destination.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_root(&destination)
+        };
+        let (destination_snapshots, destination_snapshot_ready) = if destination_root_key.is_empty() {
+            (Vec::new(), false)
+        } else if let Some(existing) = root_snapshots.get(&destination_root_key) {
+            (
+                existing
+                    .iter()
+                    .filter(|snapshot| {
+                        matches!(snapshot.source_extension.as_str(), "mp3" | "wav" | "aiff")
+                    })
+                    .cloned()
+                    .collect(),
+                true,
+            )
+        } else {
+            match enumerate_music_files_observed(
+                &destination,
+                // Enumerate the full source extension set for every unique
+                // root. A destination root may become an input root for a
+                // later slot; collecting the union once keeps that reuse
+                // correct without a second walk.
+                w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
+                &scan_cancel,
+                |_, _, _| {},
+            ) {
+                Ok(enumerated) => {
+                    let snapshots = enumerated.snapshots;
+                    root_issues.insert(destination_root_key.clone(), enumerated.issues);
+                    root_snapshots.insert(destination_root_key.clone(), snapshots.clone());
+                    (
+                        snapshots
+                            .into_iter()
+                            .filter(|snapshot| {
+                                matches!(
+                                    snapshot.source_extension.as_str(),
+                                    "mp3" | "wav" | "aiff"
+                                )
+                            })
+                            .collect(),
+                        true,
+                    )
+                }
+                Err(ScanEnumerationError::Failed(_)) => (Vec::new(), false),
+                Err(ScanEnumerationError::Cancelled) => {
+                    finish_scan_cancelled(&progress, &scan_result);
+                    return;
+                }
+            }
+        };
+        let normalized_destination_for_cache = if destination_root_key.is_empty() {
+            String::new()
+        } else {
+            destination_root_key.clone()
+        };
+
+        if destination_snapshot_ready && !destination_root_key.is_empty() {
+            scanned_outputs.entry(destination_root_key.clone()).or_insert_with(|| {
+                (
+                    slot_index,
+                    destination_snapshots
+                        .iter()
+                        .map(|snapshot| OutputFileSnapshot {
+                            path: snapshot.path.clone(),
+                            size_bytes: snapshot.size_bytes,
+                            modified_at_ms: snapshot.modified_at_ms,
+                        })
+                        .collect(),
+                )
+            });
         }
 
         // Establish denominators before worker processing starts. The walk
         // checks the shared cancellation flag on every entry, so this
         // preflight remains interruptible while the UI can render `x/total`
         // from the first processed file.
-        let source_total = match count_scan_files(
-            &source,
-            w4dj::sync::SUPPORTED_SOURCE_EXTENSIONS,
-            &scan_cancel,
-        ) {
-            Ok(total) => Some(total),
-            Err(ScanEnumerationError::Cancelled) => {
-                finish_scan_cancelled(&progress, &scan_result);
-                return;
-            }
-            Err(ScanEnumerationError::Failed(_)) => None,
+        let cache_before = scan_cache.entries.clone();
+        let cache_hit = |snapshot: &ScannedFileSnapshot| {
+            cache_before
+                .get(&snapshot.path.to_string_lossy().into_owned())
+                .is_some_and(|entry| {
+                    entry.source_root == source_root_key
+                        && entry.output_directory == normalized_destination_for_cache
+                        && entry.filename_rule == filename_rule_cache_key(filename_rule)
+                        && entry.netease_filename_format
+                            == netease_filename_format_cache_key(netease_filename_format)
+                        && entry.filename_policy
+                            == filename_normalization_policy_for_slot(slot_index).cache_key()
+                        && entry.size_bytes == snapshot.size_bytes
+                        && entry.modified_at_ms == snapshot.modified_at_ms
+                })
         };
-        let destination_total = if destination.trim().is_empty() {
-            Some(0)
-        } else {
-            match count_scan_files(&destination, &["mp3", "wav", "aiff"], &scan_cancel) {
-                Ok(total) => Some(total),
-                Err(ScanEnumerationError::Cancelled) => {
-                    finish_scan_cancelled(&progress, &scan_result);
-                    return;
-                }
-                Err(ScanEnumerationError::Failed(_)) => None,
-            }
-        };
-        update_scan_progress(&progress, |state| {
-            if let Some(task) = state
-                .tasks
-                .iter_mut()
-                .find(|task| task.slot_index == slot_index)
-            {
-                task.source_total = source_total;
-                task.destination_total = destination_total;
-                // The task progress bar follows the active phase.  Its
-                // denominator must not combine input and output entries;
-                // otherwise an empty destination or a stale output count can
-                // leak into the final input ratio.
-                task.total = source_total.unwrap_or(0);
-            }
-        });
-
         let mut observer = |phase: ScanPhase, path: &Path| {
             if scan_cancel.load(Ordering::SeqCst) {
                 return false;
@@ -2849,11 +2946,6 @@ fn run_scan_task(
                         ScanPhase::Destination => {
                             task.destination_processed =
                                 task.destination_processed.saturating_add(1);
-                            scanned_outputs
-                                .entry(destination.clone())
-                                .or_insert_with(|| (slot_index, Vec::new()))
-                                .1
-                                .push(path.to_path_buf());
                         }
                         ScanPhase::Metadata => {
                             if task.metadata_total.is_none() {
@@ -2896,7 +2988,7 @@ fn run_scan_task(
             });
             !scan_cancel.load(Ordering::SeqCst)
         };
-        let preview = match build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy_and_resolver(
+        let preview = match build_sync_preview_with_snapshots_and_bindings(
             &source,
             &destination,
             mode,
@@ -2909,7 +3001,9 @@ fn run_scan_task(
             &mut scan_cache,
             Arc::clone(&concurrency_budget),
             Arc::clone(&scan_cancel),
-            metadata_resolver.as_ref(),
+            &committed_bindings,
+            &source_snapshots,
+            &destination_snapshots,
         ) {
             Ok(Some(preview)) => preview,
             Ok(None) => {
@@ -2921,6 +3015,26 @@ fn run_scan_task(
                 return;
             }
         };
+        let mut preview = preview;
+        let mut slot_scan_issues = root_issues
+            .get(&source_root_key)
+            .cloned()
+            .unwrap_or_default();
+        if destination_root_key != source_root_key
+            && let Some(issues) = root_issues.get(&destination_root_key)
+        {
+            slot_scan_issues.extend(issues.iter().cloned());
+        }
+        for issue in slot_scan_issues {
+            preview.errors.push(PreviewIssue {
+                path: issue.path.display().to_string(),
+                message: issue.message.clone(),
+            });
+            preview.error_count += 1;
+        }
+        let source_count = source_snapshots.len();
+        let output_count = preview.output_files.len();
+        let reused_count = source_snapshots.iter().filter(|snapshot| cache_hit(snapshot)).count();
         previews.push(SlotPreview {
             slot_index,
             mode,
@@ -2949,11 +3063,21 @@ fn run_scan_task(
                 .iter_mut()
                 .find(|task| task.slot_index == slot_index)
             {
-                task.total = task.source_total.unwrap_or(task.source_processed);
+                task.source_total = Some(source_count);
+                task.destination_total = Some(output_count);
+                task.reused_count = reused_count;
+                task.incremental_count = source_count.saturating_sub(reused_count);
+                task.total = source_count;
                 task.metadata_total = task.metadata_total.or(Some(task.metadata_processed));
                 task.phase = ScanProgressPhase::Completed;
                 task.current_file.clear();
             }
+            state.processed = state.tasks.iter().map(|task| task.source_processed).sum();
+            state.total = state
+                .tasks
+                .iter()
+                .map(|task| task.source_total.unwrap_or(task.source_processed))
+                .sum();
         });
         if let Err(error) = save_scan_cache_atomic(&scan_cache_path, &scan_cache) {
             finish_scan_error(
@@ -2989,44 +3113,44 @@ fn run_scan_task(
     // succeeded so cancellation/errors leave the previous W4DJ index intact.
     let roots = scanned_outputs
         .into_iter()
-        .map(|(root, (slot_index, paths))| (slot_index, PathBuf::from(root), paths))
+        .map(|(root, (slot_index, files))| (slot_index, PathBuf::from(root), files))
         .collect::<Vec<_>>();
     if !roots.is_empty() {
         let reconcile_result = open_w4dj_library(&library_path)
             .and_then(|(mut library, _)| {
                 library
-                    .reconcile_output_roots(&roots)
+                    .reconcile_output_snapshots(&roots)
                     .map_err(|error| error.to_string())
             });
         let reconcile_summary = match reconcile_result {
             Ok(summary) => summary,
             Err(error) => {
-            let affected_slots = roots
-                .iter()
-                .map(|(slot_index, _, _)| *slot_index)
-                .collect::<Vec<_>>();
-            if let Some(journal) = journal {
-                journal.record_event(
-                    "library_snapshot_sync_failed",
-                    Some(operation_id),
-                    Some("librarySnapshot".to_string()),
-                    Some("error".to_string()),
-                    serde_json::json!({
-                        "slots": roots.iter().map(|(slot_index, root, paths)| serde_json::json!({
-                            "slotIndex": slot_index,
-                            "root": root,
-                            "destinationPaths": paths,
-                        })).collect::<Vec<_>>(),
-                        "errorChain": error,
-                    }),
-                    Some(error),
-                );
-            }
-            finish_library_sync_error(&progress, &scan_result, &affected_slots);
-            return;
+                let affected_slots = roots
+                    .iter()
+                    .map(|(slot_index, _, _)| *slot_index)
+                    .collect::<Vec<_>>();
+                if let Some(journal) = journal {
+                    journal.record_event(
+                        "library_snapshot_sync_failed",
+                        Some(operation_id),
+                        Some("librarySnapshot".to_string()),
+                        Some("error".to_string()),
+                        serde_json::json!({
+                            "slots": roots.iter().map(|(slot_index, root, paths)| serde_json::json!({
+                                "slotIndex": slot_index,
+                                "root": root,
+                                "destinationPaths": paths,
+                            })).collect::<Vec<_>>(),
+                            "errorChain": error,
+                        }),
+                        Some(error),
+                    );
+                }
+                finish_library_sync_error(&progress, &scan_result, &affected_slots);
+                return;
             }
         };
-        if let Err(error) = prune_analysis_entries_for_scanned_roots(
+        if let Err(error) = prune_analysis_entries_for_scanned_output_snapshots(
             &analysis_path,
             &roots,
             &reconcile_summary.invalidated_paths,
@@ -3090,13 +3214,43 @@ fn prune_analysis_entries_for_scanned_roots(
     Ok(())
 }
 
-fn count_scan_files(
-    folder: &str,
-    allowed_extensions: &[&str],
-    cancel: &AtomicBool,
-) -> Result<usize, ScanEnumerationError> {
-    enumerate_music_files_observed(folder, allowed_extensions, cancel, |_, _, _| {})
-        .map(|result| result.paths.len())
+fn prune_analysis_entries_for_scanned_output_snapshots(
+    analysis_path: &Path,
+    roots: &[(usize, PathBuf, Vec<OutputFileSnapshot>)],
+    invalidated_paths: &[PathBuf],
+) -> Result<(), String> {
+    let existing = load_analysis_file(analysis_path)?;
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let root_paths = roots
+        .iter()
+        .map(|(_, root, _)| fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
+    let desired = roots
+        .iter()
+        .flat_map(|(_, _, files)| files.iter())
+        .map(|file| fs::canonicalize(&file.path).unwrap_or_else(|_| file.path.clone()))
+        .collect::<HashSet<_>>();
+    let invalidated = invalidated_paths
+        .iter()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect::<HashSet<_>>();
+    let filtered = existing
+        .iter()
+        .filter(|entry| {
+            let path = Path::new(&entry.path);
+            let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            !invalidated.contains(&canonical)
+                && (!root_paths.iter().any(|root| canonical.starts_with(root))
+                    || desired.contains(&canonical))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if filtered.len() != existing.len() {
+        save_analysis_file(analysis_path, &filtered)?;
+    }
+    Ok(())
 }
 
 fn validate_scan_previews(previews: &[SlotPreview]) -> Result<(), String> {
@@ -3283,6 +3437,15 @@ fn start_confirmed_sync(
         return Err(String::from("没有可处理的转换任务"));
     }
 
+    // Start a fresh conversion-scoped metadata preparation attempt. A prior
+    // manual cache cancellation must not leak into this batch; a later
+    // cancel_sync call will set the same flag again while the coordinator is
+    // running.
+    state
+        .library
+        .metadata_cache_cancel
+        .store(false, Ordering::SeqCst);
+
     let batch_id = batch_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("batch-{}", unique_timestamp()));
@@ -3310,7 +3473,6 @@ fn start_confirmed_sync(
         .clone();
     let requested_analyses = analyses.unwrap_or_default();
     let requested_analysis_failures = analysis_failures.unwrap_or_default();
-    let metadata_context = conversion_metadata_context(&state);
     let mut jobs = Vec::with_capacity(previews.len());
     let mut seen_slots = Vec::with_capacity(previews.len());
     let monitor_previews;
@@ -3330,17 +3492,7 @@ fn start_confirmed_sync(
         let mut validated_previews = Vec::with_capacity(previews.len());
 
         for slot_preview in previews {
-            let mut slot_preview = slot_preview;
             let slot_index = slot_preview.slot_index;
-            if matches!(
-                filename_normalization_policy_for_slot(slot_index),
-                FilenameNormalizationPolicy::PreserveSource
-            ) {
-                attach_netease_identities(
-                    &mut slot_preview.preview,
-                    metadata_context.netease.as_ref(),
-                );
-            }
             if seen_slots.contains(&slot_index) {
                 return Err(format!("重复的同步任务槽位：{slot_index}"));
             }
@@ -3424,6 +3576,7 @@ fn start_confirmed_sync(
                 slot_index,
                 source: slot_preview.preview.source_directory.clone(),
                 destination: slot_preview.preview.destination_directory.clone(),
+                conversion_mode: controller.state().conversion_mode,
                 mode: slot_preview.mode,
                 lossless_format: slot_preview.lossless_format,
                 conflict_strategy: slot_preview.conflict_strategy,
@@ -3452,7 +3605,10 @@ fn start_confirmed_sync(
                 retry_of: retry_of.clone().or(slot_preview.retry_of),
                 test_monitor: None,
                 w4dj_path: w4dj_path.clone(),
-                metadata_context: metadata_context.clone(),
+                // The resolver is prepared after the slots enter their
+                // running state.  Until then workers hold a harmless empty
+                // context and are not spawned.
+                metadata_context: empty_conversion_metadata_context(),
             });
         }
 
@@ -3525,27 +3681,87 @@ fn start_confirmed_sync(
             .insert(batch_id.clone(), Arc::clone(monitor));
     }
 
-    let task_concurrency_budget = concurrency_budget_snapshot(&state);
-    let task_ffmpeg_registry = Arc::clone(&state.ffmpeg_registry);
-    for mut job in jobs {
-        job.test_monitor = test_monitor.clone();
-        let controller = Arc::clone(&state.controller);
-        let destination_coordinator = destination_coordinator.clone();
-        let history_path = history_path.clone();
-        let history_write_lock = Arc::clone(&history_write_lock);
-        let concurrency_budget = Arc::clone(&task_concurrency_budget);
-        let ffmpeg_registry = Arc::clone(&task_ffmpeg_registry);
-        thread::spawn(move || {
-            run_confirmed_sync_task(
-                controller,
-                destination_coordinator,
-                history_path,
-                history_write_lock,
-                job,
-                concurrency_budget,
-                ffmpeg_registry,
-            )
-        });
+    // NetEase preparation is conversion-scoped and runs in a batch
+    // coordinator after the task cards have entered their running state. This
+    // lets the command return immediately and lets cancellation interrupt the
+    // preparation without ever starting a later song.
+    if !jobs.is_empty() {
+        let coordinator_controller = Arc::clone(&state.controller);
+        let coordinator_library = Arc::clone(&state.library);
+        let coordinator_catalog_path = w4dj_path.clone();
+        let coordinator_preferred_database = manual_netease_database_path(&state);
+        let coordinator_destination = destination_coordinator.clone();
+        let coordinator_history_path = history_path.clone();
+        let coordinator_history_lock = Arc::clone(&history_write_lock);
+        let coordinator_budget = concurrency_budget_snapshot(&state);
+        let coordinator_ffmpeg = Arc::clone(&state.ffmpeg_registry);
+        thread::Builder::new()
+            .name("conversion-batch-coordinator".to_string())
+            .spawn(move || {
+                {
+                    let mut controller = coordinator_controller
+                        .lock()
+                        .expect("desktop lock poisoned");
+                    for job in &jobs {
+                        let _ = controller.set_current_file(job.slot_index, "正在准备网易云元数据");
+                        let _ = controller.push_log(job.slot_index, "正在准备网易云元数据");
+                    }
+                }
+                let metadata_context = match conversion_metadata_context_for_library(
+                    &coordinator_library,
+                    &coordinator_catalog_path,
+                    coordinator_preferred_database.as_deref(),
+                ) {
+                    Ok(context) => context,
+                    Err(error) if error == "cancelled" => {
+                        eprintln!("Netease metadata preparation cancelled: {error}");
+                        if let Ok(mut controller) = coordinator_controller.lock() {
+                            for job in &jobs {
+                                let _ = controller.push_log(
+                                    job.slot_index,
+                                    "网易云元数据准备已取消，将使用内嵌标签/文件名降级",
+                                );
+                            }
+                        }
+                        empty_conversion_metadata_context()
+                    }
+                    Err(error) => {
+                        eprintln!("Netease metadata cache warning: {error}");
+                        if let Ok(mut controller) = coordinator_controller.lock() {
+                            for job in &jobs {
+                                let _ = controller.push_log(
+                                    job.slot_index,
+                                    format!("网易云元数据准备失败，已降级：{error}"),
+                                );
+                            }
+                        }
+                        empty_conversion_metadata_context()
+                    }
+                };
+
+                for mut job in jobs {
+                    job.metadata_context = metadata_context.clone();
+                    job.test_monitor = test_monitor.clone();
+                    let controller = Arc::clone(&coordinator_controller);
+                    let destination_coordinator = coordinator_destination.clone();
+                    let history_path = coordinator_history_path.clone();
+                    let history_write_lock = Arc::clone(&coordinator_history_lock);
+                    let concurrency_budget = Arc::clone(&coordinator_budget);
+                    let ffmpeg_registry = Arc::clone(&coordinator_ffmpeg);
+                    thread::spawn(move || {
+                        run_confirmed_sync_task(
+                            controller,
+                            destination_coordinator,
+                            history_path,
+                            history_write_lock,
+                            job,
+                            concurrency_budget,
+                            ffmpeg_registry,
+                        )
+                    });
+                }
+            })
+            .map_err(|error| format!("启动转换批次协调器失败：{error}"))?;
     }
 
     Ok(state
@@ -4687,19 +4903,22 @@ fn build_metadata_cache_blocking(
     Ok(locators.len())
 }
 
-fn ensure_metadata_cache_ready(state: &AppState) -> Result<(), String> {
-    let Some(database_path) = locate_supported_database(manual_netease_database_path(state).as_deref()) else {
+fn ensure_metadata_cache_ready_for_library(
+    library: &LibraryState,
+    preferred: Option<&Path>,
+    cache_path: &Path,
+) -> Result<(), String> {
+    let Some(database_path) = locate_supported_database(preferred) else {
         return Ok(());
     };
-    let cache_path = netease_metadata_cache_path(state);
     let fingerprint = database_fingerprint_view(&database_path);
-    let summary = netease_cache::read_summary(&cache_path, Some(&database_path), Some(&fingerprint))
+    let summary = netease_cache::read_summary(cache_path, Some(&database_path), Some(&fingerprint))
         .map_err(|error| format!("读取网易云轻量索引状态失败：{error}"))?;
     if summary.state == CacheState::Ready {
         return Ok(());
     }
-    let count = build_metadata_cache_blocking(&state.library, &cache_path, &database_path)?;
-    let _ = update_metadata_cache_progress(&state.library, |progress| {
+    let count = build_metadata_cache_blocking(library, cache_path, &database_path)?;
+    let _ = update_metadata_cache_progress(library, |progress| {
         progress.status = CacheState::Ready.as_str().to_string();
         progress.stage = "completed".to_string();
         progress.processed = count;
@@ -4859,25 +5078,42 @@ fn ensure_netease_database_not_busy(state: &AppState) -> Result<(), String> {
 }
 
 fn conversion_metadata_context(state: &AppState) -> Arc<ConversionMetadataContext> {
-    if !netease_database_bound(state) {
-        return Arc::new(ConversionMetadataContext {
-            netease: Arc::new(NeteaseMetadataResolver::default()),
-        });
-    }
     let preferred = manual_netease_database_path(state);
-    // This is the first conversion/scan boundary, not app startup. Prepare
-    // the small locator snapshot here if the user has not explicitly done so;
-    // complete source rows are still fetched one song at a time by recover().
-    if let Err(error) = ensure_metadata_cache_ready(state)
-        && error != "cancelled"
-    {
-        eprintln!("Netease metadata cache warning: {error}");
+    let catalog_path = state
+        .library
+        .catalog_path
+        .lock()
+        .expect("library catalog path lock poisoned")
+        .clone();
+    conversion_metadata_context_for_library(&state.library, &catalog_path, preferred.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Netease metadata cache warning: {error}");
+            empty_conversion_metadata_context()
+        })
+}
+
+fn empty_conversion_metadata_context() -> Arc<ConversionMetadataContext> {
+    Arc::new(ConversionMetadataContext {
+        netease: Arc::new(NeteaseMetadataResolver::default()),
+    })
+}
+
+/// Prepare the conversion-only metadata context without borrowing the Tauri
+/// `AppState`. The batch coordinator can run this on a background thread after
+/// the task cards have entered their running state.
+fn conversion_metadata_context_for_library(
+    library: &LibraryState,
+    catalog_path: &Path,
+    preferred: Option<&Path>,
+) -> Result<Arc<ConversionMetadataContext>, String> {
+    if !library_netease_database_bound(library) {
+        return Ok(empty_conversion_metadata_context());
     }
-    let cache_path = netease_metadata_cache_path(state);
-    let (resolver, warning) = NeteaseMetadataResolver::load_lazy_with_warning(
-        preferred.as_deref(),
-        &cache_path,
-    )
+    let cache_path = catalog_path.with_file_name("library-dashboard.sqlite3");
+    // This is the first conversion boundary, not app startup. Complete source
+    // rows are still fetched one song at a time by recover().
+    ensure_metadata_cache_ready_for_library(library, preferred, &cache_path)?;
+    let (resolver, warning) = NeteaseMetadataResolver::load_lazy_with_warning(preferred, &cache_path)
         .unwrap_or_else(|error| {
             (
                 NeteaseMetadataResolver::default(),
@@ -4887,9 +5123,9 @@ fn conversion_metadata_context(state: &AppState) -> Arc<ConversionMetadataContex
     if let Some(warning) = warning {
         eprintln!("Netease metadata resolver warning: {warning}");
     }
-    Arc::new(ConversionMetadataContext {
+    Ok(Arc::new(ConversionMetadataContext {
         netease: Arc::new(resolver),
-    })
+    }))
 }
 
 fn task_one_music_directory(state: &AppState) -> Option<PathBuf> {
@@ -7645,6 +7881,24 @@ fn register_committed_output(
     candidate: &PreviewCandidate,
     _analyses: &HashMap<String, EmbeddedAnalysis>,
 ) -> io::Result<()> {
+    register_committed_output_with_facts(
+        library,
+        slot_index,
+        _destination_root,
+        candidate,
+        _analyses,
+        &CommittedOutputFacts::default(),
+    )
+}
+
+fn register_committed_output_with_facts(
+    library: &mut Option<W4djLibrary>,
+    slot_index: usize,
+    _destination_root: &Path,
+    candidate: &PreviewCandidate,
+    _analyses: &HashMap<String, EmbeddedAnalysis>,
+    naming_facts: &CommittedOutputFacts,
+) -> io::Result<()> {
     let Some(library) = library else {
         return Err(io::Error::other("W4DJ 歌曲库不可用，无法确认覆盖"));
     };
@@ -7658,7 +7912,27 @@ fn register_committed_output(
     }
     let title = output_metadata.title.trim();
     let artist = output_metadata.artist.trim();
-    library.upsert_lightweight_output(
+    let source_fingerprint = fs::metadata(&candidate.source_path).ok();
+    let mut facts = naming_facts.clone();
+    // The candidate fingerprint is the one that was preflighted immediately
+    // before conversion and therefore describes the bytes that produced this
+    // output. If the source changed while FFmpeg was running, recording a
+    // fresh post-conversion stat here would falsely associate the old output
+    // with the new source and suppress the next incremental scan.
+    facts.source_size_bytes = (candidate.source_size_bytes > 0)
+        .then_some(candidate.source_size_bytes)
+        .or_else(|| source_fingerprint.as_ref().map(fs::Metadata::len));
+    facts.source_modified_at_ms = candidate.source_modified_at_ms.or_else(|| {
+        source_fingerprint.as_ref().and_then(|metadata| {
+            metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        })
+    });
+    library.upsert_committed_output(
         slot_index,
         Some(Path::new(&candidate.source_path)),
         Path::new(&candidate.destination_path),
@@ -7666,9 +7940,38 @@ fn register_committed_output(
         candidate.netease_album_id.as_deref(),
         title,
         artist,
+        &facts,
     )
     .map(|_| ())
     .map_err(|error| io::Error::other(format!("歌曲库登记失败：{error}")))
+}
+
+fn committed_output_naming_facts(
+    conversion_mode: ConversionMode,
+    _mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+) -> CommittedOutputFacts {
+    let conversion_mode = match conversion_mode {
+        ConversionMode::ScanThenConvert => "scan_then_convert",
+        ConversionMode::Direct => "direct",
+    };
+    let lossless_format = lossless_format.map(|format| match format {
+        LosslessFormat::Wav => "wav",
+        LosslessFormat::Aiff => "aiff",
+    });
+    CommittedOutputFacts {
+        conversion_mode: Some(conversion_mode.to_string()),
+        lossless_format: lossless_format.map(str::to_string),
+        filename_rule: Some(filename_rule_cache_key(filename_rule).to_string()),
+        netease_filename_format: Some(
+            netease_filename_format_cache_key(netease_filename_format).to_string(),
+        ),
+        filename_normalization_policy: Some(filename_policy.cache_key().to_string()),
+        ..Default::default()
+    }
 }
 
 /// Replaced-output cleanup is only valid for a confirmed identity inside the active
@@ -7781,18 +8084,39 @@ fn finalize_committed_candidate(
     analyses: &HashMap<String, EmbeddedAnalysis>,
     strategy: ConflictStrategy,
 ) -> io::Result<()> {
+    finalize_committed_candidate_with_facts(
+        library,
+        slot_index,
+        destination_root,
+        candidate,
+        analyses,
+        strategy,
+        &CommittedOutputFacts::default(),
+    )
+}
+
+fn finalize_committed_candidate_with_facts(
+    library: &mut Option<W4djLibrary>,
+    slot_index: usize,
+    destination_root: &Path,
+    candidate: &PreviewCandidate,
+    analyses: &HashMap<String, EmbeddedAnalysis>,
+    strategy: ConflictStrategy,
+    naming_facts: &CommittedOutputFacts,
+) -> io::Result<()> {
     verify_committed_candidate(candidate).map_err(|error| {
         io::Error::other(format!(
             "覆盖失败：新输出={}，复读校验失败：{error}",
             candidate.destination_path
         ))
     })?;
-    register_committed_output(
+    register_committed_output_with_facts(
         library,
         slot_index,
         destination_root,
         candidate,
         analyses,
+        naming_facts,
     )
     .map_err(|error| {
         io::Error::other(format!(
@@ -7998,6 +8322,14 @@ fn run_confirmed_sync_task(
                 None
             }
         };
+        let naming_facts = committed_output_naming_facts(
+            job.conversion_mode,
+            job.mode,
+            job.lossless_format,
+            job.filename_rule,
+            job.netease_filename_format,
+            filename_normalization_policy_for_slot(job.slot_index),
+        );
 
         if let Err(error) = cleanup_result {
             setup_error = Some(format!("无法清理临时文件：{error}"));
@@ -8018,6 +8350,63 @@ fn run_confirmed_sync_task(
                 }
                 let source_path = PathBuf::from(&candidate.source_path);
                 if source_path.exists() {
+                    let current_source_metadata = fs::metadata(&source_path).ok();
+                    let current_modified_at_ms = current_source_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                    let source_changed = (candidate.source_modified_at_ms.is_some()
+                        && candidate.source_modified_at_ms != current_modified_at_ms)
+                        || (candidate.source_size_bytes > 0
+                            && current_source_metadata
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.len() != candidate.source_size_bytes));
+                    let target_path = Path::new(&candidate.destination_path);
+                    let target_was_present = job
+                        .preview
+                        .output_files
+                        .iter()
+                        .any(|path| path == &candidate.destination_path);
+                    let target_claimed_as_previous = candidate_replacement_paths(candidate)
+                        .iter()
+                        .any(|path| *path == candidate.destination_path);
+                    let target_changed = target_path.exists()
+                        && !target_was_present
+                        && !target_claimed_as_previous;
+                    if source_changed || target_changed {
+                        let message = if source_changed {
+                            "源文件在开始转换前已变化，请重新扫描"
+                        } else {
+                            "目标路径在开始转换前已被占用，请重新扫描"
+                        };
+                        record_failed_candidate(
+                            &controller,
+                            job.slot_index,
+                            &task_controller,
+                            candidate,
+                            message,
+                        );
+                        let failed_file = FailedFile {
+                            name: candidate.name.clone(),
+                            source_path: candidate.source_path.clone(),
+                            destination_path: candidate.destination_path.clone(),
+                            message: message.to_string(),
+                            category: classify_error(message),
+                        };
+                        mark_recovery_processed(
+                            &history_path,
+                            &history_write_lock,
+                            &recovery_entry,
+                            &candidate.name,
+                            task_controller.snapshot().completed,
+                            Some(failed_file.clone()),
+                        );
+                        if let Some(monitor) = job.test_monitor.as_ref() {
+                            monitor.record_candidate_result(candidate, "failed", Some(message));
+                        }
+                        continue;
+                    }
                     source_files.insert(
                         candidate.name.clone(),
                         (candidate.source_size_bytes.to_string(), source_path),
@@ -8086,12 +8475,13 @@ fn run_confirmed_sync_task(
                     )
                 });
                 let result = result.and_then(|()| {
-                    register_committed_output(
+                    register_committed_output_with_facts(
                         &mut w4dj_library,
                         job.slot_index,
                         Path::new(&job.destination),
                         candidate,
                         &analysis_lookup,
+                        &naming_facts,
                     )
                 });
                 let mut controller_guard = controller.lock().expect("desktop lock poisoned");
@@ -8192,13 +8582,14 @@ fn run_confirmed_sync_task(
                             let candidate = candidate.ok_or_else(|| {
                                 io::Error::other(format!("找不到已提交歌曲的预览记录：{name}"))
                             })?;
-                            finalize_committed_candidate(
+                            finalize_committed_candidate_with_facts(
                                 &mut w4dj_library,
                                 job.slot_index,
                                 Path::new(&job.destination),
                                 candidate,
                                 &analysis_lookup,
                                 job.conflict_strategy,
+                                &naming_facts,
                             )
                             .err()
                         } else {
@@ -8431,6 +8822,7 @@ fn pending_file_from_candidate(candidate: &PreviewCandidate) -> PendingFile {
         source_path: candidate.source_path.clone(),
         destination_path: candidate.destination_path.clone(),
         source_size_bytes: candidate.source_size_bytes,
+        source_modified_at_ms: candidate.source_modified_at_ms,
         estimated_output_bytes: candidate.estimated_output_bytes,
         previous_destination_path: candidate.previous_destination_path.clone(),
         previous_destination_paths: candidate.previous_destination_paths.clone(),
@@ -8899,7 +9291,23 @@ fn run_sync_task(
                 && let Some(library) = w4dj_library.as_mut()
                 && let Err(registration_error) = {
                     let identity = metadata_context.netease.track_identity(source_path);
-                    library.upsert_lightweight_output(
+                    let mut facts = committed_output_naming_facts(
+                        ConversionMode::Direct,
+                        mode,
+                        lossless_format,
+                        filename_rule,
+                        netease_filename_format,
+                        filename_normalization_policy_for_slot(slot_index),
+                    );
+                    facts.source_size_bytes = source_files
+                        .get(name)
+                        .and_then(|(size, _)| size.parse::<u64>().ok());
+                    facts.source_modified_at_ms = fs::metadata(source_path)
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+                    library.upsert_committed_output(
                         slot_index,
                         Some(source_path),
                         &destination_path,
@@ -8907,6 +9315,7 @@ fn run_sync_task(
                         identity.as_ref().and_then(|value| value.album_id.as_deref()),
                         identity.as_ref().map_or("", |value| value.title.as_str()),
                         identity.as_ref().map_or("", |value| value.artists.as_str()),
+                        &facts,
                     )
                 }
             {
@@ -9127,6 +9536,7 @@ mod tests {
             source_path: source.display().to_string(),
             destination_path: current.display().to_string(),
             source_size_bytes: fs::metadata(source).unwrap().len(),
+            source_modified_at_ms: None,
             estimated_output_bytes: Some(fs::metadata(current).unwrap().len()),
             previous_destination_path: old.first().map(|path| path.display().to_string()),
             previous_destination_paths: old
@@ -9342,6 +9752,8 @@ mod tests {
                 destination_total: None,
                 metadata_processed: 7,
                 metadata_total: Some(1088),
+                reused_count: 0,
+                incremental_count: 0,
                 current_file: "Song.mp3".into(),
                 error: None,
             }],
@@ -9383,6 +9795,8 @@ mod tests {
                     destination_total: Some(6),
                     metadata_processed: 6,
                     metadata_total: Some(6),
+                    reused_count: 0,
+                    incremental_count: 0,
                     current_file: String::new(),
                     error: None,
                 })
@@ -9686,6 +10100,7 @@ mod tests {
                         source_path: "/music/in/song.mp3".into(),
                         destination_path: "/music/out/song.mp3".into(),
                         source_size_bytes: 1024,
+                        source_modified_at_ms: None,
                         estimated_output_bytes: Some(1024),
         previous_destination_path: None,
         previous_destination_paths: Vec::new(),

@@ -21,19 +21,56 @@ use crate::media_probe::probe_local_audio;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-pub const W4DJ_SCHEMA_VERSION: i64 = 2;
+pub const W4DJ_SCHEMA_VERSION: i64 = 3;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommittedOutputFacts {
+    pub source_size_bytes: Option<u64>,
+    pub source_modified_at_ms: Option<u64>,
+    pub conversion_mode: Option<String>,
+    pub lossless_format: Option<String>,
+    pub filename_rule: Option<String>,
+    pub netease_filename_format: Option<String>,
+    pub filename_normalization_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedOutputBinding {
+    pub source_path: String,
+    pub destination_path: String,
+    pub output_root: String,
+    pub slot_index: usize,
+    pub source_size_bytes: Option<u64>,
+    pub source_modified_at_ms: Option<u64>,
+    pub mode: Option<String>,
+    pub lossless_format: Option<String>,
+    pub filename_rule: Option<String>,
+    pub netease_filename_format: Option<String>,
+    pub filename_normalization_policy: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutputReconcileSummary {
     pub invalidated_paths: Vec<PathBuf>,
     pub removed_paths: Vec<PathBuf>,
+}
+
+/// Filesystem facts captured during the scan walk.  Reconciliation consumes
+/// these values directly instead of issuing a second `stat` for every output.
+/// A zero-sized or otherwise invalid snapshot is rejected just like the
+/// legacy path-based reconciliation API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutputFileSnapshot {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +191,42 @@ impl W4djLibrary {
         self.catalog.path()
     }
 
+    /// Load all successful source→output bindings in one SQLite query. Scan
+    /// code uses this snapshot to classify outputs without per-track lookups.
+    pub fn committed_output_bindings(&self) -> W4djResult<Vec<CommittedOutputBinding>> {
+        let mut normalized_roots = HashMap::<String, String>::new();
+        let mut statement = self.catalog.connection().prepare(
+            "SELECT source_path,destination_path,output_root,slot_index,
+                    source_size_bytes,source_modified_at_ms,conversion_mode,
+                    lossless_format,filename_rule,netease_filename_format,
+                    filename_normalization_policy
+             FROM w4dj_track_meta WHERE status='available' AND source_path IS NOT NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let source_path: String = row.get(0)?;
+            let destination_path: String = row.get(1)?;
+            let output_root: String = row.get(2)?;
+            let normalized_root = normalized_roots
+                .entry(output_root.clone())
+                .or_insert_with(|| normalize_path(Path::new(&output_root)))
+                .clone();
+            Ok(CommittedOutputBinding {
+                source_path,
+                destination_path,
+                output_root: normalized_root,
+                slot_index: row.get::<_, i64>(3)? as usize,
+                source_size_bytes: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                source_modified_at_ms: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                mode: row.get(6)?,
+                lossless_format: row.get(7)?,
+                filename_rule: row.get(8)?,
+                netease_filename_format: row.get(9)?,
+                filename_normalization_policy: row.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn migrate(&mut self) -> W4djResult<()> {
         self.catalog.connection().execute_batch(
             r#"
@@ -182,6 +255,13 @@ impl W4djLibrary {
                 analysis_status TEXT NOT NULL DEFAULT 'notAnalyzed',
                 analysis_error TEXT,
                 measured_duration_seconds REAL,
+                source_size_bytes INTEGER,
+                source_modified_at_ms INTEGER,
+                conversion_mode TEXT,
+                lossless_format TEXT,
+                filename_rule TEXT,
+                netease_filename_format TEXT,
+                filename_normalization_policy TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 FOREIGN KEY(track_key) REFERENCES tracks(track_key) ON DELETE CASCADE
@@ -259,6 +339,9 @@ impl W4djLibrary {
                 ON imported_dj_playlist_matches(playlist_id, position);
             "#,
         )?;
+        self.ensure_committed_output_columns()?;
+        // Add the v3 nullable facts before any legacy table rebuild so the
+        // migration can copy them forward instead of silently dropping them.
         self.migrate_track_meta_without_root_foreign_key()?;
         let netease_track_id_exists: bool = self.catalog.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlist_tracks') WHERE name='netease_track_id')",
@@ -287,6 +370,32 @@ impl W4djLibrary {
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [W4DJ_SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    fn ensure_committed_output_columns(&mut self) -> W4djResult<()> {
+        let columns = [
+            ("source_size_bytes", "INTEGER"),
+            ("source_modified_at_ms", "INTEGER"),
+            ("conversion_mode", "TEXT"),
+            ("lossless_format", "TEXT"),
+            ("filename_rule", "TEXT"),
+            ("netease_filename_format", "TEXT"),
+            ("filename_normalization_policy", "TEXT"),
+        ];
+        for (name, ty) in columns {
+            let exists: bool = self.catalog.connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('w4dj_track_meta') WHERE name=?1)",
+                [name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                self.catalog.connection().execute(
+                    &format!("ALTER TABLE w4dj_track_meta ADD COLUMN {name} {ty}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -319,6 +428,13 @@ impl W4djLibrary {
                 analysis_status TEXT NOT NULL DEFAULT 'notAnalyzed',
                 analysis_error TEXT,
                 measured_duration_seconds REAL,
+                source_size_bytes INTEGER,
+                source_modified_at_ms INTEGER,
+                conversion_mode TEXT,
+                lossless_format TEXT,
+                filename_rule TEXT,
+                netease_filename_format TEXT,
+                filename_normalization_policy TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 FOREIGN KEY(track_key) REFERENCES tracks(track_key) ON DELETE CASCADE
@@ -326,9 +442,13 @@ impl W4djLibrary {
              INSERT INTO w4dj_track_meta_light(
                 track_key,source_path,destination_path,slot_index,output_root,
                 status,analysis_status,analysis_error,measured_duration_seconds,
+                source_size_bytes,source_modified_at_ms,conversion_mode,lossless_format,
+                filename_rule,netease_filename_format,filename_normalization_policy,
                 created_at_ms,updated_at_ms
              ) SELECT track_key,source_path,destination_path,slot_index,output_root,
                 status,analysis_status,analysis_error,measured_duration_seconds,
+                source_size_bytes,source_modified_at_ms,conversion_mode,lossless_format,
+                filename_rule,netease_filename_format,filename_normalization_policy,
                 created_at_ms,updated_at_ms
              FROM w4dj_track_meta;
              DROP TABLE w4dj_track_meta;
@@ -945,6 +1065,30 @@ impl W4djLibrary {
         title: &str,
         artist: &str,
     ) -> W4djResult<String> {
+        self.upsert_lightweight_output_inner(
+            slot_index,
+            source_path,
+            destination_path,
+            netease_track_id,
+            netease_album_id,
+            title,
+            artist,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_lightweight_output_inner(
+        &mut self,
+        slot_index: usize,
+        source_path: Option<&Path>,
+        destination_path: &Path,
+        netease_track_id: Option<&str>,
+        netease_album_id: Option<&str>,
+        title: &str,
+        artist: &str,
+        facts: Option<&CommittedOutputFacts>,
+    ) -> W4djResult<String> {
         let destination = normalize_index_path(destination_path);
         if destination.is_empty() {
             return Err(W4djLibraryError::Invalid("输出路径不能为空".to_string()));
@@ -1093,8 +1237,11 @@ impl W4djLibrary {
             "INSERT INTO w4dj_track_meta(
                 track_key,source_path,destination_path,slot_index,output_root,
                 status,analysis_status,analysis_error,measured_duration_seconds,
+                source_size_bytes,source_modified_at_ms,conversion_mode,lossless_format,
+                filename_rule,netease_filename_format,filename_normalization_policy,
                 created_at_ms,updated_at_ms
-             ) VALUES (?1,?2,?3,?4,?5,'available','notAnalyzed',NULL,NULL,?6,?6)
+             ) VALUES (?1,?2,?3,?4,?5,'available','notAnalyzed',NULL,NULL,
+                       ?6,?7,?8,?9,?10,?11,?12,?13,?13)
              ON CONFLICT(track_key) DO UPDATE SET
                 source_path=excluded.source_path,
                 destination_path=excluded.destination_path,
@@ -1104,6 +1251,13 @@ impl W4djLibrary {
                 analysis_status='notAnalyzed',
                 analysis_error=NULL,
                 measured_duration_seconds=NULL,
+                source_size_bytes=COALESCE(excluded.source_size_bytes,w4dj_track_meta.source_size_bytes),
+                source_modified_at_ms=COALESCE(excluded.source_modified_at_ms,w4dj_track_meta.source_modified_at_ms),
+                conversion_mode=COALESCE(excluded.conversion_mode,w4dj_track_meta.conversion_mode),
+                lossless_format=COALESCE(excluded.lossless_format,w4dj_track_meta.lossless_format),
+                filename_rule=COALESCE(excluded.filename_rule,w4dj_track_meta.filename_rule),
+                netease_filename_format=COALESCE(excluded.netease_filename_format,w4dj_track_meta.netease_filename_format),
+                filename_normalization_policy=COALESCE(excluded.filename_normalization_policy,w4dj_track_meta.filename_normalization_policy),
                 updated_at_ms=excluded.updated_at_ms",
             params![
                 track_key,
@@ -1111,6 +1265,13 @@ impl W4djLibrary {
                 destination,
                 slot_index as i64,
                 output_root,
+                facts.and_then(|facts| facts.source_size_bytes.map(|value| value as i64)),
+                facts.and_then(|facts| facts.source_modified_at_ms.map(|value| value as i64)),
+                facts.and_then(|facts| facts.conversion_mode.as_deref()),
+                facts.and_then(|facts| facts.lossless_format.as_deref()),
+                facts.and_then(|facts| facts.filename_rule.as_deref()),
+                facts.and_then(|facts| facts.netease_filename_format.as_deref()),
+                facts.and_then(|facts| facts.filename_normalization_policy.as_deref()),
                 now
             ],
         )?;
@@ -1150,6 +1311,32 @@ impl W4djLibrary {
         )?;
         transaction.commit()?;
         Ok(track_key)
+    }
+
+    /// Register a safely committed output and persist the source fingerprint
+    /// and naming context used to produce it in the same SQLite transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_committed_output(
+        &mut self,
+        slot_index: usize,
+        source_path: Option<&Path>,
+        destination_path: &Path,
+        netease_track_id: Option<&str>,
+        netease_album_id: Option<&str>,
+        title: &str,
+        artist: &str,
+        facts: &CommittedOutputFacts,
+    ) -> W4djResult<String> {
+        self.upsert_lightweight_output_inner(
+            slot_index,
+            source_path,
+            destination_path,
+            netease_track_id,
+            netease_album_id,
+            title,
+            artist,
+            Some(facts),
+        )
     }
 
     /// Register one output only after its final safe commit has completed.
@@ -1661,6 +1848,71 @@ impl W4djLibrary {
             });
         }
 
+        self.reconcile_scanned_output_roots(snapshots)
+    }
+
+    /// Reconcile output roots from the snapshots collected by the scan walk.
+    /// This is the production path: it performs no filesystem metadata reads
+    /// and therefore cannot turn reconciliation into a second output scan.
+    pub fn reconcile_output_snapshots(
+        &mut self,
+        roots: &[(usize, PathBuf, Vec<OutputFileSnapshot>)],
+    ) -> W4djResult<OutputReconcileSummary> {
+        let mut snapshots = Vec::with_capacity(roots.len());
+        for (slot_index, root_path, files) in roots {
+            let root = normalize_path(root_path);
+            if root.is_empty() {
+                continue;
+            }
+            let mut destinations = HashSet::with_capacity(files.len());
+            let mut scanned_files = Vec::with_capacity(files.len());
+            for file in files {
+                if file.size_bytes == 0 {
+                    return Err(W4djLibraryError::Invalid(
+                        "输出扫描发现无效音频文件".to_string(),
+                    ));
+                }
+                // The walk already captured the filesystem facts.  Rebuild a
+                // stable absolute key from the normalized root and the
+                // snapshot's relative path instead of canonicalizing/stat'ing
+                // each output again during reconciliation.
+                let destination = snapshot_path_key(root_path, &root, &file.path);
+                if !destinations.insert(destination.clone()) {
+                    continue;
+                }
+                scanned_files.push(ScannedOutputFile {
+                    destination,
+                    title: file
+                        .path
+                        .file_stem()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| file.path.display().to_string()),
+                    size_bytes: file.size_bytes.min(i64::MAX as u64) as i64,
+                    modified_at_ms: file
+                        .modified_at_ms
+                        .map(|value| value.min(i64::MAX as u64) as i64),
+                    measured_format: file
+                        .path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_ascii_lowercase),
+                });
+            }
+            snapshots.push(ScannedOutputRoot {
+                slot_index: *slot_index,
+                root,
+                destinations,
+                files: scanned_files,
+            });
+        }
+
+        self.reconcile_scanned_output_roots(snapshots)
+    }
+
+    fn reconcile_scanned_output_roots(
+        &mut self,
+        snapshots: Vec<ScannedOutputRoot>,
+    ) -> W4djResult<OutputReconcileSummary> {
         let transaction = self.catalog.connection_mut().transaction()?;
         let now = now_ms();
         let mut summary = OutputReconcileSummary::default();
@@ -2553,6 +2805,22 @@ fn normalize_path(path: &Path) -> String {
 /// startup and avoids an implicit stat/canonicalize scan.
 fn normalize_index_path(path: &Path) -> String {
     path.to_string_lossy().trim().to_string()
+}
+
+fn snapshot_path_key(root_path: &Path, normalized_root: &str, path: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(root_path) {
+        return Path::new(normalized_root)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned();
+    }
+    if let Ok(relative) = path.strip_prefix(Path::new(normalized_root)) {
+        return Path::new(normalized_root)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned();
+    }
+    normalize_index_path(path)
 }
 
 fn nonempty_identity(value: Option<&str>) -> Option<String> {

@@ -534,6 +534,8 @@ export type AppScanTaskProgress = {
   destination_total?: number | null;
   metadata_processed?: number;
   metadata_total?: number | null;
+  reused_count?: number;
+  incremental_count?: number;
   current_file: string;
   error?: string | null;
 };
@@ -2647,13 +2649,21 @@ function renderSyncSlot(
     ? `${conversionPhaseLabel(slot.status, state.lang)} ${slot.progressCompleted}/${slot.progressTotal}`
     : null;
   const scanProgressText = taskScanActive && scanTask
-    ? librarySyncFailed
-      ? renderedPhaseTotal == null
-        ? `${t('scanSucceeded', state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
-        : `${t('scanSucceeded', state.lang)} ${phaseProcessed}/${renderedPhaseTotal}`
-      : renderedPhaseTotal == null
-      ? `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanTask.phase === 'scanning_destination' ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(scanTask.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}`
-      : `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanTask.phase === 'scanning_destination' ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(scanTask.phase, state.lang)} ${phaseProcessed}/${renderedPhaseTotal}${scanTask.phase === 'scanning_destination' && state.lang === 'zh' ? ' 首' : ''}`
+    ? (() => {
+      const cacheSummary = scanTask.phase === 'completed'
+        ? (state.lang === 'zh'
+          ? ` · 缓存复用 ${scanTask.reused_count ?? 0} · 增量扫描 ${scanTask.incremental_count ?? 0}`
+          : ` · cache reused ${scanTask.reused_count ?? 0} · incremental ${scanTask.incremental_count ?? 0}`)
+        : '';
+      if (librarySyncFailed) {
+        return renderedPhaseTotal == null
+          ? `${t('scanSucceeded', state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}${cacheSummary}`
+          : `${t('scanSucceeded', state.lang)} ${phaseProcessed}/${renderedPhaseTotal}${cacheSummary}`;
+      }
+      return renderedPhaseTotal == null
+        ? `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanTask.phase === 'scanning_destination' ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(scanTask.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${phaseProcessed} 项` : `${phaseProcessed} scanned`}${cacheSummary}`
+        : `${scanTask.phase === 'completed' ? t('scanSucceeded', state.lang) : scanTask.phase === 'scanning_destination' ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(scanTask.phase, state.lang)} ${phaseProcessed}/${renderedPhaseTotal}${scanTask.phase === 'scanning_destination' && state.lang === 'zh' ? ' 首' : ''}${cacheSummary}`;
+    })()
     : null;
   const displayedProgressText = (analysisIsActive ? analysisProgressText : null)
     || scanProgressText
@@ -3189,9 +3199,14 @@ export function bindApp(
             ? task.source_total ?? (task.total > 0 ? task.total : null)
           : task.destination_total ?? (task.total > 0 ? task.total : null);
       const renderedTotal = total != null && processed <= total ? total : null;
+      const cacheSummary = task.phase === 'completed'
+        ? (state.lang === 'zh'
+          ? ` · 缓存复用 ${task.reused_count ?? 0} · 增量扫描 ${task.incremental_count ?? 0}`
+          : ` · cache reused ${task.reused_count ?? 0} · incremental ${task.incremental_count ?? 0}`)
+        : '';
       const progressText = renderedTotal == null
         ? `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : destinationPhase ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(task.phase, state.lang)} · ${state.lang === 'zh' ? `已扫描 ${processed} 项` : `${processed} scanned`}`
-        : `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : destinationPhase ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(task.phase, state.lang)} ${processed}/${renderedTotal}${destinationPhase && state.lang === 'zh' ? ' 首' : ''}`;
+        : `${task.phase === 'completed' ? t('scanSucceeded', state.lang) : destinationPhase ? (state.lang === 'zh' ? '正在检查输出歌曲' : 'Checking output songs') : scanPhaseLabel(task.phase, state.lang)} ${processed}/${renderedTotal}${destinationPhase && state.lang === 'zh' ? ' 首' : ''}${cacheSummary}`;
       messageElement.textContent = progressText;
       const percent = renderedTotal && renderedTotal > 0
         ? Math.min(100, Math.round((processed / renderedTotal) * 100))
@@ -3653,73 +3668,16 @@ export function bindApp(
           destination_total: null,
           metadata_processed: 0,
           metadata_total: null,
+          reused_count: 0,
+          incremental_count: 0,
           current_file: '',
         }))
         .filter((_, slotIndex) => state.slots[slotIndex].sourceDirectory.trim().length > 0),
     };
-    neteaseMetadataCachePreparing = Boolean(services.prepareNeteaseMetadataCache);
+    neteaseMetadataCachePreparing = false;
     render();
     try {
       await desktopStateHydration;
-      if (scanPreparationCancelled) {
-        neteaseMetadataCachePreparing = false;
-      }
-      if (services.prepareNeteaseMetadataCache) {
-        if (scanPreparationCancelled) {
-          scanProgress = {
-            ...scanProgress,
-            status: 'cancelled',
-            phase: 'cancelled',
-            message: t('scanCancelled', state.lang),
-          };
-          pendingGlobalAction = null;
-          render();
-          return;
-        }
-        try {
-          let cacheProgress = await services.prepareNeteaseMetadataCache();
-          const applyCacheProgressToScan = (progress: NeteaseMetadataCacheProgress) => {
-            if (!scanProgress || !['running', 'cancelling'].includes(scanProgress.status)) return;
-            const nextTask = scanProgress.tasks?.map((task) => task.slot_index === 0
-              ? {
-                ...task,
-                phase: 'preparing' as AppScanPhase,
-                processed: progress.processed,
-                total: progress.total ?? 0,
-                current_file: progress.currentItem,
-              }
-              : task);
-            scanProgress = {
-              ...scanProgress,
-              phase: 'preparing',
-              processed: progress.processed,
-              total: progress.total ?? 0,
-              current_file: progress.currentItem,
-              message: progress.message || t('scanPreparing', state.lang),
-              tasks: nextTask,
-            };
-            if (!updateScanProgressDom(scanProgress)) render();
-          };
-          applyCacheProgressToScan(cacheProgress);
-          while (
-            services.loadNeteaseMetadataCacheStatus
-            && (cacheProgress.status === 'building' || cacheProgress.status === 'cancelling')
-          ) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            cacheProgress = await services.loadNeteaseMetadataCacheStatus();
-            applyCacheProgressToScan(cacheProgress);
-          }
-          if (cacheProgress.status === 'error' || cacheProgress.status === 'cancelled') {
-            console.warn('NetEase metadata cache was not prepared:', cacheProgress.message);
-          }
-        } catch (error) {
-          // A machine without a NetEase database is still allowed to scan
-          // ordinary folders; conversion will use embedded/file-name fallback.
-          console.warn('NetEase metadata cache preparation skipped:', error);
-        } finally {
-          neteaseMetadataCachePreparing = false;
-        }
-      }
       if (scanPreparationCancelled) {
         scanProgress = {
           ...scanProgress,
@@ -7626,8 +7584,16 @@ function toViewState(state: DesktopState, lang: AppLanguage, theme: AppTheme): A
 }
 
 function formatDesktopProgress(state: DesktopSyncSlotState, lang: AppLanguage): string {
+  if (state.current_file === '正在准备网易云元数据') {
+    return state.current_file;
+  }
+
   if (state.progress_total > 0) {
     return `${state.progress_completed}/${state.progress_total}`;
+  }
+
+  if (state.current_file.trim()) {
+    return state.current_file;
   }
 
   return statusLabel(state.status, lang);

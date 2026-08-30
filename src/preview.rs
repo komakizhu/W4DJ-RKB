@@ -9,17 +9,18 @@ use crate::history::HistoryEntry;
 use crate::netease::NeteaseMetadataResolver;
 use crate::scan_cache::ScanCache;
 use crate::sync::{
-    ScanObserver, derive_song_name_with_policy_and_resolver_cancellable,
-    effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
-    get_destination_music_dict_with_rule_and_observer, get_destination_music_files,
+    ScanObserver, ScannedFileSnapshot, effective_source_extension, find_ffmpeg,
+    get_destination_music_dict_with_rule, get_destination_music_dict_with_rule_and_observer,
+    get_destination_music_files,
     get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy,
     get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy,
     get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy,
     get_music_dict_with_scan_issues_with_settings_and_observer_with_policy,
     get_music_dict_with_scan_issues_with_settings_and_policy, is_ignored_music_file,
-    is_supported_source_file, resolve_output_policy, source_entry_name,
-    target_output_path_with_policy,
+    is_supported_source_file, music_dict_from_snapshots_with_cache, resolve_output_policy,
+    source_entry_name, target_output_path_with_policy,
 };
+use crate::w4dj_library::CommittedOutputBinding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -80,6 +81,8 @@ pub struct PreviewCandidate {
     pub source_path: String,
     pub destination_path: String,
     pub source_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_modified_at_ms: Option<u64>,
     pub estimated_output_bytes: Option<u64>,
     /// Existing output to remove after a successful overwrite when the
     /// selected filename rule produces a new destination path.
@@ -117,6 +120,22 @@ pub struct OutputTrackIdentity {
     pub artists: String,
     pub album: String,
     pub source_path: PathBuf,
+}
+
+fn snapshot_path_matches_binding(
+    snapshot_path: &Path,
+    binding_path: &Path,
+    raw_root: &Path,
+    normalized_root: &Path,
+) -> bool {
+    if snapshot_path == binding_path {
+        return true;
+    }
+    snapshot_path
+        .strip_prefix(raw_root)
+        .ok()
+        .zip(binding_path.strip_prefix(normalized_root).ok())
+        .is_some_and(|(snapshot_relative, binding_relative)| snapshot_relative == binding_relative)
 }
 
 fn reliable_metadata_matches(
@@ -219,7 +238,15 @@ pub fn disambiguate_duplicate_output_names(
     let mut removed_details = Vec::new();
     for indices in groups.into_values().filter(|indices| indices.len() > 1) {
         let base_path = PathBuf::from(&preview.candidates[indices[0]].destination_path);
-        let existing_metadata = base_path.is_file().then(|| read_track_metadata(&base_path));
+        let metadata_allowed = identities.values().any(|identity| {
+            !identity.title.trim().is_empty()
+                || !identity.artists.trim().is_empty()
+                || !identity.album.trim().is_empty()
+                || identity.track_id.is_some()
+        });
+        let existing_metadata = metadata_allowed
+            .then(|| base_path.is_file().then(|| read_track_metadata(&base_path)))
+            .flatten();
         let existing_index = existing_metadata.as_ref().and_then(|metadata| {
             indices.iter().copied().find(|index| {
                 identities
@@ -574,6 +601,8 @@ pub fn build_sync_preview_with_settings_and_netease_observed_with_policy(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -627,6 +656,8 @@ pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_poli
         filename_policy,
         observer,
         Some((cache, Path::new(source_directory))),
+        None,
+        None,
         None,
         None,
     )
@@ -690,6 +721,78 @@ pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_budg
         Some((cache, Path::new(source_directory))),
         Some((budget, cancel)),
         None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_budget_and_policy_and_bindings(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    observer: Option<&mut ScanObserver<'_>>,
+    cache: &mut ScanCache,
+    budget: Arc<GlobalConcurrencyBudget>,
+    cancel: Arc<AtomicBool>,
+    committed_bindings: &HashMap<String, CommittedOutputBinding>,
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_internal(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        observer,
+        Some((cache, Path::new(source_directory))),
+        Some((budget, cancel)),
+        None,
+        Some(committed_bindings),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_sync_preview_with_snapshots_and_bindings(
+    source_directory: &str,
+    destination_directory: &str,
+    mode: Mode,
+    lossless_format: Option<LosslessFormat>,
+    conflict_strategy: ConflictStrategy,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    observer: Option<&mut ScanObserver<'_>>,
+    cache: &mut ScanCache,
+    budget: Arc<GlobalConcurrencyBudget>,
+    cancel: Arc<AtomicBool>,
+    committed_bindings: &HashMap<String, CommittedOutputBinding>,
+    source_snapshots: &[ScannedFileSnapshot],
+    destination_snapshots: &[ScannedFileSnapshot],
+) -> io::Result<Option<SyncPreview>> {
+    build_sync_preview_with_settings_and_netease_observed_internal(
+        source_directory,
+        destination_directory,
+        mode,
+        lossless_format,
+        conflict_strategy,
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        observer,
+        Some((cache, Path::new(source_directory))),
+        Some((budget, cancel)),
+        None,
+        Some(committed_bindings),
+        Some((source_snapshots, destination_snapshots)),
     )
 }
 
@@ -722,6 +825,8 @@ pub fn build_sync_preview_with_settings_and_netease_observed_with_policy_and_res
         None,
         None,
         Some(resolver),
+        None,
+        None,
     )
 }
 
@@ -754,6 +859,8 @@ pub fn build_sync_preview_with_settings_and_netease_observed_with_cache_and_budg
         Some((cache, Path::new(source_directory))),
         Some((budget, cancel)),
         Some(resolver),
+        None,
+        None,
     )
 }
 
@@ -768,9 +875,11 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     netease_filename_format: NeteaseFilenameFormat,
     filename_policy: FilenameNormalizationPolicy,
     mut observer: Option<&mut ScanObserver<'_>>,
-    scan_cache: Option<(&mut ScanCache, &Path)>,
+    mut scan_cache: Option<(&mut ScanCache, &Path)>,
     budget: Option<(Arc<GlobalConcurrencyBudget>, Arc<AtomicBool>)>,
     metadata_resolver: Option<&NeteaseMetadataResolver>,
+    committed_bindings: Option<&HashMap<String, CommittedOutputBinding>>,
+    pre_scanned: Option<(&[ScannedFileSnapshot], &[ScannedFileSnapshot])>,
 ) -> io::Result<Option<SyncPreview>> {
     let mut preview = SyncPreview {
         source_directory: source_directory.to_string(),
@@ -853,12 +962,38 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         }
     }
 
-    let (mut source_files, scan_issues, cancelled) = match scan_cache {
-        Some((cache, _source_root)) => {
-            let mut no_op_observer = |_: crate::sync::ScanPhase, _: &Path| true;
-            let scan_observer = observer.as_deref_mut().unwrap_or(&mut no_op_observer);
-            if let Some((budget, cancel)) = budget.as_ref() {
-                get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy(
+    let fallback_cancel = AtomicBool::new(false);
+    let (mut source_files, scan_issues, cancelled) = if let Some((source_snapshots, _)) =
+        pre_scanned
+    {
+        let cache = scan_cache.as_mut().map(|(cache, _)| &mut **cache);
+        let mut no_op_observer = |_: crate::sync::ScanPhase, _: &Path| true;
+        let scan_observer = observer.as_deref_mut().unwrap_or(&mut no_op_observer);
+        if let Some(cache) = cache {
+            music_dict_from_snapshots_with_cache(
+                source_snapshots,
+                source_path,
+                Path::new(destination_directory),
+                filename_rule,
+                netease_filename_format,
+                filename_policy,
+                cache,
+                budget
+                    .as_ref()
+                    .map(|(_, cancel)| cancel.as_ref())
+                    .unwrap_or(&fallback_cancel),
+                scan_observer,
+            )
+        } else {
+            (HashMap::new(), Vec::new(), false)
+        }
+    } else {
+        match scan_cache.as_mut() {
+            Some((cache, _source_root)) => {
+                let mut no_op_observer = |_: crate::sync::ScanPhase, _: &Path| true;
+                let scan_observer = observer.as_deref_mut().unwrap_or(&mut no_op_observer);
+                if let Some((budget, cancel)) = budget.as_ref() {
+                    get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy(
                     &effective_source_directory,
                     filename_rule,
                     netease_filename_format,
@@ -869,35 +1004,36 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                     Arc::clone(cancel),
                     scan_observer,
                 )
-            } else {
-                get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy(
-                    &effective_source_directory,
-                    filename_rule,
-                    netease_filename_format,
-                    filename_policy,
-                    Path::new(destination_directory),
-                    cache,
-                    scan_observer,
-                )
+                } else {
+                    get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy(
+                        &effective_source_directory,
+                        filename_rule,
+                        netease_filename_format,
+                        filename_policy,
+                        Path::new(destination_directory),
+                        cache,
+                        scan_observer,
+                    )
+                }
             }
-        }
-        None => {
-            if let Some(observer) = observer.as_deref_mut() {
-                get_music_dict_with_scan_issues_with_settings_and_observer_with_policy(
-                    &effective_source_directory,
-                    filename_rule,
-                    netease_filename_format,
-                    filename_policy,
-                    observer,
-                )
-            } else {
-                let (files, issues) = get_music_dict_with_scan_issues_with_settings_and_policy(
-                    &effective_source_directory,
-                    filename_rule,
-                    netease_filename_format,
-                    filename_policy,
-                );
-                (files, issues, false)
+            None => {
+                if let Some(observer) = observer.as_deref_mut() {
+                    get_music_dict_with_scan_issues_with_settings_and_observer_with_policy(
+                        &effective_source_directory,
+                        filename_rule,
+                        netease_filename_format,
+                        filename_policy,
+                        observer,
+                    )
+                } else {
+                    let (files, issues) = get_music_dict_with_scan_issues_with_settings_and_policy(
+                        &effective_source_directory,
+                        filename_rule,
+                        netease_filename_format,
+                        filename_policy,
+                    );
+                    (files, issues, false)
+                }
             }
         }
     };
@@ -905,11 +1041,12 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         return Ok(None);
     }
 
-    // The scanner/cache intentionally remains resolver-agnostic so ordinary
-    // Task 2 folders keep their historical behavior. Task 1 applies the
-    // matched database identity here, before any expected path, collision or
-    // conflict decision is made.
-    if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
+    let fast_scan = committed_bindings.is_some();
+    // Compatibility resolver APIs retain their historical identity enrichment.
+    // The application scan passes committed bindings and therefore takes the
+    // pure filesystem path below.
+    if !fast_scan
+        && matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
         && !matches!(filename_rule, FilenameRule::Original)
         && let Some(resolver) = metadata_resolver
     {
@@ -924,7 +1061,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             {
                 return Ok(None);
             }
-            let name = derive_song_name_with_policy_and_resolver_cancellable(
+            let name = crate::sync::derive_song_name_with_policy_and_resolver_cancellable(
                 &path,
                 filename_rule,
                 netease_filename_format,
@@ -932,9 +1069,6 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                 Some(resolver),
                 scan_cancel,
             );
-            if scan_cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst)) {
-                return Ok(None);
-            }
             let mut key = name.clone();
             if resolved.contains_key(&key) {
                 key = format!("{name}\u{1f}{}", path.display());
@@ -950,8 +1084,32 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         });
         preview.error_count += 1;
     }
-    let (_destination_files, cancelled) = if !destination_directory.trim().is_empty()
-        && Path::new(destination_directory).is_dir()
+    let (destination_files, destination_scan_issues, cancelled) = if let Some((
+        _,
+        destination_snapshots,
+    )) = pre_scanned
+    {
+        let mut no_op_observer = |_: crate::sync::ScanPhase, _: &Path| true;
+        let scan_observer = observer.as_deref_mut().unwrap_or(&mut no_op_observer);
+        let cancel = budget.as_ref().map(|(_, cancel)| cancel.as_ref());
+        let mut cancelled = false;
+        for snapshot in destination_snapshots {
+            if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst))
+                || !scan_observer(crate::sync::ScanPhase::Destination, &snapshot.path)
+            {
+                cancelled = true;
+                break;
+            }
+        }
+        // Destination output matching consumes the raw snapshot below.  A
+        // derived-name map would only add work and could drop same-stem files
+        // that are needed for conflict detection.
+        (
+            HashMap::new(),
+            Vec::<crate::sync::MusicScanIssue>::new(),
+            cancelled,
+        )
+    } else if !destination_directory.trim().is_empty() && Path::new(destination_directory).is_dir()
     {
         if let Some(observer) = observer.as_mut() {
             if let Some((budget, cancel)) = budget.as_ref() {
@@ -967,43 +1125,87 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                             crate::sync::ScanPhase::Destination,
                             observer,
                         );
-                (files, cancelled)
+                (files, Vec::new(), cancelled)
             } else {
-                get_destination_music_dict_with_rule_and_observer(
-                    destination_directory,
-                    filename_rule,
-                    observer,
-                )
+                {
+                    let (files, cancelled) = get_destination_music_dict_with_rule_and_observer(
+                        destination_directory,
+                        filename_rule,
+                        observer,
+                    );
+                    (files, Vec::new(), cancelled)
+                }
             }
         } else {
             (
                 get_destination_music_dict_with_rule(destination_directory, filename_rule),
+                Vec::new(),
                 false,
             )
         }
     } else {
-        (Default::default(), false)
+        (Default::default(), Vec::new(), false)
     };
     if cancelled {
         return Ok(None);
     };
-    let destination_inventory =
-        if !destination_directory.trim().is_empty() && Path::new(destination_directory).is_dir() {
-            get_destination_music_files(destination_directory)
-                .into_iter()
-                .map(|path| {
-                    let metadata = read_track_metadata(&path);
-                    (path, metadata)
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+    for issue in destination_scan_issues {
+        preview.errors.push(PreviewIssue {
+            path: issue.path.display().to_string(),
+            message: issue.message,
+        });
+        preview.error_count += 1;
+    }
+    let destination_inventory = if fast_scan {
+        // The raw destination snapshot is authoritative.  Do not rebuild an
+        // inventory through the derived-name map: two existing files may
+        // intentionally share a parsed stem, and dropping one here would
+        // hide a real conflict from the planner.
+        pre_scanned
+            .map(|(_, snapshots)| {
+                snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.path.clone())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                destination_files
+                    .values()
+                    .map(|(_, path)| path.clone())
+                    .collect()
+            })
+    } else if !destination_directory.trim().is_empty() && Path::new(destination_directory).is_dir()
+    {
+        get_destination_music_files(destination_directory)
+    } else {
+        Vec::new()
+    };
+    let destination_metadata_inventory = (!fast_scan).then(|| {
+        destination_inventory
+            .iter()
+            .map(|path| (path.clone(), read_track_metadata(path)))
+            .collect::<Vec<_>>()
+    });
+    let normalized_destination_root =
+        crate::scan_cache::normalize_path(Path::new(destination_directory))
+            .to_string_lossy()
+            .into_owned();
     preview.output_files = destination_inventory
         .iter()
-        .map(|(path, _)| path.display().to_string())
+        .map(|path| path.display().to_string())
         .collect();
     let mut planned_paths = HashSet::new();
+    let snapshot_mtimes = pre_scanned.map(|(source_snapshots, _)| {
+        source_snapshots
+            .iter()
+            .map(|snapshot| {
+                (
+                    snapshot.path.to_string_lossy().into_owned(),
+                    snapshot.modified_at_ms,
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    });
     let mut source_entries = source_files.iter().collect::<Vec<_>>();
     source_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
@@ -1026,27 +1228,17 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         *expected_path_counts.entry(expected_path).or_default() += 1;
     }
 
-    for (raw_name, (_, path)) in source_entries {
+    for (raw_name, (size_text, path)) in source_entries {
         let name = source_entry_name(raw_name);
-        let source_size = match fs::metadata(path) {
-            Ok(metadata) if metadata.len() > 0 => metadata.len(),
-            Ok(_) => {
-                preview.errors.push(PreviewIssue {
-                    path: path.display().to_string(),
-                    message: "源文件为空，无法转换".to_string(),
-                });
-                preview.error_count += 1;
-                continue;
-            }
-            Err(error) => {
-                preview.errors.push(PreviewIssue {
-                    path: path.display().to_string(),
-                    message: format!("无法读取源文件：{error}"),
-                });
-                preview.error_count += 1;
-                continue;
-            }
-        };
+        let source_size = size_text.parse::<u64>().unwrap_or_default();
+        if source_size == 0 {
+            preview.errors.push(PreviewIssue {
+                path: path.display().to_string(),
+                message: "源文件为空，无法转换".to_string(),
+            });
+            preview.error_count += 1;
+            continue;
+        }
 
         let source_extension = effective_source_extension(path);
         let output_extension =
@@ -1084,21 +1276,70 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                 }
             }
         }
-        let source_metadata = resolved_source_metadata(path, metadata_resolver);
-        let source_has_reliable_metadata =
-            !source_metadata.title.trim().is_empty() && !source_metadata.artist.trim().is_empty();
+        let source_metadata =
+            (!fast_scan).then(|| resolved_source_metadata(path, metadata_resolver));
+        let source_modified_at_ms = snapshot_mtimes
+            .as_ref()
+            .and_then(|mtimes| mtimes.get(&path.to_string_lossy().into_owned()).copied())
+            .flatten()
+            .or_else(|| {
+                scan_cache.as_ref().and_then(|cache| {
+                    cache
+                        .0
+                        .entries
+                        .get(&path.to_string_lossy().into_owned())
+                        .and_then(|entry| entry.modified_at_ms)
+                })
+            });
+        let source_has_reliable_metadata = source_metadata.as_ref().is_some_and(|metadata| {
+            !metadata.title.trim().is_empty() && !metadata.artist.trim().is_empty()
+        });
         let mut existing_paths = if collision_group {
             Vec::new()
-        } else {
-            destination_inventory
+        } else if let (Some(source_metadata), Some(destination_metadata_inventory)) = (
+            source_metadata.as_ref(),
+            destination_metadata_inventory.as_ref(),
+        ) {
+            destination_metadata_inventory
                 .iter()
                 .filter(|(output_path, output_metadata)| {
-                    reliable_metadata_matches(&source_metadata, output_metadata)
+                    reliable_metadata_matches(source_metadata, output_metadata)
                         || (!source_has_reliable_metadata && output_path == &expected_path)
                 })
                 .map(|(output_path, _)| output_path.clone())
                 .collect::<Vec<_>>()
+        } else {
+            destination_inventory
+                .iter()
+                .filter(|output_path| *output_path == &expected_path)
+                .cloned()
+                .collect::<Vec<_>>()
         };
+        if let Some(bindings) = committed_bindings {
+            let source_key = path.to_string_lossy().into_owned();
+            if let Some(binding) = bindings.get(&source_key)
+                && binding.output_root == normalized_destination_root
+                && destination_inventory.iter().any(|output| {
+                    snapshot_path_matches_binding(
+                        output,
+                        Path::new(&binding.destination_path),
+                        Path::new(destination_directory),
+                        Path::new(&normalized_destination_root),
+                    )
+                })
+                && binding
+                    .source_size_bytes
+                    .is_none_or(|size| size == source_size)
+                && binding
+                    .source_modified_at_ms
+                    .is_none_or(|modified| source_modified_at_ms == Some(modified))
+            {
+                let mapped = PathBuf::from(&binding.destination_path);
+                if !existing_paths.contains(&mapped) {
+                    existing_paths.push(mapped);
+                }
+            }
+        }
         existing_paths.sort();
         existing_paths.dedup();
         let existing_path = existing_paths
@@ -1107,7 +1348,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             .cloned()
             .or_else(|| existing_paths.first().cloned())
             .or_else(|| {
-                (!source_has_reliable_metadata && expected_path.exists())
+                (!fast_scan && !source_has_reliable_metadata && expected_path.exists())
                     .then_some(expected_path.clone())
             });
         if let Some(existing_path) = existing_path.as_ref()
@@ -1116,10 +1357,15 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             existing_paths.push(existing_path.clone());
         }
         let has_existing = !existing_paths.is_empty();
-        let identity_conflict =
-            source_has_reliable_metadata && expected_path.exists() && existing_paths.is_empty();
+        let identity_conflict = !fast_scan
+            && source_has_reliable_metadata
+            && expected_path.exists()
+            && existing_paths.is_empty();
         let candidate_name = if identity_conflict {
-            let suffix = sanitize_filename_component(&source_metadata.artist);
+            let suffix = source_metadata
+                .as_ref()
+                .map(|metadata| sanitize_filename_component(&metadata.artist))
+                .unwrap_or_default();
             let base = format!("{name} [{suffix}]");
             let mut candidate = base.clone();
             let mut ordinal = 2usize;
@@ -1209,7 +1455,13 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         } else {
             Vec::new()
         };
-        if paths_refer_to_same_file(path, &destination_path) {
+        let same_source_and_destination = if fast_scan {
+            path.as_path() == destination_path.as_path()
+                || path.to_string_lossy() == destination_path.to_string_lossy()
+        } else {
+            paths_refer_to_same_file(path, &destination_path)
+        };
+        if same_source_and_destination {
             preview.errors.push(PreviewIssue {
                 path: path.display().to_string(),
                 message: "输出文件与源文件相同；请选择其他输出目录，避免覆盖原曲".to_string(),
@@ -1222,6 +1474,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             source_path: path.display().to_string(),
             destination_path: destination_path.display().to_string(),
             source_size_bytes: source_size,
+            source_modified_at_ms,
             estimated_output_bytes,
             previous_destination_path,
             previous_destination_paths,
@@ -1243,8 +1496,9 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             .and_then(|total| total.checked_add(estimated_bytes));
     }
 
-    if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
+    if !fast_scan
         && let Some(resolver) = metadata_resolver
+        && matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
     {
         attach_netease_identities(&mut preview, resolver);
     }
@@ -1268,13 +1522,26 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                 .unwrap_or_default()
                 > 1;
             collision_group.then(|| {
-                let metadata = read_track_metadata(Path::new(&candidate.source_path));
+                let metadata =
+                    (!fast_scan).then(|| read_track_metadata(Path::new(&candidate.source_path)));
                 (
                     candidate.source_path.clone(),
                     OutputTrackIdentity {
-                        title: candidate.netease_title.clone().unwrap_or(metadata.title),
-                        artists: candidate.netease_artist.clone().unwrap_or(metadata.artist),
-                        album: candidate.album.clone().unwrap_or(metadata.album),
+                        title: candidate
+                            .netease_title
+                            .clone()
+                            .or_else(|| metadata.as_ref().map(|m| m.title.clone()))
+                            .unwrap_or_default(),
+                        artists: candidate
+                            .netease_artist
+                            .clone()
+                            .or_else(|| metadata.as_ref().map(|m| m.artist.clone()))
+                            .unwrap_or_default(),
+                        album: candidate
+                            .album
+                            .clone()
+                            .or_else(|| metadata.as_ref().map(|m| m.album.clone()))
+                            .unwrap_or_default(),
                         track_id: candidate.netease_track_id.clone(),
                         album_id: candidate.netease_album_id.clone(),
                         source_path: PathBuf::from(&candidate.source_path),
@@ -1478,6 +1745,11 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
                     source_path: pending_file.source_path.clone(),
                     destination_path: pending_file.destination_path.clone(),
                     source_size_bytes: metadata.len(),
+                    source_modified_at_ms: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|v| v.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64),
                     estimated_output_bytes: estimated,
                     previous_destination_path: pending_file.previous_destination_path.clone(),
                     previous_destination_paths: pending_file.previous_destination_paths.clone(),
@@ -1521,6 +1793,11 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
                     source_path: failed_file.source_path.clone(),
                     destination_path: failed_file.destination_path.clone(),
                     source_size_bytes: metadata.len(),
+                    source_modified_at_ms: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|v| v.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64),
                     estimated_output_bytes: Some(metadata.len()),
                     previous_destination_path: None,
                     previous_destination_paths: Vec::new(),

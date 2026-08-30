@@ -3732,12 +3732,16 @@ describe('bindApp', () => {
           destination_total: 0,
           metadata_processed: 1173,
           metadata_total: 1173,
+          reused_count: 998,
+          incremental_count: 2,
           current_file: '',
         }],
       },
     );
     expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
       .toContain('扫描成功 1173/1173');
+    expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
+      .toContain('缓存复用 998 · 增量扫描 2');
   });
 
   it('stops showing a completed scan as soon as a scan-then-convert preview is confirmed', async () => {

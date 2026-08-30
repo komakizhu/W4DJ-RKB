@@ -101,6 +101,8 @@ pub struct PendingFile {
     pub source_path: String,
     pub destination_path: String,
     pub source_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_modified_at_ms: Option<u64>,
     pub estimated_output_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_destination_path: Option<String>,

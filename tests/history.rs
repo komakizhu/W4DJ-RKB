@@ -289,6 +289,7 @@ fn complete_error_report_lists_pending_files() {
         source_path: "/music/in/pending.flac".into(),
         destination_path: "/music/out/pending.mp3".into(),
         source_size_bytes: 4_096,
+        source_modified_at_ms: None,
         estimated_output_bytes: Some(2_048),
         previous_destination_path: None,
         previous_destination_paths: Vec::new(),

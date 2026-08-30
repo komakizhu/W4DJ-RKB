@@ -6,7 +6,7 @@ use w4dj::analysis::{
     AnalysisLabel, ContinuousEmotionResult, DiscogsEffnetAnalysis, DiscogsEffnetHeadResult,
     EmotionCandidates, EmotionHeadStatus, HighLevelAnalysis, TrackAnalysis,
 };
-use w4dj::w4dj_library::W4djLibrary;
+use w4dj::w4dj_library::{CommittedOutputFacts, OutputFileSnapshot, W4djLibrary};
 
 #[test]
 fn high_level_json_round_trips_old_and_new_emotion_fields() {
@@ -274,6 +274,144 @@ fn lightweight_registration_without_netease_id_reuses_source_identity() {
             .destination_path,
         second
     );
+}
+
+#[test]
+fn committed_output_bindings_store_fingerprint_and_naming_context() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("source.flac");
+    let destination = directory.path().join("out/song.mp3");
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+    let facts = CommittedOutputFacts {
+        source_size_bytes: Some(123),
+        source_modified_at_ms: Some(456),
+        conversion_mode: Some("scan_then_convert".into()),
+        lossless_format: Some("wav".into()),
+        filename_rule: Some("title_artist".into()),
+        netease_filename_format: Some("title_artist".into()),
+        filename_normalization_policy: Some("soundcloud".into()),
+    };
+    library
+        .upsert_committed_output(
+            0,
+            Some(&source),
+            &destination,
+            Some("track-1"),
+            None,
+            "Song",
+            "Artist",
+            &facts,
+        )
+        .unwrap();
+
+    let bindings = library.committed_output_bindings().unwrap();
+    assert_eq!(bindings.len(), 1);
+    let binding = &bindings[0];
+    assert_eq!(binding.source_size_bytes, Some(123));
+    assert_eq!(binding.source_modified_at_ms, Some(456));
+    assert_eq!(binding.mode.as_deref(), Some("scan_then_convert"));
+    assert_eq!(binding.filename_rule.as_deref(), Some("title_artist"));
+}
+
+#[test]
+fn schema_v2_track_meta_migration_preserves_rows_and_adds_v3_facts() {
+    let directory = tempdir().unwrap();
+    let database_path = directory.path().join("w4dj-v2.sqlite3");
+    let root = directory.path().join("out");
+    fs::create_dir_all(&root).unwrap();
+    let output = root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let mut library = W4djLibrary::open(&database_path).unwrap();
+    library.upsert_output_file(0, &root, None, &output).unwrap();
+    drop(library);
+
+    let connection = Connection::open(&database_path).unwrap();
+    let stored_root: String = connection
+        .query_row("SELECT root_path FROM output_roots LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    connection
+        .execute_batch("DROP INDEX IF EXISTS w4dj_track_meta_source_path; DROP INDEX IF EXISTS w4dj_track_meta_status; DROP TABLE w4dj_track_meta;")
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE w4dj_track_meta(
+                track_key TEXT PRIMARY KEY,
+                source_path TEXT,
+                destination_path TEXT NOT NULL UNIQUE,
+                slot_index INTEGER NOT NULL,
+                output_root TEXT NOT NULL,
+                status TEXT NOT NULL,
+                analysis_status TEXT NOT NULL DEFAULT 'notAnalyzed',
+                analysis_error TEXT,
+                measured_duration_seconds REAL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                FOREIGN KEY(output_root) REFERENCES output_roots(root_path)
+             );",
+        )
+        .unwrap();
+    let track_key: String = connection
+        .query_row("SELECT track_key FROM tracks LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO w4dj_track_meta VALUES(?1,?2,?3,0,?4,'available','notAnalyzed',NULL,NULL,1,1)",
+            rusqlite::params![
+                track_key,
+                "/in/song.flac",
+                output.to_string_lossy(),
+                stored_root
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let library = W4djLibrary::open(&database_path).unwrap();
+    let bindings = library.committed_output_bindings().unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].source_path, "/in/song.flac");
+    let connection = Connection::open(database_path).unwrap();
+    let columns = connection
+        .prepare("SELECT name FROM pragma_table_info('w4dj_track_meta')")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(columns.iter().any(|column| column == "source_size_bytes"));
+    assert!(columns.iter().any(|column| column == "filename_rule"));
+}
+
+#[test]
+fn reconcile_output_snapshots_uses_captured_file_facts() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("out");
+    fs::create_dir_all(&root).unwrap();
+    let output = root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let size = fs::metadata(&output).unwrap().len();
+    let modified = fs::metadata(&output)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+    library
+        .reconcile_output_snapshots(&[(
+            0,
+            root.clone(),
+            vec![OutputFileSnapshot {
+                path: output.clone(),
+                size_bytes: size,
+                modified_at_ms: Some(modified),
+            }],
+        )])
+        .unwrap();
+    assert_eq!(library.stats().unwrap().available, 1);
 }
 
 #[test]

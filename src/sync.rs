@@ -7,9 +7,7 @@ use crate::metadata::{
     FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
 };
 use crate::netease::{NeteaseMetadataResolver, NeteaseRecoveryDiagnostic, RecoveredMetadata};
-use crate::scan_cache::{
-    ScanCache, ScanCacheEntry, can_reuse_entry, can_reuse_entry_normalized, modified_at_ms,
-};
+use crate::scan_cache::{ScanCache, ScanCacheEntry, can_reuse_derived_name_entry_normalized};
 use crate::task::{TaskController, TaskSnapshot};
 use id3::frame::{Comment, ExtendedText, Lyrics, Picture};
 use id3::{TagLike, Version};
@@ -56,9 +54,7 @@ fn unique_source_entry_key(
     if !entries.contains_key(name) {
         return name.to_string();
     }
-    let normalized = crate::scan_cache::normalize_path(path)
-        .to_string_lossy()
-        .into_owned();
+    let normalized = path.to_string_lossy().into_owned();
     format!("{name}{SOURCE_ENTRY_KEY_SEPARATOR}{normalized}")
 }
 
@@ -231,7 +227,16 @@ pub type ScanObserver<'a> = dyn FnMut(ScanPhase, &Path) -> bool + 'a;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumeratedMusicFiles {
     pub paths: Vec<PathBuf>,
+    pub snapshots: Vec<ScannedFileSnapshot>,
     pub issues: Vec<MusicScanIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedFileSnapshot {
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub modified_at_ms: Option<u64>,
+    pub source_extension: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,21 +271,39 @@ where
     if folder.trim().is_empty() {
         return Ok(EnumeratedMusicFiles {
             paths: Vec::new(),
+            snapshots: Vec::new(),
             issues: Vec::new(),
         });
     }
     let source_path = Path::new(folder);
     let mut paths = Vec::new();
+    let mut snapshots = Vec::new();
     let mut issues = Vec::new();
     if source_path.is_file() {
         if cancel.load(Ordering::SeqCst) {
             return Err(ScanEnumerationError::Cancelled);
         }
         if is_supported_source_file_with_extensions(source_path, allowed_extensions) {
-            paths.push(source_path.to_path_buf());
+            let path = source_path.to_path_buf();
+            let metadata = fs::metadata(&path).ok();
+            paths.push(path.clone());
+            snapshots.push(ScannedFileSnapshot {
+                source_extension: path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase(),
+                path: path.clone(),
+                size_bytes: metadata.as_ref().map_or(0, fs::Metadata::len),
+                modified_at_ms: metadata.as_ref().and_then(metadata_modified_at_ms),
+            });
             observe(1, Some(1), source_path);
         }
-        return Ok(EnumeratedMusicFiles { paths, issues });
+        return Ok(EnumeratedMusicFiles {
+            paths,
+            snapshots,
+            issues,
+        });
     }
     if !source_path.exists() {
         return Err(ScanEnumerationError::Failed(format!(
@@ -302,7 +325,19 @@ where
                     && !is_ignored_music_file(entry.path())
                     && has_allowed_extension(entry.path(), allowed_extensions)
                 {
-                    paths.push(entry.path().to_path_buf());
+                    let path = entry.path().to_path_buf();
+                    let metadata = entry.metadata().ok();
+                    paths.push(path.clone());
+                    snapshots.push(ScannedFileSnapshot {
+                        source_extension: path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            .unwrap_or_default()
+                            .to_lowercase(),
+                        path,
+                        size_bytes: metadata.as_ref().map_or(0, fs::Metadata::len),
+                        modified_at_ms: metadata.as_ref().and_then(metadata_modified_at_ms),
+                    });
                     observe(paths.len(), None, entry.path());
                 }
             }
@@ -324,7 +359,11 @@ where
     } else {
         observe(0, Some(0), source_path);
     }
-    Ok(EnumeratedMusicFiles { paths, issues })
+    Ok(EnumeratedMusicFiles {
+        paths,
+        snapshots,
+        issues,
+    })
 }
 
 fn is_supported_source_file_with_extensions(path: &Path, allowed_extensions: &[&str]) -> bool {
@@ -702,121 +741,45 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_pol
         return (HashMap::new(), Vec::new(), false);
     }
 
-    let source_root = source_path.to_path_buf();
-    let mut music_dict = HashMap::new();
-    let mut scan_issues = Vec::new();
-    let mut cancelled = false;
-
-    for entry_result in walkdir::WalkDir::new(folder)
-        .into_iter()
-        .filter_entry(|entry| !is_hidden_path(entry.path()))
-    {
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(error) => {
-                if let Some(path) = error.path().filter(|path| !is_ignored_music_file(path)) {
-                    scan_issues.push(MusicScanIssue {
-                        path: path.to_path_buf(),
-                        message: format!("无法扫描歌曲文件：{error}"),
-                    });
-                }
-                continue;
+    let enumeration_cancel = AtomicBool::new(false);
+    let enumerated = enumerate_music_files_observed(
+        folder,
+        SUPPORTED_SOURCE_EXTENSIONS,
+        &enumeration_cancel,
+        |_, _, path| {
+            if !observer(ScanPhase::Source, path) {
+                enumeration_cancel.store(true, Ordering::SeqCst);
             }
-        };
-
-        if !entry.file_type().is_file()
-            || is_ignored_music_file(entry.path())
-            || !has_allowed_extension(entry.path(), SUPPORTED_SOURCE_EXTENSIONS)
-        {
-            continue;
-        }
-
-        if !observer(ScanPhase::Source, entry.path()) {
-            cancelled = true;
-            break;
-        }
-
-        let path = entry.path().to_path_buf();
-        let path_key = crate::scan_cache::normalize_path(&path)
-            .to_string_lossy()
-            .into_owned();
-        let metadata = entry.metadata().ok();
-        let size_bytes = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-        let modified_at = modified_at_ms(&path);
-        let cached = cache
-            .entries
-            .get(&path_key)
-            .filter(|cached| {
-                can_reuse_entry(
-                    cached,
-                    &path,
-                    &source_root,
-                    output_directory,
-                    filename_rule_cache_key(filename_rule),
-                    netease_filename_format_cache_key(netease_filename_format),
-                    filename_policy.cache_key(),
-                    size_bytes,
-                    modified_at,
-                )
-            })
-            .cloned();
-
-        let (song_name, cached_issue) = if let Some(cached) = cached {
-            (
-                cached.safe_output_stem.unwrap_or(cached.derived_name),
-                cached.scan_issue,
-            )
-        } else {
-            let song_name = derive_song_name_with_policy(
-                &path,
-                filename_rule,
-                netease_filename_format,
-                filename_policy,
-            );
-            let entry = ScanCacheEntry {
-                source_path: path_key,
-                source_root: crate::scan_cache::normalize_path(&source_root)
-                    .to_string_lossy()
-                    .into_owned(),
-                output_directory: crate::scan_cache::normalize_path(output_directory)
-                    .to_string_lossy()
-                    .into_owned(),
-                filename_rule: filename_rule_cache_key(filename_rule).to_string(),
-                netease_filename_format: netease_filename_format_cache_key(netease_filename_format)
-                    .to_string(),
-                filename_policy: filename_policy.cache_key().to_string(),
-                size_bytes,
-                modified_at_ms: modified_at,
-                derived_name: song_name.clone(),
-                source_extension: path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or_default()
-                    .to_lowercase(),
-                scan_issue: None,
-                safe_output_stem: Some(song_name.clone()),
-                ..Default::default()
-            };
-            cache.insert(entry);
-            (song_name, None)
-        };
-
-        if let Some(issue) = cached_issue {
-            scan_issues.push(MusicScanIssue {
-                path: path.clone(),
-                message: issue,
-            });
-        }
-
-        let size = size_bytes.to_string();
-        let key = unique_source_entry_key(&song_name, &path, &music_dict);
-        music_dict.insert(key, (size, path));
+        },
+    );
+    let (snapshots, mut scan_issues) = match enumerated {
+        Ok(result) => (result.snapshots, result.issues),
+        Err(ScanEnumerationError::Cancelled) => return (HashMap::new(), Vec::new(), true),
+        Err(ScanEnumerationError::Failed(message)) => (
+            Vec::new(),
+            vec![MusicScanIssue {
+                path: source_path.to_path_buf(),
+                message,
+            }],
+        ),
+    };
+    if enumeration_cancel.load(Ordering::SeqCst) {
+        return (HashMap::new(), scan_issues, true);
     }
-
-    if !cancelled {
-        cache.remove_missing_sources(&source_root);
-    }
-    (music_dict, scan_issues, cancelled)
+    let mut snapshot_observer = |_: ScanPhase, _: &Path| true;
+    let (music_dict, helper_issues, helper_cancelled) = music_dict_from_snapshots_with_cache(
+        &snapshots,
+        source_path,
+        output_directory,
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        cache,
+        &AtomicBool::new(false),
+        &mut snapshot_observer,
+    );
+    scan_issues.extend(helper_issues);
+    (music_dict, scan_issues, helper_cancelled)
 }
 
 /// File-level scanner with a bounded scan-only worker set.  The configured
@@ -861,7 +824,7 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_bud
     filename_policy: FilenameNormalizationPolicy,
     output_directory: &Path,
     cache: &mut ScanCache,
-    budget: Arc<GlobalConcurrencyBudget>,
+    _budget: Arc<GlobalConcurrencyBudget>,
     cancel: Arc<AtomicBool>,
     observer: &mut ScanObserver<'_>,
 ) -> (
@@ -869,66 +832,62 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_bud
     Vec<MusicScanIssue>,
     bool,
 ) {
-    let source_root = Path::new(folder).to_path_buf();
-    let normalized_source_root = crate::scan_cache::normalize_path(&source_root);
+    let normalized_source_root = crate::scan_cache::normalize_path(Path::new(folder));
     let normalized_output_directory = crate::scan_cache::normalize_path(output_directory);
-    let (paths, mut scan_issues, enumeration_cancelled) =
-        enumerate_music_paths(folder, SUPPORTED_SOURCE_EXTENSIONS, &cancel);
+    let (snapshots, mut scan_issues, enumeration_cancelled) =
+        enumerate_music_snapshots(folder, SUPPORTED_SOURCE_EXTENSIONS, &cancel);
     if enumeration_cancelled {
         return (HashMap::new(), scan_issues, true);
     }
-    let (results, worker_error) = scan_paths_with_budget(
-        paths,
-        budget,
-        Arc::clone(&cancel),
-        filename_rule,
-        netease_filename_format,
-        filename_policy,
-        ScanPhase::Source,
-        observer,
-    );
-    if let Some(error) = worker_error {
-        scan_issues.push(MusicScanIssue {
-            path: source_root.clone(),
-            message: format!("扫描 worker 发生异常：{error}"),
-        });
-        return (HashMap::new(), scan_issues, false);
-    }
+    let observed_paths = snapshots
+        .iter()
+        .map(|snapshot| snapshot.path.to_string_lossy().into_owned())
+        .collect::<std::collections::HashSet<_>>();
     let mut music_dict = HashMap::new();
     let mut cancelled = cancel.load(Ordering::SeqCst);
-    for result in results {
+    for snapshot in snapshots {
         if cancel.load(Ordering::SeqCst) {
             cancelled = true;
             break;
         }
-        let path = result.path;
-        let path_key = crate::scan_cache::normalize_path(&path)
-            .to_string_lossy()
-            .into_owned();
+        let path = snapshot.path.clone();
+        let path_key = path.to_string_lossy().into_owned();
         let cached = cache
             .entries
             .get(&path_key)
             .filter(|cached| {
-                can_reuse_entry_normalized(
+                can_reuse_derived_name_entry_normalized(
                     cached,
-                    &crate::scan_cache::normalize_path(&path),
+                    Path::new(&path_key),
                     &normalized_source_root,
-                    &normalized_output_directory,
                     filename_rule_cache_key(filename_rule),
                     netease_filename_format_cache_key(netease_filename_format),
                     filename_policy.cache_key(),
-                    result.size_bytes,
-                    result.modified_at,
+                    snapshot.size_bytes,
+                    snapshot.modified_at_ms,
                 )
             })
             .cloned();
         let (song_name, cached_issue) = if let Some(cached) = cached {
+            if !observer(ScanPhase::Source, &path) {
+                cancelled = true;
+                break;
+            }
             (
                 cached.safe_output_stem.unwrap_or(cached.derived_name),
                 cached.scan_issue,
             )
         } else {
-            let song_name = result.derived_name;
+            if !observer(ScanPhase::Source, &path) {
+                cancelled = true;
+                break;
+            }
+            let song_name = derive_song_name_from_filename(
+                &path,
+                filename_rule,
+                netease_filename_format,
+                filename_policy,
+            );
             cache.insert(ScanCacheEntry {
                 source_path: path_key,
                 source_root: normalized_source_root.to_string_lossy().into_owned(),
@@ -937,14 +896,10 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_bud
                 netease_filename_format: netease_filename_format_cache_key(netease_filename_format)
                     .to_string(),
                 filename_policy: filename_policy.cache_key().to_string(),
-                size_bytes: result.size_bytes,
-                modified_at_ms: result.modified_at,
+                size_bytes: snapshot.size_bytes,
+                modified_at_ms: snapshot.modified_at_ms,
                 derived_name: song_name.clone(),
-                source_extension: path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .unwrap_or_default()
-                    .to_lowercase(),
+                source_extension: snapshot.source_extension.clone(),
                 scan_issue: None,
                 safe_output_stem: Some(song_name.clone()),
                 ..Default::default()
@@ -957,12 +912,11 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_bud
                 message: issue,
             });
         }
-        let size = result.size_bytes.to_string();
         let key = unique_source_entry_key(&song_name, &path, &music_dict);
-        music_dict.insert(key, (size, path));
+        music_dict.insert(key, (snapshot.size_bytes.to_string(), path));
     }
     if !cancelled {
-        cache.remove_missing_sources(&source_root);
+        cache.remove_missing_sources_from_snapshot(&normalized_source_root, &observed_paths);
     }
     (music_dict, scan_issues, cancelled)
 }
@@ -1011,13 +965,13 @@ pub fn get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_an
     Vec<MusicScanIssue>,
     bool,
 ) {
-    let (paths, scan_issues, enumeration_cancelled) =
-        enumerate_music_paths(folder, allowed_extensions, &cancel);
+    let (snapshots, scan_issues, enumeration_cancelled) =
+        enumerate_music_snapshots(folder, allowed_extensions, &cancel);
     if enumeration_cancelled {
         return (HashMap::new(), scan_issues, true);
     }
     let (results, worker_error) = scan_paths_with_budget(
-        paths,
+        snapshots,
         budget,
         Arc::clone(&cancel),
         filename_rule,
@@ -1063,7 +1017,6 @@ struct ScanWorkerResult {
     index: usize,
     path: PathBuf,
     size_bytes: u64,
-    modified_at: Option<u64>,
     derived_name: String,
 }
 
@@ -1076,6 +1029,7 @@ fn metadata_modified_at_ms(metadata: &fs::Metadata) -> Option<u64> {
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
+#[allow(dead_code)]
 fn enumerate_music_paths(
     folder: &str,
     allowed_extensions: &[&str],
@@ -1095,9 +1049,167 @@ fn enumerate_music_paths(
     }
 }
 
+fn enumerate_music_snapshots(
+    folder: &str,
+    allowed_extensions: &[&str],
+    cancel: &AtomicBool,
+) -> (Vec<ScannedFileSnapshot>, Vec<MusicScanIssue>, bool) {
+    match enumerate_music_files_observed(folder, allowed_extensions, cancel, |_, _, _| {}) {
+        Ok(result) => (result.snapshots, result.issues, false),
+        Err(ScanEnumerationError::Cancelled) => (Vec::new(), Vec::new(), true),
+        Err(ScanEnumerationError::Failed(message)) => (
+            Vec::new(),
+            vec![MusicScanIssue {
+                path: Path::new(folder).to_path_buf(),
+                message,
+            }],
+            false,
+        ),
+    }
+}
+
+/// Build a source map from an already collected filesystem snapshot. This is
+/// the shared-root fast path used by the two task slots; no directory walk or
+/// per-file stat is performed here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn music_dict_from_snapshots_with_cache(
+    snapshots: &[ScannedFileSnapshot],
+    source_root: &Path,
+    output_directory: &Path,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    cache: &mut ScanCache,
+    cancel: &AtomicBool,
+    observer: &mut ScanObserver<'_>,
+) -> (
+    HashMap<String, (String, PathBuf)>,
+    Vec<MusicScanIssue>,
+    bool,
+) {
+    let normalized_source_root = crate::scan_cache::normalize_path(source_root);
+    let normalized_output_directory = crate::scan_cache::normalize_path(output_directory);
+    let mut result = HashMap::new();
+    let issues = Vec::new();
+    let observed_paths = snapshots
+        .iter()
+        .map(|snapshot| snapshot.path.to_string_lossy().into_owned())
+        .collect::<std::collections::HashSet<_>>();
+    let mut ordered_snapshots = snapshots.iter().collect::<Vec<_>>();
+    ordered_snapshots.sort_by(|left, right| left.path.cmp(&right.path));
+    for snapshot in ordered_snapshots {
+        if cancel.load(Ordering::SeqCst) || !observer(ScanPhase::Source, &snapshot.path) {
+            return (result, issues, true);
+        }
+        let path_key = snapshot.path.to_string_lossy().into_owned();
+        let cached = cache.entries.get(&path_key).filter(|entry| {
+            can_reuse_derived_name_entry_normalized(
+                entry,
+                Path::new(&path_key),
+                &normalized_source_root,
+                filename_rule_cache_key(filename_rule),
+                netease_filename_format_cache_key(netease_filename_format),
+                filename_policy.cache_key(),
+                snapshot.size_bytes,
+                snapshot.modified_at_ms,
+            )
+        });
+        let name = if let Some(entry) = cached {
+            entry
+                .safe_output_stem
+                .clone()
+                .unwrap_or_else(|| entry.derived_name.clone())
+        } else {
+            let name = derive_song_name_from_filename(
+                &snapshot.path,
+                filename_rule,
+                netease_filename_format,
+                filename_policy,
+            );
+            cache.insert(ScanCacheEntry {
+                source_path: path_key,
+                source_root: normalized_source_root.to_string_lossy().into_owned(),
+                output_directory: normalized_output_directory.to_string_lossy().into_owned(),
+                filename_rule: filename_rule_cache_key(filename_rule).to_string(),
+                netease_filename_format: netease_filename_format_cache_key(netease_filename_format)
+                    .to_string(),
+                filename_policy: filename_policy.cache_key().to_string(),
+                size_bytes: snapshot.size_bytes,
+                modified_at_ms: snapshot.modified_at_ms,
+                derived_name: name.clone(),
+                source_extension: snapshot.source_extension.clone(),
+                safe_output_stem: Some(name.clone()),
+                ..Default::default()
+            });
+            name
+        };
+        let key = unique_source_entry_key(&name, &snapshot.path, &result);
+        result.insert(
+            key,
+            (snapshot.size_bytes.to_string(), snapshot.path.clone()),
+        );
+    }
+    cache.remove_missing_sources_from_snapshot(&normalized_source_root, &observed_paths);
+    (result, issues, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(crate) fn music_dict_from_snapshots_with_budget(
+    snapshots: &[ScannedFileSnapshot],
+    budget: Arc<GlobalConcurrencyBudget>,
+    cancel: Arc<AtomicBool>,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+    phase: ScanPhase,
+    observer: &mut ScanObserver<'_>,
+) -> (
+    HashMap<String, (String, PathBuf)>,
+    Vec<MusicScanIssue>,
+    bool,
+) {
+    let owned = snapshots.to_vec();
+    let (results, worker_error) = scan_paths_with_budget(
+        owned,
+        budget,
+        Arc::clone(&cancel),
+        filename_rule,
+        netease_filename_format,
+        filename_policy,
+        phase,
+        observer,
+    );
+    let mut issues = Vec::new();
+    if let Some(error) = worker_error {
+        issues.push(MusicScanIssue {
+            path: snapshots
+                .first()
+                .map(|s| s.path.clone())
+                .unwrap_or_default(),
+            message: format!("扫描 worker 发生异常：{error}"),
+        });
+    }
+    let mut result = HashMap::new();
+    for item in results {
+        let size = item.size_bytes.to_string();
+        if matches!(phase, ScanPhase::Source) {
+            let key = unique_source_entry_key(&item.derived_name, &item.path, &result);
+            result.insert(key, (size, item.path));
+        } else if result
+            .get(&item.derived_name)
+            .map(|existing| should_prefer_file(&item.path, &size, existing))
+            .unwrap_or(true)
+        {
+            result.insert(item.derived_name, (size, item.path));
+        }
+    }
+    (result, issues, cancel.load(Ordering::SeqCst))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_paths_with_budget(
-    paths: Vec<PathBuf>,
+    snapshots: Vec<ScannedFileSnapshot>,
     budget: Arc<GlobalConcurrencyBudget>,
     cancel: Arc<AtomicBool>,
     filename_rule: FilenameRule,
@@ -1106,11 +1218,11 @@ fn scan_paths_with_budget(
     phase: ScanPhase,
     observer: &mut ScanObserver<'_>,
 ) -> (Vec<ScanWorkerResult>, Option<String>) {
-    if paths.is_empty() {
+    if snapshots.is_empty() {
         return (Vec::new(), None);
     }
     let queue = Arc::new(Mutex::new(
-        paths.into_iter().enumerate().collect::<VecDeque<_>>(),
+        snapshots.into_iter().enumerate().collect::<VecDeque<_>>(),
     ));
     let (sender, receiver) = mpsc::channel();
     let worker_error = Arc::new(Mutex::new(None::<String>));
@@ -1131,21 +1243,19 @@ fn scan_paths_with_budget(
                         break;
                     }
                     let item = queue.lock().expect("scan queue lock poisoned").pop_front();
-                    let Some((index, path)) = item else {
+                    let Some((index, snapshot)) = item else {
                         break;
                     };
-                    let metadata = fs::metadata(&path).ok();
                     let result = ScanWorkerResult {
                         index,
-                        size_bytes: metadata.as_ref().map_or(0, fs::Metadata::len),
-                        modified_at: metadata.as_ref().and_then(metadata_modified_at_ms),
-                        derived_name: derive_song_name_with_policy(
-                            &path,
+                        size_bytes: snapshot.size_bytes,
+                        derived_name: derive_song_name_from_filename(
+                            &snapshot.path,
                             filename_rule,
                             netease_filename_format,
                             filename_policy,
                         ),
-                        path,
+                        path: snapshot.path,
                     };
                     if sender.send(result).is_err() {
                         break;
@@ -1187,7 +1297,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_else(|| "未知 panic".to_string())
 }
 
-fn filename_rule_cache_key(rule: FilenameRule) -> &'static str {
+pub fn filename_rule_cache_key(rule: FilenameRule) -> &'static str {
     match rule {
         FilenameRule::TitleArtist => "title_artist",
         FilenameRule::ArtistTitle => "artist_title",
@@ -1195,7 +1305,7 @@ fn filename_rule_cache_key(rule: FilenameRule) -> &'static str {
     }
 }
 
-fn netease_filename_format_cache_key(format: NeteaseFilenameFormat) -> &'static str {
+pub fn netease_filename_format_cache_key(format: NeteaseFilenameFormat) -> &'static str {
     match format {
         NeteaseFilenameFormat::TitleOnly => "title_only",
         NeteaseFilenameFormat::ArtistTitle => "artist_title",
@@ -4192,6 +4302,54 @@ pub(crate) fn derive_song_name_with_policy(
     candidate.unwrap_or_else(|| {
         normalize_fallback_song_name(&fallback_name, filename_rule, filename_policy)
     })
+}
+
+/// Fast scan-only filename derivation.  It deliberately never opens the
+/// source file; tags, NCM payloads and database identities belong to the
+/// conversion stage.  Existing filename rules are retained as context, but
+/// when a filename does not expose a reliable title/artist split its stem is
+/// the only safe identity available during a filesystem snapshot.
+pub(crate) fn derive_song_name_from_filename(
+    path: &Path,
+    filename_rule: FilenameRule,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+) -> String {
+    let fallback_name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    if matches!(filename_rule, FilenameRule::Original) {
+        return match filename_policy {
+            FilenameNormalizationPolicy::PreserveSource => {
+                sanitize_preserve_source_filename_component(fallback_name)
+            }
+            FilenameNormalizationPolicy::SoundCloud => sanitize_filename_component(fallback_name),
+        };
+    }
+    // The existing fallback parser is entirely string based. Reusing its
+    // normalization keeps SoundCloud-style separators and collaboration
+    // markers stable without opening an audio container. PreserveSource also
+    // honors the configured NetEase filename orientation when a split is
+    // visible in the source filename.
+    let identity = if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource) {
+        infer_song_identity_with_netease_filename_format(
+            fallback_name,
+            None,
+            None,
+            netease_filename_format,
+            filename_policy,
+        )
+    } else {
+        infer_song_identity(fallback_name, None, None)
+    };
+    build_song_name_with_policy(
+        &identity.title,
+        &identity.artist,
+        filename_rule,
+        filename_policy,
+    )
+    .unwrap_or_else(|| normalize_text_for_policy(fallback_name, filename_policy))
 }
 
 /// Derive a destination stem using a conservative NetEase identity when the

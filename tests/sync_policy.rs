@@ -30,9 +30,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 use sync::{
-    ConversionMetadataContext, TargetProfile, cleanup_temporary_outputs, compare_music_dicts,
-    get_destination_music_dict, resolve_output_policy,
-    update_existing_metadata_transactionally_with_context_and_policy,
+    ConversionMetadataContext, ScannedFileSnapshot, TargetProfile, cleanup_temporary_outputs,
+    compare_music_dicts, get_destination_music_dict, music_dict_from_snapshots_with_cache,
+    resolve_output_policy, update_existing_metadata_transactionally_with_context_and_policy,
 };
 use tempfile::tempdir;
 
@@ -325,6 +325,92 @@ fn scan_counter_handles_a_hundreds_track_library() {
     assert!(!cancelled);
 
     let _ = fs::remove_dir_all(temp_dir);
+}
+
+/// Manual, non-CI benchmark for the acceptance target. Run with
+/// `cargo test --test sync_policy benchmark_fast_incremental_scan_1000_files
+/// -- --ignored --nocapture` on the target machine.
+#[test]
+#[ignore = "local SSD benchmark; not a CI timing gate"]
+fn benchmark_fast_incremental_scan_1000_files() {
+    use std::time::Instant;
+
+    let temp_dir = tempdir().unwrap();
+    for index in 0..1_000 {
+        fs::write(
+            temp_dir.path().join(format!("track-{index:04}.mp3")),
+            b"placeholder",
+        )
+        .unwrap();
+    }
+    let cancel = AtomicBool::new(false);
+    let mut observe = |_: sync::ScanPhase, _: &std::path::Path| true;
+    let cold_started = Instant::now();
+    let cold_snapshot = sync::enumerate_music_files_observed(
+        temp_dir.path().to_str().unwrap(),
+        sync::SUPPORTED_SOURCE_EXTENSIONS,
+        &cancel,
+        |_, _, _| {},
+    )
+    .unwrap()
+    .snapshots;
+    let mut cache = scan_cache::ScanCache::empty();
+    let cold_dict = music_dict_from_snapshots_with_cache(
+        &cold_snapshot,
+        temp_dir.path(),
+        &temp_dir.path().join("out"),
+        config::FilenameRule::Original,
+        NeteaseFilenameFormat::TitleOnly,
+        FilenameNormalizationPolicy::SoundCloud,
+        &mut cache,
+        &cancel,
+        &mut observe,
+    )
+    .0;
+    let cold_elapsed = cold_started.elapsed();
+
+    let warm_started = Instant::now();
+    let warm_snapshot = sync::enumerate_music_files_observed(
+        temp_dir.path().to_str().unwrap(),
+        sync::SUPPORTED_SOURCE_EXTENSIONS,
+        &cancel,
+        |_, _, _| {},
+    )
+    .unwrap()
+    .snapshots;
+    let warm_dict = music_dict_from_snapshots_with_cache(
+        &warm_snapshot,
+        temp_dir.path(),
+        &temp_dir.path().join("out"),
+        config::FilenameRule::Original,
+        NeteaseFilenameFormat::TitleOnly,
+        FilenameNormalizationPolicy::SoundCloud,
+        &mut cache,
+        &cancel,
+        &mut observe,
+    )
+    .0;
+    let warm_elapsed = warm_started.elapsed();
+    let reused = warm_snapshot
+        .iter()
+        .filter(|snapshot: &&ScannedFileSnapshot| {
+            cache
+                .entries
+                .get(&snapshot.path.to_string_lossy().into_owned())
+                .is_some_and(|entry| entry.size_bytes == snapshot.size_bytes)
+        })
+        .count();
+
+    println!(
+        "fast scan benchmark: cold={}ms warm={}ms files={} reused={} netease_queries=0 traversals=2",
+        cold_elapsed.as_millis(),
+        warm_elapsed.as_millis(),
+        cold_dict.len().max(warm_dict.len()),
+        reused,
+    );
+    assert_eq!(cold_snapshot.len(), 1_000);
+    assert_eq!(warm_snapshot.len(), 1_000);
+    assert_eq!(reused, 1_000);
 }
 
 #[test]

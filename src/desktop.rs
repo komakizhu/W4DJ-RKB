@@ -398,6 +398,19 @@ impl DesktopController {
         Ok(())
     }
 
+    /// Publish a task-scoped status message before the first conversion file
+    /// starts. The frontend renders this through the existing current-file
+    /// channel, so metadata preparation is visible without adding a second
+    /// progress state to the desktop protocol.
+    pub fn set_current_file(
+        &mut self,
+        slot_index: usize,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        self.slot_mut(slot_index)?.current_file = message.into();
+        Ok(())
+    }
+
     pub fn complete_current_file(&mut self, slot_index: usize) -> Result<(), String> {
         let task_controller = self.task_controller(slot_index)?;
         task_controller.complete_current_file();
