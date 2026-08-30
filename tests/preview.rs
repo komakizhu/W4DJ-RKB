@@ -26,6 +26,28 @@ fn write_file(path: impl AsRef<std::path::Path>, size: usize) {
     fs::write(path, vec![b'x'; size]).unwrap();
 }
 
+fn write_tagged_wav(path: &std::path::Path, title: &str, artist: &str) {
+    let mut wav = Vec::with_capacity(48);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&40u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&8_000u32.to_le_bytes());
+    wav.extend_from_slice(&16_000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&4u32.to_le_bytes());
+    wav.extend_from_slice(&[0, 0, 0, 0]);
+    fs::write(path, wav).unwrap();
+    let mut tag = Tag::new();
+    tag.set_title(title);
+    tag.set_artist(artist);
+    tag.write_to_path(path, Version::Id3v24).unwrap();
+}
+
 #[test]
 fn task1_preview_uses_database_identity_before_building_output_path() {
     let source = tempdir().unwrap();
@@ -86,6 +108,67 @@ fn task1_preview_uses_database_identity_before_building_output_path() {
         preview.candidates[0].netease_artist.as_deref(),
         Some("川村ゆみ, Lotus Juice")
     );
+}
+
+#[test]
+fn lazy_netease_matching_keys_never_replace_formal_source_metadata() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let database = tempdir().unwrap();
+    let source_path = source.path().join("Nikita, the Wicked - LIKE ME.wav");
+    write_tagged_wav(&source_path, "LIKE ME", "Nikita, the Wicked");
+    let source_size = fs::metadata(&source_path).unwrap().len();
+    let database_path = database.path().join("sqlite_storage.sqlite3");
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE track (file TEXT, title TEXT, artist TEXT, album TEXT, tid INTEGER, filesize INTEGER);",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO track(file,title,artist,album,tid,filesize) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                source_path.to_string_lossy(),
+                "LIKE ME",
+                "Nikita, the Wicked",
+                "LIKE ME",
+                2_602_157_520_i64,
+                source_size,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let locators =
+        w4dj::netease::load_locators_from_db_observed(&database_path, |_, _, _| true).unwrap();
+    assert_eq!(locators[0].artist_key, "nikita, the wicked");
+    let resolver = NeteaseMetadataResolver::from_locators(&database_path, locators, None);
+
+    let preview = build_sync_preview_with_settings_and_netease_observed_with_policy_and_resolver(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+        ConflictStrategy::Skip,
+        FilenameRule::TitleArtist,
+        Default::default(),
+        FilenameNormalizationPolicy::PreserveSource,
+        None,
+        &resolver,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(preview.candidates.len(), 1);
+    assert_eq!(preview.candidates[0].name, "LIKE ME - Nikita, the Wicked");
+    assert_eq!(
+        preview.candidates[0].netease_track_id.as_deref(),
+        Some("2602157520")
+    );
+    assert_eq!(preview.candidates[0].netease_title, None);
+    assert_eq!(preview.candidates[0].netease_artist, None);
+    assert_eq!(preview.candidates[0].album, None);
 }
 
 #[test]
@@ -208,6 +291,8 @@ fn duplicate_preview() -> SyncPreview {
                 source_size_bytes: 1,
                 estimated_output_bytes: Some(1),
                 previous_destination_path: None,
+                previous_destination_paths: Vec::new(),
+                metadata_destination_paths: Vec::new(),
                 operation: PreviewOperation::Convert,
                 netease_track_id: None,
                 netease_album_id: None,
@@ -223,6 +308,8 @@ fn duplicate_preview() -> SyncPreview {
                 source_size_bytes: 1,
                 estimated_output_bytes: Some(1),
                 previous_destination_path: None,
+                previous_destination_paths: Vec::new(),
+                metadata_destination_paths: Vec::new(),
                 operation: PreviewOperation::Convert,
                 netease_track_id: None,
                 netease_album_id: None,
@@ -241,6 +328,7 @@ fn duplicate_preview() -> SyncPreview {
         output_duplicate_count: 0,
         action_kind: "convert".to_string(),
         action_count: 2,
+        output_files: Vec::new(),
         database_directory: None,
         detail_items: Vec::new(),
     }
@@ -350,6 +438,8 @@ fn disambiguation_keeps_existing_identity_in_preview_details() {
                 source_size_bytes: 1,
                 estimated_output_bytes: Some(1),
                 previous_destination_path: None,
+                previous_destination_paths: Vec::new(),
+                metadata_destination_paths: Vec::new(),
                 operation: PreviewOperation::Convert,
                 netease_track_id: None,
                 netease_album_id: None,
@@ -365,6 +455,8 @@ fn disambiguation_keeps_existing_identity_in_preview_details() {
                 source_size_bytes: 1,
                 estimated_output_bytes: Some(1),
                 previous_destination_path: None,
+                previous_destination_paths: Vec::new(),
+                metadata_destination_paths: Vec::new(),
                 operation: PreviewOperation::Convert,
                 netease_track_id: None,
                 netease_album_id: None,
@@ -377,6 +469,7 @@ fn disambiguation_keeps_existing_identity_in_preview_details() {
         skipped: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
+        output_files: vec![existing_path.display().to_string()],
         available_space_bytes: None,
         disk_space_sufficient: None,
         input_count: 2,
@@ -786,14 +879,6 @@ fn conflict_strategies_produce_distinct_conversion_plans() {
             .ends_with("Song.mp3")
     );
 
-    let renamed = preview(ConflictStrategy::Rename);
-    assert_eq!(renamed.candidates[0].name, "Song (2)");
-    assert!(
-        renamed.candidates[0]
-            .destination_path
-            .ends_with("Song (2).mp3")
-    );
-
     let metadata = preview(ConflictStrategy::UpdateMetadata);
     assert_eq!(
         metadata.candidates[0].operation,
@@ -843,6 +928,186 @@ fn overwrite_remembers_old_path_when_filename_rule_changes() {
         preview.candidates[0].previous_destination_path.as_deref(),
         Some(old_output.to_str().unwrap())
     );
+    assert_eq!(preview.output_files, vec![old_output.display().to_string()]);
+}
+
+#[test]
+fn overwrite_matches_same_identity_across_lossless_formats() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_path = source.path().join("Song - Artist.wav");
+    let old_output = destination.path().join("Song - Artist.wav");
+    write_tagged_wav(&source_path, "Song", "Artist");
+    write_tagged_wav(&old_output, "Song", "Artist");
+
+    let preview = build_sync_preview_with_settings(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Lossless,
+        Some(w4dj::config::LosslessFormat::Aiff),
+        ConflictStrategy::Overwrite,
+        FilenameRule::TitleArtist,
+    )
+    .unwrap();
+
+    assert_eq!(preview.new_count, 0);
+    assert_eq!(preview.existing_count, 1);
+    assert_eq!(preview.action_count, 1);
+    assert_eq!(preview.candidates.len(), 1);
+    assert!(
+        preview.candidates[0]
+            .destination_path
+            .ends_with("Song - Artist.aiff")
+    );
+    assert_eq!(
+        preview.candidates[0].previous_destination_path.as_deref(),
+        Some(old_output.to_str().unwrap())
+    );
+}
+
+#[test]
+fn overwrite_collects_every_confirmed_same_identity_output() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_path = source.path().join("Song - Artist.wav");
+    let old_wav = destination.path().join("Song - Artist.wav");
+    let old_mp3 = destination.path().join("Artist - Song.mp3");
+    write_tagged_wav(&source_path, "Song", "Artist");
+    write_tagged_wav(&old_wav, "Song", "Artist");
+    write_file(&old_mp3, 128);
+    let mut tag = Tag::new();
+    tag.set_title("Song");
+    tag.set_artist("Artist");
+    tag.write_to_path(&old_mp3, Version::Id3v24).unwrap();
+
+    let preview = build_sync_preview_with_settings(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Lossless,
+        Some(w4dj::config::LosslessFormat::Aiff),
+        ConflictStrategy::Overwrite,
+        FilenameRule::TitleArtist,
+    )
+    .unwrap();
+
+    assert_eq!(preview.existing_count, 1);
+    assert_eq!(preview.action_count, 1);
+    assert_eq!(preview.candidates[0].previous_destination_paths.len(), 2);
+    assert!(
+        preview.candidates[0]
+            .previous_destination_paths
+            .contains(&old_wav.display().to_string())
+    );
+    assert!(
+        preview.candidates[0]
+            .previous_destination_paths
+            .contains(&old_mp3.display().to_string())
+    );
+    assert_eq!(preview.output_files.len(), 2);
+    assert!(
+        preview
+            .output_files
+            .contains(&old_wav.display().to_string())
+    );
+    assert!(
+        preview
+            .output_files
+            .contains(&old_mp3.display().to_string())
+    );
+}
+
+#[test]
+fn skip_recognizes_a_confirmed_identity_in_another_format() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    write_tagged_wav(&source.path().join("Song - Artist.wav"), "Song", "Artist");
+    write_tagged_wav(
+        &destination.path().join("Song - Artist.wav"),
+        "Song",
+        "Artist",
+    );
+
+    let preview = build_sync_preview_with_settings(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Lossless,
+        Some(w4dj::config::LosslessFormat::Aiff),
+        ConflictStrategy::Skip,
+        FilenameRule::TitleArtist,
+    )
+    .unwrap();
+
+    assert_eq!(preview.existing_count, 1);
+    assert_eq!(preview.skipped_count, 1);
+    assert!(preview.candidates.is_empty());
+}
+
+#[test]
+fn metadata_update_targets_all_confirmed_identity_copies() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_path = source.path().join("Song - Artist.mp3");
+    let output_mp3 = destination.path().join("Song - Artist.mp3");
+    let output_wav = destination.path().join("Artist - Song.wav");
+    for path in [&source_path, &output_mp3] {
+        write_file(path, 128);
+        let mut tag = Tag::new();
+        tag.set_title("Song");
+        tag.set_artist("Artist");
+        tag.write_to_path(path, Version::Id3v24).unwrap();
+    }
+    write_tagged_wav(&output_wav, "Song", "Artist");
+
+    let preview = build_sync_preview_with_settings(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+        ConflictStrategy::UpdateMetadata,
+        FilenameRule::TitleArtist,
+    )
+    .unwrap();
+
+    assert_eq!(preview.existing_count, 1);
+    assert_eq!(
+        preview.candidates[0].operation,
+        PreviewOperation::UpdateMetadata
+    );
+    assert_eq!(preview.candidates[0].metadata_destination_paths.len(), 2);
+}
+
+#[test]
+fn same_filename_with_conflicting_reliable_identity_is_preserved() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_path = source.path().join("Song - Artist.mp3");
+    let occupied = destination.path().join("Song - Artist.mp3");
+    for (path, artist) in [(&source_path, "Artist"), (&occupied, "Another Artist")] {
+        write_file(path, 128);
+        let mut tag = Tag::new();
+        tag.set_title("Song");
+        tag.set_artist(artist);
+        tag.write_to_path(path, Version::Id3v24).unwrap();
+    }
+
+    let preview = build_sync_preview_with_settings(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+        ConflictStrategy::Overwrite,
+        FilenameRule::TitleArtist,
+    )
+    .unwrap();
+
+    assert_eq!(preview.existing_count, 0);
+    assert_eq!(preview.new_count, 1);
+    assert!(preview.candidates[0].previous_destination_paths.is_empty());
+    assert_ne!(
+        preview.candidates[0].destination_path,
+        occupied.display().to_string()
+    );
+    assert!(occupied.exists());
 }
 
 #[test]
@@ -868,21 +1133,6 @@ fn cleaned_name_collisions_keep_both_sources_and_are_explicit() {
     write_file(source.path().join("A:B.mp3"), 120);
     write_file(source.path().join("A?B.mp3"), 121);
 
-    let renamed = build_sync_preview_with_settings(
-        source.path().to_str().unwrap(),
-        destination.path().to_str().unwrap(),
-        Mode::Compat,
-        None,
-        ConflictStrategy::Rename,
-        FilenameRule::Original,
-    )
-    .unwrap();
-    assert_eq!(renamed.candidates.len(), 2);
-    assert_ne!(
-        renamed.candidates[0].destination_path,
-        renamed.candidates[1].destination_path
-    );
-
     let skipped = build_sync_preview_with_settings(
         source.path().to_str().unwrap(),
         destination.path().to_str().unwrap(),
@@ -901,32 +1151,6 @@ fn cleaned_name_collisions_keep_both_sources_and_are_explicit() {
         skipped.candidates[0].destination_path,
         skipped.candidates[1].destination_path
     );
-}
-
-#[test]
-fn auto_rename_reserves_names_across_the_whole_batch() {
-    let source = tempdir().unwrap();
-    let destination = tempdir().unwrap();
-    write_file(source.path().join("Song.mp3"), 120);
-    write_file(source.path().join("Song (2).mp3"), 120);
-    write_file(destination.path().join("Song.mp3"), 80);
-
-    let preview = build_sync_preview_with_settings(
-        source.path().to_str().unwrap(),
-        destination.path().to_str().unwrap(),
-        Mode::Compat,
-        None,
-        ConflictStrategy::Rename,
-        FilenameRule::TitleArtist,
-    )
-    .unwrap();
-
-    let destinations = preview
-        .candidates
-        .iter()
-        .map(|candidate| &candidate.destination_path)
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(destinations.len(), preview.candidates.len());
 }
 
 #[test]
@@ -962,6 +1186,8 @@ fn retry_preview_restores_pending_files_saved_before_app_exit() {
             source_size_bytes: 120,
             estimated_output_bytes: Some(120),
             previous_destination_path: None,
+            previous_destination_paths: Vec::new(),
+            metadata_destination_paths: Vec::new(),
             operation: PreviewOperation::Convert,
         }],
         metadata_diagnostics: Vec::new(),
@@ -1027,6 +1253,8 @@ fn retry_preview_ignores_old_macos_appledouble_failures_and_pending_files() {
             source_size_bytes: 120,
             estimated_output_bytes: Some(120),
             previous_destination_path: None,
+            previous_destination_paths: Vec::new(),
+            metadata_destination_paths: Vec::new(),
             operation: PreviewOperation::Convert,
         }],
         metadata_diagnostics: Vec::new(),

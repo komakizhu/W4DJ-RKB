@@ -3,6 +3,19 @@ name = "w4dj-desktop"
 version = "3.2.0-beta.3"
 edition = "2024"
 default-run = "w4dj-desktop"
+autobins = false
+
+[features]
+acceptance-tools = []
+
+[[bin]]
+name = "w4dj-desktop"
+path = "src/main.rs"
+
+[[bin]]
+name = "export_emotion_evaluation_manifest"
+path = "src/bin/export_emotion_evaluation_manifest.rs"
+required-features = ["acceptance-tools"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

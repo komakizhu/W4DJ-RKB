@@ -327,8 +327,41 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let mut metadata = read_embedded_track_metadata(path);
 
-    let mut metadata = match extension.as_str() {
+    // Plain MP3/FLAC downloads from NetEase may have no embedded tags even
+    // though the desktop client still knows the track.  Merge only missing
+    // values so user-authored tags remain authoritative.  Callers that need
+    // to prove what is physically present in an output file must use
+    // `read_embedded_track_metadata` instead.
+    if !matches!(extension.as_str(), "ncm")
+        && let Some(recovered) = recover_local_metadata(path)
+    {
+        if metadata.title.trim().is_empty() {
+            metadata.title = recovered.title;
+        }
+        if metadata.artist.trim().is_empty() {
+            metadata.artist = recovered.artist;
+        }
+        if metadata.album.trim().is_empty() {
+            metadata.album = recovered.album;
+        }
+    }
+
+    metadata
+}
+
+/// Read only metadata physically embedded in the container.  This function
+/// intentionally never consults the NetEase resolver, so database fallback
+/// cannot make a missing output tag appear to have been written.
+pub fn read_embedded_track_metadata(path: &Path) -> TrackMetadata {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
         "flac" => metaflac::Tag::read_from_path(path)
             .ok()
             .and_then(|tag| {
@@ -377,26 +410,7 @@ pub fn read_track_metadata(path: &Path) -> TrackMetadata {
             })
             .unwrap_or_default(),
         _ => TrackMetadata::default(),
-    };
-
-    // Plain MP3/FLAC downloads from NetEase may have no embedded tags even
-    // though the desktop client still knows the track.  Merge only missing
-    // values so user-authored tags remain authoritative.
-    if !matches!(extension.as_str(), "ncm")
-        && let Some(recovered) = recover_local_metadata(path)
-    {
-        if metadata.title.trim().is_empty() {
-            metadata.title = recovered.title;
-        }
-        if metadata.artist.trim().is_empty() {
-            metadata.artist = recovered.artist;
-        }
-        if metadata.album.trim().is_empty() {
-            metadata.album = recovered.album;
-        }
     }
-
-    metadata
 }
 
 fn first_metadata_value(values: Option<&Vec<String>>) -> String {

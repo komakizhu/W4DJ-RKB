@@ -6,6 +6,7 @@
 
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml \
+  --features acceptance-tools \
   --bin export_emotion_evaluation_manifest -- \
   --database "/path/to/w4dj.sqlite3" \
   --output "/tmp/emotion-evaluation-manifest.json" \

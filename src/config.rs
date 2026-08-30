@@ -29,7 +29,6 @@ pub enum ConflictStrategy {
     #[default]
     Skip,
     Overwrite,
-    Rename,
     UpdateMetadata,
 }
 

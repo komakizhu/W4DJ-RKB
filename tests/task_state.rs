@@ -52,6 +52,15 @@ fn completion_does_not_exceed_total() {
 }
 
 #[test]
+fn committed_completion_can_be_reverted_when_post_commit_finalization_fails() {
+    let task = TaskController::running(1);
+    task.complete_current_file();
+    task.revert_completed_file();
+    assert_eq!(task.snapshot().completed, 0);
+    assert_eq!(task.snapshot().remaining, 1);
+}
+
+#[test]
 fn cancel_prevents_new_files_from_starting() {
     let task = TaskController::running(2);
     task.request_cancel();

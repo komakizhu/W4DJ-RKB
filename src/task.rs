@@ -48,6 +48,10 @@ impl TaskState {
         }
     }
 
+    pub fn revert_completed_file(&mut self) {
+        self.completed = self.completed.saturating_sub(1);
+    }
+
     pub fn should_start_next_file(&self) -> bool {
         !self.paused && !self.cancelled && self.completed < self.total
     }
@@ -107,6 +111,10 @@ impl TaskController {
 
     pub fn complete_current_file(&self) {
         self.with_state(|state| state.complete_current_file());
+    }
+
+    pub fn revert_completed_file(&self) {
+        self.with_state(|state| state.revert_completed_file());
     }
 
     pub fn snapshot(&self) -> TaskSnapshot {

@@ -296,6 +296,7 @@ Expected: 新旧 JSON 均可读，四套结果映射正确，页面对缺失/失
 ~~~bash
 CARGO_TARGET_DIR=/private/tmp/w4dj-emotion-acceptance-target \
   cargo run --quiet --manifest-path src-tauri/Cargo.toml \
+  --features acceptance-tools \
   --bin export_emotion_evaluation_manifest -- \
   --database "$W4DJ_DB" \
   --output /private/tmp/w4dj-emotion-evaluation-5.json \

@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: &str = "1";
+pub const CACHE_SCHEMA_VERSION: &str = "2";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheState {
@@ -114,21 +114,26 @@ pub fn read_summary(
     let stored_fingerprint = value("fingerprint")?
         .and_then(|raw| serde_json::from_str::<DatabaseFingerprintView>(&raw).ok());
     let stored_path = value("databasePath")?.map(PathBuf::from);
-    let state = match value("status")?.as_deref() {
-        Some("ready")
-            if stored_path == database_path.map(Path::to_path_buf)
-                && current_fingerprint.is_some_and(|fingerprint| {
-                    Some(fingerprint) == stored_fingerprint.as_ref()
-                }) =>
-        {
-            CacheState::Ready
+    let schema_is_current = value("schemaVersion")?.as_deref() == Some(CACHE_SCHEMA_VERSION);
+    let state = if !schema_is_current {
+        CacheState::Stale
+    } else {
+        match value("status")?.as_deref() {
+            Some("ready")
+                if stored_path == database_path.map(Path::to_path_buf)
+                    && current_fingerprint.is_some_and(|fingerprint| {
+                        Some(fingerprint) == stored_fingerprint.as_ref()
+                    }) =>
+            {
+                CacheState::Ready
+            }
+            Some("ready") => CacheState::Stale,
+            Some("building") => CacheState::Building,
+            Some("cancelling") => CacheState::Cancelling,
+            Some("cancelled") => CacheState::Cancelled,
+            Some("error") => CacheState::Error,
+            _ => CacheState::Idle,
         }
-        Some("ready") => CacheState::Stale,
-        Some("building") => CacheState::Building,
-        Some("cancelling") => CacheState::Cancelling,
-        Some("cancelled") => CacheState::Cancelled,
-        Some("error") => CacheState::Error,
-        _ => CacheState::Idle,
     };
     let record_count = connection
         .query_row("SELECT COUNT(*) FROM netease_track_locators", [], |row| {

@@ -4,7 +4,7 @@
 //! layer. This module owns the new w4dj.sqlite3 lifecycle: rows are created
 //! from successfully committed output files, not from NetEase database rows.
 
-use crate::analysis::{TrackAnalysis, load_analysis_file, read_track_metadata};
+use crate::analysis::{TrackAnalysis, load_analysis_file, read_embedded_track_metadata};
 use crate::dj_playlist::{
     DjPlaylistImportWarning, ImportedDjPlaylist, ImportedDjPlaylistSummary, ImportedDjPlaylistTrack,
 };
@@ -1185,7 +1185,7 @@ impl W4djLibrary {
             .as_ref()
             .map(|facts| facts.format.clone())
             .or(measured_format);
-        let metadata_values = read_track_metadata(destination_path);
+        let metadata_values = read_embedded_track_metadata(destination_path);
         let mut track = self
             .catalog
             .track_detail(&track_key)?

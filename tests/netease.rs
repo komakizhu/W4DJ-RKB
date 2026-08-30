@@ -161,6 +161,7 @@ fn lightweight_locator_cache_round_trips_without_raw_metadata_columns() {
     assert_eq!(locators.len(), 1);
     assert_eq!(locators[0].track_id, "42");
     assert_eq!(locators[0].title_key, "song");
+    assert_eq!(locators[0].artist_key, "artist");
     netease_cache::replace_locators(
         &cache,
         &database,
@@ -204,6 +205,26 @@ fn lightweight_locator_cache_becomes_stale_when_wal_fingerprint_changes() {
     .unwrap();
     let changed = database_fingerprint_view(&database);
     let summary = netease_cache::read_summary(&cache, Some(&database), Some(&changed)).unwrap();
+    assert_eq!(summary.state, CacheState::Stale);
+}
+
+#[test]
+fn lightweight_locator_cache_rejects_an_old_schema_version() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("sqlite_storage.sqlite3");
+    let cache = directory.path().join("library-dashboard.sqlite3");
+    create_database(&database, "CREATE TABLE track (file TEXT);");
+    let fingerprint = database_fingerprint_view(&database);
+    netease_cache::replace_locators(&cache, &database, &fingerprint, &[]).unwrap();
+    Connection::open(&cache)
+        .unwrap()
+        .execute(
+            "UPDATE netease_cache_meta SET value='1' WHERE key='schemaVersion'",
+            [],
+        )
+        .unwrap();
+
+    let summary = netease_cache::read_summary(&cache, Some(&database), Some(&fingerprint)).unwrap();
     assert_eq!(summary.state, CacheState::Stale);
 }
 

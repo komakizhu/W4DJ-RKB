@@ -17,7 +17,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
         lossless_format: Some(LosslessFormat::Aiff),
         conversion_mode: ConversionMode::Direct,
         enhanced_mode: true,
-        conflict_strategy: ConflictStrategy::Rename,
+        conflict_strategy: ConflictStrategy::Overwrite,
         filename_rule: FilenameRule::ArtistTitle,
         netease_filename_format: Default::default(),
         netease_database_path: Some(String::from("/music/sqlite_storage.sqlite3")),
@@ -36,7 +36,7 @@ fn preferences_roundtrip_persists_both_sync_slots() {
     assert!(matches!(loaded.lossless_format, Some(LosslessFormat::Aiff)));
     assert!(matches!(loaded.conversion_mode, ConversionMode::Direct));
     assert!(loaded.enhanced_mode);
-    assert_eq!(loaded.conflict_strategy, ConflictStrategy::Rename);
+    assert_eq!(loaded.conflict_strategy, ConflictStrategy::Overwrite);
     assert_eq!(loaded.filename_rule, FilenameRule::ArtistTitle);
     assert_eq!(
         loaded.netease_database_path.as_deref(),

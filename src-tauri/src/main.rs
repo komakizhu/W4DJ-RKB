@@ -18,7 +18,7 @@ use w4dj::analysis::{
     REQUIRED_DISCOGS_HEAD_IDS, TrackAnalysis, TrackMetadata, analysis_file_path,
     build_rekordbox_xml, clear_analysis_file, is_basic_analysis_complete,
     is_complete_analysis, load_analysis_file,
-    merge_analysis_entries, read_track_metadata, save_analysis_file,
+    merge_analysis_entries, read_embedded_track_metadata, read_track_metadata, save_analysis_file,
 };
 use w4dj::config::{
     ConflictStrategy, ConversionMode, FilenameNormalizationPolicy, FilenameRule, LosslessFormat,
@@ -42,6 +42,7 @@ use w4dj::history::{
 };
 use w4dj::library_catalog::{CatalogLocalFile, CatalogSourceRecord, LibraryCatalog};
 use w4dj::library_query::{LibraryPage, LibraryQuery};
+use w4dj::media_probe::probe_local_audio;
 use w4dj::w4dj_library::{
     EmotionEvaluationManifest, W4djLibrary, write_emotion_evaluation_manifest,
 };
@@ -1858,20 +1859,88 @@ fn validate_destination_directory(path: &Path) -> Result<(), String> {
 #[tauri::command]
 fn open_destination(path: String) -> Result<(), String> {
     let destination = PathBuf::from(path.trim());
-    validate_destination_directory(&destination)?;
+    let reveal_file = destination.is_file();
+    if !reveal_file {
+        validate_destination_directory(&destination)?;
+    }
 
     #[cfg(target_os = "macos")]
-    let mut command = Command::new("open");
+    let mut command = {
+        let mut command = Command::new("open");
+        if reveal_file {
+            command.arg("-R");
+        }
+        command
+    };
     #[cfg(target_os = "windows")]
-    let mut command = Command::new("explorer");
+    let mut command = {
+        let mut command = Command::new("explorer");
+        if reveal_file {
+            command.arg("/select,");
+        }
+        command
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = Command::new("xdg-open");
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let launch_target: &Path = &destination;
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let launch_target: &Path = if reveal_file {
+        destination.parent().unwrap_or(&destination)
+    } else {
+        &destination
+    };
+
+    command
+        .arg(launch_target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法打开输出目录：{error}"))
+}
+
+/// Reveal a planned output file from the preview dialog. Planned new files do
+/// not exist yet, so the containing output directory is opened in that case;
+/// existing files are revealed/selected by the platform file manager.
+#[tauri::command]
+fn open_destination_file(path: String) -> Result<(), String> {
+    let destination = PathBuf::from(path.trim());
+    if destination.as_os_str().is_empty() {
+        return Err(String::from("输出文件为空"));
+    }
+    let reveal_file = destination.is_file();
+    let target = if reveal_file {
+        destination.clone()
+    } else if let Some(parent) = destination.parent().filter(|parent| parent.is_dir()) {
+        parent.to_path_buf()
+    } else {
+        return Err(format!("输出文件不存在且所在目录不可用：{}", destination.display()));
+    };
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        if reveal_file {
+            command.arg("-R");
+        }
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        if reveal_file {
+            command.arg("/select,");
+        }
+        command
+    };
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let mut command = Command::new("xdg-open");
 
     command
-        .arg(&destination)
+        .arg(&target)
         .spawn()
         .map(|_| ())
-        .map_err(|error| format!("无法打开输出目录：{error}"))
+        .map_err(|error| format!("无法打开输出文件位置：{error}"))
 }
 
 #[tauri::command]
@@ -7215,6 +7284,7 @@ fn main() {
             check_for_updates,
             open_external_url,
             open_destination,
+            open_destination_file,
             open_source,
             list_audio_files,
             read_audio_file,
@@ -7277,7 +7347,7 @@ fn main() {
             };
             let mut window_builder = WebviewWindowBuilder::new(app, "main", headless_url)
                 .title("W4DJ RKB")
-                .inner_size(1120.0, 760.0)
+                .inner_size(1280.0, 800.0)
                 .min_inner_size(760.0, 560.0)
                 .resizable(true)
                 .visible(!headless_mode);
@@ -7574,13 +7644,21 @@ fn register_committed_output(
     _destination_root: &Path,
     candidate: &PreviewCandidate,
     _analyses: &HashMap<String, EmbeddedAnalysis>,
-) -> Option<String> {
+) -> io::Result<()> {
     let Some(library) = library else {
-        return None;
+        return Err(io::Error::other("W4DJ 歌曲库不可用，无法确认覆盖"));
     };
-    let title = candidate.netease_title.as_deref().unwrap_or_default();
-    let artist = candidate.netease_artist.as_deref().unwrap_or_default();
-    if let Err(error) = library.upsert_lightweight_output(
+    let output_metadata = read_embedded_track_metadata(Path::new(&candidate.destination_path));
+    // The library is an index of the final artifact.  Never fall back to a
+    // lightweight matching key or a candidate preview value here: doing so
+    // would make the database disagree with what users can actually read
+    // from the committed output file.
+    if output_metadata.title.trim().is_empty() {
+        return Err(io::Error::other("最终输出标题复读为空，无法登记歌曲库"));
+    }
+    let title = output_metadata.title.trim();
+    let artist = output_metadata.artist.trim();
+    library.upsert_lightweight_output(
         slot_index,
         Some(Path::new(&candidate.source_path)),
         Path::new(&candidate.destination_path),
@@ -7588,24 +7666,165 @@ fn register_committed_output(
         candidate.netease_album_id.as_deref(),
         title,
         artist,
-    ) {
-        eprintln!(
-            "W4DJ output registration warning for {}: {}",
-            candidate.destination_path, error
-        );
-        return Some(format!(
-            "歌曲库轻量登记警告：{}（音频已保留，可稍后重试登记）",
-            error
-        ));
-    }
-    None
+    )
+    .map(|_| ())
+    .map_err(|error| io::Error::other(format!("歌曲库登记失败：{error}")))
 }
 
-/// Replaced-output cleanup is only valid for a rename inside the active
+/// Replaced-output cleanup is only valid for a confirmed identity inside the active
 /// destination root. A successful conversion to a different root updates
 /// the lightweight index but must never inspect or remove the old root.
 fn replacement_is_inside_destination_root(previous_path: &Path, destination_root: &Path) -> bool {
     previous_path.starts_with(destination_root)
+}
+
+fn candidate_replacement_paths(candidate: &PreviewCandidate) -> Vec<&str> {
+    let mut paths = candidate
+        .previous_destination_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if let Some(previous) = candidate.previous_destination_path.as_deref()
+        && !paths.contains(&previous)
+    {
+        paths.push(previous);
+    }
+    paths
+}
+
+fn validate_replacement_snapshot(
+    candidate: &PreviewCandidate,
+    destination_root: &Path,
+) -> io::Result<()> {
+    for previous in candidate_replacement_paths(candidate) {
+        let previous = Path::new(previous);
+        if !replacement_is_inside_destination_root(previous, destination_root) {
+            return Err(io::Error::other("旧输出不在当前输出目录，请重新扫描"));
+        }
+        if !previous.is_file() {
+            return Err(io::Error::other("输出目录已变化，请重新扫描"));
+        }
+        if previous == Path::new(&candidate.source_path) {
+            return Err(io::Error::other("旧输出与源文件相同，已拒绝覆盖"));
+        }
+        let source = read_embedded_track_metadata(Path::new(&candidate.source_path));
+        let output = read_embedded_track_metadata(previous);
+        if !source.title.trim().is_empty()
+            && !source.artist.trim().is_empty()
+            && (!source.title.trim().eq_ignore_ascii_case(output.title.trim())
+                || !source.artist.trim().eq_ignore_ascii_case(output.artist.trim()))
+        {
+            return Err(io::Error::other("旧输出身份已变化，请重新扫描"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_committed_candidate(candidate: &PreviewCandidate) -> io::Result<()> {
+    let destination = Path::new(&candidate.destination_path);
+    let metadata = fs::metadata(destination)
+        .map_err(|error| io::Error::other(format!("无法复读新输出：{error}")))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(io::Error::other("新输出为空或不是文件"));
+    }
+    probe_local_audio(destination)
+        .map_err(|error| io::Error::other(format!("新输出音频复读失败：{error}")))?;
+
+    let source = read_embedded_track_metadata(Path::new(&candidate.source_path));
+    let source_has_formal_identity =
+        !source.title.trim().is_empty() && !source.artist.trim().is_empty();
+    let expected_title = if source_has_formal_identity {
+        source.title.as_str()
+    } else {
+        candidate
+            .netease_title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&source.title)
+    };
+    let expected_artist = if source_has_formal_identity {
+        source.artist.as_str()
+    } else {
+        candidate
+            .netease_artist
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&source.artist)
+    };
+    let expected_album = if !source.album.trim().is_empty() {
+        source.album.as_str()
+    } else {
+        candidate
+            .album
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&source.album)
+    };
+    if !expected_title.trim().is_empty() && !expected_artist.trim().is_empty() {
+        let output = read_embedded_track_metadata(destination);
+        if expected_title.trim() != output.title.trim()
+            || expected_artist.trim() != output.artist.trim()
+            || (!expected_album.trim().is_empty()
+                && expected_album.trim() != output.album.trim())
+        {
+            return Err(io::Error::other("新输出关键标签复读校验失败"));
+        }
+    }
+    Ok(())
+}
+
+fn finalize_committed_candidate(
+    library: &mut Option<W4djLibrary>,
+    slot_index: usize,
+    destination_root: &Path,
+    candidate: &PreviewCandidate,
+    analyses: &HashMap<String, EmbeddedAnalysis>,
+    strategy: ConflictStrategy,
+) -> io::Result<()> {
+    verify_committed_candidate(candidate).map_err(|error| {
+        io::Error::other(format!(
+            "覆盖失败：新输出={}，复读校验失败：{error}",
+            candidate.destination_path
+        ))
+    })?;
+    register_committed_output(
+        library,
+        slot_index,
+        destination_root,
+        candidate,
+        analyses,
+    )
+    .map_err(|error| {
+        io::Error::other(format!(
+            "覆盖失败：新输出={}，旧输出={:?}，{error}",
+            candidate.destination_path,
+            candidate_replacement_paths(candidate)
+        ))
+    })?;
+    if matches!(strategy, ConflictStrategy::Overwrite) {
+        for previous_path in candidate_replacement_paths(candidate) {
+            if !replacement_is_inside_destination_root(
+                Path::new(previous_path),
+                destination_root,
+            ) {
+                return Err(io::Error::other(format!(
+                    "覆盖清理路径不在当前输出目录：{previous_path}"
+                )));
+            }
+            remove_replaced_output(
+                Path::new(previous_path),
+                Path::new(&candidate.destination_path),
+                Path::new(&candidate.source_path),
+            )
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "覆盖失败：新输出={}，旧输出={previous_path}，删除失败：{error}",
+                    candidate.destination_path
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn embedded_analysis_from_track(analysis: &TrackAnalysis) -> EmbeddedAnalysis {
@@ -7751,6 +7970,17 @@ fn run_confirmed_sync_task(
         setup_error = Some(error);
     } else if let Err(error) = fs::create_dir_all(&job.destination) {
         setup_error = Some(format!("无法创建输出目录：{error}"));
+    } else if let Some(error) = job
+        .candidates
+        .iter()
+        .filter(|_| matches!(job.conflict_strategy, ConflictStrategy::Overwrite))
+        .find_map(|candidate| {
+            validate_replacement_snapshot(candidate, Path::new(&job.destination))
+                .err()
+                .map(|error| error.to_string())
+        })
+    {
+        setup_error = Some(error);
     }
 
     if setup_error.is_none() {
@@ -7833,24 +8063,29 @@ fn run_confirmed_sync_task(
                     break;
                 }
 
-                let result = update_existing_metadata_transactionally_with_context_and_policy(
-                    Path::new(&candidate.source_path),
-                    Path::new(&candidate.destination_path),
-                    job.netease_filename_format,
-                    |temporary_output| {
-                        apply_analysis_for_candidate_to_path(
-                            candidate,
-                            temporary_output,
-                            &analysis_lookup,
-                            job.metadata_context.as_ref(),
-                        )
-                    },
-                    job.metadata_context.as_ref(),
-                    filename_normalization_policy_for_slot(job.slot_index),
-                );
-                let registration_warning = if result.is_ok()
-                    && let Some(candidate) = candidate_lookup.get(&candidate.name)
-                {
+                let destinations = if candidate.metadata_destination_paths.is_empty() {
+                    vec![candidate.destination_path.clone()]
+                } else {
+                    candidate.metadata_destination_paths.clone()
+                };
+                let result = destinations.iter().try_for_each(|destination| {
+                    update_existing_metadata_transactionally_with_context_and_policy(
+                        Path::new(&candidate.source_path),
+                        Path::new(destination),
+                        job.netease_filename_format,
+                        |temporary_output| {
+                            apply_analysis_for_candidate_to_path(
+                                candidate,
+                                temporary_output,
+                                &analysis_lookup,
+                                job.metadata_context.as_ref(),
+                            )
+                        },
+                        job.metadata_context.as_ref(),
+                        filename_normalization_policy_for_slot(job.slot_index),
+                    )
+                });
+                let result = result.and_then(|()| {
                     register_committed_output(
                         &mut w4dj_library,
                         job.slot_index,
@@ -7858,15 +8093,8 @@ fn run_confirmed_sync_task(
                         candidate,
                         &analysis_lookup,
                     )
-                } else {
-                    None
-                };
+                });
                 let mut controller_guard = controller.lock().expect("desktop lock poisoned");
-                if let Some(warning) = registration_warning {
-                    controller_guard
-                        .push_log(job.slot_index, warning)
-                        .expect("confirmed slot index should be valid");
-                }
                 let failed_file = match result {
                     Ok(()) => {
                         task_controller.complete_current_file();
@@ -7957,52 +8185,27 @@ fn run_confirmed_sync_task(
                         if error.is_some_and(|error| {
                             error.kind() == io::ErrorKind::Interrupted && task.is_cancelled()
                         }) {
-                            return;
+                            return Ok(());
                         }
                         let candidate = candidate_lookup.get(name);
-                        let replacement_warning = if error.is_none()
-                            && matches!(job.conflict_strategy, ConflictStrategy::Overwrite)
-                        {
-                            candidate
-                                .and_then(|candidate| candidate.previous_destination_path.as_deref())
-                                .and_then(|previous_path| {
-                                    if !replacement_is_inside_destination_root(
-                                        Path::new(previous_path),
-                                        Path::new(&job.destination),
-                                    ) {
-                                        return None;
-                                    }
-                                    candidate.and_then(|candidate| {
-                                        match remove_replaced_output(
-                                            Path::new(previous_path),
-                                            Path::new(&candidate.destination_path),
-                                            Path::new(&candidate.source_path),
-                                        ) {
-                                            Ok(true) | Ok(false) => None,
-                                            Err(error) => Some(format!(
-                                                "覆盖已生成新文件，但旧输出未能删除 {}：{}",
-                                                previous_path, error
-                                            )),
-                                        }
-                                    })
-                                })
+                        let finalize_error = if error.is_none() {
+                            let candidate = candidate.ok_or_else(|| {
+                                io::Error::other(format!("找不到已提交歌曲的预览记录：{name}"))
+                            })?;
+                            finalize_committed_candidate(
+                                &mut w4dj_library,
+                                job.slot_index,
+                                Path::new(&job.destination),
+                                candidate,
+                                &analysis_lookup,
+                                job.conflict_strategy,
+                            )
+                            .err()
                         } else {
                             None
                         };
-                        let registration_warning = if error.is_none() {
-                            candidate.and_then(|candidate| {
-                                register_committed_output(
-                                    &mut w4dj_library,
-                                    job.slot_index,
-                                    Path::new(&job.destination),
-                                    candidate,
-                                    &analysis_lookup,
-                                )
-                            })
-                        } else {
-                            None
-                        };
-                        let failed_file = if let Some(error) = error {
+                        let effective_error = error.or(finalize_error.as_ref());
+                        let failed_file = if let Some(error) = effective_error {
                             let failed_file = FailedFile {
                                 name: name.to_string(),
                                 source_path: candidate
@@ -8027,16 +8230,6 @@ fn run_confirmed_sync_task(
                         } else {
                             let mut controller_guard =
                                 controller.lock().expect("desktop lock poisoned");
-                            if let Some(warning) = replacement_warning {
-                                controller_guard
-                                    .push_log(job.slot_index, warning)
-                                    .expect("confirmed slot index should be valid");
-                            }
-                            if let Some(warning) = registration_warning {
-                                controller_guard
-                                    .push_log(job.slot_index, warning)
-                                    .expect("confirmed slot index should be valid");
-                            }
                             controller_guard
                                 .record_file_result(job.slot_index, name, task.snapshot(), None)
                                 .expect("confirmed slot index should be valid");
@@ -8068,6 +8261,7 @@ fn run_confirmed_sync_task(
                             task.snapshot().completed,
                             failed_file,
                         );
+                        Ok(())
                     },
                     Arc::clone(&concurrency_budget),
                     Arc::clone(&ffmpeg_registry),
@@ -8239,6 +8433,8 @@ fn pending_file_from_candidate(candidate: &PreviewCandidate) -> PendingFile {
         source_size_bytes: candidate.source_size_bytes,
         estimated_output_bytes: candidate.estimated_output_bytes,
         previous_destination_path: candidate.previous_destination_path.clone(),
+        previous_destination_paths: candidate.previous_destination_paths.clone(),
+        metadata_destination_paths: candidate.metadata_destination_paths.clone(),
         operation: candidate.operation,
     }
 }
@@ -8677,7 +8873,7 @@ fn run_sync_task(
             if error.is_some_and(|error| {
                 error.kind() == io::ErrorKind::Interrupted && task.is_cancelled()
             }) {
-                return;
+                return Ok(());
             }
             if error.is_some() {
                 failed_files += 1;
@@ -8730,6 +8926,7 @@ fn run_sync_task(
                     error.map(|err| err.to_string()),
                 )
                 .expect("sync slot index validated before worker start");
+            Ok(())
         },
         Arc::clone(&concurrency_budget),
         Arc::clone(&ffmpeg_registry),
@@ -8888,14 +9085,64 @@ mod tests {
     };
     use std::fs;
     use std::collections::BTreeSet;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
-    use w4dj::config::Mode;
+    use w4dj::config::{ConflictStrategy, Mode};
     use w4dj::desktop::{DesktopController, DesktopState};
     use w4dj::history::{AnalysisReport, FailedFile, HistoryEntry, HistoryStatus};
     use w4dj::m3u8::ResolvedDjPlaylistTrack;
+    use w4dj::w4dj_library::W4djLibrary;
+
+    fn write_valid_audio(path: &Path, codec: &str, title: &str, artist: &str) {
+        let ffmpeg = w4dj::sync::find_ffmpeg().expect("test requires bundled ffmpeg");
+        let status = std::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.15",
+                "-metadata",
+                &format!("title={title}"),
+                "-metadata",
+                &format!("artist={artist}"),
+                "-c:a",
+                codec,
+                "-y",
+            ])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn overwrite_candidate(source: &Path, current: &Path, old: Vec<&Path>) -> PreviewCandidate {
+        PreviewCandidate {
+            name: "Song - Artist".into(),
+            source_path: source.display().to_string(),
+            destination_path: current.display().to_string(),
+            source_size_bytes: fs::metadata(source).unwrap().len(),
+            estimated_output_bytes: Some(fs::metadata(current).unwrap().len()),
+            previous_destination_path: old.first().map(|path| path.display().to_string()),
+            previous_destination_paths: old
+                .into_iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            metadata_destination_paths: Vec::new(),
+            operation: Default::default(),
+            netease_track_id: None,
+            netease_album_id: None,
+            album: None,
+            netease_title: None,
+            netease_artist: None,
+            disambiguation_reason: None,
+        }
+    }
     use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
     use w4dj::preview::{PreviewCandidate, PreviewIssue, SlotPreview, SyncPreview};
     use w4dj::task::TaskController;
@@ -9440,7 +9687,9 @@ mod tests {
                         destination_path: "/music/out/song.mp3".into(),
                         source_size_bytes: 1024,
                         estimated_output_bytes: Some(1024),
-                        previous_destination_path: None,
+        previous_destination_path: None,
+        previous_destination_paths: Vec::new(),
+        metadata_destination_paths: Vec::new(),
                         operation: Default::default(),
                         netease_track_id: None,
                         netease_album_id: None,
@@ -9463,6 +9712,7 @@ mod tests {
                 action_count: 0,
                 database_directory: None,
                 detail_items: Vec::new(),
+                output_files: Vec::new(),
             },
         }
     }
@@ -10253,5 +10503,363 @@ mod tests {
             super::playlist_export_paths(&selected_inside_folder, "模拟 UK Bass 歌单").unwrap();
         assert_eq!(same_directory, directory);
         assert_eq!(same_playlist_path, playlist_path);
+    }
+
+    #[test]
+    fn committed_cross_format_overwrite_registers_new_output_before_removing_all_old_outputs() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-cross-format-finalize-{}",
+            super::unique_timestamp()
+        ));
+        let source_root = root.join("source");
+        let output_root = root.join("output");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&output_root).unwrap();
+        let source = source_root.join("Song - Artist.wav");
+        let current = output_root.join("Song - Artist.aiff");
+        let old_wav = output_root.join("Song - Artist.wav");
+        let old_mp3 = output_root.join("Artist - Song.mp3");
+        write_valid_audio(&source, "pcm_s16le", "Song", "Artist");
+        write_valid_audio(&current, "pcm_s16be", "Song", "Artist");
+        write_valid_audio(&old_wav, "pcm_s16le", "Song", "Artist");
+        write_valid_audio(&old_mp3, "libmp3lame", "Song", "Artist");
+        let plan = w4dj::metadata::build_output_metadata(
+            w4dj::metadata::MetadataWriteProfile::NcmCore,
+            &w4dj::metadata::SourceMetadata {
+                title: "Song".into(),
+                artists: vec!["Artist".into()],
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        w4dj::metadata::write_output_metadata_plan(&current, &plan).unwrap();
+        let candidate = overwrite_candidate(&source, &current, vec![&old_wav, &old_mp3]);
+        let database_path = root.join("w4dj.sqlite3");
+        let mut library = Some(W4djLibrary::open(&database_path).unwrap());
+
+        super::finalize_committed_candidate(
+            &mut library,
+            0,
+            &output_root,
+            &candidate,
+            &HashMap::new(),
+            ConflictStrategy::Overwrite,
+        )
+        .unwrap();
+
+        assert!(current.exists());
+        assert!(!old_wav.exists());
+        assert!(!old_mp3.exists());
+        assert_eq!(
+            library
+                .as_ref()
+                .unwrap()
+                .query(&Default::default())
+                .unwrap()
+                .total,
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_output_verification_prefers_formal_source_tags_over_lazy_matching_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-formal-metadata-verification-{}",
+            super::unique_timestamp()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("Nikita, the Wicked - LIKE ME.mp3");
+        let output = root.join("LIKE ME - Nikita, the Wicked.aiff");
+        write_valid_audio(&source, "libmp3lame", "LIKE ME", "Nikita, the Wicked");
+        write_valid_audio(&output, "pcm_s16be", "LIKE ME", "Nikita, the Wicked");
+        let formal_metadata = w4dj::metadata::SourceMetadata {
+            title: "LIKE ME".into(),
+            artists: vec!["Nikita, the Wicked".into()],
+            album: "LIKE ME".into(),
+            ..Default::default()
+        };
+        let plan = w4dj::metadata::build_output_metadata(
+            w4dj::metadata::MetadataWriteProfile::NcmCore,
+            &formal_metadata,
+            None,
+            None,
+        );
+        for path in [&source, &output] {
+            w4dj::metadata::write_output_metadata_plan(path, &plan).unwrap();
+        }
+        let mut candidate = overwrite_candidate(&source, &output, Vec::new());
+        candidate.netease_title = Some("like me".into());
+        candidate.netease_artist = Some("nikita,the wicked".into());
+
+        super::verify_committed_candidate(&candidate).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_output_registration_uses_formal_output_tags_not_lazy_matching_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-formal-metadata-registration-{}",
+            super::unique_timestamp()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("Nikita, the Wicked - LIKE ME.mp3");
+        let output = root.join("LIKE ME - Nikita, the Wicked.aiff");
+        write_valid_audio(&source, "libmp3lame", "LIKE ME", "Nikita, the Wicked");
+        write_valid_audio(&output, "pcm_s16be", "LIKE ME", "Nikita, the Wicked");
+        let formal_metadata = w4dj::metadata::SourceMetadata {
+            title: "LIKE ME".into(),
+            artists: vec!["Nikita, the Wicked".into()],
+            album: "LIKE ME".into(),
+            ..Default::default()
+        };
+        let plan = w4dj::metadata::build_output_metadata(
+            w4dj::metadata::MetadataWriteProfile::NcmCore,
+            &formal_metadata,
+            None,
+            None,
+        );
+        w4dj::metadata::write_output_metadata_plan(&output, &plan).unwrap();
+        let mut candidate = overwrite_candidate(&source, &output, Vec::new());
+        candidate.netease_title = Some("like me".into());
+        candidate.netease_artist = Some("nikita,the wicked".into());
+        candidate.netease_track_id = Some("2602157520".into());
+        let mut library = Some(W4djLibrary::open(&root.join("w4dj.sqlite3")).unwrap());
+
+        super::register_committed_output(
+            &mut library,
+            0,
+            &root,
+            &candidate,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let page = library.as_ref().unwrap().query(&Default::default()).unwrap();
+        assert_eq!(page.items[0].title, "LIKE ME");
+        assert_eq!(page.items[0].artists, "Nikita, the Wicked");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_output_registration_rejects_matching_keys_when_final_tags_are_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-formal-metadata-registration-missing-tags-{}",
+            super::unique_timestamp()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("Song - Artist.mp3");
+        let output = root.join("Song - Artist-out.mp3");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&output, b"output").unwrap();
+        let mut candidate = overwrite_candidate(&source, &output, Vec::new());
+        candidate.netease_title = Some("Song".into());
+        candidate.netease_artist = Some("Artist".into());
+        let mut library = Some(W4djLibrary::open(&root.join("w4dj.sqlite3")).unwrap());
+
+        let error = super::register_committed_output(
+            &mut library,
+            0,
+            &root,
+            &candidate,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("最终输出标题复读为空"));
+        assert_eq!(library.as_ref().unwrap().query(&Default::default()).unwrap().total, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registration_failure_keeps_every_old_output_and_reports_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-cross-format-register-failure-{}",
+            super::unique_timestamp()
+        ));
+        let source_root = root.join("source");
+        let output_root = root.join("output");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&output_root).unwrap();
+        let source = source_root.join("Song - Artist.wav");
+        let current = output_root.join("Song - Artist.aiff");
+        let old_wav = output_root.join("Song - Artist.wav");
+        write_valid_audio(&source, "pcm_s16le", "Song", "Artist");
+        write_valid_audio(&current, "pcm_s16be", "Song", "Artist");
+        write_valid_audio(&old_wav, "pcm_s16le", "Song", "Artist");
+        let candidate = overwrite_candidate(&source, &current, vec![&old_wav]);
+
+        let error = super::finalize_committed_candidate(
+            &mut None,
+            0,
+            &output_root,
+            &candidate,
+            &HashMap::new(),
+            ConflictStrategy::Overwrite,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("歌曲库"));
+        assert!(current.exists());
+        assert!(old_wav.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn real_six_track_wav_then_aiff_overwrite_leaves_no_old_wav() {
+        let root = std::env::temp_dir().join(format!(
+            "w4dj-six-track-cross-format-{}",
+            super::unique_timestamp()
+        ));
+        let source_root = root.join("source");
+        let output_root = root.join("output");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&output_root).unwrap();
+        for index in 1..=4 {
+            write_valid_audio(
+                &source_root.join(format!("Lossless {index} - Artist.flac")),
+                "flac",
+                &format!("Lossless {index}"),
+                "Artist",
+            );
+        }
+        for index in 1..=2 {
+            write_valid_audio(
+                &source_root.join(format!("Mp3 {index} - Artist.mp3")),
+                "libmp3lame",
+                &format!("Mp3 {index}"),
+                "Artist",
+            );
+        }
+
+        let first = w4dj::preview::build_sync_preview_with_settings(
+            source_root.to_str().unwrap(),
+            output_root.to_str().unwrap(),
+            Mode::Lossless,
+            Some(w4dj::config::LosslessFormat::Wav),
+            ConflictStrategy::Overwrite,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(first.candidates.len(), 6);
+        let first_files = first
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.name.clone(),
+                    (
+                        candidate.source_size_bytes.to_string(),
+                        PathBuf::from(&candidate.source_path),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let first_refs = first_files.iter().collect::<HashMap<_, _>>();
+        let first_task = TaskController::running(6);
+        w4dj::sync::sync_music_library_transactional_with_observer_and_budget_and_context_with_policy(
+            &first_refs,
+            output_root.to_str().unwrap(),
+            &Mode::Lossless,
+            Some(w4dj::config::LosslessFormat::Wav),
+            Default::default(),
+            w4dj::config::FilenameNormalizationPolicy::SoundCloud,
+            &first_task,
+            |_, _| Ok(()),
+            |_, _, _| Ok(()),
+            Arc::new(w4dj::concurrency::GlobalConcurrencyBudget::new(2)),
+            Arc::new(w4dj::sync::ActiveFfmpegRegistry::default()),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(first_task.snapshot().completed, 6);
+        assert_eq!(
+            w4dj::sync::get_destination_music_files(output_root.to_str().unwrap())
+                .iter()
+                .filter(|path| path.extension().is_some_and(|value| value == "wav"))
+                .count(),
+            4
+        );
+
+        let second = w4dj::preview::build_sync_preview_with_settings(
+            source_root.to_str().unwrap(),
+            output_root.to_str().unwrap(),
+            Mode::Lossless,
+            Some(w4dj::config::LosslessFormat::Aiff),
+            ConflictStrategy::Overwrite,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!((second.new_count, second.existing_count, second.action_count), (0, 6, 6));
+        let candidate_lookup = second
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.name.clone(), candidate.clone()))
+            .collect::<HashMap<_, _>>();
+        let second_files = second
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.name.clone(),
+                    (
+                        candidate.source_size_bytes.to_string(),
+                        PathBuf::from(&candidate.source_path),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let second_refs = second_files.iter().collect::<HashMap<_, _>>();
+        let second_task = TaskController::running(6);
+        let mut library = Some(W4djLibrary::open(&root.join("w4dj.sqlite3")).unwrap());
+        w4dj::sync::sync_music_library_transactional_with_observer_and_budget_and_context_with_policy(
+            &second_refs,
+            output_root.to_str().unwrap(),
+            &Mode::Lossless,
+            Some(w4dj::config::LosslessFormat::Aiff),
+            Default::default(),
+            w4dj::config::FilenameNormalizationPolicy::SoundCloud,
+            &second_task,
+            |_, _| Ok(()),
+            |name, _, error| {
+                if error.is_some() {
+                    return Ok(());
+                }
+                super::finalize_committed_candidate(
+                    &mut library,
+                    0,
+                    &output_root,
+                    candidate_lookup.get(name).unwrap(),
+                    &HashMap::new(),
+                    ConflictStrategy::Overwrite,
+                )
+            },
+            Arc::new(w4dj::concurrency::GlobalConcurrencyBudget::new(2)),
+            Arc::new(w4dj::sync::ActiveFfmpegRegistry::default()),
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(second_task.snapshot().completed, 6);
+        let outputs = w4dj::sync::get_destination_music_files(output_root.to_str().unwrap());
+        assert_eq!(outputs.len(), 6);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|path| path.extension().is_some_and(|value| value == "aiff"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|path| path.extension().is_some_and(|value| value == "mp3"))
+                .count(),
+            2
+        );
+        assert!(outputs.iter().all(|path| path.extension().is_none_or(|value| value != "wav")));
+        let _ = fs::remove_dir_all(root);
     }
 }

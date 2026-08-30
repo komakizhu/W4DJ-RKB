@@ -125,6 +125,12 @@ fn conversion_report_includes_per_track_metadata_diagnostics() {
         metadata_validation: "通过：标题、歌手和可用封面已校验".into(),
         validation_basis: Some("source_tags".into()),
         output_tags_match: Some(true),
+        title_source: Some("sourceTag".into()),
+        artist_source: Some("sourceTag".into()),
+        album_source: None,
+        title_difference: Some("exact".into()),
+        artist_difference: Some("exact".into()),
+        album_difference: None,
         netease_recovery: None,
     });
 
@@ -132,6 +138,9 @@ fn conversion_report_includes_per_track_metadata_diagnostics() {
     assert!(report.contains("[逐曲元数据诊断]"));
     assert!(report.contains("输出封面：有（有效图片）"));
     assert!(report.contains("最终标题：Song；最终歌手：Artist"));
+    assert!(report.contains("标题来源：sourceTag"));
+    assert!(report.contains("歌手来源：sourceTag"));
+    assert!(report.contains("专辑差异：旧版未记录"));
 }
 
 #[test]
@@ -157,6 +166,12 @@ fn conversion_report_explains_netease_database_and_cover_recovery() {
         metadata_validation: "通过".into(),
         validation_basis: Some("source_tags".into()),
         output_tags_match: Some(true),
+        title_source: Some("sourceTag".into()),
+        artist_source: Some("sourceTag".into()),
+        album_source: Some("sourceTag".into()),
+        title_difference: Some("exact".into()),
+        artist_difference: Some("exact".into()),
+        album_difference: Some("exact".into()),
         netease_recovery: Some(NeteaseRecoveryDiagnostic {
             database_path: Some("/music/sqlite_storage.sqlite3".into()),
             database_loaded: true,
@@ -276,6 +291,8 @@ fn complete_error_report_lists_pending_files() {
         source_size_bytes: 4_096,
         estimated_output_bytes: Some(2_048),
         previous_destination_path: None,
+        previous_destination_paths: Vec::new(),
+        metadata_destination_paths: Vec::new(),
         operation: CandidateOperation::Convert,
     });
 

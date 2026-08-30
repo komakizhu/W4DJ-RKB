@@ -104,6 +104,10 @@ pub struct PendingFile {
     pub estimated_output_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_destination_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_destination_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_destination_paths: Vec<String>,
     #[serde(default)]
     pub operation: CandidateOperation,
 }
@@ -840,7 +844,7 @@ pub fn format_error_report_with_runtime(
 
     for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
         report.push_str(&format!(
-            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n校验依据：{}\n输出标签实际匹配：{}\n源封面：{}\n输出封面：{}\n网易云匹配方式：{}\n网易云封面来源：{}\n网易云曲目 ID：{}\n网易云专辑 ID：{}\n网易云终止原因：{}\n最终校验：{}\n\n",
+            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n校验依据：{}\n输出标签实际匹配：{}\n标题来源：{}\n歌手来源：{}\n专辑来源：{}\n标题差异：{}\n歌手差异：{}\n专辑差异：{}\n源封面：{}\n输出封面：{}\n网易云匹配方式：{}\n网易云封面来源：{}\n网易云曲目 ID：{}\n网易云专辑 ID：{}\n网易云终止原因：{}\n最终校验：{}\n\n",
             index + 1,
             diagnostic.source_path,
             diagnostic.destination_path,
@@ -861,6 +865,12 @@ pub fn format_error_report_with_runtime(
                 .output_tags_match
                 .map(|value| if value { "是" } else { "否" })
                 .unwrap_or("无法读取"),
+            diagnostic.title_source.as_deref().unwrap_or("旧版未记录"),
+            diagnostic.artist_source.as_deref().unwrap_or("旧版未记录"),
+            diagnostic.album_source.as_deref().unwrap_or("旧版未记录"),
+            diagnostic.title_difference.as_deref().unwrap_or("旧版未记录"),
+            diagnostic.artist_difference.as_deref().unwrap_or("旧版未记录"),
+            diagnostic.album_difference.as_deref().unwrap_or("旧版未记录"),
             if diagnostic.source_artwork { "有（有效图片）" } else { "无或无效" },
             match diagnostic.output_artwork { Some(true) => "有（有效图片）", Some(false) => "无或无效", None => "无法读取" },
             diagnostic
@@ -1331,7 +1341,6 @@ fn conflict_strategy_label(strategy: ConflictStrategy) -> &'static str {
     match strategy {
         ConflictStrategy::Skip => "跳过",
         ConflictStrategy::Overwrite => "覆盖",
-        ConflictStrategy::Rename => "自动重命名",
         ConflictStrategy::UpdateMetadata => "仅更新元数据",
     }
 }

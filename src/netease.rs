@@ -522,13 +522,7 @@ impl NeteaseMetadataResolver {
                 cancel,
             )?;
             let locator = &self.locators[matched.index];
-            return Some(NeteaseTrackIdentity {
-                track_id: non_empty_string(&locator.track_id),
-                album_id: None,
-                title: locator.title_key.clone(),
-                artists: locator.artist_key.clone(),
-                album: locator.album_key.clone(),
-            });
+            return Some(locator_match_identity(locator));
         }
         let matched_record =
             choose_record_with_method_cancellable(source_path, &self.records, source_size, cancel)
@@ -567,32 +561,24 @@ impl NeteaseMetadataResolver {
                 &NEVER_CANCELLED,
             )?;
             let locator = &self.locators[matched.index];
-            return Some(NeteaseTrackIdentity {
-                track_id: non_empty_string(&locator.track_id),
-                album_id: None,
-                title: locator.title_key.clone(),
-                artists: locator.artist_key.clone(),
-                album: locator.album_key.clone(),
-            });
+            return Some(locator_match_identity(locator));
         }
         self.track_identity(source_path)
     }
 
     pub(crate) fn recover(&self, source_path: &Path) -> MetadataRecovery {
         if self.records.is_empty() && !self.locators.is_empty() {
-            let temporary = self
-                .locators
-                .iter()
-                .map(locator_as_record)
-                .collect::<Vec<_>>();
-            let matched = choose_record_with_method(source_path, &temporary);
-            let Some(locator) = (match matched {
-                RecordMatch::Matched { record, .. } => self.locators.iter().find(|locator| {
-                    locator.source_table == record.source_table
-                        && locator.source_primary_key == record.source_primary_key
-                }),
-                RecordMatch::NoMatch | RecordMatch::Ambiguous { .. } => None,
-            }) else {
+            let never_cancelled = AtomicBool::new(false);
+            let Some(locator) = choose_locator_with_method_cancellable(
+                source_path,
+                &self.locators,
+                self.locator_index.as_ref(),
+                fs::metadata(source_path)
+                    .ok()
+                    .map(|metadata| metadata.len()),
+                &never_cancelled,
+            )
+            .and_then(|matched| self.locators.get(matched.index)) else {
                 return recover_with_records(
                     source_path,
                     &[],
@@ -623,6 +609,18 @@ impl NeteaseMetadataResolver {
             self.database_path.as_deref(),
             self.database_loaded,
         )
+    }
+}
+
+fn locator_match_identity(locator: &NeteaseTrackLocator) -> NeteaseTrackIdentity {
+    // Locator text fields are normalized matching keys, not canonical tags.
+    // Expose only the stable track ID until `recover` reads the original row.
+    NeteaseTrackIdentity {
+        track_id: non_empty_string(&locator.track_id),
+        album_id: None,
+        title: String::new(),
+        artists: String::new(),
+        album: String::new(),
     }
 }
 
@@ -1149,9 +1147,9 @@ where
                     &locator_file_name
                 }),
                 size_bytes: row_u64(row, 7),
-                title_key: normalize_text(&title),
-                artist_key: normalize_text(&artist),
-                album_key: normalize_text(&album),
+                title_key: persistent_metadata_key(&title),
+                artist_key: persistent_metadata_key(&artist),
+                album_key: persistent_metadata_key(&album),
             })
         })?;
         let mut processed = 0usize;
@@ -1343,22 +1341,6 @@ fn load_record_by_locator(
         record.file_name = format!("{} - {}", record.title, record.artist);
     }
     Ok(Some(record))
-}
-
-fn locator_as_record(locator: &NeteaseTrackLocator) -> NeteaseRecord {
-    NeteaseRecord {
-        source_table: locator.source_table.clone(),
-        source_primary_key: locator.source_primary_key.clone(),
-        source_version: locator.source_version.clone(),
-        path: locator.normalized_path.clone(),
-        file_name: locator.normalized_file_name.clone(),
-        title: locator.title_key.clone(),
-        artist: locator.artist_key.clone(),
-        album: locator.album_key.clone(),
-        size_bytes: locator.size_bytes,
-        track_id: locator.track_id.clone(),
-        ..NeteaseRecord::default()
-    }
 }
 
 fn table_columns(connection: &Connection, table: &str) -> rusqlite::Result<HashSet<String>> {
@@ -1790,11 +1772,19 @@ fn artist_name_count(value: &str) -> usize {
 }
 
 fn same_track_identity(left: &NeteaseRecord, right: &NeteaseRecord) -> bool {
-    normalize_text(&left.title) == normalize_text(&right.title)
-        && normalize_text(&left.artist) == normalize_text(&right.artist)
+    match (
+        non_empty_string(&left.track_id),
+        non_empty_string(&right.track_id),
+    ) {
+        (Some(left_id), Some(right_id)) => return left_id == right_id,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    tolerant_comparison_key(&left.title) == tolerant_comparison_key(&right.title)
+        && tolerant_comparison_key(&left.artist) == tolerant_comparison_key(&right.artist)
         && (!left.album.trim().is_empty()
             && !right.album.trim().is_empty()
-            && normalize_text(&left.album) == normalize_text(&right.album))
+            && tolerant_comparison_key(&left.album) == tolerant_comparison_key(&right.album))
 }
 
 fn combine_path(path: &str, directory: &str) -> String {
@@ -2055,12 +2045,13 @@ fn locator_match_evidence_for_scan(
     let same_stem = same_file_stem(source_name, &locator.normalized_file_name);
     let same_size = source_size.is_some() && source_size == locator.size_bytes;
     let filename_identity = split_filename_parts(source_path).is_some_and(|(left, right)| {
-        let left = normalize_text(&left);
-        let right = normalize_text(&right);
+        let left = tolerant_comparison_key(&left);
+        let right = tolerant_comparison_key(&right);
+        let title = tolerant_comparison_key(&locator.title_key);
+        let artist = tolerant_comparison_key(&locator.artist_key);
         !locator.title_key.is_empty()
             && !locator.artist_key.is_empty()
-            && ((locator.title_key == left && locator.artist_key == right)
-                || (locator.title_key == right && locator.artist_key == left))
+            && ((title == left && artist == right) || (title == right && artist == left))
     });
 
     if exact_path {
@@ -2093,9 +2084,17 @@ fn locator_match_evidence_for_scan(
 }
 
 fn same_locator_identity(left: &NeteaseTrackLocator, right: &NeteaseTrackLocator) -> bool {
-    left.title_key == right.title_key
-        && left.artist_key == right.artist_key
-        && left.album_key == right.album_key
+    match (
+        non_empty_string(&left.track_id),
+        non_empty_string(&right.track_id),
+    ) {
+        (Some(left_id), Some(right_id)) => return left_id == right_id,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    tolerant_comparison_key(&left.title_key) == tolerant_comparison_key(&right.title_key)
+        && tolerant_comparison_key(&left.artist_key) == tolerant_comparison_key(&right.artist_key)
+        && tolerant_comparison_key(&left.album_key) == tolerant_comparison_key(&right.album_key)
 }
 
 fn record_match_evidence_for_scan(
@@ -2121,10 +2120,10 @@ fn record_match_evidence_for_scan(
     let same_stem = same_file_stem(source_name, &record_name);
     let same_size = source_size.is_some() && source_size == record.size_bytes;
     let filename_identity = split_filename_parts(source_path).is_some_and(|(left, right)| {
-        let left = normalize_text(&left);
-        let right = normalize_text(&right);
-        let title = normalize_text(&record.title);
-        let artist = normalize_text(&record.artist);
+        let left = tolerant_comparison_key(&left);
+        let right = tolerant_comparison_key(&right);
+        let title = tolerant_comparison_key(&record.title);
+        let artist = tolerant_comparison_key(&record.artist);
         !title.is_empty()
             && !artist.is_empty()
             && ((title == left && artist == right) || (title == right && artist == left))
@@ -2197,10 +2196,10 @@ fn record_match_evidence_with_size(
     let same_stem = same_file_stem(&source_name, &record_name);
     let same_size = source_size.is_some() && source_size == record.size_bytes;
     let filename_identity = split_filename_parts(source_path).is_some_and(|(left, right)| {
-        let left = normalize_text(&left);
-        let right = normalize_text(&right);
-        let title = normalize_text(&record.title);
-        let artist = normalize_text(&record.artist);
+        let left = tolerant_comparison_key(&left);
+        let right = tolerant_comparison_key(&right);
+        let title = tolerant_comparison_key(&record.title);
+        let artist = tolerant_comparison_key(&record.artist);
         !title.is_empty()
             && !artist.is_empty()
             && ((title == left && artist == right) || (title == right && artist == left))
@@ -2241,9 +2240,17 @@ fn record_match_evidence_with_size(
 }
 
 fn same_record_identity(left: &NeteaseRecord, right: &NeteaseRecord) -> bool {
-    normalize_text(&left.title) == normalize_text(&right.title)
-        && normalize_text(&left.artist) == normalize_text(&right.artist)
-        && normalize_text(&left.album) == normalize_text(&right.album)
+    match (
+        non_empty_string(&left.track_id),
+        non_empty_string(&right.track_id),
+    ) {
+        (Some(left_id), Some(right_id)) => return left_id == right_id,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    tolerant_comparison_key(&left.title) == tolerant_comparison_key(&right.title)
+        && tolerant_comparison_key(&left.artist) == tolerant_comparison_key(&right.artist)
+        && tolerant_comparison_key(&left.album) == tolerant_comparison_key(&right.album)
 }
 
 fn normalized_path(value: &str) -> String {
@@ -2271,7 +2278,7 @@ fn normalized_file_name(value: &str) -> String {
     Path::new(&value.replace('\\', "/"))
         .file_name()
         .and_then(|name| name.to_str())
-        .map(normalize_text)
+        .map(tolerant_comparison_key)
         .unwrap_or_default()
 }
 
@@ -2293,10 +2300,18 @@ fn file_stem_key(value: &str) -> String {
                 .then(|| &value[..value.len().saturating_sub(extension.len())])
         })
         .unwrap_or(value);
-    normalize_text(stem)
+    tolerant_comparison_key(stem)
 }
 
-fn normalize_text(value: &str) -> String {
+/// Key persisted in the lightweight locator cache. It only trims the
+/// outside and folds case; punctuation and internal spaces stay intact.
+pub(crate) fn persistent_metadata_key(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+/// Runtime-only comparison key. This preserves the historical tolerant
+/// matching behavior and must never be persisted or written to tags.
+pub(crate) fn tolerant_comparison_key(value: &str) -> String {
     value
         // NetEase filenames and the web-track JSON frequently disagree only
         // on typographic punctuation. Treat those representations as the
@@ -2899,13 +2914,21 @@ mod tests {
         NeteaseCoverSource, NeteaseMetadataResolver, NeteaseRecord, NeteaseRecordMatchMethod,
         choose_record, choose_record_with_method, cover_from_record, cover_references_from_json,
         find_adjacent_cover, find_cover_by_name_in_roots, find_source_directory_cover,
-        load_records_from_connection, record_match_score,
+        load_records_from_connection, persistent_metadata_key, record_match_score,
+        tolerant_comparison_key,
     };
     use rusqlite::{Connection, params};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
+
+    #[test]
+    fn persistent_and_tolerant_metadata_keys_are_separate() {
+        let value = " Boogybytes,  Vol. 3 “Live” ";
+        assert_eq!(persistent_metadata_key(value), "boogybytes,  vol. 3 “live”");
+        assert_eq!(tolerant_comparison_key(value), "boogybytes,vol. 3 \"live\"");
+    }
 
     #[test]
     fn recovery_diagnostic_uses_camel_case_and_reads_legacy_defaults() {
@@ -3375,6 +3398,38 @@ mod tests {
             record.cover_references,
             vec![String::from("https://p1.music.126.net/42.jpg")]
         );
+    }
+
+    #[test]
+    fn does_not_merge_same_text_from_different_track_ids() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE track (file TEXT, title TEXT, artist TEXT, album TEXT, tid INTEGER);
+                 CREATE TABLE web_track (tid INTEGER, version INTEGER, track TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO track(file,title,artist,album,tid) VALUES (?1,?2,?3,?4,?5)",
+                params!["Same Song.mp3", "Same Song", "Same Artist", "Same Album", 1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO web_track(tid,version,track) VALUES (?1,?2,?3)",
+                params![
+                    2,
+                    1,
+                    r#"{"id":2,"name":"Same Song","artists":[{"name":"Same Artist"}],"album":{"id":9,"name":"Same Album"}}"#,
+                ],
+            )
+            .unwrap();
+
+        let records = load_records_from_connection(&connection).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record.track_id == "1"));
+        assert!(records.iter().any(|record| record.track_id == "2"));
     }
 
     #[test]

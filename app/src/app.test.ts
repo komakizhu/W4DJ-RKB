@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
   bindApp,
   canReuseTrackAnalysis,
@@ -21,6 +23,7 @@ import {
   type DesktopState,
   type DesktopSyncSlotState,
   type NeteaseDiscoveryProgress,
+  type NeteaseMetadataCacheProgress,
   type SyncSlotIndex,
 } from './app';
 import type { LibraryPage, LibraryRefreshProgress, LibraryStatus, LibraryTrack } from './library-dashboard';
@@ -294,6 +297,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   }),
   openExternalUrl: vi.fn().mockResolvedValue(undefined),
   openDestination: vi.fn().mockResolvedValue(undefined),
+  openDestinationFile: vi.fn().mockResolvedValue(undefined),
   openSource: vi.fn().mockResolvedValue(undefined),
   startAllSync: vi
     .fn()
@@ -695,6 +699,74 @@ describe('renderApp', () => {
     expect(root.querySelector('.rail-copy')).toBeNull();
   });
 
+  it('uses only the preview shell as a small-screen scroll fallback', () => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    document.head.append(style);
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      {
+        previews: makePreviewResponse(),
+        detail: { slotIndex: 0, kind: 'input' },
+        retryOf: null,
+      },
+    );
+    document.body.append(root);
+
+    const dialog = root.querySelector<HTMLElement>('.preview-dialog')!;
+    const cards = root.querySelector<HTMLElement>('.preview-cards')!;
+    const detailList = root.querySelector<HTMLElement>('.preview-detail-list')!;
+    expect(getComputedStyle(dialog).overflow).toBe('auto');
+    expect(getComputedStyle(cards).overflow).toBe('visible');
+    expect(getComputedStyle(detailList).maxHeight).toBe('212px');
+    expect(getComputedStyle(detailList).overflowY).toBe('auto');
+
+    root.remove();
+    style.remove();
+  });
+
+  it('aligns overwrite, skip, and metadata-only row statuses to the right of filenames', () => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    document.head.append(style);
+    const preview = makePreview(0);
+    preview.conflict_strategy = 'update_metadata';
+    preview.preview.action_kind = 'update_metadata';
+    preview.preview.action_count = 1;
+    preview.preview.detail_items = [{
+      name: 'Song.mp3',
+      source_path: '/music/in-1/Song.mp3',
+      destination_path: '/music/out-1/Song.mp3',
+      existing_output: true,
+      classification: 'update_metadata',
+      reason: null,
+    }];
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      {
+        previews: [preview],
+        detail: { slotIndex: 0, kind: 'action' },
+        retryOf: null,
+      },
+    );
+    document.body.append(root);
+
+    const row = root.querySelector<HTMLElement>('.preview-detail-link-row')!;
+    const name = row.querySelector('.preview-detail-entry-name');
+    const status = row.querySelector<HTMLElement>('.preview-detail-entry-status')!;
+    expect(name?.textContent).toBe('Song.mp3');
+    expect(status.textContent).toBe('将更新元数据');
+    expect(getComputedStyle(status).justifySelf).toBe('end');
+    expect(getComputedStyle(status).textAlign).toBe('right');
+
+    root.remove();
+    style.remove();
+  });
+
   it('puts the explicit NetEase scan action beside Task 1 source and shows its progress in the slot bar', () => {
     const root = renderApp(
       makeViewState(),
@@ -723,9 +795,74 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-action="scan-local-netease"]')?.textContent).toContain('扫描本地网易云文件夹');
     const progress = root.querySelector('[data-slot="0"] .progress-fill') as HTMLElement;
     expect(progress.style.width).toBe('38%');
-    expect(root.querySelector('[data-slot="0"] .slot-progress-row')?.classList.contains('has-netease-status')).toBe(true);
+    const statusRow = root.querySelector('[data-slot="0"] [data-role="slot-status-row"]');
+    expect(statusRow).not.toBeNull();
+    expect(statusRow?.querySelector('[data-role="slot-progress-message"]')?.textContent).toContain('Song.mp3');
+    expect(statusRow?.querySelector('[data-role="netease-database-status"]')).not.toBeNull();
     expect(root.querySelector('[data-slot="0"] .progress-track')?.getAttribute('style')).toBeNull();
     expect(root.querySelector('[data-slot="0"] .progress-copy')?.textContent).toContain('Song.mp3');
+    expect(root.querySelector('[data-role="netease-discovery-progress"]')).toBeNull();
+    expect(root.querySelector('.global-stage-message')).toBeNull();
+  });
+
+  it('shows the long NetEase scan reminder in Task 1 index status only', () => {
+    const progress: NeteaseDiscoveryProgress = {
+      discoveryId: 'discovery-1',
+      status: 'running',
+      stage: 'queryingPaths',
+      processed: 12,
+      total: 544,
+      currentItem: '',
+      message: '正在读取网易云音乐目录字段',
+      suggestion: null,
+      error: null,
+    };
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [],
+      null,
+      false,
+      null,
+      false,
+      false,
+      false,
+      0,
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      progress,
+      null,
+      true,
+      {
+        status: {
+          manualPath: null,
+          effectivePath: '/music/sqlite_storage.sqlite3',
+          source: 'automatic',
+          loaded: false,
+          recordCount: 544,
+          warning: '网易云轻量索引未就绪，转换前会按需准备',
+          cacheStatus: 'stale',
+        },
+        busy: false,
+        message: null,
+        error: null,
+      },
+      null,
+      [],
+      true,
+    );
+
+    expect(root.querySelector('.global-stage-message')).toBeNull();
+    expect(root.querySelector('[data-role="netease-discovery-progress"]')).toBeNull();
+    expect(root.querySelector('[data-slot="0"] [data-role="netease-situation-value"]')?.textContent)
+      .toBe('扫描时间较长，可手动选择文件夹');
   });
 
   it('renders manual NetEase database controls only beside Task 1', () => {
@@ -782,8 +919,111 @@ describe('renderApp', () => {
     expect(situation?.querySelector('[data-role="netease-situation-value"]')?.textContent)
       .toBe('数据库已选');
     expect(situation?.getAttribute('data-tone')).toBe('success');
-    expect(databaseStatus?.parentElement?.classList.contains('slot-progress-row')).toBe(true);
+    expect(databaseStatus?.parentElement?.getAttribute('data-role')).toBe('slot-status-row');
     expect(neteaseToolbar?.querySelector('[data-role="netease-database-status"]')).toBeNull();
+  });
+
+  it('uses one 9px baseline-aligned status row above the progress track', () => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    document.head.append(style);
+    const root = renderApp(
+      makeViewState(), null, null, null, [], null, false, null, false, false, false, 0, undefined,
+      {
+        status: 'completed',
+        phase: 'completed',
+        processed: 6,
+        total: 6,
+        current_file: '',
+        message: '扫描完成',
+        tasks: [{
+          slot_index: 0,
+          phase: 'completed',
+          processed: 6,
+          total: 6,
+          source_processed: 6,
+          source_total: 6,
+          destination_processed: 6,
+          destination_total: 6,
+          metadata_processed: 6,
+          metadata_total: 6,
+          current_file: '',
+        }],
+      },
+      false, null, null, undefined, null, null, false,
+      {
+        status: {
+          manualPath: null,
+          effectivePath: '/music/sqlite_storage.sqlite3',
+          source: 'automatic',
+          loaded: true,
+          recordCount: 6,
+          warning: null,
+          cacheStatus: 'ready',
+        },
+        busy: false,
+        message: null,
+        error: null,
+      },
+    );
+    document.body.append(root);
+
+    const row = root.querySelector<HTMLElement>('[data-slot="0"] [data-role="slot-status-row"]')!;
+    const left = row.querySelector<HTMLElement>('[data-role="slot-progress-message"]')!;
+    const right = row.querySelector<HTMLElement>('[data-role="netease-situation"]')!;
+    const progressRow = root.querySelector<HTMLElement>('[data-slot="0"] .slot-progress-row')!;
+    expect(getComputedStyle(row).alignItems).toBe('baseline');
+    expect(getComputedStyle(left).fontSize).toBe('9px');
+    expect(getComputedStyle(right).fontSize).toBe('9px');
+    expect(getComputedStyle(left).lineHeight).toBe(getComputedStyle(right).lineHeight);
+    expect(row.nextElementSibling).toBe(progressRow);
+
+    root.remove();
+    style.remove();
+  });
+
+  it('anchors the NetEase database links to the source heading', () => {
+    const style = document.createElement('style');
+    style.textContent = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    document.head.append(style);
+    const root = renderApp(
+      makeViewState(), null, null, null, [], null, false, null, false, false, false, 0,
+      { status: 'idle', completed: 0, total: 0, resultCount: 0, failedCount: 0, message: '' },
+      null,
+      false,
+      null,
+      null,
+      { version: '', embedding: false, genre: false, mood: false, instrument: false, installing: false },
+      null,
+      null,
+      null,
+      false,
+      {
+        status: {
+          manualPath: null,
+          effectivePath: '/music/sqlite_storage.sqlite3',
+          source: 'automatic',
+          loaded: true,
+          recordCount: 1,
+          warning: null,
+          cacheStatus: 'ready',
+        },
+        busy: false,
+        message: null,
+        error: null,
+      },
+    );
+    document.body.append(root);
+
+    const toolbar = root.querySelector<HTMLElement>('[data-role="netease-source-toolbar"]')!;
+    const databaseButton = root.querySelector<HTMLElement>('[data-action="select-netease-database"]')!;
+    expect(getComputedStyle(toolbar).position).toBe('absolute');
+    expect(getComputedStyle(toolbar).top).toBe('0px');
+    expect(getComputedStyle(toolbar).bottom).toBe('auto');
+    expect(getComputedStyle(databaseButton).lineHeight).toBe('1.35');
+
+    root.remove();
+    style.remove();
   });
 
   it('resolves compact NetEase status text while retaining diagnostic details', () => {
@@ -850,6 +1090,28 @@ describe('renderApp', () => {
       message: null,
       error: 'schema 不受支持',
     }, 'zh')).toEqual({ message: '读取错误', detail: 'schema 不受支持', tone: 'error' });
+  });
+
+  it('treats a ready cache as authoritative over a stale not-ready warning', () => {
+    expect(resolveNeteaseSituation({
+      status: {
+        manualPath: null,
+        effectivePath: '/music/sqlite_storage.sqlite3',
+        source: 'automatic',
+        loaded: false,
+        recordCount: 42,
+        warning: '网易云轻量索引未就绪，转换前会按需准备',
+        cacheStatus: 'ready',
+        cachedRecordCount: 42,
+      },
+      busy: false,
+      message: null,
+      error: null,
+    }, 'zh')).toEqual({
+      message: '索引已就绪',
+      detail: '索引已就绪 · 42',
+      tone: 'success',
+    });
   });
 
   it('shows database choose/change text from effectivePath only', () => {
@@ -1092,7 +1354,9 @@ describe('renderApp', () => {
         error: null,
       },
     );
-    expect(root.querySelector('[data-role="netease-discovery-progress"]')?.textContent).toContain('1/3');
+    expect(root.querySelector('[data-role="netease-discovery-progress"]')).toBeNull();
+    expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
+      .toContain('1/3');
     expect(root.querySelector('[data-action="pick-source"]')).not.toBeNull();
   });
 
@@ -1134,7 +1398,7 @@ describe('renderApp', () => {
     );
 
     expect(root.querySelector('[data-role="sync-slot"][data-slot="0"] .progress-copy')?.textContent)
-      .toBe('2/4');
+      .toBe('正在转换 2/4');
     expect(root.querySelector('[data-role="sync-slot"][data-slot="1"] .progress-copy')).toBeNull();
   });
 
@@ -1195,7 +1459,7 @@ describe('renderApp', () => {
     );
 
     const slot = root.querySelector('[data-role="sync-slot"][data-slot="0"]');
-    expect(slot?.querySelector('.progress-copy')?.textContent).toBe('7/40');
+    expect(slot?.querySelector('.progress-copy')?.textContent).toBe('正在转换 7/40');
     expect((slot?.querySelector('.progress-fill') as HTMLElement).style.width).toBe('18%');
   });
 
@@ -1626,11 +1890,32 @@ describe('renderApp', () => {
     expect(slotTwo.dataset.status).toBe('running');
     expect(root.querySelector('[data-action="cancel-all"]')).not.toBeNull();
     expect((slotTwo.querySelector('.progress-fill') as HTMLElement).style.width).toBe('45%');
-    expect(slotTwo.querySelector('.progress-copy')?.textContent).toBe('45/100');
-    expect(slotTwo.querySelector('.progress-copy--numeric')).not.toBeNull();
+    expect(slotTwo.querySelector('.progress-copy')?.textContent).toBe('正在转换 45/100');
+    expect(slotTwo.querySelector('.progress-copy--numeric')).toBeNull();
+    expect(slotTwo.querySelector('[data-role="slot-status-row"]')).not.toBeNull();
+    expect(slotTwo.querySelector('[data-role="netease-database-status"]')).toBeNull();
     expect(slotTwo.querySelector('.status-toggle')).toBeNull();
     expect(slotTwo.querySelector('[data-role="log-drawer"]')).toBeNull();
     expect(slotTwo.querySelector('.detail-toggle-copy')).toBeNull();
+  });
+
+  it('labels terminal conversion progress with its outcome and completed count', () => {
+    const cases = [
+      { status: 'completed' as const, completed: 6, expected: '转换完成 6/6' },
+      { status: 'error' as const, completed: 4, expected: '转换失败 4/6' },
+      { status: 'cancelled' as const, completed: 3, expected: '转换已取消 3/6' },
+    ];
+
+    for (const item of cases) {
+      const root = renderApp(makeViewStateWithSlot(0, {
+        status: item.status,
+        progressTotal: 6,
+        progressCompleted: item.completed,
+        progressText: `${item.completed}/6`,
+      }));
+      expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
+        .toBe(item.expected);
+    }
   });
 
   it('shows a localized destination fallback hint for slot two', () => {
@@ -1828,7 +2113,11 @@ describe('bindApp', () => {
       suggestion: null,
       error: '未能自动找到',
     });
-    await vi.waitFor(() => expect(root.querySelector('[data-role="netease-discovery-progress"]')?.textContent).toContain('未能自动找到'));
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="netease-discovery-progress"]')).toBeNull();
+      expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
+        .toContain('未能自动找到');
+    });
     expect(pickSource).not.toHaveBeenCalled();
     expect(root.querySelector('[data-action="scan-local-netease"]')?.textContent).toContain('手动选择文件夹');
 
@@ -1877,6 +2166,46 @@ describe('bindApp', () => {
       localFileCount: 4,
     });
     await vi.waitFor(() => expect(services.selectSourceDirectory).toHaveBeenCalledWith(0, '/music/netease'));
+  });
+
+  it('clears a stale not-ready warning when the metadata cache becomes ready', async () => {
+    let emitCacheProgress: ((progress: NeteaseMetadataCacheProgress) => void) | null = null;
+    const services = makeMockServices({
+      loadNeteaseMetadataDatabaseStatus: vi.fn().mockResolvedValue({
+        manualPath: null,
+        effectivePath: '/music/sqlite_storage.sqlite3',
+        source: 'automatic',
+        loaded: false,
+        recordCount: 42,
+        warning: '网易云轻量索引未就绪，转换前会按需准备',
+        cacheStatus: 'stale',
+        cachedRecordCount: 0,
+      }),
+      listenNeteaseMetadataCacheProgress: vi.fn().mockImplementation(async (handler) => {
+        emitCacheProgress = handler;
+        return () => undefined;
+      }),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    await vi.waitFor(() => expect(emitCacheProgress).not.toBeNull());
+    await vi.waitFor(() => expect(root.querySelector('[data-role="netease-situation-value"]')?.textContent)
+      .toBe('索引未就绪'));
+    emitCacheProgress?.({
+      status: 'ready',
+      stage: 'completed',
+      processed: 42,
+      total: 42,
+      currentItem: '',
+      message: '网易云轻量索引已就绪',
+      error: null,
+      databasePath: '/music/sqlite_storage.sqlite3',
+      cachedRecordCount: 42,
+    });
+
+    await vi.waitFor(() => expect(root.querySelector('[data-role="netease-situation-value"]')?.textContent)
+      .toBe('索引已就绪'));
   });
 
   it('offers row-only relocate/remove actions and confirmed invalid cleanup', async () => {
@@ -3112,7 +3441,8 @@ describe('bindApp', () => {
 
     await vi.waitFor(() => {
       expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
-      expect(root.querySelector('[data-role="preview-modal"]')?.textContent).toContain('输入曲目');
+      expect(root.querySelector('[data-role="preview-modal"]')?.textContent).toContain('预计新增');
+      expect(root.querySelector('[data-role="preview-modal"]')?.textContent).toContain('输入歌曲数 / 输出歌曲数');
       expect(root.querySelector('[data-role="preview-modal"]')?.textContent).toContain('预计输出');
     });
     expect(services.startConfirmedSync).not.toHaveBeenCalled();
@@ -3120,8 +3450,10 @@ describe('bindApp', () => {
 
   it('uses explicit preview labels and opens sorted input details on demand', async () => {
     const openSource = vi.fn().mockResolvedValue(undefined);
+    const openDestinationFile = vi.fn().mockResolvedValue(undefined);
     const services = makeMockServices({
       openSource,
+      openDestinationFile,
       loadScanResult: vi.fn().mockResolvedValue([{
         ...makePreview(0),
         conflict_strategy: 'overwrite',
@@ -3146,7 +3478,7 @@ describe('bindApp', () => {
               destination_path: '/music/out-1/Alpha.mp3',
               existing_output: false,
               classification: 'new',
-              reason: null,
+              reason: '将创建新的输出文件',
             },
           ],
         },
@@ -3156,17 +3488,192 @@ describe('bindApp', () => {
     bindApp(root, makeViewState(), services);
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull());
-    expect(root.textContent).toContain('输入曲目');
-    expect(root.textContent).toContain('输出重复曲目');
+    expect(root.textContent).toContain('预计新增');
+    expect(root.textContent).toContain('输入歌曲数 / 输出歌曲数');
     expect(root.textContent).toContain('将覆盖');
+    expect(root.querySelectorAll('[data-action="preview-detail"]')).toHaveLength(4);
+    const expectedCard = root.querySelector('[data-role="preview-expected-new"]');
+    expect(expectedCard?.tagName).toBe('BUTTON');
+    expect(expectedCard?.getAttribute('data-action')).toBe('preview-detail');
+    expect(expectedCard?.getAttribute('data-detail-kind')).toBe('expected-new');
+    expect(expectedCard?.querySelector('[data-action="open-preview-file"]')).toBeNull();
+    expect(expectedCard?.querySelector('[data-role="preview-expected-new-reasons"]')).toBeNull();
     expect(root.querySelector('[data-role="preview-modal"] .preview-head .preview-batch-label')).toBeNull();
     expect(root.querySelector('[data-role="preview-modal"] .preview-card-head-meta > .preview-batch-label')).toBeNull();
+    (expectedCard as HTMLButtonElement).click();
+    expect(root.querySelector('[data-role="preview-detail-dialog"] h3')?.textContent).toBe('预计新增');
+    expect(root.querySelectorAll('[data-role="preview-detail-dialog"] .preview-detail-list li')).toHaveLength(2);
+    expect(root.querySelector('[data-role="preview-detail-dialog"]')?.textContent).toContain('Alpha.mp3');
+    expect(root.querySelector('[data-role="preview-detail-dialog"]')?.textContent).toContain('zeta.mp3');
+    expect(root.querySelector('[data-role="preview-detail-dialog"]')?.textContent).toContain('将创建新的输出文件');
+    const expectedDetailRow = root.querySelector('[data-role="preview-detail-dialog"] .preview-detail-static-list li');
+    expect(expectedDetailRow?.querySelector('.preview-detail-entry-name')).not.toBeNull();
+    expect(expectedDetailRow?.querySelector('.preview-detail-entry-status')).not.toBeNull();
+    expect(root.querySelectorAll('[data-role="preview-detail-dialog"] [data-action="open-preview-file"]')).toHaveLength(0);
+    (root.querySelector('[data-action="close-preview-detail"]') as HTMLButtonElement).click();
     (root.querySelector('[data-action="preview-detail"][data-detail-kind="input"]') as HTMLButtonElement).click();
-    const rows = root.querySelectorAll('[data-role="preview-detail-dialog"] li');
-    expect(rows).toHaveLength(2);
-    expect(rows[0]?.textContent).toContain('Alpha.mp3');
-    (rows[0]?.querySelector('[data-action="open-preview-file"]') as HTMLButtonElement).click();
+    expect(root.querySelector('[data-role="preview-detail-dialog"] h3')?.textContent).toBe('输入歌曲数 / 输出歌曲数');
+    const inputRows = root.querySelectorAll('[data-side="input"] .preview-detail-list li');
+    const outputRows = root.querySelectorAll('[data-side="output"] .preview-detail-list li');
+    expect(root.querySelectorAll('[data-role="preview-detail-columns"]')).toHaveLength(1);
+    expect(inputRows).toHaveLength(2);
+    expect(outputRows).toHaveLength(2);
+    expect(inputRows[0]?.textContent).toContain('Alpha.mp3');
+    (inputRows[0]?.querySelector('.preview-detail-entry') as HTMLElement).click();
     expect(openSource).toHaveBeenCalledWith('/music/in-1/Alpha.mp3');
+    expect(outputRows[0]?.textContent).toContain('Alpha.mp3');
+    (outputRows[0]?.querySelector('.preview-detail-entry') as HTMLElement).click();
+    expect(openDestinationFile).toHaveBeenCalledWith('/music/out-1/Alpha.mp3');
+    (root.querySelector('[data-action="close-preview-detail"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="preview-detail"][data-detail-kind="action"]') as HTMLButtonElement).click();
+    const actionRow = root.querySelector('[data-role="preview-detail-dialog"] .preview-detail-link-row');
+    expect(actionRow?.textContent).toContain('zeta.mp3');
+    (actionRow?.querySelector('.preview-detail-entry') as HTMLElement).click();
+    expect(openDestinationFile).toHaveBeenCalledWith('/music/out-1/zeta.mp3');
+  });
+
+  it('renders the physical output snapshot and existing overwrite path', async () => {
+    const openDestinationFile = vi.fn().mockResolvedValue(undefined);
+    const sourcePath = '/music/in-1/zeta.ncm';
+    const existingPath = '/music/out-1/zeta.mp3';
+    const plannedPath = '/music/out-1/zeta.aiff';
+    const base = makePreview(0);
+    const services = makeMockServices({
+      openDestinationFile,
+      loadScanResult: vi.fn().mockResolvedValue([{
+        ...base,
+        conflict_strategy: 'overwrite',
+        preview: {
+          ...base.preview,
+          new_count: 0,
+          existing_count: 1,
+          input_count: 1,
+          output_duplicate_count: 1,
+          action_kind: 'overwrite',
+          action_count: 1,
+          output_files: [existingPath],
+          candidates: [{
+            ...base.preview.candidates[0],
+            name: 'zeta',
+            source_path: sourcePath,
+            destination_path: plannedPath,
+            previous_destination_path: existingPath,
+            previous_destination_paths: [existingPath],
+          }],
+          detail_items: [{
+            name: 'zeta.aiff',
+            source_path: sourcePath,
+            destination_path: plannedPath,
+            existing_output: true,
+            classification: 'overwrite',
+            reason: null,
+          }],
+        },
+      }]),
+    });
+    const root = document.createElement('div');
+    const style = document.createElement('style');
+    style.textContent = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    document.head.append(style);
+    document.body.append(root);
+    expect(style.textContent).toContain('.preview-detail-entry:focus-visible .preview-detail-entry-icon');
+    expect(style.textContent).toContain('box-shadow: inset 0 0 0 1px var(--focus)');
+    bindApp(root, makeViewState(), services);
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull());
+
+    (root.querySelector('[data-action="preview-detail"][data-detail-kind="input"]') as HTMLButtonElement).click();
+    const outputRow = root.querySelector('[data-side="output"] .preview-detail-list li');
+    expect(outputRow?.textContent).toContain('zeta.mp3');
+    expect(outputRow?.textContent).not.toContain('.aiff');
+    expect(outputRow?.querySelector('.preview-detail-entry-name')?.closest('button')).toBeNull();
+    (outputRow?.querySelector('.preview-detail-entry-name') as HTMLElement).click();
+    expect(openDestinationFile).not.toHaveBeenCalled();
+    const iconButton = outputRow?.querySelector('.preview-detail-entry') as HTMLElement;
+    expect(getComputedStyle(iconButton).width).toBe('26px');
+    expect(getComputedStyle(iconButton).height).toBe('26px');
+    expect(getComputedStyle(iconButton).padding).toBe('0px');
+    expect(getComputedStyle(iconButton.querySelector('.ui-icon') as HTMLElement).marginRight).toBe('0px');
+    iconButton.click();
+    expect(openDestinationFile).toHaveBeenCalledWith(existingPath);
+
+    (root.querySelector('[data-action="close-preview-detail"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="preview-detail"][data-detail-kind="action"]') as HTMLButtonElement).click();
+    const actionRow = root.querySelector('[data-role="preview-detail-dialog"] .preview-detail-list li');
+    expect(actionRow?.textContent).toContain('zeta.mp3');
+    expect(actionRow?.textContent).not.toContain('.aiff');
+    expect(actionRow?.querySelector('.preview-detail-entry-name')?.closest('button')).toBeNull();
+    (actionRow?.querySelector('.preview-detail-entry-name') as HTMLElement).click();
+    expect(openDestinationFile).toHaveBeenCalledTimes(1);
+    (actionRow?.querySelector('.preview-detail-entry') as HTMLElement).click();
+    expect(openDestinationFile).toHaveBeenCalledWith(existingPath);
+    expect(openDestinationFile).toHaveBeenCalledTimes(2);
+    root.remove();
+    style.remove();
+  });
+
+  it('excludes skipped songs from the expected-new count', async () => {
+    const services = makeMockServices({
+      loadScanResult: vi.fn().mockResolvedValue([{
+        ...makePreview(0),
+        preview: {
+          ...makePreview(0).preview,
+          new_count: 2,
+          existing_count: 1,
+          skipped_count: 1,
+          input_count: 4,
+          output_duplicate_count: 1,
+          action_kind: 'skip',
+          action_count: 1,
+          detail_items: [
+            {
+              name: 'new-a.mp3',
+              source_path: '/music/in-1/new-a.mp3',
+              destination_path: '/music/out-1/new-a.mp3',
+              existing_output: false,
+              classification: 'new',
+              reason: null,
+            },
+            {
+              name: 'new-b.mp3',
+              source_path: '/music/in-1/new-b.mp3',
+              destination_path: '/music/out-1/new-b.mp3',
+              existing_output: false,
+              classification: 'new',
+              reason: null,
+            },
+            {
+              name: 'existing.mp3',
+              source_path: '/music/in-1/existing.mp3',
+              destination_path: '/music/out-1/existing.mp3',
+              existing_output: true,
+              classification: 'skip',
+              reason: '输出已存在',
+            },
+          ],
+        },
+      }]),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull());
+
+    const expectedCard = root.querySelector('[data-role="preview-expected-new"]') as HTMLButtonElement;
+    expect(expectedCard.querySelector('dd')?.textContent).toBe('2');
+    expect(expectedCard.tagName).toBe('BUTTON');
+    expect(expectedCard.getAttribute('data-action')).toBe('preview-detail');
+    expect(expectedCard.querySelector('[data-action="open-preview-file"]')).toBeNull();
+    expectedCard.click();
+    expect(root.querySelectorAll('[data-role="preview-detail-dialog"] .preview-detail-static-list li')).toHaveLength(2);
+    expect(root.querySelector('[data-role="preview-detail-dialog"]')?.textContent).toContain('new-a.mp3');
+    expect(root.querySelectorAll('[data-role="preview-detail-dialog"] [data-action="open-preview-file"]')).toHaveLength(0);
+    (root.querySelector('[data-action="close-preview-detail"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="preview-detail"][data-detail-kind="input"]') as HTMLButtonElement).click();
+    expect(root.querySelector('[data-side="input"]')?.textContent).toContain('输出已存在');
+    const skippedStatus = root.querySelector('[data-side="input"] .preview-detail-entry-status');
+    expect(skippedStatus?.textContent).toContain('输出已存在');
+    expect(skippedStatus?.parentElement?.classList.contains('preview-detail-link-row')).toBe(true);
   });
 
   it('keeps a completed scan result visible with the input denominator', () => {
@@ -3196,6 +3703,177 @@ describe('bindApp', () => {
     );
     expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
       .toContain('扫描成功 1173/1173');
+  });
+
+  it('stops showing a completed scan as soon as a scan-then-convert preview is confirmed', async () => {
+    const services = makeMockServices({
+      startScan: vi.fn().mockResolvedValue({
+        status: 'completed',
+        phase: 'completed',
+        processed: 6,
+        total: 6,
+        current_file: '',
+        message: '扫描完成',
+        tasks: [{
+          slot_index: 0,
+          phase: 'completed',
+          processed: 6,
+          total: 6,
+          source_processed: 6,
+          source_total: 6,
+          destination_processed: 6,
+          destination_total: 6,
+          metadata_processed: 6,
+          metadata_total: 6,
+          current_file: '',
+        }],
+      } satisfies AppScanProgress),
+      loadScanResult: vi.fn().mockResolvedValue([makePreview(0)]),
+      startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
+        slots: [
+          makeDesktopSlot({ status: 'running', progress_total: 6, progress_completed: 0 }),
+          makeDesktopSlot(),
+        ],
+      })),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
+    });
+    expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
+      .toContain('扫描成功 6/6');
+
+    (root.querySelector('[data-action="confirm-start"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
+    });
+
+    const progress = root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]');
+    expect(progress?.textContent).not.toContain('扫描成功');
+    expect(progress?.textContent).toContain('正在转换 0/6');
+  });
+
+  it('keeps a completed scan visible while opening history, the library, or changing theme', async () => {
+    const libraryStatus: LibraryStatus = {
+      catalogPath: '/tmp/w4dj-library.sqlite',
+      trackCount: 0,
+      netease: {
+        databasePath: null,
+        musicFolder: null,
+        recordCount: 0,
+        localFileCount: 0,
+      },
+      manualDatabasePath: null,
+      refresh: {
+        refreshId: 'idle',
+        status: 'idle',
+        stage: 'locatingDatabase',
+        processed: 0,
+        total: null,
+        currentItem: '',
+        message: '',
+        summary: null,
+        error: null,
+      },
+      databaseWarning: null,
+    };
+    const completedScan: AppScanProgress = {
+      status: 'completed',
+      phase: 'completed',
+      processed: 6,
+      total: 6,
+      current_file: '',
+      message: '扫描完成',
+      tasks: [{
+        slot_index: 0,
+        phase: 'completed',
+        processed: 6,
+        total: 6,
+        source_processed: 6,
+        source_total: 6,
+        destination_processed: 6,
+        destination_total: 6,
+        metadata_processed: 6,
+        metadata_total: 6,
+        current_file: '',
+      }],
+    };
+    const services = makeMockServices({
+      startScan: vi.fn().mockResolvedValue(completedScan),
+      loadScanResult: vi.fn().mockResolvedValue([makePreview(0)]),
+      loadLibraryStatus: vi.fn().mockResolvedValue(libraryStatus),
+      queryLibraryCatalog: vi.fn().mockResolvedValue({ items: [], total: 0, limit: 100, offset: 0 }),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull();
+    });
+    const expectCompletedScan = () => expect(
+      root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent,
+    ).toContain('扫描成功 6/6');
+    expectCompletedScan();
+
+    root.querySelector<HTMLElement>('[data-role="history"] summary')?.click();
+    expectCompletedScan();
+    (root.querySelector('[data-action="toggle-theme"]') as HTMLButtonElement).click();
+    expectCompletedScan();
+    (root.querySelector('[data-action="open-library"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="library-modal"]')).not.toBeNull());
+    expectCompletedScan();
+  });
+
+  it('clears only the affected completed scan result when that task source changes', async () => {
+    const completedScan: AppScanProgress = {
+      status: 'completed',
+      phase: 'completed',
+      processed: 12,
+      total: 12,
+      current_file: '',
+      message: '扫描完成',
+      tasks: [0, 1].map((slotIndex) => ({
+        slot_index: slotIndex as SyncSlotIndex,
+        phase: 'completed' as const,
+        processed: 6,
+        total: 6,
+        source_processed: 6,
+        source_total: 6,
+        destination_processed: 6,
+        destination_total: 6,
+        metadata_processed: 6,
+        metadata_total: 6,
+        current_file: '',
+      })),
+    };
+    const services = makeMockServices({
+      startScan: vi.fn().mockResolvedValue(completedScan),
+      loadScanResult: vi.fn().mockResolvedValue(makePreviewResponse()),
+      selectSourceDirectory: vi.fn().mockResolvedValue(makeDesktopState({
+        slots: [
+          makeDesktopSlot({ source_directory: '' }),
+          makeDesktopSlot({ source_directory: '/music/in-2', destination_directory: '/music/out-2' }),
+        ],
+      })),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => {
+      expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')?.textContent)
+        .toContain('扫描成功 6/6');
+    });
+    (root.querySelector('[data-action="clear-source"][data-slot="0"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(services.selectSourceDirectory).toHaveBeenCalledWith(0, ''));
+
+    expect(root.querySelector('[data-slot="0"] [data-role="slot-progress-message"]')).toBeNull();
+    expect(root.querySelector('[data-slot="1"] [data-role="slot-progress-message"]')?.textContent)
+      .toContain('扫描成功 6/6');
   });
 
   it('attributes a library snapshot failure to the task card without exposing SQLite details', () => {
@@ -3297,8 +3975,19 @@ describe('bindApp', () => {
   });
 
   it('direct mode starts conversion automatically after a completed scan', async () => {
+    const loadNeteaseMetadataDatabaseStatus = vi.fn().mockResolvedValue({
+      manualPath: null,
+      effectivePath: '/music/sqlite_storage.sqlite3',
+      source: 'automatic',
+      loaded: true,
+      recordCount: 42,
+      warning: null,
+      cacheStatus: 'ready',
+      cachedRecordCount: 42,
+    });
     const services = makeMockServices({
       loadDesktopState: vi.fn().mockResolvedValue(makeDesktopState({ conversion_mode: 'direct' })),
+      loadNeteaseMetadataDatabaseStatus,
       loadScanResult: vi.fn().mockResolvedValue(makePreviewResponse()),
       startConfirmedSync: vi.fn().mockResolvedValue(makeDesktopState({
         slots: [
@@ -3315,6 +4004,7 @@ describe('bindApp', () => {
       expect(services.startConfirmedSync).toHaveBeenCalledTimes(1);
       expect(root.querySelector('[data-role="preview-modal"]')).toBeNull();
     });
+    await vi.waitFor(() => expect(loadNeteaseMetadataDatabaseStatus).toHaveBeenCalledTimes(2));
     expect(services.readAudioFile).not.toHaveBeenCalled();
     expect(services.saveTrackAnalyses).not.toHaveBeenCalled();
   });
@@ -3817,7 +4507,7 @@ describe('bindApp', () => {
     await vi.waitFor(() => expect(root.querySelector('[data-action="cancel-scan"]')).not.toBeNull());
     (root.querySelector('[data-action="cancel-scan"]') as HTMLButtonElement).click();
     expect(services.cancelScan).toHaveBeenCalledTimes(1);
-    expect(root.querySelector('[data-role="scan-message"]')?.textContent).toContain('正在取消扫描');
+    expect(root.querySelector('[data-role="scan-message"]')).toBeNull();
     expect((root.querySelector('[data-action="cancel-scan"]') as HTMLButtonElement).disabled).toBe(true);
     deferred.resolve({
       status: 'cancelled', phase: 'cancelled', processed: 1, total: 100,
@@ -3825,7 +4515,7 @@ describe('bindApp', () => {
     });
     await vi.waitFor(() => {
       expect(root.querySelector('[data-role="scan-modal"]')).toBeNull();
-      expect(root.querySelector('[data-role="scan-message"]')?.textContent).toContain('扫描已取消');
+      expect(root.querySelector('[data-role="scan-message"]')).toBeNull();
       expect(services.startConfirmedSync).not.toHaveBeenCalled();
     });
   });
@@ -4304,8 +4994,7 @@ describe('bindApp', () => {
     (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
-      expect(root.querySelector('[data-role="scan-message"]')?.textContent)
-        .toContain('Sync failed dramatically');
+      expect(root.querySelector('[data-role="scan-message"]')).toBeNull();
       expect(root.querySelector('[data-role="scan-modal"]')).toBeNull();
     });
   });

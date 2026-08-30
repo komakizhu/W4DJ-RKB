@@ -11,7 +11,7 @@ use crate::scan_cache::ScanCache;
 use crate::sync::{
     ScanObserver, derive_song_name_with_policy_and_resolver_cancellable,
     effective_source_extension, find_ffmpeg, get_destination_music_dict_with_rule,
-    get_destination_music_dict_with_rule_and_observer,
+    get_destination_music_dict_with_rule_and_observer, get_destination_music_files,
     get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy,
     get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy,
     get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy,
@@ -85,6 +85,14 @@ pub struct PreviewCandidate {
     /// selected filename rule produces a new destination path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_destination_path: Option<String>,
+    /// All confirmed same-identity outputs that must be removed after the new
+    /// output has been verified and registered. The singular field above is
+    /// retained only for reading older resumable history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_destination_paths: Vec<String>,
+    /// Existing same-identity copies updated by the metadata-only strategy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_destination_paths: Vec<String>,
     #[serde(default)]
     pub operation: CandidateOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +117,43 @@ pub struct OutputTrackIdentity {
     pub artists: String,
     pub album: String,
     pub source_path: PathBuf,
+}
+
+fn reliable_metadata_matches(
+    source: &crate::analysis::TrackMetadata,
+    output: &crate::analysis::TrackMetadata,
+) -> bool {
+    !source.title.trim().is_empty()
+        && !source.artist.trim().is_empty()
+        && source
+            .title
+            .trim()
+            .eq_ignore_ascii_case(output.title.trim())
+        && source
+            .artist
+            .trim()
+            .eq_ignore_ascii_case(output.artist.trim())
+}
+
+fn resolved_source_metadata(
+    source_path: &Path,
+    resolver: Option<&NeteaseMetadataResolver>,
+) -> crate::analysis::TrackMetadata {
+    let mut metadata = read_track_metadata(source_path);
+    if let Some(identity) =
+        resolver.and_then(|resolver| resolver.track_identity_for_preview(source_path))
+    {
+        if !identity.title.trim().is_empty() {
+            metadata.title = identity.title;
+        }
+        if !identity.artists.trim().is_empty() {
+            metadata.artist = identity.artists;
+        }
+        if !identity.album.trim().is_empty() {
+            metadata.album = identity.album;
+        }
+    }
+    metadata
 }
 
 impl OutputTrackIdentity {
@@ -353,7 +398,7 @@ pub struct SyncPreview {
     #[serde(default)]
     pub output_duplicate_count: usize,
     /// Primary action represented by `action_count` (skip/overwrite/
-    /// update_metadata/rename).
+    /// update_metadata).
     #[serde(default)]
     pub action_kind: String,
     #[serde(default)]
@@ -364,6 +409,12 @@ pub struct SyncPreview {
     /// One row per input/issue, rendered lazily by the confirmation UI.
     #[serde(default)]
     pub detail_items: Vec<PreviewDetailItem>,
+    /// The normal audio files that actually existed in the destination
+    /// directory when this immutable preview snapshot was built.  This is
+    /// deliberately separate from candidate.destination_path, which is the
+    /// path the current run plans to create.
+    #[serde(default)]
+    pub output_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -374,7 +425,7 @@ pub struct PreviewDetailItem {
     pub destination_path: Option<String>,
     #[serde(default)]
     pub existing_output: bool,
-    /// new | duplicate | skip | overwrite | update_metadata | rename | error
+    /// new | duplicate | skip | overwrite | update_metadata | error
     pub classification: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -743,6 +794,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             .and_then(|resolver| resolver.database_path())
             .map(|path| path.display().to_string()),
         detail_items: Vec::new(),
+        output_files: Vec::new(),
     };
 
     let source_path = Path::new(source_directory);
@@ -898,7 +950,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         });
         preview.error_count += 1;
     }
-    let (destination_files, cancelled) = if !destination_directory.trim().is_empty()
+    let (_destination_files, cancelled) = if !destination_directory.trim().is_empty()
         && Path::new(destination_directory).is_dir()
     {
         if let Some(observer) = observer.as_mut() {
@@ -935,10 +987,22 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     if cancelled {
         return Ok(None);
     };
-    let mut occupied_paths = destination_files
-        .values()
-        .map(|(_, path)| path.clone())
-        .collect::<HashSet<_>>();
+    let destination_inventory =
+        if !destination_directory.trim().is_empty() && Path::new(destination_directory).is_dir() {
+            get_destination_music_files(destination_directory)
+                .into_iter()
+                .map(|path| {
+                    let metadata = read_track_metadata(&path);
+                    (path, metadata)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+    preview.output_files = destination_inventory
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect();
     let mut planned_paths = HashSet::new();
     let mut source_entries = source_files.iter().collect::<Vec<_>>();
     source_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -1001,7 +1065,6 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         let in_batch_collision = planned_paths.contains(&expected_path);
         if in_batch_collision && !collision_group {
             match conflict_strategy {
-                ConflictStrategy::Rename => {}
                 ConflictStrategy::Skip => {
                     preview.skipped_count += 1;
                     preview.skipped.push(PreviewIssue {
@@ -1021,21 +1084,60 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                 }
             }
         }
-        let existing_path = if collision_group {
-            None
+        let source_metadata = resolved_source_metadata(path, metadata_resolver);
+        let source_has_reliable_metadata =
+            !source_metadata.title.trim().is_empty() && !source_metadata.artist.trim().is_empty();
+        let mut existing_paths = if collision_group {
+            Vec::new()
         } else {
-            destination_files
-                .get(name)
-                .filter(|(_, path)| {
-                    path.extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case(output_extension))
+            destination_inventory
+                .iter()
+                .filter(|(output_path, output_metadata)| {
+                    reliable_metadata_matches(&source_metadata, output_metadata)
+                        || (!source_has_reliable_metadata && output_path == &expected_path)
                 })
-                .map(|(_, path)| path.clone())
-                .or_else(|| expected_path.exists().then_some(expected_path.clone()))
+                .map(|(output_path, _)| output_path.clone())
+                .collect::<Vec<_>>()
         };
-        let has_existing = existing_path.is_some();
-        let mut candidate_name = name.to_string();
+        existing_paths.sort();
+        existing_paths.dedup();
+        let existing_path = existing_paths
+            .iter()
+            .find(|existing| **existing == expected_path)
+            .cloned()
+            .or_else(|| existing_paths.first().cloned())
+            .or_else(|| {
+                (!source_has_reliable_metadata && expected_path.exists())
+                    .then_some(expected_path.clone())
+            });
+        if let Some(existing_path) = existing_path.as_ref()
+            && !existing_paths.contains(existing_path)
+        {
+            existing_paths.push(existing_path.clone());
+        }
+        let has_existing = !existing_paths.is_empty();
+        let identity_conflict =
+            source_has_reliable_metadata && expected_path.exists() && existing_paths.is_empty();
+        let candidate_name = if identity_conflict {
+            let suffix = sanitize_filename_component(&source_metadata.artist);
+            let base = format!("{name} [{suffix}]");
+            let mut candidate = base.clone();
+            let mut ordinal = 2usize;
+            while target_output_path_with_policy(
+                destination_directory,
+                &candidate,
+                output_extension,
+                filename_policy,
+            )
+            .exists()
+            {
+                candidate = format!("{base} ({ordinal})");
+                ordinal += 1;
+            }
+            candidate
+        } else {
+            name.to_string()
+        };
         let mut operation = CandidateOperation::Convert;
 
         if has_existing {
@@ -1046,7 +1148,6 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                     continue;
                 }
                 ConflictStrategy::Overwrite => {}
-                ConflictStrategy::Rename => {}
                 ConflictStrategy::UpdateMetadata => {
                     if supports_metadata_update(
                         path,
@@ -1062,33 +1163,6 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                         continue;
                     }
                 }
-            }
-        }
-
-        if matches!(conflict_strategy, ConflictStrategy::Rename)
-            && !collision_group
-            && matches!(operation, CandidateOperation::Convert)
-        {
-            let desired_path = target_output_path_with_policy(
-                destination_directory,
-                &candidate_name,
-                output_extension,
-                filename_policy,
-            );
-            if has_existing
-                || in_batch_collision
-                || desired_path.exists()
-                || occupied_paths.contains(&desired_path)
-            {
-                candidate_name = next_available_name(
-                    destination_directory,
-                    name,
-                    output_extension,
-                    filename_policy,
-                    &mut occupied_paths,
-                );
-            } else {
-                occupied_paths.insert(desired_path);
             }
         }
 
@@ -1115,16 +1189,25 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                 filename_policy,
             )
         };
-        let previous_destination_path = if matches!(conflict_strategy, ConflictStrategy::Overwrite)
-            && existing_path
-                .as_ref()
-                .is_some_and(|existing| existing != &destination_path)
+        let previous_destination_paths = if matches!(conflict_strategy, ConflictStrategy::Overwrite)
         {
-            existing_path
-                .as_ref()
+            existing_paths
+                .iter()
+                .filter(|existing| **existing != destination_path)
                 .map(|existing| existing.display().to_string())
+                .collect::<Vec<_>>()
         } else {
-            None
+            Vec::new()
+        };
+        let previous_destination_path = previous_destination_paths.first().cloned();
+        let metadata_destination_paths = if matches!(operation, CandidateOperation::UpdateMetadata)
+        {
+            existing_paths
+                .iter()
+                .map(|existing| existing.display().to_string())
+                .collect()
+        } else {
+            Vec::new()
         };
         if paths_refer_to_same_file(path, &destination_path) {
             preview.errors.push(PreviewIssue {
@@ -1141,6 +1224,8 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             source_size_bytes: source_size,
             estimated_output_bytes,
             previous_destination_path,
+            previous_destination_paths,
+            metadata_destination_paths,
             operation,
             netease_track_id: None,
             netease_album_id: None,
@@ -1150,7 +1235,9 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             disambiguation_reason: None,
         });
         planned_paths.insert(destination_path);
-        preview.new_count += 1;
+        if !has_existing {
+            preview.new_count += 1;
+        }
         preview.estimated_output_bytes = preview
             .estimated_output_bytes
             .and_then(|total| total.checked_add(estimated_bytes));
@@ -1250,7 +1337,6 @@ fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrateg
     preview.action_kind = match strategy {
         ConflictStrategy::Skip => "skip",
         ConflictStrategy::Overwrite => "overwrite",
-        ConflictStrategy::Rename => "rename",
         ConflictStrategy::UpdateMetadata => "update_metadata",
     }
     .to_string();
@@ -1259,9 +1345,18 @@ fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrateg
         ConflictStrategy::Overwrite => preview
             .candidates
             .iter()
-            .filter(|candidate| Path::new(&candidate.destination_path).exists())
+            .filter(|candidate| {
+                Path::new(&candidate.destination_path).exists()
+                    || candidate
+                        .previous_destination_paths
+                        .iter()
+                        .any(|path| Path::new(path).exists())
+                    || candidate
+                        .previous_destination_path
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).exists())
+            })
             .count(),
-        ConflictStrategy::Rename => preview.candidates.len(),
         ConflictStrategy::UpdateMetadata => preview
             .candidates
             .iter()
@@ -1277,13 +1372,15 @@ fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrateg
             || candidate
                 .previous_destination_path
                 .as_deref()
-                .is_some_and(|path| Path::new(path).exists());
+                .is_some_and(|path| Path::new(path).exists())
+            || candidate
+                .previous_destination_paths
+                .iter()
+                .any(|path| Path::new(path).exists());
         let classification = if matches!(candidate.operation, CandidateOperation::UpdateMetadata) {
             "update_metadata"
         } else if matches!(strategy, ConflictStrategy::Overwrite) && existing_output {
             "overwrite"
-        } else if matches!(strategy, ConflictStrategy::Rename) {
-            "rename"
         } else if existing_output {
             "duplicate"
         } else {
@@ -1361,6 +1458,7 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
         action_count: 0,
         database_directory: None,
         detail_items: Vec::new(),
+        output_files: Vec::new(),
     };
 
     for pending_file in &entry.pending_files {
@@ -1382,6 +1480,8 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
                     source_size_bytes: metadata.len(),
                     estimated_output_bytes: estimated,
                     previous_destination_path: pending_file.previous_destination_path.clone(),
+                    previous_destination_paths: pending_file.previous_destination_paths.clone(),
+                    metadata_destination_paths: pending_file.metadata_destination_paths.clone(),
                     operation: pending_file.operation,
                     netease_track_id: None,
                     netease_album_id: None,
@@ -1423,6 +1523,8 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
                     source_size_bytes: metadata.len(),
                     estimated_output_bytes: Some(metadata.len()),
                     previous_destination_path: None,
+                    previous_destination_paths: Vec::new(),
+                    metadata_destination_paths: Vec::new(),
                     operation: CandidateOperation::Convert,
                     netease_track_id: None,
                     netease_album_id: None,
@@ -1465,30 +1567,6 @@ pub fn build_retry_preview(entry: &HistoryEntry) -> SyncPreview {
         preview.disk_space_sufficient = Some(available >= required);
     }
     preview
-}
-
-fn next_available_name(
-    destination_directory: &str,
-    base_name: &str,
-    extension: &str,
-    filename_policy: FilenameNormalizationPolicy,
-    occupied_paths: &mut HashSet<std::path::PathBuf>,
-) -> String {
-    let mut index = 2usize;
-    loop {
-        let candidate = format!("{} ({})", base_name, index);
-        let path = target_output_path_with_policy(
-            destination_directory,
-            &candidate,
-            extension,
-            filename_policy,
-        );
-        if !path.exists() && !occupied_paths.contains(&path) {
-            occupied_paths.insert(path);
-            return candidate;
-        }
-        index += 1;
-    }
 }
 
 fn supports_metadata_update(source: &Path, destination: &Path) -> bool {

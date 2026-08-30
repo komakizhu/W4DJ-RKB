@@ -171,6 +171,7 @@ fn stone_kold_duplicate_tracks_convert_to_distinct_outputs_with_metadata() {
                 if let Some(error) = error {
                     failures.push(error.to_string());
                 }
+                Ok(())
             },
             Arc::new(GlobalConcurrencyBudget::new(2)),
             Arc::new(ActiveFfmpegRegistry::new()),

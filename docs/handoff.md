@@ -388,6 +388,27 @@ size+mtime 同时相等才保留分析；变化或旧指纹缺失会清除 SQLit
 
 最新版 arm64 App 已于 2026-08-29 21:07:39 CST 构建，版本 `3.2.0-beta.3`，约 96 MB。
 
+## 2026-08-29 beta-3 定稿后的本机验收资源与下一版交接
+
+`3.2.0-beta.3` 已在本地 `main` 定稿为提交 `ae8c116`，未推送远端。已跟踪源码在该提交后保持干净，但工作区故意保留下列未跟踪的本机调试/验收资源，不得当作遗漏源码或随意清理：
+
+- `.pnpm-store/`：约 8 KB 的 pnpm 本地项目索引，可重建，不应提交。
+- `app/public/acceptance-audio`：绝对路径软链接，指向 `/Users/mac2/Music/test`；仅供工作区浏览器/headless 验收，删除链接不得删除目标音频。
+- `app/public/essentia-models`：绝对路径软链接，指向 `src-tauri/resources/essentia-models`；仅供工作区验收，正式 App 仍从 Tauri resources 打包模型。
+- `docs/.DS_Store` 与 `src-tauri/.DS_Store`：macOS Finder 本地状态文件，不应提交。
+
+Vite 生产配置使用 `publicDir: false`，当前 `app/dist` 不包含上述验收音频或验收模型链接；不得为了清理 Git 状态而将它们加入正式 App 或提交绝对路径。
+
+beta-3 环境不能完成的项目顺延到下一版：Windows Hidden 属性、Windows 整体构建/运行，Rekordbox/CDJ 导入，macOS Hidden 真实标记，1,190/1,192 首真实目录现场扫描与转换，真实扫描→转换→增强分析→标签回写整链路，以及人工 GUI/播放器验收。已有自动化和临时副本验收结果必须保留，下一版只补环境依赖项，不得把未现场验收项改写为已通过。
+
+## 2026-08-29 任务卡扫描/转换状态栏交接
+
+已确认根因是 `scan_then_convert` 确认预览时未清理 completed `scanProgress`，而 `renderSyncSlot` 优先显示扫描，导致后端已正确完成 6/6 转换时界面仍显示“扫描成功 6/6”。现已在确认后结束扫描显示，转换阶段显示带语义的实际计数。
+
+footer 现为一行固定状态（左进度，右索引/同步错误）加下方独立进度条，两侧均为 `9px` / `1.35` baseline。扫描成功快照在历史、歌曲库和主题切换时保留，来源变化时仅移除对应任务快照。歌曲库同步失败仍优先显示安全红色文案并阻止转换；没有修改 Rust 数据层。
+
+验证已通过：前端 12 文件/209 项、TypeScript、Vite 与 `git diff --check`。最新 arm64 App 已于 2026-08-29 23:34:19 CST 构建，版本 `3.2.0-beta.3`，约 96 MB。
+
 ## 2026-08-29 统一运行日志与双层报告（实现完成，当前交接点）
 
 共享工作树已实现统一本地 RuntimeJournal 与两种手动 JSON 报告。日志目录为应用数据目录下的 `W4DJ-runtime-journal`，采用有界非阻塞队列、独立写入线程、进度合并、1000 条补偿区及 30 天/200 MB 轮转；启动异常 marker 会产生 `previous_run_interrupted`，不扫描旧 runtime-session 目录。转换运行会话后台事件也会同步到全局日志，报告导出前刷新队列。`export_run_report` 汇总单条转换历史、内部会话及同 operationId 的全局事件；`export_full_runtime_report` 流式导出日志、健康状态和补偿区，均通过临时文件原子替换，不自动生成或写入 Downloads。
@@ -395,3 +416,62 @@ size+mtime 同时相等才保留分析；变化或旧指纹缺失会清除 SQLit
 前端转换历史只保留“导出本次运行报告”按钮；关于页新增“导出完整运行报告”。用户取消保存对话框不会调用后端。旧 `export_history_error_report`/`export_runtime_session` 命令暂留兼容但不再有可见入口。HistoryEntry 的 `operationId` 为可选字段，旧 history.json 可读取。
 
 已验证前端 12 文件/203 项、Rust 120 项、Tauri 103 项、TypeScript、Vite、cargo check、fmt、diff-check，以及根库与 Tauri 严格 all-targets Clippy。`pnpm --dir app test -- --run` 被本机 `ERR_PNPM_IGNORED_BUILDS` 安全策略阻断，但同一依赖树直接运行 Vitest 已全部通过；RuntimeJournal 压力/轮转单元测试 4 项通过。通过 `open -g` 完成异常重启/正常退出验收：强制终止后出现 `previous_run_interrupted`，正常退出写入 `app_stopped` 并清除 active marker。最新 arm64 App 构建于 2026-08-29 18:41:42。接手者仍需在可用环境补做真实扫描→转换→增强分析链路验收；保持版本 `3.2.0-beta.3`，不 commit/push/merge/release。
+
+## 2026-08-30 跨格式覆盖与重复清理交接
+
+队列标记 `side-plan:01a04e2b-cross-format-overwrite-v1-confirmed-2026-08-30` 已实施。根因是旧预览以歌曲名映射单个目标并强制扩展名相同，导致 WAV→AIFF 只识别路径不变的 MP3，旧 WAV 没有进入清理集合。现在输出扫描保留全部路径，来源身份在冲突分类前解析；可靠 title+artist 或权威身份相同才允许跨格式覆盖，同名冲突会保留旧文件并使用独立目标。
+
+`PreviewCandidate` 新增向后兼容的 `previous_destination_paths` 与 `metadata_destination_paths`；旧单数路径仍只用于读取可恢复历史。覆盖最终化在 coordinator 线程串行执行复读、歌曲库登记和旧文件清理，任一步失败都会撤销 TaskController 的完成计数并形成逐曲失败。仅更新元数据遍历全部确认副本；Skip 可跨格式命中。Rename 已完全从产品冲突策略删除。
+
+自动/真实证据：预览回归覆盖跨格式覆盖、多个副本、Skip、元数据全部副本和身份冲突保留；Tauri 回归覆盖登记失败保留旧输出。六首真实临时音频完成 4 FLAC→WAV+2 MP3，再 AIFF 覆盖，得到新增 0、覆盖 6、完成 6、失败 0，最终 4 AIFF+2 MP3、WAV 0。临时目录自动清理，用户 `/Users/mac2/Music/test` 未被访问。继续交接时保留现有未跟踪验收软链接和 `.pnpm-store`，不把它们打入 App。
+
+最终 arm64 App 为 `src-tauri/target/aarch64-apple-darwin/release/bundle/macos/W4DJ RKB.app`，版本 `3.2.0-beta.3`，构建时间 2026-08-30 01:30 CST，约 93 MiB。`export_emotion_evaluation_manifest` 已改为显式 `acceptance-tools` feature 才能构建，避免验收 CLI 被 Cargo 自动放进 App；工作区调用方式已同步到验收 README。
+
+## 2026-08-30 网易云元数据来源隔离与持久化键修复（已完成）
+
+队列标记 `side-plan:01a05072-netease-metadata-provenance-v1-confirmed-2026-08-30` 已接入共享工作树。轻量 locator 的持久化键现在只 trim/lowercase，宽松标点/空白折叠仅在内存匹配；cache schema 已从 `1` 升为 `2`，旧缓存会判 stale。locator 与正式网易云身份分离，最终匹配后才按定位回读只读数据库原始行，Track ID 优先且同分多候选保持歧义。
+
+元数据逐字段使用源标签、网易云正式数据库和可靠文件名的优先级，保留内部格式并在 `MetadataDiagnostic` 中记录来源与差异类别；Title/Artist/Album 均参与输出校验。W4DJ 登记只读取最终输出容器中的实际文本，缺失时不再使用轻量键或候选文本静默兜底。
+
+544 条真实 locator 只读审计为 544/544 行可回读；当前生产缓存仍标记旧 `schemaVersion=1`，新代码会判 stale 并在后续正常运行时重建。按新持久化键规则重算发现 224 个字段级格式差异、涉及 207 个 Track ID，保留数据库原始内部空格、标点、全半角和引号。审计未修改网易云数据库、应用缓存或用户音频。
+
+最终验证：根库 `cargo test --all`、Tauri `cargo test --manifest-path src-tauri/Cargo.toml`（74/74）、前端 Vitest（12 文件/209 项）、TypeScript、Vite、cargo check、fmt、`git diff --check`、Tauri 严格 Clippy 与根库 `-A dead_code` all-targets Clippy 均通过；根库不抑制既有 dead-code 的严格 all-targets 仍保留历史诊断。最新版 arm64 App 已在最终代码上编译，版本保持 `3.2.0-beta.3`。未 commit/push/merge/release。
+
+## 2026-08-30 网易云索引状态与全局操作区修复（当前交接点）
+
+已修复截图中的两个 UI 状态问题：缓存 ready 事件现在会清除旧的“索引未就绪”warning，并且 ready 状态优先于 stale warning；转换完成后会主动刷新网易云缓存状态，新扫描会重置旧 discoveryId，避免迟到事件覆盖当前结果。长时间扫描提醒已移动到任务 1 进度条右侧的索引状态位置。
+
+“同时开始”下方已经完全移除扫描进度、扫描错误、取消和超时等独立提醒文字，任务卡和右侧索引状态仍保留必要状态；运行中的主按钮仅显示取消操作文案。前端全量 12 文件/212 项、`app.test.ts` 137 项、TypeScript、Vite 和 `git diff --check` 已通过；pnpm 包装命令受本机 `ERR_PNPM_IGNORED_BUILDS` 策略阻断，直接使用同一依赖树的 Vitest 已通过。
+
+接手者后续只需在用户环境完成真实网易云扫描和 GUI 视觉验收。版本保持 `3.2.0-beta.3`，保留工作树现有未提交改动，不 commit/push/merge/release。
+## 2026-08-30 转换前预览真实输出与网易云链接对齐修复
+
+本轮预览新增 `output_files` 真实目的目录快照，输出明细只显示当时存在的非隐藏音频；覆盖明细优先显示 `previous_destination_paths` 中实际将被替换的旧文件，因此 MP3→AIFF 预览不再把 AIFF 计划目标冒充现有输出。网易云来源工具栏改为标题行顶部锚定，数据库链接与扫描按钮统一 `9px / 1.35`。Rust 预览 32/32、前端全量 12 文件/215 项（app.test.ts 140/140）、TypeScript 与 diff-check 已通过；最新版 arm64 App 于 2026-08-30 15:57:23 +0800 重建，版本仍为 `3.2.0-beta.3`，未提交或推送。
+
+## 2026-08-30 预览明细超链接命中区与图标对齐修复
+
+输入/输出/覆盖/跳过/错误明细的歌曲文件名已恢复为可复制文本，不再是整行链接；仅左侧 26×26 图标矩形按钮执行文件夹定位，悬停和焦点样式也限制在该按钮。按钮内部显式清除全局 `.ui-icon` 右间距并固定网格尺寸，修复图标左下偏移。`app.test.ts` 140/140、前端全量 215/215、TypeScript、Vite 已通过，版本保持 `3.2.0-beta.3`。
+
+## 2026-08-30 预览链接高亮完整性修复
+
+高亮样式已从父级外扩 outline 改为图标矩形自身的 focus/hover 边框和内阴影，避免滚动区域裁切导致红色高亮不完整。交互仍为仅左侧 26×26 图标可定位、文件名可复制；前端全量 215/215、TypeScript、Vite 已通过，版本保持 `3.2.0-beta.3`。
+
+## 2026-08-30 转换确认弹窗扁平布局修复
+
+第一次内部滚动方案会让预览卡片和逐曲列表同时出现滚轮并压缩文字，已撤销。当前预览卡片、逐曲列表和双栏明细均自然展开，只有整个确认弹窗在小屏幕放不下时才使用单一外层兜底滚动；默认桌面窗口宽度适度扩大到 `1280`，高度调整为 `800`，主界面底部保留接近顶部红框所示的呼吸留白，正常 6 首确认页直接平铺。布局回归、前端全量 217/217、TypeScript、Vite 与 Tauri 74/74 均通过，版本保持 `3.2.0-beta.3`。
+
+歌曲明细列表保留正常行高并完整展示至少 6 首，第 7 首起才启用列表滚动；不要再次通过压缩行高或继续放大默认窗口来容纳更多歌曲。
+
+逐曲操作状态已统一放到歌名右侧并靠右对齐，覆盖 overwrite、skip、update_metadata 和 new。状态文字使用独立列，歌名保持可复制且在空间不足时省略，因此两者不会重叠。
+
+## 2026-08-30 转换前确认页统计重排
+
+转换前确认页的四个统计模块现为“预计新增”“将覆盖/将跳过/将更新元数据”“输入歌曲数 / 输出歌曲数”“错误文件”。预计新增按所选策略计算：覆盖包含待替换歌曲，跳过的已有歌曲不计入，仅更新元数据只计入实际新建文件。四个统计入口均可打开逐曲明细；预计新增卡片不内嵌文件摘要，展开后是静态文件名/原因列表，不提供打开文件链接。预计新增与当前策略动作的数字强调色相反。
+
+前端 `app.test.ts` 138 项、TypeScript、Vite 和最新版 arm64 App 构建已通过。版本保持 `3.2.0-beta.3`，未 commit/push/merge/release。
+
+## 2026-08-30 转换前确认页输入/输出明细修复（当前交接点）
+
+预计新增统计卡现在可点击展开；卡片不内嵌红框式文件摘要，展开内容是静态文件名/原因列表，不显示打开文件按钮。输入歌曲数 / 输出歌曲数的明细现在分成输入、输出两列，仅展示各自文件夹的文件名。输入、输出、操作和错误明细的整行（包括歌曲文件名）均可触发文件夹定位；输入列保留每个文件的跳过/错误原因，输出列保留目标文件名和文件夹定位动作。
+
+输出明细不再调用仅接受目录的 `open_destination`：新增 `open_destination_file`，已生成文件使用 macOS Finder/Windows Explorer 的选中定位，尚未生成的预测文件打开其父输出目录；两者都不直接打开或播放歌曲。输入明细继续使用 `open_source`，按钮文案为“在文件夹中定位”。回归测试验证可点击预计新增卡、静态文件名/原因明细、两列文件名、原因保留及两种定位动作；最新 arm64 App 于 2026-08-30 14:45:39 +0800 重建，版本保持 `3.2.0-beta.3`，未 commit/push/merge/release。
