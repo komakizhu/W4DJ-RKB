@@ -5,6 +5,7 @@ import {
   bindApp,
   canReuseTrackAnalysis,
   DJ_PLAYLIST_QR_CONCURRENCY,
+  formatHistoryTimestamp,
   pickSourceWithPlatformDialog,
   humanizeError,
   renderDjPlaylistQrPages,
@@ -342,7 +343,41 @@ const createDeferred = <T>() => {
   return { promise, resolve, reject };
 };
 
+describe('history timestamp formatting', () => {
+  it('converts UTC history timestamps to the system timezone', () => {
+    const instant = new Date('2026-07-16T14:05:12Z');
+    const offsetMinutes = -instant.getTimezoneOffset();
+    const offsetSign = offsetMinutes >= 0 ? '+' : '-';
+    const absoluteOffsetMinutes = Math.abs(offsetMinutes);
+    const expected = [
+      `${instant.getFullYear()}-${String(instant.getMonth() + 1).padStart(2, '0')}-${String(instant.getDate()).padStart(2, '0')}`,
+      `${String(instant.getHours()).padStart(2, '0')}:${String(instant.getMinutes()).padStart(2, '0')}:${String(instant.getSeconds()).padStart(2, '0')}`,
+    ].join(' ')
+      + ` UTC${offsetSign}${String(Math.floor(absoluteOffsetMinutes / 60)).padStart(2, '0')}:${String(absoluteOffsetMinutes % 60).padStart(2, '0')}`;
+
+    expect(formatHistoryTimestamp('2026-07-16 14:05:12 UTC')).toBe(expected);
+  });
+
+  it('preserves timestamps it cannot parse', () => {
+    expect(formatHistoryTimestamp('legacy timestamp')).toBe('legacy timestamp');
+  });
+});
+
 describe('renderApp', () => {
+  it('renders conversion history timestamps in the system timezone', () => {
+    const startedAt = '2026-07-16 14:05:12 UTC';
+    const root = renderApp(
+      makeViewState(),
+      null,
+      null,
+      null,
+      [makeHistoryEntry({ started_at: startedAt })],
+    );
+
+    expect(root.querySelector('.history-entry-head strong')?.textContent)
+      .toBe(formatHistoryTimestamp(startedAt));
+  });
+
   it('renders the .w4dj launcher with source attribution and import/export choices', () => {
     const root = renderApp(
       makeViewState(),

@@ -2431,7 +2431,7 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
     <article class="history-entry" data-history-id="${escapeHtml(entry.id)}">
       <header class="history-entry-head">
         <div>
-          <strong>${escapeHtml(entry.started_at)}</strong>
+          <strong>${escapeHtml(formatHistoryTimestamp(entry.started_at))}</strong>
           <span class="history-status" data-history-status="${entry.status}">${historyStatusLabel(entry.status, lang)}</span>
         </div>
         <span>${entry.completed_count}/${entry.new_count} · ${entry.failed_count} ${t('failedCount', lang)}${pendingFiles.length > 0 ? ` · ${pendingFiles.length} ${t('pendingCount', lang)}` : ''}</span>
@@ -2447,6 +2447,88 @@ function renderHistoryEntry(entry: AppHistoryEntry, lang: AppLanguage): string {
       </footer>
     </article>
   `;
+}
+
+const HISTORY_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(?:\s*(UTC|Z|[+-]\d{2}:?\d{2}))?$/i;
+
+function parseHistoryTimestamp(value: string): Date | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const match = HISTORY_TIMESTAMP_PATTERN.exec(trimmed);
+  if (!match) {
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6] || 0);
+  const milliseconds = Number((match[7] || '').padEnd(3, '0')) || 0;
+  const timezone = match[8]?.toUpperCase();
+
+  if (!timezone) {
+    const local = new Date(0);
+    local.setFullYear(year, month - 1, day);
+    local.setHours(hour, minute, second, milliseconds);
+    return local.getFullYear() === year
+      && local.getMonth() === month - 1
+      && local.getDate() === day
+      && local.getHours() === hour
+      && local.getMinutes() === minute
+      && local.getSeconds() === second
+      ? local
+      : null;
+  }
+
+  const utc = new Date(0);
+  utc.setUTCFullYear(year, month - 1, day);
+  utc.setUTCHours(hour, minute, second, milliseconds);
+  if (utc.getUTCFullYear() !== year
+    || utc.getUTCMonth() !== month - 1
+    || utc.getUTCDate() !== day
+    || utc.getUTCHours() !== hour
+    || utc.getUTCMinutes() !== minute
+    || utc.getUTCSeconds() !== second) {
+    return null;
+  }
+
+  if (timezone === 'UTC' || timezone === 'Z') {
+    return utc;
+  }
+
+  const offset = /^([+-])(\d{2}):?(\d{2})$/.exec(timezone);
+  if (!offset) {
+    return null;
+  }
+  const offsetMinutes = Number(offset[2]) * 60 + Number(offset[3]);
+  const direction = offset[1] === '+' ? 1 : -1;
+  return new Date(utc.getTime() - direction * offsetMinutes * 60 * 1000);
+}
+
+/**
+ * History timestamps are persisted in UTC. Date's local accessors use the
+ * WebView's system timezone, which is supplied by macOS and Windows without
+ * requiring platform-specific timezone code in the Rust backend.
+ */
+export function formatHistoryTimestamp(value: string): string {
+  const date = parseHistoryTimestamp(value);
+  if (!date) {
+    return value;
+  }
+
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offsetSign = offsetMinutes >= 0 ? '+' : '-';
+  const absoluteOffsetMinutes = Math.abs(offsetMinutes);
+  const pad = (part: number): string => String(part).padStart(2, '0');
+  const timezone = `UTC${offsetSign}${pad(Math.floor(absoluteOffsetMinutes / 60))}:${pad(absoluteOffsetMinutes % 60)}`;
+
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())} ${timezone}`;
 }
 
 function renderSyncSlot(
