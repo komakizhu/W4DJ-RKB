@@ -3,10 +3,13 @@ use id3::TagLike;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(feature = "ncm-decryption")]
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "ncm-decryption")]
 use ncmdump::Ncmdump;
 
 /// Music-analysis data produced by Essentia.js.
@@ -393,6 +396,7 @@ pub fn read_embedded_track_metadata(path: &Path) -> TrackMetadata {
                 genre: tag.genre().unwrap_or_default().to_string(),
             })
             .unwrap_or_default(),
+        #[cfg(feature = "ncm-decryption")]
         "ncm" => File::open(path)
             .ok()
             .and_then(|file| Ncmdump::from_reader(file).ok())

@@ -312,6 +312,9 @@ export type AppInfo = {
   version: string;
   developer: string;
   project_url: string;
+  product_name?: string;
+  variant?: string;
+  ncm_decryption?: boolean;
 };
 
 export type AppUpdateCheck = {
@@ -1481,6 +1484,7 @@ export async function pickSourceWithPlatformDialog(
   lang: AppLanguage,
   chooseSourceType: () => Promise<SourcePickerChoice>,
   openSource: (options: SourcePickerOpenOptions) => Promise<string | null>,
+  ncmDecryption = true,
 ): Promise<string | null> {
   const choice = await chooseSourceType();
   if (choice === 'cancel') {
@@ -1496,7 +1500,13 @@ export async function pickSourceWithPlatformDialog(
           filters: [
             {
               name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
-              extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
+              extensions: [
+                'mp3',
+                'flac',
+                ...(ncmDecryption ? ['ncm'] : []),
+                'wav',
+                'aiff',
+              ],
             },
           ],
         }),
@@ -1557,6 +1567,9 @@ const defaultServices: AppServices = {
           const selected = await open({ ...options, multiple: false });
           return typeof selected === 'string' ? selected : null;
         },
+        await invoke<AppInfo>('app_info')
+          .then((info) => info.ncm_decryption !== false)
+          .catch(() => true),
       );
     }
   },
@@ -1696,13 +1709,23 @@ const defaultServices: AppServices = {
   clearLibraryCatalogCache: () => invoke<void>('clear_library_catalog_cache'),
   pickLibraryTrackFile: async () => {
     const lang = (localStorage.getItem('w4dj_lang') as AppLanguage) || 'zh';
+    const ncmDecryption = await invoke<AppInfo>('app_info')
+      .then((info) => info.ncm_decryption !== false)
+      .catch(() => true);
     const selected = await open({
       directory: false,
       multiple: false,
       title: lang === 'zh' ? '选择新的歌曲文件' : 'Choose a replacement audio file',
       filters: [{
         name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
-        extensions: ['mp3', 'flac', 'ncm', 'wav', 'aif', 'aiff'],
+        extensions: [
+          'mp3',
+          'flac',
+          ...(ncmDecryption ? ['ncm'] : []),
+          'wav',
+          'aif',
+          'aiff',
+        ],
       }],
     });
     return typeof selected === 'string' ? selected : null;
@@ -7436,7 +7459,7 @@ function renderAboutModal(info: AppInfo | null, update: AppUpdateCheck | null, l
   return `
     <div class="about-modal" data-role="about-modal" role="dialog" aria-modal="true" aria-label="${t('about', lang)}">
       <section class="about-dialog">
-        <p class="panel-kicker">W4DJ RKB</p>
+        <p class="panel-kicker">${escapeHtml(info.product_name || 'W4DJ RKB')}</p>
         <h2>${t('about', lang)}</h2>
         <dl>
           <div><dt>${t('version', lang)}</dt><dd>v${escapeHtml(info.version)}</dd></div>

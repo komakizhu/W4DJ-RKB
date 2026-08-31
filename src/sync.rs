@@ -3,14 +3,15 @@ use crate::concurrency::{ConcurrencyPermit, GlobalConcurrencyBudget};
 use crate::config::{
     FilenameNormalizationPolicy, FilenameRule, LosslessFormat, Mode, NeteaseFilenameFormat,
 };
-use crate::metadata::{
-    FlacMetadata, Metadata, Mp3Metadata, build_id3_tag, build_id3_tag_from_flac,
-};
+use crate::metadata::build_id3_tag_from_flac;
+#[cfg(feature = "ncm-decryption")]
+use crate::metadata::{FlacMetadata, Metadata, Mp3Metadata, build_id3_tag};
 use crate::netease::{NeteaseMetadataResolver, NeteaseRecoveryDiagnostic, RecoveredMetadata};
 use crate::scan_cache::{ScanCache, ScanCacheEntry, can_reuse_derived_name_entry_normalized};
 use crate::task::{TaskController, TaskSnapshot};
 use id3::frame::{Comment, ExtendedText, Lyrics, Picture};
 use id3::{TagLike, Version};
+#[cfg(feature = "ncm-decryption")]
 use ncmdump::Ncmdump;
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -33,7 +34,22 @@ use std::thread;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
+#[cfg(feature = "ncm-decryption")]
 pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "ncm", "wav", "aiff"];
+#[cfg(not(feature = "ncm-decryption"))]
+pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "aiff"];
+
+pub const NCM_DECRYPTION_UNAVAILABLE_MESSAGE: &str =
+    "此 Legacy 版本不包含 NCM 解密功能，请先使用标准版处理 .ncm 文件";
+
+pub fn ncm_decryption_available() -> bool {
+    cfg!(feature = "ncm-decryption")
+}
+
+#[cfg(not(feature = "ncm-decryption"))]
+fn ncm_decryption_unavailable_error() -> io::Error {
+    Error::new(ErrorKind::Unsupported, NCM_DECRYPTION_UNAVAILABLE_MESSAGE)
+}
 const SOURCE_ENTRY_KEY_SEPARATOR: char = '\u{1f}';
 
 /// Return the presentation name from a source-scan key. The suffix is an
@@ -2136,6 +2152,7 @@ pub fn update_existing_metadata_with_resolver_and_policy(
             })?;
             build_id3_tag_from_flac(&tag)
         }
+        #[cfg(feature = "ncm-decryption")]
         "ncm" => {
             let file = File::open(source_path)?;
             let mut ncm = Ncmdump::from_reader(file).map_err(|error| {
@@ -2149,6 +2166,8 @@ pub fn update_existing_metadata_with_resolver_and_policy(
             })?;
             build_id3_tag(&info, &image)
         }
+        #[cfg(not(feature = "ncm-decryption"))]
+        "ncm" => return Err(ncm_decryption_unavailable_error()),
         _ => id3::Tag::read_from_path(source_path).map_err(|error| {
             Error::new(
                 ErrorKind::InvalidData,
@@ -2339,6 +2358,7 @@ fn process_music_file(
                     "mp3" if matches!(output_policy.target_profile, TargetProfile::CompatMp3) => {
                         copy_file(src_path, temporary_output)?;
                     }
+                    #[cfg(feature = "ncm-decryption")]
                     "ncm" => {
                         if let Some((registry, cancelled)) = control {
                             process_ncm_file_to_output_managed(
@@ -2360,6 +2380,8 @@ fn process_music_file(
                             )?
                         }
                     }
+                    #[cfg(not(feature = "ncm-decryption"))]
+                    "ncm" => return Err(ncm_decryption_unavailable_error()),
                     _ => {
                         if let Some((registry, cancelled)) = control {
                             convert_audio_to_output_path_managed(
@@ -3205,6 +3227,7 @@ fn read_source_container_metadata(source_path: &Path) -> id3::Tag {
         "flac" => metaflac::Tag::read_from_path(source_path)
             .map(|tag| build_id3_tag_from_flac(&tag))
             .unwrap_or_else(|_| id3::Tag::new()),
+        #[cfg(feature = "ncm-decryption")]
         "ncm" => {
             let Ok(file) = File::open(source_path) else {
                 return id3::Tag::new();
@@ -3218,6 +3241,8 @@ fn read_source_container_metadata(source_path: &Path) -> id3::Tag {
             let image = ncm.get_image().unwrap_or_default();
             build_id3_tag(&info, &image)
         }
+        #[cfg(not(feature = "ncm-decryption"))]
+        "ncm" => id3::Tag::new(),
         _ => read_id3_tag_or_empty(source_path),
     }
 }
@@ -3856,6 +3881,7 @@ fn configure_background_process(command: &mut Command) {
 #[cfg(not(target_os = "windows"))]
 fn configure_background_process(_command: &mut Command) {}
 
+#[cfg(feature = "ncm-decryption")]
 fn process_ncm_file_to_output(
     src_path: &Path,
     output_path: &Path,
@@ -3873,6 +3899,7 @@ fn process_ncm_file_to_output(
     )
 }
 
+#[cfg(feature = "ncm-decryption")]
 fn process_ncm_file_to_output_managed(
     src_path: &Path,
     output_path: &Path,
@@ -3892,6 +3919,7 @@ fn process_ncm_file_to_output_managed(
     )
 }
 
+#[cfg(feature = "ncm-decryption")]
 fn process_ncm_file_to_output_control(
     src_path: &Path,
     output_path: &Path,
@@ -4102,6 +4130,7 @@ pub(crate) fn effective_source_extension(source_path: &Path) -> String {
     detect_ncm_output_extension(path).unwrap_or(extension)
 }
 
+#[cfg(feature = "ncm-decryption")]
 fn detect_ncm_output_extension(src_path: &Path) -> io::Result<String> {
     let file = File::open(src_path)?;
     let mut ncm = Ncmdump::from_reader(file).map_err(|e| {
@@ -4118,6 +4147,11 @@ fn detect_ncm_output_extension(src_path: &Path) -> io::Result<String> {
     })?;
 
     Ok(info.format.trim().to_lowercase())
+}
+
+#[cfg(not(feature = "ncm-decryption"))]
+fn detect_ncm_output_extension(_src_path: &Path) -> io::Result<String> {
+    Err(ncm_decryption_unavailable_error())
 }
 
 fn remove_conflicting_outputs(
@@ -4289,6 +4323,7 @@ pub(crate) fn derive_song_name_with_policy(
             netease_filename_format,
             filename_policy,
         ),
+        #[cfg(feature = "ncm-decryption")]
         "ncm" => song_name_from_ncm(
             path,
             filename_rule,
@@ -4296,6 +4331,8 @@ pub(crate) fn derive_song_name_with_policy(
             netease_filename_format,
             filename_policy,
         ),
+        #[cfg(not(feature = "ncm-decryption"))]
+        "ncm" => None,
         _ => None,
     };
 
@@ -4467,6 +4504,7 @@ fn song_name_from_audio_tag(
     )
 }
 
+#[cfg(feature = "ncm-decryption")]
 fn song_name_from_ncm(
     path: &Path,
     filename_rule: FilenameRule,
@@ -5080,6 +5118,7 @@ fn sanitize_filename_component(value: &str) -> String {
     crate::filename_policy::sanitize_filename_component(value)
 }
 
+#[cfg(feature = "ncm-decryption")]
 fn write_container_tags(
     output_path: &Path,
     target_profile: TargetProfile,
@@ -5101,17 +5140,18 @@ fn write_container_tags(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveFfmpegRegistry, ConversionMetadataContext, EmbeddedAnalysis, SongIdentity,
-        apply_track_analysis_metadata, build_song_name, build_song_name_with_policy,
-        build_song_name_with_rule, commit_temporary_output, compare_music_dicts, derive_song_name,
-        derive_song_name_with_policy, derive_song_name_with_policy_and_resolver,
-        derive_song_name_with_rule, derive_song_name_with_settings, ensure_generated_output,
-        ensure_output_metadata, ensure_output_metadata_with_settings,
+        ActiveFfmpegRegistry, ConversionMetadataContext, EmbeddedAnalysis,
+        SUPPORTED_SOURCE_EXTENSIONS, SongIdentity, apply_track_analysis_metadata, build_song_name,
+        build_song_name_with_policy, build_song_name_with_rule, commit_temporary_output,
+        compare_music_dicts, derive_song_name, derive_song_name_with_policy,
+        derive_song_name_with_policy_and_resolver, derive_song_name_with_rule,
+        derive_song_name_with_settings, ensure_generated_output, ensure_output_metadata,
+        ensure_output_metadata_with_settings,
         ensure_output_metadata_with_settings_with_context_and_policy,
         enumerate_music_files_observed, fill_missing_metadata, find_ffmpeg_next_to_exe,
         infer_song_identity, inspect_metadata_diagnostic_with_resolver, is_hidden_path,
-        is_ignored_music_file, merge_recovered_metadata, remove_conflicting_outputs,
-        run_output_transaction, sanitize_filename_component,
+        is_ignored_music_file, merge_recovered_metadata, ncm_decryption_available,
+        remove_conflicting_outputs, run_output_transaction, sanitize_filename_component,
         sanitize_preserve_source_filename_component, strip_163_key_from_mp3,
         sync_music_library_transactional_with_observer_and_budget_and_context,
         target_output_path_with_policy, update_analysis_metadata_transactionally,
@@ -5134,6 +5174,15 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn exposes_the_expected_ncm_capability_for_each_build_variant() {
+        assert_eq!(ncm_decryption_available(), cfg!(feature = "ncm-decryption"));
+        assert_eq!(
+            SUPPORTED_SOURCE_EXTENSIONS.contains(&"ncm"),
+            cfg!(feature = "ncm-decryption")
+        );
+    }
 
     fn write_executable_file(path: &Path, contents: &[u8]) {
         fs::write(path, contents).unwrap();

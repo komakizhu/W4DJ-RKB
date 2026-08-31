@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(all(feature = "legacy", feature = "ncm-decryption"))]
+compile_error!("legacy and ncm-decryption features cannot be enabled together");
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
@@ -11,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
+#[cfg(feature = "ncm-decryption")]
 use ncmdump::Ncmdump;
 use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -998,6 +1002,9 @@ struct AppInfo {
     version: &'static str,
     developer: &'static str,
     project_url: &'static str,
+    product_name: &'static str,
+    variant: &'static str,
+    ncm_decryption: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -1987,16 +1994,20 @@ fn open_source(path: String) -> Result<(), String> {
 }
 
 fn is_analyzable_audio_file(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(
-                    extension.to_ascii_lowercase().as_str(),
-                    "mp3" | "flac" | "ncm" | "wav" | "aiff" | "aif"
-                )
-            })
+    if !path.is_file() {
+        return false;
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase());
+    let Some(extension) = extension else {
+        return false;
+    };
+
+    matches!(extension.as_str(), "mp3" | "flac" | "wav" | "aiff" | "aif")
+        || (w4dj::sync::ncm_decryption_available() && extension == "ncm")
 }
 
 fn collect_analyzable_audio_files(path: &Path, output: &mut Vec<String>) -> io::Result<()> {
@@ -2050,14 +2061,18 @@ fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
         return Err(String::from("音频路径为空"));
     }
     let path = PathBuf::from(trimmed);
+    let is_ncm = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"));
+    if is_ncm && !w4dj::sync::ncm_decryption_available() {
+        return Err(w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE.to_string());
+    }
     if !is_analyzable_audio_file(&path) {
         return Err(format!("暂不支持分析此音频文件：{}", path.display()));
     }
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
-    {
+    #[cfg(feature = "ncm-decryption")]
+    if is_ncm {
         let file = fs::File::open(&path).map_err(|error| format!("读取 NCM 文件失败：{error}"))?;
         let mut ncm = Ncmdump::from_reader(file).map_err(|error| format!("解析 NCM 文件失败：{error}"))?;
         return ncm
@@ -4184,6 +4199,17 @@ fn app_info() -> AppInfo {
         version: env!("CARGO_PKG_VERSION"),
         developer: "komakizhu",
         project_url: "https://github.com/komakizhu/W4DJ-RKB",
+        product_name: if cfg!(feature = "legacy") {
+            "W4DJ RKB Legacy"
+        } else {
+            "W4DJ RKB"
+        },
+        variant: if cfg!(feature = "legacy") {
+            "legacy"
+        } else {
+            "standard"
+        },
+        ncm_decryption: w4dj::sync::ncm_decryption_available(),
     }
 }
 
@@ -9371,10 +9397,20 @@ fn validate_source_input(source: &str) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("输入来源不存在：{source}"));
     }
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
+        && !w4dj::sync::ncm_decryption_available()
+    {
+        return Err(w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE.to_string());
+    }
     if path.is_file() && !is_supported_source_file(path) {
-        return Err(String::from(
-            "不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件",
-        ));
+        return Err(if w4dj::sync::ncm_decryption_available() {
+            String::from("不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件")
+        } else {
+            String::from("不支持的单曲格式；请选择 MP3、FLAC、WAV 或 AIFF 文件")
+        });
     }
     if !path.is_dir() && !path.is_file() {
         return Err(String::from("输入来源不是文件夹或音频文件"));

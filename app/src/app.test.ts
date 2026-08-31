@@ -292,7 +292,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '3.2.0-beta.3',
+    version: '3.2.0',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -1857,13 +1857,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '3.2.0-beta.3',
+        version: '3.2.0',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.0-beta.3');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.0');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
     expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();
@@ -2923,6 +2923,29 @@ describe('bindApp', () => {
         {
           name: 'Supported audio files',
           extensions: ['mp3', 'flac', 'ncm', 'wav', 'aiff'],
+        },
+      ],
+    });
+  });
+
+  it('omits NCM from the platform picker for the Legacy build', async () => {
+    const openSource = vi.fn().mockResolvedValue('/music/track.flac');
+
+    await pickSourceWithPlatformDialog(
+      'Choose source 2',
+      'en',
+      async () => 'track',
+      openSource,
+      false,
+    );
+
+    expect(openSource).toHaveBeenCalledWith({
+      directory: false,
+      title: 'Choose source 2',
+      filters: [
+        {
+          name: 'Supported audio files',
+          extensions: ['mp3', 'flac', 'wav', 'aiff'],
         },
       ],
     });
