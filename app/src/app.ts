@@ -1804,10 +1804,13 @@ export function renderApp(
         <h1>${t('title', state.lang)}</h1>
       </div>
       <div class="topbar-actions">
-        <button type="button" class="help-button" data-action="open-help"${onboardingTarget === 'tutorial' ? ' data-onboarding-target="tutorial"' : ''} aria-label="${t('tutorial', state.lang)}" title="${t('tutorial', state.lang)}">
-          ${icon('help')}
-          <span>${t('tutorial', state.lang)}</span>
-        </button>
+        <div class="tutorial-anchor"${onboardingTarget === 'tutorial' ? ' data-onboarding-anchor="tutorial"' : ''}>
+          <button type="button" class="help-button" data-action="open-help"${onboardingTarget === 'tutorial' ? ' data-onboarding-target="tutorial"' : ''} aria-label="${t('tutorial', state.lang)}" title="${t('tutorial', state.lang)}">
+            ${icon('help')}
+            <span>${t('tutorial', state.lang)}</span>
+          </button>
+          ${onboardingTarget === 'tutorial' ? renderOnboardingCallout(state.lang, onboardingStep) : ''}
+        </div>
         <button type="button" class="help-button" data-action="open-library" aria-label="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" title="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" data-feature-hidden="${SONG_LIBRARY_FEATURE_VISIBLE ? 'false' : 'true'}"${SONG_LIBRARY_FEATURE_VISIBLE ? '' : ' hidden'}>
           ${icon('list')}
           <span>${state.lang === 'zh' ? '歌曲库' : 'Library'}</span>
@@ -1976,7 +1979,7 @@ export function renderApp(
     ${renderPreviewModal(previewModal, state.lang, previewBusy)}
     ${renderAboutModal(aboutInfo, updateInfo, state.lang)}
     ${renderHelpModal(helpVisible, state.lang)}
-    ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep)}
+    ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep, onboardingTarget === 'tutorial')}
     ${renderLibraryDashboard(libraryState, state.lang)}
     ${renderDjPlaylistModal(djPlaylistState, state.lang)}
   `;
@@ -7515,10 +7518,24 @@ function renderHelpModal(visible: boolean, lang: AppLanguage): string {
   `;
 }
 
-function renderOnboardingModal(visible: boolean, lang: AppLanguage, step: OnboardingStep = 0): string {
+function renderOnboardingModal(
+  visible: boolean,
+  lang: AppLanguage,
+  step: OnboardingStep = 0,
+  calloutAnchored = false,
+): string {
   if (!visible) {
     return '';
   }
+
+  return `
+    <div class="onboarding-modal" data-role="onboarding-backdrop" aria-hidden="true">
+      ${calloutAnchored ? '' : renderOnboardingCallout(lang, step)}
+    </div>
+  `;
+}
+
+function renderOnboardingCallout(lang: AppLanguage, step: OnboardingStep): string {
 
   const steps = [
     { target: 'mode', title: t('onboardingStepOneTitle', lang), body: t('onboardingStepOneBody', lang) },
@@ -7531,8 +7548,7 @@ function renderOnboardingModal(visible: boolean, lang: AppLanguage, step: Onboar
   const isLastStep = step === ONBOARDING_STEP_COUNT - 1;
 
   return `
-    <div class="onboarding-modal" data-role="onboarding-modal" data-step="${step}" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-body">
-      <section class="onboarding-callout" data-role="onboarding-step">
+    <section class="onboarding-callout" data-role="onboarding-modal" data-step="${step}" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-body">
         <div class="onboarding-callout-head">
           <div>
             <p class="panel-kicker">W4DJ RKB</p>
@@ -7549,8 +7565,7 @@ function renderOnboardingModal(visible: boolean, lang: AppLanguage, step: Onboar
             <button type="button" class="global-action" data-action="onboarding-next">${isLastStep ? t('onboardingFinish', lang) : t('onboardingNext', lang)}</button>
           </div>
         </footer>
-      </section>
-    </div>
+    </section>
   `;
 }
 
