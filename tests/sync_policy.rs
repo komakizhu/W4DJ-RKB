@@ -22,6 +22,7 @@ mod task;
 
 use config::{FilenameNormalizationPolicy, LosslessFormat, Mode, NeteaseFilenameFormat};
 use id3::{Tag, TagLike};
+#[cfg(feature = "ncm-decryption")]
 use ncmdump::NcmInfo;
 use netease::NeteaseMetadataResolver;
 use std::collections::HashMap;
@@ -573,6 +574,7 @@ fn cleanup_temporary_outputs_preserves_macos_appledouble_sidecars() {
 }
 
 #[test]
+#[cfg(feature = "ncm-decryption")]
 fn build_id3_tag_carries_cover_and_text() {
     let info = NcmInfo {
         album: "Album".into(),

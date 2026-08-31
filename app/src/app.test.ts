@@ -2933,6 +2933,29 @@ describe('bindApp', () => {
     });
   });
 
+  it('omits NCM from the platform picker for the Legacy build', async () => {
+    const openSource = vi.fn().mockResolvedValue('/music/track.flac');
+
+    await pickSourceWithPlatformDialog(
+      'Choose source 2',
+      'en',
+      async () => 'track',
+      openSource,
+      false,
+    );
+
+    expect(openSource).toHaveBeenCalledWith({
+      directory: false,
+      title: 'Choose source 2',
+      filters: [
+        {
+          name: 'Supported audio files',
+          extensions: ['mp3', 'flac', 'wav', 'aiff'],
+        },
+      ],
+    });
+  });
+
   it('does not open a platform picker after cancelling the source type prompt', async () => {
     const openSource = vi.fn();
 
