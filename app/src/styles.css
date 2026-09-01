@@ -214,6 +214,12 @@ h1 {
   gap: 8px;
 }
 
+.tutorial-anchor {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
 .topbar-actions > [hidden] {
   display: none !important;
 }
@@ -1798,17 +1804,23 @@ h1 {
 
 .app-shell[data-onboarding-active="true"][data-onboarding-step="3"] .onboarding-callout {
   right: auto;
-  bottom: 178px;
+  bottom: 236px;
   left: 24px;
   width: min(360px, calc(100% - 48px));
   transform: none;
 }
 
-.app-shell[data-onboarding-active="true"][data-onboarding-step="4"] .onboarding-callout {
+.app-shell[data-onboarding-active="true"] .tutorial-anchor[data-onboarding-anchor="tutorial"] {
+  z-index: 41;
+}
+
+.app-shell[data-onboarding-active="true"][data-onboarding-step="4"] .tutorial-anchor[data-onboarding-anchor="tutorial"] .onboarding-callout {
+  top: calc(100% + 16px);
   right: auto;
-  bottom: 24px;
-  left: 24px;
-  transform: none;
+  bottom: auto;
+  left: 50%;
+  width: min(360px, calc(100vw - 48px));
+  transform: translateX(-50%);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1825,6 +1837,22 @@ h1 {
     left: 12px;
     width: auto;
     transform: none;
+  }
+
+  .app-shell[data-onboarding-active="true"][data-onboarding-step="3"] .onboarding-callout {
+    right: 12px;
+    bottom: 190px;
+    left: 12px;
+    width: auto;
+  }
+
+  .app-shell[data-onboarding-active="true"][data-onboarding-step="4"] .tutorial-anchor[data-onboarding-anchor="tutorial"] .onboarding-callout {
+    top: calc(100% + 12px);
+    right: auto;
+    bottom: auto;
+    left: 50%;
+    width: min(360px, calc(100vw - 24px));
+    transform: translateX(-50%);
   }
 }
 

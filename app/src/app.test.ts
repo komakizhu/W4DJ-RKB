@@ -292,7 +292,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '3.2.0',
+    version: '3.2.1',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -1857,13 +1857,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '3.2.0',
+        version: '3.2.1',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.0');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.1');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
     expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();
@@ -2027,11 +2027,16 @@ describe('renderApp', () => {
 
   it('uses the fifth onboarding step to explain how to reopen the guide', () => {
     const root = renderApp(makeViewState(), null, null, null, [], null, false, null, false, false, true, 4);
+    const tutorialAnchor = root.querySelector('[data-onboarding-anchor="tutorial"]');
+    const tutorialTarget = root.querySelector('[data-onboarding-target="tutorial"]');
+    const onboardingCallout = root.querySelector('[data-role="onboarding-modal"]');
 
-    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('随时重新查看教程');
-    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('重新查看使用引导');
-    expect(root.querySelector('[data-role="onboarding-modal"]')?.textContent).toContain('5/5');
-    expect(root.querySelector('[data-onboarding-target="tutorial"]')?.getAttribute('data-action')).toBe('open-help');
+    expect(onboardingCallout?.textContent).toContain('随时重新查看教程');
+    expect(onboardingCallout?.textContent).toContain('重新查看使用引导');
+    expect(onboardingCallout?.textContent).toContain('5/5');
+    expect(tutorialTarget?.getAttribute('data-action')).toBe('open-help');
+    expect(tutorialAnchor?.contains(tutorialTarget)).toBe(true);
+    expect(tutorialAnchor?.contains(onboardingCallout)).toBe(true);
   });
 
   it('turns technical conversion errors into recovery-focused user messages', () => {
