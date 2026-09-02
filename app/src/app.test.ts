@@ -292,7 +292,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '3.2.1',
+    version: '3.2.2',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -1857,13 +1857,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '3.2.1',
+        version: '3.2.2',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.1');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.2');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
     expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();
@@ -2933,6 +2933,29 @@ describe('bindApp', () => {
     });
   });
 
+  it('omits NCM from the platform picker for the Legacy build', async () => {
+    const openSource = vi.fn().mockResolvedValue('/music/track.flac');
+
+    await pickSourceWithPlatformDialog(
+      'Choose source 2',
+      'en',
+      async () => 'track',
+      openSource,
+      false,
+    );
+
+    expect(openSource).toHaveBeenCalledWith({
+      directory: false,
+      title: 'Choose source 2',
+      filters: [
+        {
+          name: 'Supported audio files',
+          extensions: ['mp3', 'flac', 'wav', 'aiff'],
+        },
+      ],
+    });
+  });
+
   it('does not open a platform picker after cancelling the source type prompt', async () => {
     const openSource = vi.fn();
 
@@ -3653,7 +3676,9 @@ describe('bindApp', () => {
   });
 
   it('excludes skipped songs from the expected-new count', async () => {
+    const openDestinationFile = vi.fn().mockResolvedValue(undefined);
     const services = makeMockServices({
+      openDestinationFile,
       loadScanResult: vi.fn().mockResolvedValue([{
         ...makePreview(0),
         preview: {
@@ -3714,6 +3739,62 @@ describe('bindApp', () => {
     const skippedStatus = root.querySelector('[data-side="input"] .preview-detail-entry-status');
     expect(skippedStatus?.textContent).toContain('输出已存在');
     expect(skippedStatus?.parentElement?.classList.contains('preview-detail-link-row')).toBe(true);
+    (root.querySelector('[data-action="close-preview-detail"]') as HTMLButtonElement).click();
+    (root.querySelector('[data-action="preview-detail"][data-detail-kind="action"]') as HTMLButtonElement).click();
+    const skippedRow = root.querySelector('[data-role="preview-detail-dialog"] .preview-detail-list li');
+    expect(skippedRow?.textContent).toContain('existing.mp3');
+    const skippedLink = skippedRow?.querySelector('[data-action="open-preview-file"]') as HTMLButtonElement;
+    expect(skippedLink.dataset.openTarget).toBe('destination-file');
+    expect(skippedLink.dataset.path).toBe('/music/out-1/existing.mp3');
+    skippedLink.click();
+    expect(openDestinationFile).toHaveBeenCalledWith('/music/out-1/existing.mp3');
+  });
+
+  it('shows only scheduled updates in metadata-only action details', async () => {
+    const preview = makePreview(0);
+    const services = makeMockServices({
+      loadScanResult: vi.fn().mockResolvedValue([{
+        ...preview,
+        conflict_strategy: 'update_metadata',
+        preview: {
+          ...preview.preview,
+          new_count: 0,
+          existing_count: 2,
+          skipped_count: 1,
+          input_count: 2,
+          action_kind: 'update_metadata',
+          action_count: 1,
+          detail_items: [
+            {
+              name: 'scheduled.mp3',
+              source_path: '/music/in-1/scheduled.mp3',
+              destination_path: '/music/out-1/scheduled.mp3',
+              existing_output: true,
+              classification: 'update_metadata',
+              reason: null,
+            },
+            {
+              name: 'unsupported.flac',
+              source_path: '/music/in-1/unsupported.flac',
+              destination_path: '/music/out-1/unsupported.flac',
+              existing_output: true,
+              classification: 'skip',
+              reason: '此格式暂不支持仅更新元数据',
+            },
+          ],
+        },
+      }]),
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState({ conflictStrategy: 'update_metadata' }), services);
+    (root.querySelector('[data-action="start-all"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="preview-modal"]')).not.toBeNull());
+
+    (root.querySelector('[data-action="preview-detail"][data-detail-kind="action"]') as HTMLButtonElement).click();
+    const dialog = root.querySelector('[data-role="preview-detail-dialog"]');
+    expect(dialog?.textContent).toContain('scheduled.mp3');
+    expect(dialog?.textContent).not.toContain('unsupported.flac');
+    expect(dialog?.querySelectorAll('.preview-detail-list li')).toHaveLength(1);
   });
 
   it('keeps a completed scan result visible with the input denominator', () => {

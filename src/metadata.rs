@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
-use std::io::{Cursor, Error, ErrorKind, Seek, SeekFrom, Write};
+#[cfg(feature = "ncm-decryption")]
+use std::io::{Cursor, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind};
 use std::path::Path;
 
 use anyhow::Result;
 use id3::frame::Picture;
 use id3::{TagLike, Version};
 
+#[cfg(feature = "ncm-decryption")]
 use ncmdump::NcmInfo;
 
 use crate::analysis::TrackAnalysis;
@@ -401,11 +404,13 @@ pub(crate) fn get_image_mime_type(bytes: &[u8]) -> &'static str {
     "image/*"
 }
 
+#[cfg(feature = "ncm-decryption")]
 pub(crate) trait Metadata {
     /// Get the data with metadata.
     fn inject_metadata(&mut self, data: Vec<u8>) -> Result<Vec<u8>>;
 }
 
+#[cfg(feature = "ncm-decryption")]
 pub(crate) fn build_id3_tag(info: &NcmInfo, image: &[u8]) -> id3::Tag {
     let artists = info
         .artist
@@ -484,8 +489,10 @@ pub(crate) fn build_id3_tag_from_flac(tag: &metaflac::Tag) -> id3::Tag {
     result
 }
 
+#[cfg(feature = "ncm-decryption")]
 pub(crate) struct Mp3Metadata(id3::Tag);
 
+#[cfg(feature = "ncm-decryption")]
 impl Mp3Metadata {
     pub(crate) fn new(info: &NcmInfo, image: &[u8], data: &[u8]) -> Self {
         let cursor = Cursor::new(data.to_vec());
@@ -510,6 +517,7 @@ impl Mp3Metadata {
     }
 }
 
+#[cfg(feature = "ncm-decryption")]
 impl Metadata for Mp3Metadata {
     fn inject_metadata(&mut self, data: Vec<u8>) -> Result<Vec<u8>> {
         let mut cursor = Cursor::new(data);
@@ -519,8 +527,10 @@ impl Metadata for Mp3Metadata {
     }
 }
 
+#[cfg(feature = "ncm-decryption")]
 pub(crate) struct FlacMetadata(metaflac::Tag);
 
+#[cfg(feature = "ncm-decryption")]
 impl FlacMetadata {
     pub(crate) fn new(info: &NcmInfo, image: &[u8], data: &[u8]) -> Self {
         let mut tag = metaflac::Tag::read_from(&mut Cursor::new(&data))
@@ -547,6 +557,7 @@ impl FlacMetadata {
     }
 }
 
+#[cfg(feature = "ncm-decryption")]
 impl Metadata for FlacMetadata {
     fn inject_metadata(&mut self, data: Vec<u8>) -> Result<Vec<u8>> {
         let data = metaflac::Tag::skip_metadata(&mut Cursor::new(&data));
@@ -561,26 +572,9 @@ impl Metadata for FlacMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        Metadata, MetadataWriteProfile, Mp3Metadata, SourceMetadata, build_id3_tag_from_parts,
-        build_output_metadata, split_supported_fields,
+        MetadataWriteProfile, SourceMetadata, build_id3_tag_from_parts, build_output_metadata,
+        split_supported_fields,
     };
-    use id3::{Tag, TagLike, Version};
-    use ncmdump::NcmInfo;
-    use std::io::Cursor;
-
-    fn sample_info() -> NcmInfo {
-        NcmInfo {
-            name: "Track title".to_string(),
-            id: 1,
-            album: "Album".to_string(),
-            artist: vec![("Artist".to_string(), 2)],
-            bitrate: 320_000,
-            duration: 180_000,
-            format: "mp3".to_string(),
-            mv_id: None,
-            alias: None,
-        }
-    }
 
     #[test]
     fn ignores_invalid_cover_bytes_when_building_id3_metadata() {
@@ -592,33 +586,6 @@ mod tests {
         );
 
         assert_eq!(tag.pictures().count(), 0);
-    }
-
-    #[test]
-    fn replaces_stale_mp3_cover_with_the_extracted_cover() {
-        let mut original = Tag::new();
-        original.add_frame(id3::frame::Picture {
-            mime_type: "image/jpeg".to_string(),
-            picture_type: id3::frame::PictureType::CoverFront,
-            description: String::new(),
-            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x01],
-        });
-        let mut original_bytes = Vec::new();
-        original
-            .write_to(&mut original_bytes, Version::Id3v23)
-            .unwrap();
-        original_bytes.extend_from_slice(b"audio");
-
-        let extracted_cover = vec![0xff, 0xd8, 0xff, 0xe0, 0x02];
-        let mut metadata = Mp3Metadata::new(&sample_info(), &extracted_cover, &original_bytes);
-        let output = metadata.inject_metadata(b"audio".to_vec()).unwrap();
-        let tag = Tag::read_from2(Cursor::new(output)).unwrap();
-        let pictures = tag.pictures().collect::<Vec<_>>();
-
-        assert_eq!(pictures.len(), 1);
-        assert_eq!(pictures[0].data, extracted_cover);
-        assert_eq!(tag.title(), Some("Track title"));
-        assert_eq!(tag.artist(), Some("Artist"));
     }
 
     #[test]
@@ -654,5 +621,54 @@ mod tests {
         assert_eq!(plan.fields.get("genre"), Some(&"J-Pop".to_string()));
         assert_eq!(plan.fields.get("copyright"), Some(&"Copyright".to_string()));
         assert_eq!(plan.fields.get("date"), Some(&"2024-01-01".to_string()));
+    }
+}
+
+#[cfg(all(test, feature = "ncm-decryption"))]
+mod ncm_tests {
+    use super::{Metadata, Mp3Metadata};
+    use id3::{Tag, TagLike, Version};
+    use ncmdump::NcmInfo;
+    use std::io::Cursor;
+
+    fn sample_info() -> NcmInfo {
+        NcmInfo {
+            name: "Track title".to_string(),
+            id: 1,
+            album: "Album".to_string(),
+            artist: vec![("Artist".to_string(), 2)],
+            bitrate: 320_000,
+            duration: 180_000,
+            format: "mp3".to_string(),
+            mv_id: None,
+            alias: None,
+        }
+    }
+
+    #[test]
+    fn replaces_stale_mp3_cover_with_the_extracted_cover() {
+        let mut original = Tag::new();
+        original.add_frame(id3::frame::Picture {
+            mime_type: "image/jpeg".to_string(),
+            picture_type: id3::frame::PictureType::CoverFront,
+            description: String::new(),
+            data: vec![0xff, 0xd8, 0xff, 0xe0, 0x01],
+        });
+        let mut original_bytes = Vec::new();
+        original
+            .write_to(&mut original_bytes, Version::Id3v23)
+            .unwrap();
+        original_bytes.extend_from_slice(b"audio");
+
+        let extracted_cover = vec![0xff, 0xd8, 0xff, 0xe0, 0x02];
+        let mut metadata = Mp3Metadata::new(&sample_info(), &extracted_cover, &original_bytes);
+        let output = metadata.inject_metadata(b"audio".to_vec()).unwrap();
+        let tag = Tag::read_from2(Cursor::new(output)).unwrap();
+        let pictures = tag.pictures().collect::<Vec<_>>();
+
+        assert_eq!(pictures.len(), 1);
+        assert_eq!(pictures[0].data, extracted_cover);
+        assert_eq!(tag.title(), Some("Track title"));
+        assert_eq!(tag.artist(), Some("Artist"));
     }
 }

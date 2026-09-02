@@ -16,13 +16,16 @@ jobs:
         include:
           - platform: 'macos-latest'
             args: '--bundles dmg'
-            asset_name: 'W4DJ-RKB-macOS-Apple-Silicon-v[version][ext]'
+            asset_name_prefix: 'W4DJ-RKB-macOS-Apple-Silicon-v'
+            asset_extension: '[ext]'
           - platform: 'macos-15-intel'
             args: '--bundles dmg'
-            asset_name: 'W4DJ-RKB-macOS-Intel-v[version][ext]'
+            asset_name_prefix: 'W4DJ-RKB-macOS-Intel-v'
+            asset_extension: '[ext]'
           - platform: 'windows-latest'
             args: '--bundles nsis'
-            asset_name: 'W4DJ-RKB-Windows-Installer-v[version][setup][ext]'
+            asset_name_prefix: 'W4DJ-RKB-Windows-Installer-v'
+            asset_extension: '[setup][ext]'
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -68,6 +71,25 @@ jobs:
         run: |
           Invoke-WebRequest -Uri "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/ffmpeg-win32-x64" -OutFile "src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe"
 
+      - name: Select release variant
+        id: variant
+        shell: bash
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-legacy)
+              echo 'tauri_args=-- --no-default-features --features legacy' >> "$GITHUB_OUTPUT"
+              echo 'config_args=--config src-tauri/tauri.legacy.conf.json' >> "$GITHUB_OUTPUT"
+              echo 'asset_suffix=-Legacy' >> "$GITHUB_OUTPUT"
+              echo 'app_name=W4DJ RKB Legacy' >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo 'tauri_args=' >> "$GITHUB_OUTPUT"
+              echo 'config_args=' >> "$GITHUB_OUTPUT"
+              echo 'asset_suffix=' >> "$GITHUB_OUTPUT"
+              echo 'app_name=W4DJ RKB' >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
       - name: Prepare release notes
         shell: bash
         run: |
@@ -97,8 +119,8 @@ jobs:
           releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: false
           prerelease: true
-          args: ${{ matrix.args }}
-          releaseAssetNamePattern: ${{ matrix.asset_name }}
+          args: ${{ matrix.args }} ${{ steps.variant.outputs.config_args }} ${{ steps.variant.outputs.tauri_args }}
+          releaseAssetNamePattern: '${{ matrix.asset_name_prefix }}[version]${{ steps.variant.outputs.asset_suffix }}${{ matrix.asset_extension }}'
 
       - name: Add macOS Gatekeeper repair helper to DMG
         if: runner.os == 'macOS'
@@ -117,6 +139,7 @@ jobs:
           workdir="$(mktemp -d)"
           rw_image="$workdir/w4dj-rw.dmg"
           mountpoint="$workdir/mount"
+          app_name='${{ steps.variant.outputs.app_name }}'
           mkdir -p "$mountpoint"
 
           hdiutil convert "$dmg" -format UDRW -o "$rw_image"
@@ -130,7 +153,7 @@ jobs:
               set current view of container window to icon view
               set icon size of icon view options of container window to 128
               set arrangement of icon view options of container window to not arranged
-              set position of item "W4DJ RKB.app" to {150, 240}
+              set position of item "${app_name}.app" to {150, 240}
               set position of item "解决文件已损坏问题（双击）.command" to {410, 240}
               set position of item "Applications" to {670, 240}
               close
@@ -145,8 +168,8 @@ jobs:
           verify_mount="$workdir/verify-mount"
           mkdir -p "$verify_mount"
           hdiutil attach "$rebuilt" -mountpoint "$verify_mount" -nobrowse -noautoopen
-          if [[ ! -d "$verify_mount/W4DJ RKB.app" ]]; then
-            echo "最终 DMG 缺少 W4DJ RKB.app" >&2
+          if [[ ! -d "$verify_mount/$app_name.app" ]]; then
+            echo "最终 DMG 缺少 $app_name.app" >&2
             exit 1
           fi
           if [[ ! -x "$verify_mount/解决文件已损坏问题（双击）.command" ]]; then
@@ -162,7 +185,8 @@ jobs:
           mv "$rebuilt" "$dmg"
 
           version="${GITHUB_REF_NAME#v}"
-          asset_name='${{ matrix.asset_name }}'
+          version="${version%-legacy}"
+          asset_name='${{ matrix.asset_name_prefix }}[version]${{ steps.variant.outputs.asset_suffix }}${{ matrix.asset_extension }}'
           asset_name="${asset_name//\[version\]/$version}"
           asset_name="${asset_name//\[ext\]/.dmg}"
           renamed_dmg="$workdir/$asset_name"

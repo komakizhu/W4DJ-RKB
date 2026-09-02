@@ -13,6 +13,7 @@ W4DJ RKB 基于并继续复刻开发自 [Slipstream-Max/w4dj](https://github.com
 ## 1. 产品主要功能
 
 - **音频转换与同步**：支持 NCM、MP3、FLAC、WAV 等音频格式；将下载音乐清洗并转换为 Rekordbox 与 CDJ/XDJ 支持的线下播放格式。提供两个可独立设置来源和输出目录的插槽并支持拖入歌曲文件夹或单曲。
+- **发行版本**：标准版包含 NCM 解密；Legacy 版不包含 NCM 解密，但保留 3.2.1 的其他转换、元数据、网易云本地数据库、歌曲库、分析和播放列表功能。
 - **一键导入 DJ Set**：导入[老炮DJ](https://github.com/komakizhu/dj-crate-digger-skill)生成的 `.w4dj` 歌单，生成二维码一键导入网易云歌单；DJ Set 经过 W4DJ 转换之后，导出 `.m3u8` 供 Rekordbox 使用。详见[具体操作指南](https://github.com/komakizhu/dj-crate-digger/blob/main/docs/w4dj/README.md)。
 - **元数据与封面**：尽量保留或恢复标题、艺术家、专辑、曲号、Genre、歌词和封面；网易云数据库只读，输出歌曲由独立的 `w4dj.sqlite3` 管理。
 - **界面与教程**：支持中文/英文和深色/浅色模式切换，并可随时重新打开使用教程。
@@ -36,7 +37,7 @@ W4DJ RKB 不会替用户下载或获取版权音频；歌曲必须先通过合�
 W4DJ RKB 自己编写的代码采用 **GNU AGPL-3.0-only**，完整条款见 [`LICENSE`](LICENSE)。该许可只适用于本项目原创代码；上游复刻部分、第三方依赖、随包模型和其他资源仍按各自原许可证执行。发布或再分发时，请同时遵守本项目及各依赖、模型的适用条款。
 
 - **复刻与上游来源**：[Slipstream-Max/w4dj](https://github.com/Slipstream-Max/w4dj)。W4DJ RKB 保留该项目的来源说明，不替上游项目重新授予许可证。
-- **NCM 解密相关**：[anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump)、[iqiziqi/ncmdump.rs](https://github.com/iqiziqi/ncmdump.rs)。
+- **NCM 解密相关（仅标准版）**：[anonymous5l/ncmdump](https://github.com/anonymous5l/ncmdump)、[iqiziqi/ncmdump.rs](https://github.com/iqiziqi/ncmdump.rs)。
 - **Essentia.js**：AGPL-3.0，[许可证文本](https://www.gnu.org/licenses/agpl-3.0.html)。
 - **TensorFlow.js**：Apache-2.0，[许可证文本](https://www.apache.org/licenses/LICENSE-2.0)。
 - **随包音频分析模型**：CC BY-NC-SA 4.0，[许可证文本](https://creativecommons.org/licenses/by-nc-sa/4.0/)。模型归属、转换说明和商业授权信息见 [`src-tauri/resources/essentia-models/NOTICE.md`](src-tauri/resources/essentia-models/NOTICE.md)。

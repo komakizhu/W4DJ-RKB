@@ -1390,7 +1390,13 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             preview.existing_count += 1;
             match conflict_strategy {
                 ConflictStrategy::Skip => {
-                    preview.skipped_count += 1;
+                    record_existing_skip(
+                        &mut preview,
+                        &candidate_name,
+                        path,
+                        existing_path.as_ref().expect("checked above"),
+                        "输出已存在，已按设置跳过",
+                    );
                     continue;
                 }
                 ConflictStrategy::Overwrite => {}
@@ -1405,7 +1411,13 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
                             path: path.display().to_string(),
                             message: "此格式暂不支持仅更新元数据；将保留现有输出文件".to_string(),
                         });
-                        preview.skipped_count += 1;
+                        record_existing_skip(
+                            &mut preview,
+                            &candidate_name,
+                            path,
+                            existing_path.as_ref().expect("checked above"),
+                            "此格式暂不支持仅更新元数据；将保留现有输出文件",
+                        );
                         continue;
                     }
                 }
@@ -1598,6 +1610,13 @@ fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrateg
     preview.input_count = preview
         .candidates
         .len()
+        .saturating_add(
+            preview
+                .detail_items
+                .iter()
+                .filter(|item| item.classification == "skip" || item.classification == "duplicate")
+                .count(),
+        )
         .saturating_add(preview.skipped.len())
         .saturating_add(preview.errors.len());
     preview.output_duplicate_count = preview.existing_count;
@@ -1691,6 +1710,24 @@ fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrateg
     }
     items.sort_by_cached_key(|item| item.name.to_lowercase());
     preview.detail_items = items;
+}
+
+fn record_existing_skip(
+    preview: &mut SyncPreview,
+    name: &str,
+    source_path: &Path,
+    destination_path: &Path,
+    reason: &str,
+) {
+    preview.skipped_count += 1;
+    preview.detail_items.push(PreviewDetailItem {
+        name: name.to_string(),
+        source_path: source_path.display().to_string(),
+        destination_path: Some(destination_path.display().to_string()),
+        existing_output: true,
+        classification: "skip".to_string(),
+        reason: Some(reason.to_string()),
+    });
 }
 
 fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
