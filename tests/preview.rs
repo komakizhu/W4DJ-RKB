@@ -587,6 +587,53 @@ fn preview_reports_missing_source_and_invalid_destination() {
     assert!(!preview.warnings[0].message.is_empty());
 }
 
+#[cfg(not(feature = "ncm-decryption"))]
+#[test]
+fn legacy_preview_explains_that_a_single_ncm_needs_the_standard_build() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let source_path = source.path().join("Track.ncm");
+    write_file(&source_path, 120);
+
+    let preview = build_sync_preview(
+        source_path.to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.error_count, 1);
+    assert_eq!(
+        preview.errors[0].message,
+        w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE
+    );
+}
+
+#[cfg(not(feature = "ncm-decryption"))]
+#[test]
+fn legacy_preview_explains_that_a_ncm_folder_needs_the_standard_build() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    let nested = source.path().join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    write_file(nested.join("Track.ncm"), 120);
+
+    let preview = build_sync_preview(
+        source.path().to_str().unwrap(),
+        destination.path().to_str().unwrap(),
+        Mode::Compat,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(preview.error_count, 1);
+    assert_eq!(
+        preview.errors[0].message,
+        w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE
+    );
+}
+
 #[test]
 fn preview_recovers_replaced_single_file_when_extension_changes() {
     let source = tempdir().unwrap();

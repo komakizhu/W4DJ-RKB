@@ -548,8 +548,10 @@ function renderDetail(
   tab: LibraryLyricsTab,
   search: string,
   sourceRecords: LibrarySourceRecord[] = [],
+  productName = 'W4DJ RKB',
 ): string {
   if (!track) return '';
+  const escapedProductName = escapeHtml(productName.trim() || 'W4DJ RKB');
   const mood = track.moodJson && track.moodJson !== '[]' ? track.moodJson : '—';
   const instruments = track.instrumentJson && track.instrumentJson !== '[]' ? track.instrumentJson : '—';
   const lyrics = lyricsForTab(track, tab);
@@ -565,7 +567,7 @@ function renderDetail(
   ];
   return `
     <aside class="library-detail-drawer" data-role="library-detail">
-      <header><div><p class="panel-kicker">W4DJ RKB</p><h3>${escapeHtml(track.title || '—')}</h3></div>
+      <header><div><p class="panel-kicker">${escapedProductName}</p><h3>${escapeHtml(track.title || '—')}</h3></div>
         <button class="secondary-action" type="button" data-action="close-library-detail">${lang === 'zh' ? '关闭' : 'Close'}</button>
       </header>
       <section class="library-detail-section"><h4>${lang === 'zh' ? '标准化信息' : 'Normalized information'}</h4><dl class="library-detail-grid">
@@ -617,8 +619,10 @@ function renderDetail(
 export function renderLibraryDashboard(
   state: LibraryDashboardState | null,
   lang: 'zh' | 'en',
+  productName = 'W4DJ RKB',
 ): string {
   if (!state?.visible) return '';
+  const escapedProductName = escapeHtml(productName.trim() || 'W4DJ RKB');
   const page = state.page;
   const status = state.status;
   const pageStart = page ? page.offset + 1 : 0;
@@ -657,7 +661,7 @@ export function renderLibraryDashboard(
   return `
     <div class="library-modal" data-role="library-modal" role="dialog" aria-modal="true" aria-label="${lang === 'zh' ? '歌曲库' : 'Song library'}">
       <section class="library-dialog">
-        <header class="library-head"><div><p class="panel-kicker">W4DJ RKB</p><h2>${lang === 'zh' ? '歌曲库' : 'Song library'}</h2>
+        <header class="library-head"><div><p class="panel-kicker">${escapedProductName}</p><h2>${lang === 'zh' ? '歌曲库' : 'Song library'}</h2>
           <p>${analyzedTrackCount > 0 ? `${lang === 'zh' ? 'W4DJ 分析库' : 'W4DJ analysis library'} · ${analyzedTrackCount} ${lang === 'zh' ? '首' : 'tracks'}` : (lang === 'zh' ? '尚未有完成分析的歌曲' : 'No completed analyses yet')}</p>
         </div><button class="secondary-action" type="button" data-action="close-library">${lang === 'zh' ? '关闭' : 'Close'}</button></header>
         <div class="library-toolbar">
@@ -687,7 +691,7 @@ export function renderLibraryDashboard(
         ${page ? `<div class="library-table-wrap"><table class="library-table">${columnGroup}<thead><tr>${columnHeaders}
         </tr></thead><tbody>${trackRows(page, lang, state.coverData || {}, columns)}</tbody></table></div>
         <footer class="library-pagination"><span>${page.total ? `${pageStart}–${pageEnd} / ${page.total}` : (lang === 'zh' ? '0 首' : '0 tracks')}</span><button class="secondary-action" data-action="library-prev" ${currentPage <= 1 ? 'disabled' : ''}>${lang === 'zh' ? '上一页' : 'Previous'}</button><span>${currentPage} / ${totalPages}</span><button class="secondary-action" data-action="library-next" ${currentPage >= totalPages ? 'disabled' : ''}>${lang === 'zh' ? '下一页' : 'Next'}</button></footer>` : ''}
-        ${renderDetail(state.detail, lang, state.lyricsTab || 'plain', state.lyricsSearch || '', state.sourceRecords || [])}
+        ${renderDetail(state.detail, lang, state.lyricsTab || 'plain', state.lyricsSearch || '', state.sourceRecords || [], productName)}
         ${state.contextMenu ? `<div class="library-context-menu" data-role="library-context-menu" style="left:${Math.max(8, state.contextMenu.x)}px;top:${Math.max(8, state.contextMenu.y)}px"><button type="button" data-action="relocate-library-track" data-track-key="${escapeHtml(state.contextMenu.trackKey)}">${lang === 'zh' ? '重新定位文件' : 'Relocate file'}</button><button type="button" data-action="remove-library-track" data-track-key="${escapeHtml(state.contextMenu.trackKey)}">${lang === 'zh' ? '移除记录' : 'Remove record'}</button></div>` : ''}
       </section>
     </div>

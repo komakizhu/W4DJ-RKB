@@ -144,8 +144,13 @@ jobs:
 
           hdiutil convert "$dmg" -format UDRW -o "$rw_image"
           hdiutil attach "$rw_image" -mountpoint "$mountpoint" -nobrowse -noautoopen
-          cp "$helper" "$mountpoint/解决文件已损坏问题（双击）.command"
-          chmod +x "$mountpoint/解决文件已损坏问题（双击）.command"
+          helper_target="$mountpoint/解决文件已损坏问题（双击）.command"
+          sed "s|__W4DJ_APP_NAME__|$app_name|g" "$helper" > "$helper_target"
+          chmod +x "$helper_target"
+          if grep -q '__W4DJ_APP_NAME__' "$helper_target"; then
+            echo "Gatekeeper 修复工具未写入应用名称" >&2
+            exit 1
+          fi
           osascript <<APPLESCRIPT
           tell application "Finder"
             tell folder (POSIX file "$mountpoint" as alias)

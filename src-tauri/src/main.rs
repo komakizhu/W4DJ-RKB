@@ -99,6 +99,11 @@ mod essentia_model_import;
 // but every normal app launch starts with it disabled. The frontend uses the
 // matching single visibility switch before exposing its controls again.
 const ENHANCED_ANALYSIS_DEFAULT_ENABLED: bool = false;
+const APP_PRODUCT_NAME: &str = if cfg!(feature = "legacy") {
+    "W4DJ RKB Legacy"
+} else {
+    "W4DJ RKB"
+};
 
 #[cfg(target_os = "macos")]
 use objc2::MainThreadMarker;
@@ -3275,7 +3280,7 @@ fn validate_scan_previews(previews: &[SlotPreview]) -> Result<(), String> {
         .collect::<Vec<_>>();
 
     if processable.is_empty() {
-        return Err(String::from("没有可处理的转换任务"));
+        return Err(no_processable_previews_error(previews));
     }
 
     for preview in &processable {
@@ -3422,6 +3427,7 @@ fn collect_processable_previews(
     previews: Vec<SlotPreview>,
     allow_error_only_retry: bool,
 ) -> Result<Vec<SlotPreview>, String> {
+    let no_processable_error = no_processable_previews_error(&previews);
     let processable = previews
         .into_iter()
         .filter(|preview| {
@@ -3433,10 +3439,19 @@ fn collect_processable_previews(
         .collect::<Vec<_>>();
 
     if processable.is_empty() {
-        return Err(String::from("没有可处理的转换任务"));
+        return Err(no_processable_error);
     }
 
     Ok(processable)
+}
+
+fn no_processable_previews_error(previews: &[SlotPreview]) -> String {
+    previews
+        .iter()
+        .flat_map(|preview| preview.preview.errors.iter())
+        .next()
+        .map(|issue| format!("输入文件检查失败：{}", issue.message))
+        .unwrap_or_else(|| String::from("没有可处理的转换任务"))
 }
 
 #[tauri::command]
@@ -4199,11 +4214,7 @@ fn app_info() -> AppInfo {
         version: env!("CARGO_PKG_VERSION"),
         developer: "komakizhu",
         project_url: "https://github.com/komakizhu/W4DJ-RKB",
-        product_name: if cfg!(feature = "legacy") {
-            "W4DJ RKB Legacy"
-        } else {
-            "W4DJ RKB"
-        },
+        product_name: APP_PRODUCT_NAME,
         variant: if cfg!(feature = "legacy") {
             "legacy"
         } else {
@@ -7608,7 +7619,7 @@ fn main() {
                 WebviewUrl::App("index.html".into())
             };
             let mut window_builder = WebviewWindowBuilder::new(app, "main", headless_url)
-                .title("W4DJ RKB")
+                .title(APP_PRODUCT_NAME)
                 .inner_size(1280.0, 800.0)
                 .min_inner_size(760.0, 560.0)
                 .resizable(true)
@@ -10532,6 +10543,25 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(not(feature = "ncm-decryption"))]
+    #[test]
+    fn source_validation_explains_that_legacy_cannot_decrypt_ncm() {
+        let source = std::env::temp_dir().join(format!(
+            "w4dj-single-source-{}-{}.ncm",
+            std::process::id(),
+            super::unique_timestamp()
+        ));
+        fs::write(&source, b"not-a-decrypted-track").unwrap();
+
+        let result = validate_source_input(source.to_str().unwrap());
+        let _ = fs::remove_file(&source);
+
+        assert_eq!(
+            result.unwrap_err(),
+            w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE
+        );
+    }
+
     #[test]
     fn history_timestamps_are_human_readable_utc() {
         assert_eq!(super::format_unix_timestamp(0), "1970-01-01 00:00:00 UTC");
@@ -10609,6 +10639,25 @@ mod tests {
         let _ = fs::remove_dir_all(root);
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn empty_preview_errors_are_returned_instead_of_a_generic_empty_task_message() {
+        let mut preview = sample_preview(0, false);
+        preview.preview.errors.push(PreviewIssue {
+            path: String::from("/music/in/Track.ncm"),
+            message: w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE.to_string(),
+        });
+
+        let expected = format!(
+            "输入文件检查失败：{}",
+            w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE
+        );
+        assert_eq!(
+            collect_processable_previews(vec![preview.clone()], false).unwrap_err(),
+            expected
+        );
+        assert_eq!(validate_scan_previews(&[preview]).unwrap_err(), expected);
     }
 
     #[test]

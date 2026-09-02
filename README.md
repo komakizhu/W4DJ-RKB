@@ -13,7 +13,7 @@ W4DJ RKB 基于并继续复刻开发自 [Slipstream-Max/w4dj](https://github.com
 ## 1. 产品主要功能
 
 - **音频转换与同步**：支持 NCM、MP3、FLAC、WAV 等音频格式；将下载音乐清洗并转换为 Rekordbox 与 CDJ/XDJ 支持的线下播放格式。提供两个可独立设置来源和输出目录的插槽并支持拖入歌曲文件夹或单曲。
-- **发行版本**：标准版包含 NCM 解密；Legacy 版不包含 NCM 解密，但保留 3.2.1 的其他转换、元数据、网易云本地数据库、歌曲库、分析和播放列表功能。
+- **发行版本**：标准版包含 NCM 解密；Legacy 版不包含 NCM 解密，但保留 3.2.2 的其他转换、元数据、网易云本地数据库、歌曲库、分析和播放列表功能。
 - **一键导入 DJ Set**：导入[老炮DJ](https://github.com/komakizhu/dj-crate-digger-skill)生成的 `.w4dj` 歌单，生成二维码一键导入网易云歌单；DJ Set 经过 W4DJ 转换之后，导出 `.m3u8` 供 Rekordbox 使用。详见[具体操作指南](https://github.com/komakizhu/dj-crate-digger/blob/main/docs/w4dj/README.md)。
 - **元数据与封面**：尽量保留或恢复标题、艺术家、专辑、曲号、Genre、歌词和封面；网易云数据库只读，输出歌曲由独立的 `w4dj.sqlite3` 管理。
 - **界面与教程**：支持中文/英文和深色/浅色模式切换，并可随时重新打开使用教程。

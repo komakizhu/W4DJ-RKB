@@ -31,6 +31,40 @@ use std::sync::{Arc, atomic::AtomicBool};
 
 pub use crate::config::CandidateOperation as PreviewOperation;
 
+fn is_ncm_source_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
+}
+
+fn contains_ncm_source_file(path: &Path) -> bool {
+    if path.is_file() {
+        return is_ncm_source_file(path);
+    }
+
+    if !path.is_dir() {
+        return false;
+    }
+
+    walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_type().is_file() && is_ncm_source_file(entry.path()))
+}
+
+fn unsupported_source_message(path: &Path) -> &'static str {
+    let supported_formats = if crate::sync::ncm_decryption_available() {
+        "不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件"
+    } else {
+        "不支持的单曲格式；请选择 MP3、FLAC、WAV 或 AIFF 文件"
+    };
+    if is_ncm_source_file(path) && !crate::sync::ncm_decryption_available() {
+        crate::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE
+    } else {
+        supported_formats
+    }
+}
+
 /// Recover a single-file source after the original downloaded file was
 /// replaced in the same directory, for example `Track.ncm` -> `Track.mp3`.
 /// Prefer an exact stem match. If the downloaded replacement also changed its
@@ -927,7 +961,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     if source_path.is_file() && !is_supported_source_file(source_path) {
         preview.errors.push(PreviewIssue {
             path: source_directory.to_string(),
-            message: "不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件".to_string(),
+            message: unsupported_source_message(source_path).to_string(),
         });
         preview.error_count = 1;
         preview.estimated_output_bytes = None;
@@ -1039,6 +1073,17 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     };
     if cancelled {
         return Ok(None);
+    }
+
+    if source_files.is_empty()
+        && !crate::sync::ncm_decryption_available()
+        && contains_ncm_source_file(source_path)
+    {
+        preview.errors.push(PreviewIssue {
+            path: source_directory.to_string(),
+            message: crate::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE.to_string(),
+        });
+        preview.error_count += 1;
     }
 
     let fast_scan = committed_bindings.is_some();

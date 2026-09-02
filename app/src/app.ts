@@ -1798,6 +1798,7 @@ export function renderApp(
   djPlaylistState: DjPlaylistUiState | null = null,
   importedDjPlaylistSummaries: ImportedDjPlaylistSummary[] = [],
   neteaseDiscoveryManualFallbackVisible = false,
+  productName = 'W4DJ RKB',
 ): HTMLElement {
   const root = document.createElement('main');
   root.className = 'app-shell';
@@ -1817,13 +1818,15 @@ export function renderApp(
   const conversionRunning = isRunning && !scanRunning && !analysisRunning;
   const hasCancelled = state.slots.some((slot) => slot.status === 'cancelled');
   const configuredTasks = state.slots.filter((slot) => slot.sourceDirectory.trim()).length;
+  const resolvedProductName = productName.trim() || 'W4DJ RKB';
+  const escapedProductName = escapeHtml(resolvedProductName);
   const onboardingTarget: OnboardingTarget | null = onboardingVisible
     ? (['mode', 'source', 'destination', 'start', 'tutorial'] as const)[onboardingStep]
     : null;
   root.innerHTML = `
     <header class="topbar">
       <div class="brand-block">
-        <p class="eyebrow">${t('eyebrow', state.lang)}</p>
+        <p class="eyebrow">${escapedProductName}</p>
         <h1>${t('title', state.lang)}</h1>
       </div>
       <div class="topbar-actions">
@@ -1832,7 +1835,7 @@ export function renderApp(
             ${icon('help')}
             <span>${t('tutorial', state.lang)}</span>
           </button>
-          ${onboardingTarget === 'tutorial' ? renderOnboardingCallout(state.lang, onboardingStep) : ''}
+          ${onboardingTarget === 'tutorial' ? renderOnboardingCallout(state.lang, onboardingStep, resolvedProductName) : ''}
         </div>
         <button type="button" class="help-button" data-action="open-library" aria-label="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" title="${state.lang === 'zh' ? '歌曲库' : 'Song library'}" data-feature-hidden="${SONG_LIBRARY_FEATURE_VISIBLE ? 'false' : 'true'}"${SONG_LIBRARY_FEATURE_VISIBLE ? '' : ' hidden'}>
           ${icon('list')}
@@ -1996,15 +1999,15 @@ export function renderApp(
             undefined,
           )}
         </div>
-        ${renderHistory(history, state.lang, historyExpanded, historyLoadError)}
+        ${renderHistory(history, state.lang, historyExpanded, historyLoadError, resolvedProductName)}
       </div>
     </section>
-    ${renderPreviewModal(previewModal, state.lang, previewBusy)}
+    ${renderPreviewModal(previewModal, state.lang, previewBusy, resolvedProductName)}
     ${renderAboutModal(aboutInfo, updateInfo, state.lang)}
-    ${renderHelpModal(helpVisible, state.lang)}
-    ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep, onboardingTarget === 'tutorial')}
-    ${renderLibraryDashboard(libraryState, state.lang)}
-    ${renderDjPlaylistModal(djPlaylistState, state.lang)}
+    ${renderHelpModal(helpVisible, state.lang, resolvedProductName)}
+    ${renderOnboardingModal(onboardingVisible, state.lang, onboardingStep, onboardingTarget === 'tutorial', resolvedProductName)}
+    ${renderLibraryDashboard(libraryState, state.lang, resolvedProductName)}
+    ${renderDjPlaylistModal(djPlaylistState, state.lang, resolvedProductName)}
   `;
 
   return root;
@@ -2014,6 +2017,7 @@ function renderPreviewModal(
   modal: AppPreviewModalState | null,
   lang: AppLanguage,
   busy = false,
+  productName = 'W4DJ RKB',
 ): string {
   if (!modal) {
     return '';
@@ -2027,6 +2031,7 @@ function renderPreviewModal(
     (item) => item.preview.disk_space_sufficient !== false,
   );
   const canConfirm = hasEnoughSpace && (processableCount > 0 || previewHasRetryErrors(modal));
+  const escapedProductName = escapeHtml(productName.trim() || 'W4DJ RKB');
   const detailPreview = modal.detail
     ? modal.previews.find((item) => item.slot_index === modal.detail?.slotIndex)
     : undefined;
@@ -2035,7 +2040,7 @@ function renderPreviewModal(
       <div class="preview-dialog">
         <header class="preview-head">
           <div>
-            <p class="panel-kicker">W4DJ RKB</p>
+            <p class="panel-kicker">${escapedProductName}</p>
             <h2>${t('previewTitle', lang)}</h2>
           </div>
         </header>
@@ -2332,8 +2337,13 @@ function djPlaylistText(key: keyof typeof translations.zh, lang: AppLanguage, va
   );
 }
 
-function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguage): string {
+function renderDjPlaylistModal(
+  state: DjPlaylistUiState | null,
+  lang: AppLanguage,
+  productName = 'W4DJ RKB',
+): string {
   if (!state) return '';
+  const escapedProductName = escapeHtml(productName.trim() || 'W4DJ RKB');
   const overlay = state.dropActive
     ? `<div class="dj-playlist-drop-overlay" data-role="dj-playlist-drop-overlay" aria-live="polite"><div>${t('djPlaylistDrop', lang)}</div></div>`
     : '';
@@ -2344,7 +2354,7 @@ function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguag
       <div class="dj-playlist-modal" data-role="dj-playlist-export-picker" role="dialog" aria-modal="true" aria-label="${t('djPlaylistChooseRecent', lang)}">
         <div class="dj-playlist-dialog dj-playlist-export-picker-dialog">
           <header class="dj-playlist-head">
-            <div><p class="panel-kicker">W4DJ RKB</p><h2>${t('djPlaylistChooseRecent', lang)}</h2></div>
+            <div><p class="panel-kicker">${escapedProductName}</p><h2>${t('djPlaylistChooseRecent', lang)}</h2></div>
             <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
           </header>
           <div class="dj-playlist-recent-list">${recent.map((summary) => `<button type="button" class="dj-playlist-recent-item" data-action="dj-playlist-select-recent" data-playlist-id="${escapeHtml(summary.playlistId)}"><strong>${escapeHtml(summary.name)}</strong><span>${summary.trackCount} ${t('djPlaylistTracks', lang)}</span></button>`).join('')}</div>
@@ -2358,7 +2368,7 @@ function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguag
       <div class="dj-playlist-modal" data-role="dj-playlist-export-choice" role="dialog" aria-modal="true" aria-label="${t('djPlaylistCopyAudioTitle', lang)}">
         <div class="dj-playlist-dialog dj-playlist-export-choice-dialog">
           <header class="dj-playlist-head">
-            <div><p class="panel-kicker">W4DJ RKB</p><h2>${t('djPlaylistCopyAudioTitle', lang)}</h2></div>
+            <div><p class="panel-kicker">${escapedProductName}</p><h2>${t('djPlaylistCopyAudioTitle', lang)}</h2></div>
             <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
           </header>
           <p class="dj-playlist-export-name">${escapeHtml(playlistName)}${report ? ` · ${report.matchedCount}/${report.total}` : ''}</p>
@@ -2378,7 +2388,7 @@ function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguag
       <div class="dj-playlist-modal" data-role="dj-playlist-launcher" role="dialog" aria-modal="true" aria-label="${t('djPlaylistDialogTitle', lang)}">
         <div class="dj-playlist-dialog dj-playlist-launcher-dialog">
           <header class="dj-playlist-head">
-            <div><p class="panel-kicker">W4DJ RKB</p><h2>${t('djPlaylistDialogTitle', lang)}</h2></div>
+            <div><p class="panel-kicker">${escapedProductName}</p><h2>${t('djPlaylistDialogTitle', lang)}</h2></div>
             <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
           </header>
           <p class="dj-playlist-launcher-source">${t('djPlaylistSource', lang)} <a href="https://github.com/komakizhu/dj-crate-digger-skill" data-action="open-dj-crate-digger-link" target="_blank" rel="noreferrer">${t('djPlaylistSourceLink', lang)}</a></p>
@@ -2396,7 +2406,7 @@ function renderDjPlaylistModal(state: DjPlaylistUiState | null, lang: AppLanguag
     <div class="dj-playlist-modal" data-role="dj-playlist-dialog" role="dialog" aria-modal="true" aria-label="${t('djPlaylistDialogTitle', lang)}">
       <div class="dj-playlist-dialog">
         <header class="dj-playlist-head">
-          <div><p class="panel-kicker">W4DJ RKB</p><h2>${escapeHtml(playlist?.name || t('djPlaylistDialogTitle', lang))}</h2></div>
+          <div><p class="panel-kicker">${escapedProductName}</p><h2>${escapeHtml(playlist?.name || t('djPlaylistDialogTitle', lang))}</h2></div>
           <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
         </header>
         ${state.busy ? `<p class="dj-playlist-loading">${t('djPlaylistImporting', lang)}</p>` : ''}
@@ -2423,12 +2433,14 @@ function renderHistory(
   lang: AppLanguage,
   expanded = false,
   historyLoadError: string | null = null,
+  productName = 'W4DJ RKB',
 ): string {
+  const escapedProductName = escapeHtml(productName.trim() || 'W4DJ RKB');
   return `
     <details class="history-panel" data-role="history" ${expanded ? 'open' : ''}>
       <summary class="history-head">
         <div>
-          <p class="panel-kicker">W4DJ RKB</p>
+          <p class="panel-kicker">${escapedProductName}</p>
           <h2>${t('history', lang)}</h2>
         </div>
       </summary>
@@ -2856,6 +2868,7 @@ export function bindApp(
   root: HTMLElement,
   initialState: AppViewState = defaultState,
   services: AppServices = defaultServices,
+  initialProductName?: string,
 ): void {
   let state = initialState;
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2869,6 +2882,7 @@ export function bindApp(
   let history: AppHistoryEntry[] = [];
   let historyLoadError: string | null = null;
   let aboutInfo: AppInfo | null = null;
+  let productName = initialProductName?.trim() || 'W4DJ RKB';
   let updateInfo: AppUpdateCheck | null = null;
   let modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus;
   let helpVisible = false;
@@ -3089,6 +3103,7 @@ export function bindApp(
         djPlaylistState,
         importedDjPlaylistSummaries,
         neteaseDiscoveryManualFallbackVisible,
+        productName,
       ),
     );
 
@@ -5867,6 +5882,7 @@ export function bindApp(
   const openAbout = async () => {
     try {
       aboutInfo = await services.loadAppInfo();
+      productName = aboutInfo.product_name?.trim() || productName;
       render();
     } catch (error) {
       reportError(error);
@@ -7480,17 +7496,18 @@ function renderAboutModal(info: AppInfo | null, update: AppUpdateCheck | null, l
   `;
 }
 
-function renderHelpModal(visible: boolean, lang: AppLanguage): string {
+function renderHelpModal(visible: boolean, lang: AppLanguage, productName = 'W4DJ RKB'): string {
   if (!visible) {
     return '';
   }
+  const escapedProductName = escapeHtml(productName.trim() || 'W4DJ RKB');
 
   return `
     <div class="about-modal help-modal" data-role="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title" aria-describedby="help-intro">
       <section class="help-dialog">
         <header class="help-dialog-head">
           <div>
-            <p class="panel-kicker">W4DJ RKB</p>
+            <p class="panel-kicker">${escapedProductName}</p>
             <h2 id="help-title">${t('helpTitle', lang)}</h2>
           </div>
         </header>
@@ -7546,6 +7563,7 @@ function renderOnboardingModal(
   lang: AppLanguage,
   step: OnboardingStep = 0,
   calloutAnchored = false,
+  productName = 'W4DJ RKB',
 ): string {
   if (!visible) {
     return '';
@@ -7553,12 +7571,16 @@ function renderOnboardingModal(
 
   return `
     <div class="onboarding-modal" data-role="onboarding-backdrop" aria-hidden="true">
-      ${calloutAnchored ? '' : renderOnboardingCallout(lang, step)}
+      ${calloutAnchored ? '' : renderOnboardingCallout(lang, step, productName)}
     </div>
   `;
 }
 
-function renderOnboardingCallout(lang: AppLanguage, step: OnboardingStep): string {
+function renderOnboardingCallout(
+  lang: AppLanguage,
+  step: OnboardingStep,
+  productName = 'W4DJ RKB',
+): string {
 
   const steps = [
     { target: 'mode', title: t('onboardingStepOneTitle', lang), body: t('onboardingStepOneBody', lang) },
@@ -7569,12 +7591,13 @@ function renderOnboardingCallout(lang: AppLanguage, step: OnboardingStep): strin
   ] as const;
   const currentStep = steps[step];
   const isLastStep = step === ONBOARDING_STEP_COUNT - 1;
+  const escapedProductName = escapeHtml(productName.trim() || 'W4DJ RKB');
 
   return `
     <section class="onboarding-callout" data-role="onboarding-modal" data-step="${step}" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" aria-describedby="onboarding-body">
         <div class="onboarding-callout-head">
           <div>
-            <p class="panel-kicker">W4DJ RKB</p>
+            <p class="panel-kicker">${escapedProductName}</p>
             <h2 id="onboarding-title">${currentStep.title}</h2>
           </div>
           <span class="onboarding-counter">${step + 1}/${ONBOARDING_STEP_COUNT}</span>
