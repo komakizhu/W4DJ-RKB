@@ -873,7 +873,19 @@ fn conflict_strategies_produce_distinct_conversion_plans() {
 
     let skipped = preview(ConflictStrategy::Skip);
     assert_eq!(skipped.skipped_count, 1);
+    assert_eq!(skipped.input_count, 1);
     assert!(skipped.candidates.is_empty());
+    assert_eq!(
+        skipped.detail_items,
+        vec![w4dj::preview::PreviewDetailItem {
+            name: "Song".to_string(),
+            source_path: source.path().join("Song.mp3").display().to_string(),
+            destination_path: Some(destination.path().join("Song.mp3").display().to_string()),
+            existing_output: true,
+            classification: "skip".to_string(),
+            reason: Some("输出已存在，已按设置跳过".to_string()),
+        }]
+    );
 
     let overwritten = preview(ConflictStrategy::Overwrite);
     assert_eq!(overwritten.candidates[0].name, "Song");

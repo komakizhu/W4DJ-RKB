@@ -4231,7 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj"
-version = "3.2.1"
+version = "3.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4253,7 +4253,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj-desktop"
-version = "3.2.1"
+version = "3.2.2"
 dependencies = [
  "base64 0.22.1",
  "flate2",
