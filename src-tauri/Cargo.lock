@@ -4231,7 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj"
-version = "3.2.2"
+version = "3.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -4253,7 +4253,7 @@ dependencies = [
 
 [[package]]
 name = "w4dj-desktop"
-version = "3.2.2"
+version = "3.2.3"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4262,11 +4262,13 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
  "ureq",
  "w4dj",
  "window-vibrancy",

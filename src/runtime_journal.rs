@@ -233,6 +233,17 @@ impl RuntimeJournal {
     /// atomic rename.  Events are streamed line by line instead of loading a
     /// whole 200 MB journal into memory.
     pub fn export_full_report(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.export_full_report_with_diagnostics(path, None)
+    }
+
+    /// Export the journal together with an optional point-in-time diagnostic
+    /// snapshot. The diagnostic value is supplied by the desktop layer so
+    /// this generic journal stays independent of W4DJ's database schema.
+    pub fn export_full_report_with_diagnostics(
+        &self,
+        path: impl AsRef<Path>,
+        diagnostics: Option<&Value>,
+    ) -> io::Result<()> {
         self.flush();
         let path = path.as_ref();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -253,6 +264,10 @@ impl RuntimeJournal {
                     "maxBytes": MAX_BYTES,
                 }),
             )?;
+            if let Some(diagnostics) = diagnostics {
+                file.write_all(b",\"diagnostics\":")?;
+                serde_json::to_writer(&mut file, diagnostics)?;
+            }
             file.write_all(b",\"events\":[")?;
             let mut first = true;
             let mut files = fs::read_dir(&self.inner.root)?
@@ -506,6 +521,23 @@ mod tests {
             value["events"]
                 .as_array()
                 .is_some_and(|events| !events.is_empty())
+        );
+        let diagnostics = serde_json::json!({
+            "w4dj": {
+                "database": {
+                    "available": true,
+                    "snapshotBytes": 123,
+                },
+            },
+        });
+        journal
+            .export_full_report_with_diagnostics(&output, Some(&diagnostics))
+            .expect("export with diagnostics");
+        let value: Value = serde_json::from_slice(&fs::read(&output).expect("report bytes"))
+            .expect("valid report with diagnostics");
+        assert_eq!(
+            value["diagnostics"]["w4dj"]["database"]["snapshotBytes"],
+            123
         );
         journal.mark_clean_shutdown();
         let _ = fs::remove_dir_all(root);

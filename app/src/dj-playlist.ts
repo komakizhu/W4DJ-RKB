@@ -2,7 +2,6 @@ export type ImportedDjPlaylistTrack = {
   position: number;
   title: string;
   artistDisplay: string;
-  neteaseTrackId: string | null;
   dedupeKey: string;
   neteaseImportLine: string;
 };

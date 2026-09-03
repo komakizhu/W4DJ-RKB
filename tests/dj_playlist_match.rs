@@ -1,28 +1,17 @@
-use std::fs;
 use std::path::PathBuf;
 
 use w4dj::dj_playlist::{ImportedDjPlaylist, ImportedDjPlaylistTrack};
 use w4dj::dj_playlist_match::{
-    DjOutputCandidate, DjPlaylistMatchKind, match_imported_playlist, normalize_identity_text,
+    DjOutputCandidate, DjPlaylistMatchKind, bm25f_track_score, match_imported_playlist,
+    match_imported_playlist_with_priority, normalize_identity_text,
 };
-use w4dj::w4dj_library::W4djLibrary;
 
-fn track(
-    position: u64,
-    title: &str,
-    artist: &str,
-    netease_track_id: Option<&str>,
-) -> ImportedDjPlaylistTrack {
-    let id = netease_track_id.map(str::to_string);
+fn track(position: u64, title: &str, artist: &str) -> ImportedDjPlaylistTrack {
     ImportedDjPlaylistTrack {
         position,
         title: title.to_string(),
         artist_display: artist.to_string(),
-        netease_track_id: id.clone(),
-        dedupe_key: id
-            .as_deref()
-            .map(|value| format!("netease:{value}"))
-            .unwrap_or_else(|| format!("title-artist:{position}")),
+        dedupe_key: format!("title-artist:{position}"),
         netease_import_line: format!("{title} - {artist}"),
     }
 }
@@ -39,21 +28,25 @@ fn playlist(tracks: Vec<ImportedDjPlaylistTrack>) -> ImportedDjPlaylist {
     }
 }
 
-fn candidate(
-    key: &str,
-    title: &str,
-    artist: &str,
-    netease_track_id: Option<&str>,
-) -> DjOutputCandidate {
+fn candidate(key: &str, title: &str, artist: &str) -> DjOutputCandidate {
     DjOutputCandidate {
         track_key: key.to_string(),
         title: title.to_string(),
         artist_display: artist.to_string(),
-        netease_track_id: netease_track_id.map(str::to_string),
         duration_seconds: None,
         destination_path: PathBuf::from(format!("/music/{key}.mp3")),
         status: "available".to_string(),
         readable: true,
+        conversion_batch_id: None,
+        committed_at_ms: None,
+    }
+}
+
+fn batched_candidate(key: &str, title: &str, artist: &str, batch_id: &str) -> DjOutputCandidate {
+    DjOutputCandidate {
+        conversion_batch_id: Some(batch_id.to_string()),
+        committed_at_ms: Some(100),
+        ..candidate(key, title, artist)
     }
 }
 
@@ -66,171 +59,209 @@ fn normalizes_fullwidth_case_punctuation_and_whitespace() {
 }
 
 #[test]
-fn netease_id_is_the_first_and_only_identity_when_present() {
-    let report = match_imported_playlist(
-        &playlist(vec![track(1, "Wrong title", "Wrong artist", Some("42"))]),
-        &[candidate(
-            "output:1",
-            "Official title",
-            "Official artist",
-            Some("42"),
-        )],
-    );
-    assert_eq!(report.matched_count, 1);
-    assert_eq!(report.matches[0].track_key.as_deref(), Some("output:1"));
-    assert_eq!(
-        report.matches[0].match_method.as_deref(),
-        Some("neteaseTrackId")
-    );
-    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::NeteaseTrackId);
-}
-
-#[test]
-fn an_id_miss_does_not_fall_back_to_a_lookalike_title() {
-    let report = match_imported_playlist(
-        &playlist(vec![track(1, "Song", "Artist", Some("42"))]),
-        &[candidate("output:1", "Song", "Artist", Some("99"))],
-    );
-    assert_eq!(report.unmatched_count, 1);
-    assert_eq!(report.matches[0].track_key, None);
-}
-
-#[test]
-fn unique_title_artist_is_the_only_automatic_fallback() {
-    let report = match_imported_playlist(
-        &playlist(vec![track(1, "Track (Radio Edit)", "Main, Guest", None)]),
-        &[candidate(
-            "output:1",
-            "track (radio edit)",
-            "Guest feat. Main",
-            None,
-        )],
-    );
-    assert_eq!(report.matched_count, 1);
-    assert_eq!(report.matches[0].track_key.as_deref(), Some("output:1"));
-    assert_eq!(
-        report.matches[0].match_method.as_deref(),
-        Some("uniqueTitleArtistFallback")
-    );
-    assert_eq!(
-        report.matches[0].kind,
-        DjPlaylistMatchKind::UniqueTitleArtistFallback
-    );
-}
-
-#[test]
-fn full_title_keeps_mix_versions_distinct() {
-    let report = match_imported_playlist(
-        &playlist(vec![track(1, "Song (Live)", "Artist", None)]),
-        &[candidate("live", "Song", "Artist", None)],
-    );
-    assert_eq!(report.unmatched_count, 1);
-    assert_eq!(report.matches[0].track_key, None);
-}
-
-#[test]
-fn ambiguous_fallback_is_not_auto_selected() {
-    let report = match_imported_playlist(
-        &playlist(vec![track(1, "Song", "Artist", None)]),
-        &[
-            candidate("a", "Song", "Artist", None),
-            candidate("b", "Song", "Artist", None),
-        ],
-    );
-    assert_eq!(report.ambiguous_count, 1);
-    assert!(report.matches[0].track_key.is_none());
-    assert_eq!(report.matches[0].candidates.len(), 2);
-    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::Ambiguous);
-}
-
-#[test]
-fn repeated_id_positions_reuse_one_confirmed_output_without_dropping_rows() {
-    let report = match_imported_playlist(
-        &playlist(vec![
-            track(1, "Song", "Artist", Some("42")),
-            track(2, "Song", "Artist", Some("42")),
-        ]),
-        &[candidate("available", "Song", "Artist", Some("42"))],
-    );
-    assert_eq!(report.matched_count, 2);
-    assert_eq!(report.matches.len(), 2);
-    assert_eq!(report.matches[0].track_key.as_deref(), Some("available"));
-    assert_eq!(report.matches[1].track_key.as_deref(), Some("available"));
-}
-
-#[test]
-fn duplicate_outputs_for_one_id_are_ambiguous_but_remain_id_matches() {
-    let report = match_imported_playlist(
-        &playlist(vec![track(1, "Same", "Artist", Some("42"))]),
-        &[
-            candidate("a", "First output", "Artist", Some("42")),
-            candidate("b", "Second output", "Artist", Some("42")),
-        ],
-    );
-    assert_eq!(report.ambiguous_count, 1);
-    assert_eq!(
-        report.matches[0].kind,
-        w4dj::dj_playlist_match::DjPlaylistMatchKind::Ambiguous
-    );
-    assert_eq!(
-        report.matches[0].match_method.as_deref(),
-        Some("neteaseTrackId")
-    );
-}
-
-#[test]
-fn indexed_output_identity_is_matched_before_export_checks_its_path() {
-    let report = match_imported_playlist(
-        &playlist(vec![track(1, "Song", "Artist", None)]),
-        &[DjOutputCandidate {
-            status: "missing".to_string(),
-            ..candidate("missing", "Song", "Artist", None)
-        }],
-    );
-    assert_eq!(report.matched_count, 1);
-    assert_eq!(report.matches[0].track_key.as_deref(), Some("missing"));
-}
-
-#[test]
-fn w4dj_database_identity_resolves_id_to_the_current_readable_output() {
-    let directory = tempfile::tempdir().unwrap();
-    let output_root = directory.path().join("outputs");
-    fs::create_dir_all(&output_root).unwrap();
-    let output = output_root.join("renamed-official-file.mp3");
-    fs::write(&output, b"audio").unwrap();
-
-    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
-    library
-        .upsert_output_file(0, &output_root, None, &output)
-        .unwrap();
-    library
-        .set_output_identity(&output, Some("123456789012345678"), None)
-        .unwrap();
-
-    let candidates = library.available_dj_output_candidates().unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(
-        candidates[0].netease_track_id.as_deref(),
-        Some("123456789012345678")
-    );
-    assert_eq!(
-        candidates[0].destination_path,
-        fs::canonicalize(&output).unwrap()
-    );
-
+fn exact_title_and_multiple_artists_match_with_bm25f() {
     let report = match_imported_playlist(
         &playlist(vec![track(
             1,
-            "Different title",
-            "Different artist",
-            Some("123456789012345678"),
+            "Eat Your Man (with Nelly Furtado) Extended Mix",
+            "Dom Dolla, Nelly Furtado",
         )]),
-        &candidates,
+        &[candidate(
+            "output:1",
+            "Eat Your Man (with Nelly Furtado) Extended Mix",
+            "Dom Dolla / Nelly Furtado",
+        )],
     );
+
     assert_eq!(report.matched_count, 1);
-    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::NeteaseTrackId);
+    assert_eq!(report.matches[0].track_key.as_deref(), Some("output:1"));
+    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::LibraryBm25f);
     assert_eq!(
-        report.matches[0].track_key.as_deref(),
-        Some(candidates[0].track_key.as_str())
+        report.matches[0].match_method.as_deref(),
+        Some("libraryBm25f")
     );
+    assert!(report.matches[0].score.unwrap_or_default() >= 90);
+}
+
+#[test]
+fn version_labels_and_artist_region_suffixes_are_softly_matched() {
+    let report = match_imported_playlist(
+        &playlist(vec![track(
+            1,
+            "Atmosphere Extended Mix",
+            "FISHER (OZ), Kita Alexander",
+        )]),
+        &[candidate(
+            "output:1",
+            "Atmosphere [Extended]",
+            "FISHER, Kita Alexander",
+        )],
+    );
+
+    assert_eq!(report.matched_count, 1);
+    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::LibraryBm25f);
+    assert!(report.matches[0].score.unwrap_or_default() >= 50);
+}
+
+#[test]
+fn unrelated_artist_does_not_cross_match_even_when_title_is_similar() {
+    let report = match_imported_playlist(
+        &playlist(vec![track(
+            1,
+            "Atmosphere Extended Mix",
+            "FISHER, Kita Alexander",
+        )]),
+        &[candidate(
+            "wrong",
+            "Atmosphere [Extended]",
+            "Paul de Fol, Kris Max",
+        )],
+    );
+
+    assert_eq!(report.unmatched_count, 1);
+    assert!(report.matches[0].track_key.is_none());
+    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::Unmatched);
+}
+
+#[test]
+fn recent_batch_is_preferred_even_when_its_text_score_is_below_library_threshold() {
+    let report = match_imported_playlist_with_priority(
+        &playlist(vec![track(1, "Playlist title", "Playlist artist")]),
+        &[batched_candidate(
+            "recent",
+            "Completely different",
+            "Unknown",
+            "batch-1",
+        )],
+        &[candidate("library", "Playlist title", "Playlist artist")],
+    );
+
+    assert_eq!(report.matched_count, 1);
+    assert_eq!(report.matches[0].track_key.as_deref(), Some("recent"));
+    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::RecentBm25f);
+    assert_eq!(report.matches[0].score, Some(0));
+}
+
+#[test]
+fn a_short_recent_batch_is_filled_from_the_historical_library() {
+    let report = match_imported_playlist_with_priority(
+        &playlist(vec![
+            track(1, "New One", "New Artist"),
+            track(2, "New Two", "New Artist"),
+            track(3, "Previously Converted", "Known Artist"),
+        ]),
+        &[
+            batched_candidate("recent-1", "New One", "New Artist", "batch-1"),
+            batched_candidate("recent-2", "New Two", "New Artist", "batch-1"),
+        ],
+        &[candidate(
+            "library-3",
+            "Previously Converted",
+            "Known Artist",
+        )],
+    );
+
+    assert_eq!(report.matched_count, 3);
+    assert_eq!(report.matches[0].kind, DjPlaylistMatchKind::RecentBm25f);
+    assert_eq!(report.matches[1].kind, DjPlaylistMatchKind::RecentBm25f);
+    assert_eq!(report.matches[2].kind, DjPlaylistMatchKind::LibraryBm25f);
+    assert_eq!(report.matches[2].track_key.as_deref(), Some("library-3"));
+}
+
+#[test]
+fn automatic_assignment_is_deterministic_and_consumes_distinct_outputs() {
+    let playlist = playlist(vec![track(1, "Same", "Artist"), track(2, "Same", "Artist")]);
+    let candidates = vec![
+        candidate("b", "Same", "Artist"),
+        candidate("a", "Same", "Artist"),
+    ];
+
+    let first = match_imported_playlist(&playlist, &candidates);
+    let second = match_imported_playlist(&playlist, &candidates);
+    assert_eq!(first, second);
+    assert_eq!(first.matches[0].track_key.as_deref(), Some("a"));
+    assert_eq!(first.matches[1].track_key.as_deref(), Some("b"));
+}
+
+#[test]
+fn identical_playlist_rows_may_reuse_one_output_but_different_rows_may_not() {
+    let repeated = match_imported_playlist_with_priority(
+        &playlist(vec![
+            track(1, "Same Song", "Same Artist"),
+            track(2, "Same Song", "Same Artist"),
+        ]),
+        &[batched_candidate(
+            "one-output",
+            "Different",
+            "Different",
+            "batch-1",
+        )],
+        &[],
+    );
+    assert_eq!(repeated.matched_count, 2);
+    assert_eq!(
+        repeated.matches[0].track_key,
+        Some("one-output".to_string())
+    );
+    assert_eq!(
+        repeated.matches[1].track_key,
+        Some("one-output".to_string())
+    );
+
+    let different = match_imported_playlist_with_priority(
+        &playlist(vec![
+            track(1, "Song One", "Artist"),
+            track(2, "Song Two", "Artist"),
+        ]),
+        &[batched_candidate(
+            "one-output",
+            "Unrelated",
+            "Unknown",
+            "batch-1",
+        )],
+        &[],
+    );
+    assert_eq!(different.matched_count, 1);
+    assert!(
+        different
+            .matches
+            .iter()
+            .any(|row| row.status == "unmatched")
+    );
+}
+
+#[test]
+fn suggestions_remain_available_for_manual_review_below_the_auto_threshold() {
+    let report = match_imported_playlist(
+        &playlist(vec![track(1, "Rare Song", "Artist")]),
+        &[candidate("lookalike", "Song Live", "Other")],
+    );
+
+    assert_eq!(report.unmatched_count, 1);
+    assert_eq!(report.matches[0].candidates.len(), 1);
+    assert!(report.matches[0].candidates[0].score > 0);
+}
+
+#[test]
+fn bm25f_partial_title_and_artist_prefers_the_intended_track() {
+    let corpus = vec![
+        candidate("right", "Where You Are Extended Mix", "John Summit / HAYLA"),
+        candidate("wrong", "Where Are You Now", "Lost Frequencies"),
+    ];
+    let right = bm25f_track_score(
+        "Where You Are (Extended Mix)",
+        "John Summit, HAYLA",
+        &corpus[0].title,
+        &corpus[0].artist_display,
+        &corpus,
+    );
+    let wrong = bm25f_track_score(
+        "Where You Are (Extended Mix)",
+        "John Summit, HAYLA",
+        &corpus[1].title,
+        &corpus[1].artist_display,
+        &corpus,
+    );
+    assert!(right > wrong);
+    assert!(right >= 50);
 }

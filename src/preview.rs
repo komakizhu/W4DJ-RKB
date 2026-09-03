@@ -403,27 +403,43 @@ pub fn disambiguate_duplicate_output_names(
     preview.detail_items.extend(removed_details);
 }
 
-/// Attach the immutable NetEase identity to candidates after scanning.  This
-/// is intentionally metadata-only: the final path selected by the collision
+/// Attach the immutable NetEase identity to one candidate. This is
+/// intentionally metadata-only: the final path selected by the collision
 /// pass is never changed here, and the identity is not reconstructed from a
 /// disambiguation suffix.
+pub fn attach_netease_identity(
+    candidate: &mut PreviewCandidate,
+    resolver: &NeteaseMetadataResolver,
+) {
+    // A non-empty ID is already authoritative. In particular, do not let a
+    // later path/metadata lookup silently replace an ID supplied by an
+    // imported playlist or an older confirmed preview.
+    if candidate
+        .netease_track_id
+        .as_deref()
+        .is_some_and(|track_id| !track_id.trim().is_empty())
+    {
+        return;
+    }
+    if let Some(identity) = resolver.track_identity_for_preview(Path::new(&candidate.source_path)) {
+        candidate.netease_track_id = identity.track_id;
+        candidate.netease_album_id = identity.album_id;
+        if !identity.title.trim().is_empty() {
+            candidate.netease_title = Some(identity.title);
+        }
+        if !identity.artists.trim().is_empty() {
+            candidate.netease_artist = Some(identity.artists);
+        }
+        if !identity.album.trim().is_empty() {
+            candidate.album = Some(identity.album);
+        }
+    }
+}
+
+/// Attach the immutable NetEase identity to candidates after scanning.
 pub fn attach_netease_identities(preview: &mut SyncPreview, resolver: &NeteaseMetadataResolver) {
     for candidate in &mut preview.candidates {
-        if let Some(identity) =
-            resolver.track_identity_for_preview(Path::new(&candidate.source_path))
-        {
-            candidate.netease_track_id = identity.track_id;
-            candidate.netease_album_id = identity.album_id;
-            if !identity.title.trim().is_empty() {
-                candidate.netease_title = Some(identity.title);
-            }
-            if !identity.artists.trim().is_empty() {
-                candidate.netease_artist = Some(identity.artists);
-            }
-            if !identity.album.trim().is_empty() {
-                candidate.album = Some(identity.album);
-            }
-        }
+        attach_netease_identity(candidate, resolver);
     }
 }
 
@@ -1252,7 +1268,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             .collect::<HashMap<_, _>>()
     });
     let mut source_entries = source_files.iter().collect::<Vec<_>>();
-    source_entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    source_entries.sort_by_key(|(left, _)| *left);
 
     // Count the paths before applying conflict handling.  A collision group
     // is the only case where the duplicate-name disambiguation rule applies;

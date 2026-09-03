@@ -8,7 +8,9 @@
 
 use crate::analysis::TrackAnalysis;
 use crate::library_query::{LibraryPage, LibraryQuery, compile_query};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params_from_iter, types::Value};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, Transaction, params_from_iter, types::Value,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -286,6 +288,18 @@ impl LibraryCatalog {
         }
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            connection,
+        })
+    }
+
+    /// Open an existing catalog without creating, migrating, or recovering
+    /// it. Diagnostic exports use this boundary so exporting a report cannot
+    /// mutate the user's database while trying to inspect it.
+    pub(crate) fn open_read_only(path: &Path) -> LibraryResult<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             path: path.to_path_buf(),

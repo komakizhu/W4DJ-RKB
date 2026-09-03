@@ -48,8 +48,9 @@ use w4dj::library_catalog::{CatalogLocalFile, CatalogSourceRecord, LibraryCatalo
 use w4dj::library_query::{LibraryPage, LibraryQuery};
 use w4dj::media_probe::probe_local_audio;
 use w4dj::w4dj_library::{
-    CommittedOutputBinding, CommittedOutputFacts, EmotionEvaluationManifest, OutputFileSnapshot,
-    W4djLibrary, write_emotion_evaluation_manifest,
+    CommittedOutputBinding, CommittedOutputFacts, EmotionEvaluationManifest,
+    OUTPUT_IDENTITY_MANIFEST_FILE_NAME, OutputFileSnapshot, W4djLibrary,
+    write_emotion_evaluation_manifest,
 };
 use w4dj::runtime_journal::RuntimeJournal;
 use w4dj::netease_library::{
@@ -69,7 +70,7 @@ use w4dj::netease_cache::{self, CacheState};
 use w4dj::preferences::{AppPreferences, load_preferences, save_preferences};
 use w4dj::preview::{
     PreviewCandidate, PreviewIssue, PreviewOperation, SlotPreview, SyncPreview,
-    build_retry_preview,
+    attach_netease_identity, attach_netease_identities, build_retry_preview,
     build_sync_preview_with_settings_and_netease_observed_with_policy,
     build_sync_preview_with_snapshots_and_bindings,
     is_recovered_single_source,
@@ -1000,6 +1001,8 @@ struct ScanJob {
     operation_id: String,
     journal: Option<RuntimeJournal>,
     committed_bindings: HashMap<String, CommittedOutputBinding>,
+    preferred_netease_database: Option<PathBuf>,
+    netease_database_bound: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -2527,6 +2530,12 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
         return Err(String::from("请至少选择一个歌曲文件夹或单曲"));
     }
 
+    let preferred_netease_database = manual_netease_database_path(state.inner());
+    let netease_resolver = load_netease_resolver_for_identity(
+        library_netease_database_bound(&state.library),
+        preferred_netease_database.as_deref(),
+    );
+
     let mut previews = slots
         .into_iter()
         .map(|(slot_index, source, destination)| {
@@ -2543,6 +2552,10 @@ fn preview_all_sync(state: tauri::State<'_, AppState>) -> Result<Vec<SlotPreview
             )
             .map_err(|error| format!("预检失败：{error}"))?
             .ok_or_else(|| "预检被取消".to_string())?;
+            let mut preview = preview;
+            if let Some(resolver) = netease_resolver.as_ref() {
+                attach_netease_identities(&mut preview, resolver);
+            }
             Ok(SlotPreview {
                 slot_index,
                 mode,
@@ -2687,6 +2700,8 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         )
     };
     let library_path = library_catalog_path(&state);
+    let preferred_netease_database = manual_netease_database_path(state.inner());
+    let netease_database_bound = library_netease_database_bound(&state.library);
     let scan_operation_id = format!("scan-{}", unique_timestamp());
     record_global_event(
         state.inner(),
@@ -2759,6 +2774,8 @@ fn start_scan(state: tauri::State<'_, AppState>) -> Result<ScanProgress, String>
         operation_id: scan_operation_id,
         journal: runtime_journal(state.inner()),
         committed_bindings,
+        preferred_netease_database,
+        netease_database_bound,
     };
     thread::spawn(move || run_scan_task(progress, scan_cancel, scan_result, job));
 
@@ -2786,7 +2803,13 @@ fn run_scan_task(
         operation_id,
         journal,
         committed_bindings,
+        preferred_netease_database,
+        netease_database_bound,
     } = job;
+    let netease_resolver = load_netease_resolver_for_identity(
+        netease_database_bound,
+        preferred_netease_database.as_deref(),
+    );
     let mut scan_cache = load_scan_cache(&scan_cache_path).unwrap_or_else(|_| ScanCache::empty());
     if scan_cancel.load(Ordering::SeqCst) {
         finish_scan_cancelled(&progress, &scan_result);
@@ -3036,6 +3059,9 @@ fn run_scan_task(
             }
         };
         let mut preview = preview;
+        if let Some(resolver) = netease_resolver.as_ref() {
+            attach_netease_identities(&mut preview, resolver);
+        }
         let mut slot_scan_issues = root_issues
             .get(&source_root_key)
             .cloned()
@@ -4336,8 +4362,15 @@ fn import_w4dj_playlist(path: String, state: tauri::State<'_, AppState>) -> Resu
     let playlist = parse_w4dj_playlist(&bytes, Some(&canonical)).map_err(|error| error.to_string())?;
     let path = library_catalog_path(&state);
     let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
     library
         .upsert_imported_dj_playlist(&playlist)
+        .map_err(|error| error.to_string())?;
+    library
+        .restore_imported_dj_playlist_review_manifests(&playlist.playlist_id, &output_roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
         .map_err(|error| error.to_string())?;
     library
         .get_imported_dj_playlist(&playlist.playlist_id)
@@ -4362,8 +4395,13 @@ fn load_imported_dj_playlist(
         return Err("DJ 歌单 ID 不能为空".to_string());
     }
     let path = library_catalog_path(&state);
-    W4djLibrary::open(&path)
-        .and_then(|library| library.get_imported_dj_playlist(&playlist_id))
+    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .restore_imported_dj_playlist_review_manifests(&playlist_id, &output_roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .get_imported_dj_playlist(&playlist_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "找不到指定的 DJ 歌单".to_string())
 }
@@ -4392,7 +4430,11 @@ fn export_imported_dj_playlist_w4dj(
         return Err("W4DJ 导出目录不存在".to_string());
     }
     let library_path = library_catalog_path(&state);
-    let library = W4djLibrary::open(&library_path).map_err(|error| error.to_string())?;
+    let mut library = W4djLibrary::open(&library_path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
+        .map_err(|error| error.to_string())?;
     let playlist = library
         .get_imported_dj_playlist(&playlist_id)
         .map_err(|error| error.to_string())?
@@ -4428,7 +4470,6 @@ struct DjPlaylistM3u8ExportResult {
     copied_count: usize,
     copy_audio: bool,
     portable: bool,
-    omitted: Vec<w4dj::m3u8::M3u8OmittedTrack>,
 }
 
 fn playlist_export_paths(
@@ -4600,11 +4641,32 @@ fn match_imported_dj_playlist(
     }
     let path = library_catalog_path(&state);
     let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .restore_imported_dj_playlist_review_manifests(&playlist_id, &output_roots)
+        .map_err(|error| error.to_string())?;
+    if library
+        .has_imported_dj_playlist_matches(&playlist_id)
+        .map_err(|error| error.to_string())?
+    {
+        library
+            .persist_output_identity_manifests(&output_roots)
+            .map_err(|error| error.to_string())?;
+        return library
+            .get_imported_dj_playlist_match_report(&playlist_id)
+            .map_err(|error| error.to_string());
+    }
     let report = library
         .compute_imported_dj_playlist_matches(&playlist_id)
         .map_err(|error| error.to_string())?;
     library
         .replace_imported_dj_playlist_matches(&playlist_id, &report)
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
         .map_err(|error| error.to_string())?;
     library
         .get_imported_dj_playlist_match_report(&playlist_id)
@@ -4620,8 +4682,13 @@ fn load_imported_dj_playlist_matches(
         return Err("DJ 歌单 ID 不能为空".to_string());
     }
     let path = library_catalog_path(&state);
-    W4djLibrary::open(&path)
-        .and_then(|library| library.get_imported_dj_playlist_match_report(&playlist_id))
+    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .restore_imported_dj_playlist_review_manifests(&playlist_id, &output_roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .get_imported_dj_playlist_match_report(&playlist_id)
         .map_err(|error| error.to_string())
 }
 
@@ -4637,8 +4704,91 @@ fn set_imported_dj_playlist_match(
     }
     let path = library_catalog_path(&state);
     let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
     library
         .set_imported_dj_playlist_match(&playlist_id, position, &track_key)
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .get_imported_dj_playlist_match_report(&playlist_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_imported_dj_playlist_match_by_path(
+    playlist_id: String,
+    position: u64,
+    destination_path: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<DjPlaylistMatchReport, String> {
+    if playlist_id.trim().is_empty() || destination_path.trim().is_empty() {
+        return Err("DJ 歌单 ID 和本地歌曲路径不能为空".to_string());
+    }
+    let path = library_catalog_path(&state);
+    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .set_imported_dj_playlist_match_by_path(
+            &playlist_id,
+            position,
+            Path::new(&destination_path),
+        )
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .get_imported_dj_playlist_match_report(&playlist_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_imported_dj_playlist_match_confirmed(
+    playlist_id: String,
+    position: u64,
+    confirmed: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<DjPlaylistMatchReport, String> {
+    if playlist_id.trim().is_empty() {
+        return Err("DJ 歌单 ID 不能为空".to_string());
+    }
+    let path = library_catalog_path(&state);
+    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .set_imported_dj_playlist_match_confirmed(&playlist_id, position, confirmed)
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .get_imported_dj_playlist_match_report(&playlist_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_imported_dj_playlist_matches_excluded(
+    playlist_id: String,
+    positions: Vec<u64>,
+    excluded: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<DjPlaylistMatchReport, String> {
+    if playlist_id.trim().is_empty() {
+        return Err("DJ 歌单 ID 不能为空".to_string());
+    }
+    if positions.is_empty() {
+        return Err("至少需要选择一首歌曲".to_string());
+    }
+    let path = library_catalog_path(&state);
+    let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .set_imported_dj_playlist_matches_excluded(&playlist_id, &positions, excluded)
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
         .map_err(|error| error.to_string())?;
     library
         .get_imported_dj_playlist_match_report(&playlist_id)
@@ -4656,8 +4806,12 @@ fn clear_imported_dj_playlist_match(
     }
     let path = library_catalog_path(&state);
     let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
     library
         .clear_imported_dj_playlist_match(&playlist_id, position)
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
         .map_err(|error| error.to_string())?;
     library
         .get_imported_dj_playlist_match_report(&playlist_id)
@@ -4668,7 +4822,6 @@ fn clear_imported_dj_playlist_match(
 fn export_imported_dj_playlist_m3u8(
     playlist_id: String,
     path: String,
-    allow_partial: bool,
     copy_audio: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<DjPlaylistM3u8ExportResult, String> {
@@ -4687,11 +4840,18 @@ fn export_imported_dj_playlist_m3u8(
         return Err("M3U8 导出路径必须使用 .m3u8 扩展名".to_string());
     }
     let library_path = library_catalog_path(&state);
-    let library = W4djLibrary::open(&library_path).map_err(|error| error.to_string())?;
+    let mut library = W4djLibrary::open(&library_path).map_err(|error| error.to_string())?;
+    let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
+    library
+        .persist_output_identity_manifests(&output_roots)
+        .map_err(|error| error.to_string())?;
     let playlist = library
         .get_imported_dj_playlist(&playlist_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "找不到指定的 DJ 歌单".to_string())?;
+    library
+        .restore_imported_dj_playlist_review_manifests(&playlist_id, &output_roots)
+        .map_err(|error| error.to_string())?;
     let selected_parent = selected_path
         .parent()
         .ok_or_else(|| "无法确定歌单导出目录".to_string())?;
@@ -4702,16 +4862,62 @@ fn export_imported_dj_playlist_m3u8(
     let report = library
         .get_imported_dj_playlist_match_report(&playlist_id)
         .map_err(|error| error.to_string())?;
+    if report.total == 0 {
+        return Err("不能导出空的 M3U8 歌单".to_string());
+    }
+    if report.matches.len() != report.total {
+        return Err("歌单匹配记录不完整，请重新识别".to_string());
+    }
+    let excluded_positions = report
+        .matches
+        .iter()
+        .filter(|row| row.excluded)
+        .map(|row| row.position)
+        .collect::<HashSet<_>>();
+    let active_rows = report
+        .matches
+        .iter()
+        .filter(|row| !row.excluded)
+        .collect::<Vec<_>>();
+    if active_rows.is_empty() {
+        return Err("导出列表为空，请恢复歌曲或重新匹配".to_string());
+    }
+    let unbound = active_rows
+        .iter()
+        .filter(|row| {
+            row.status != "matched"
+                || row.track_key.is_none()
+                || row.destination_path.is_none()
+        })
+        .count();
+    if unbound > 0 {
+        return Err(format!(
+            "请先为导出列表中的歌曲选择本地输出，当前还有 {} 首未匹配",
+            unbound
+        ));
+    }
+    let mut export_playlist = playlist.clone();
+    export_playlist
+        .tracks
+        .retain(|track| !excluded_positions.contains(&track.position));
     let candidates = library
         .available_dj_output_candidates()
         .map_err(|error| error.to_string())?;
-    let resolved = report
-        .matches
-        .iter()
-        .filter_map(|row| {
-            let track_key = row.track_key.as_deref()?;
-            let candidate = candidates.iter().find(|candidate| candidate.track_key == track_key)?;
-            Some(ResolvedDjPlaylistTrack {
+    let resolved = active_rows
+        .into_iter()
+        .map(|row| {
+            let track_key = row
+                .track_key
+                .as_deref()
+                .ok_or_else(|| format!("第 {} 首歌曲缺少本地输出", row.position))?;
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.track_key == track_key)
+                .ok_or_else(|| format!("第 {} 首歌曲的本地输出已不存在", row.position))?;
+            if row.destination_path.as_ref() != Some(&candidate.destination_path) {
+                return Err(format!("第 {} 首歌曲的复核路径已变化，请重新选择本地歌曲", row.position));
+            }
+            Ok(ResolvedDjPlaylistTrack {
                 position: row.position,
                 title: row.title.clone(),
                 artist_display: row.artist_display.clone(),
@@ -4719,9 +4925,13 @@ fn export_imported_dj_playlist_m3u8(
                 destination_path: candidate.destination_path.clone(),
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     let mut resolved = resolved;
     let copy_audio = copy_audio.unwrap_or(false);
+    // Validate every active source before creating an export directory. A
+    // failed review cannot leave behind a misleading partial playlist folder.
+    build_relative_m3u8_with_summary(&export_playlist, &resolved, &output)
+        .map_err(|error| error.to_string())?;
     let created_export_directory = !export_directory.exists();
     if created_export_directory {
         fs::create_dir(&export_directory)
@@ -4752,7 +4962,7 @@ fn export_imported_dj_playlist_m3u8(
         Vec::new()
     };
     let (contents, summary): (String, M3u8ExportSummary) =
-        match build_relative_m3u8_with_summary(&playlist, &resolved, &output, allow_partial) {
+        match build_relative_m3u8_with_summary(&export_playlist, &resolved, &output) {
             Ok(result) => result,
             Err(error) => {
                 for created_path in &created_audio {
@@ -4793,7 +5003,6 @@ fn export_imported_dj_playlist_m3u8(
         copied_count: if copy_audio { resolved.len() } else { 0 },
         copy_audio,
         portable: copy_audio,
-        omitted: summary.omitted,
     })
 }
 
@@ -4817,12 +5026,75 @@ fn manual_netease_database_path(state: &AppState) -> Option<PathBuf> {
         .clone()
 }
 
+fn configured_output_roots_for_identity(state: &AppState) -> Vec<(usize, PathBuf)> {
+    state
+        .controller
+        .lock()
+        .ok()
+        .map(|controller| {
+            controller
+                .state()
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(slot_index, _)| {
+                    controller
+                        .effective_destination(slot_index)
+                        .ok()
+                        .flatten()
+                        .filter(|path| !path.trim().is_empty())
+                        .map(|path| (slot_index, PathBuf::from(path)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn prepare_w4dj_output_identity_state(
+    library: &mut W4djLibrary,
+    state: &AppState,
+) -> Result<Vec<(usize, PathBuf)>, String> {
+    let roots = configured_output_roots_for_identity(state);
+    library
+        .restore_output_identity_manifests(&roots)
+        .map_err(|error| error.to_string())?;
+    library
+        .persist_output_identity_manifests(&roots)
+        .map_err(|error| error.to_string())?;
+    Ok(roots)
+}
+
 fn netease_database_bound(state: &AppState) -> bool {
     state.library.netease_database_bound.load(Ordering::SeqCst)
 }
 
 fn library_netease_database_bound(library: &LibraryState) -> bool {
     library.netease_database_bound.load(Ordering::SeqCst)
+}
+
+/// Load the complete local NetEase snapshot at an explicit identity boundary
+/// (scan/import/match), never during app startup.  The lazy resolver used by
+/// ordinary conversion metadata remains separate because it does not contain
+/// enough rows to resolve a title/artist-only playlist export.
+fn load_netease_resolver_for_identity(
+    bound: bool,
+    preferred: Option<&Path>,
+) -> Option<NeteaseMetadataResolver> {
+    if !bound {
+        return None;
+    }
+    match NeteaseMetadataResolver::load_with_warning(preferred) {
+        Ok((resolver, warning)) => {
+            if let Some(warning) = warning {
+                eprintln!("Netease identity resolver warning: {warning}");
+            }
+            resolver.database_loaded().then_some(resolver)
+        }
+        Err(error) => {
+            eprintln!("Netease identity resolver failed: {error}");
+            None
+        }
+    }
 }
 
 fn unbind_netease_database_binding(state: &AppState) -> Result<(), String> {
@@ -6987,6 +7259,381 @@ fn read_runtime_session_artifacts(session_dir: &Path) -> serde_json::Value {
     })
 }
 
+fn read_json_artifact_for_full_runtime_report(path: &Path) -> serde_json::Value {
+    let path_string = path.display().to_string();
+    if path.as_os_str().is_empty() {
+        return serde_json::json!({
+            "available": false,
+            "path": path_string,
+            "error": "路径尚未初始化",
+        });
+    }
+    match fs::read_to_string(path) {
+        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+            Ok(data) => serde_json::json!({
+                "available": true,
+                "path": path_string,
+                "data": data,
+            }),
+            Err(error) => serde_json::json!({
+                "available": true,
+                "path": path_string,
+                "raw": contents,
+                "parseError": error.to_string(),
+            }),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({
+            "available": false,
+            "path": path_string,
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "path": path_string,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn collect_output_identity_manifests_for_full_runtime_report(
+    roots: &[(usize, PathBuf)],
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        roots
+            .iter()
+            .map(|(slot_index, root)| {
+                let manifest_path = root.join(OUTPUT_IDENTITY_MANIFEST_FILE_NAME);
+                serde_json::json!({
+                    "slotIndex": slot_index,
+                    "rootPath": root,
+                    "manifest": read_json_artifact_for_full_runtime_report(&manifest_path),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn read_binary_artifact_for_full_runtime_report(path: &Path) -> serde_json::Value {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::json!({
+            "path": path.display().to_string(),
+            "bytes": bytes.len(),
+            "base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        }),
+        Err(error) => serde_json::json!({
+            "path": path.display().to_string(),
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn read_raw_sqlite_files_for_full_runtime_report(path: &Path) -> serde_json::Value {
+    let mut files = serde_json::Map::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = if suffix.is_empty() {
+            path.to_path_buf()
+        } else {
+            PathBuf::from(format!("{}{suffix}", path.display()))
+        };
+        if candidate.is_file() {
+            let name = candidate
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| candidate.display().to_string());
+            files.insert(
+                name,
+                read_binary_artifact_for_full_runtime_report(&candidate),
+            );
+        }
+    }
+    serde_json::Value::Object(files)
+}
+
+fn collect_w4dj_runtime_diagnostics(path: &Path) -> serde_json::Value {
+    let mut database = serde_json::Map::new();
+    database.insert("path".to_string(), serde_json::json!(path));
+    database.insert("format".to_string(), serde_json::json!("SQLite 3"));
+
+    let mut diagnostics = serde_json::Map::new();
+    if path.as_os_str().is_empty() || !path.is_file() {
+        database.insert("available".to_string(), serde_json::json!(false));
+        database.insert(
+            "error".to_string(),
+            serde_json::json!("W4DJ 私有歌曲库文件不存在或路径尚未初始化"),
+        );
+        diagnostics.insert("database".to_string(), serde_json::Value::Object(database));
+        return serde_json::Value::Object(diagnostics);
+    }
+
+    database.insert("available".to_string(), serde_json::json!(true));
+    match W4djLibrary::open_read_only(path) {
+        Ok(library) => {
+            database.insert("readable".to_string(), serde_json::json!(true));
+            match w4dj::netease::sqlite_schema_snapshot(path) {
+                Ok(schema) => {
+                    database.insert("schema".to_string(), schema);
+                }
+                Err(error) => {
+                    database.insert(
+                        "schemaError".to_string(),
+                        serde_json::json!(error.to_string()),
+                    );
+                }
+            }
+            match library.sqlite_snapshot_bytes() {
+                Ok(bytes) => {
+                    database.insert("snapshotType".to_string(), serde_json::json!("sqliteOnlineBackup"));
+                    database.insert("snapshotBytes".to_string(), serde_json::json!(bytes.len()));
+                    database.insert(
+                        "snapshotBase64".to_string(),
+                        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                    );
+                }
+                Err(error) => {
+                    database.insert("snapshotError".to_string(), serde_json::json!(error.to_string()));
+                    database.insert(
+                        "rawFiles".to_string(),
+                        read_raw_sqlite_files_for_full_runtime_report(path),
+                    );
+                }
+            }
+            diagnostics.insert(
+                "stats".to_string(),
+                match library.stats() {
+                    Ok(stats) => serde_json::json!(stats),
+                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                },
+            );
+            diagnostics.insert(
+                "outputCandidates".to_string(),
+                match library.available_dj_output_candidates() {
+                    Ok(candidates) => serde_json::json!(candidates),
+                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                },
+            );
+            let playlists = match library.list_imported_dj_playlists() {
+                Ok(summaries) => serde_json::Value::Array(
+                    summaries
+                        .into_iter()
+                        .map(|summary| {
+                            let playlist_id = summary.playlist_id.clone();
+                            let playlist = match library.get_imported_dj_playlist(&playlist_id) {
+                                Ok(value) => serde_json::json!(value),
+                                Err(error) => serde_json::json!({"error": error.to_string()}),
+                            };
+                            let match_report =
+                                match library.get_imported_dj_playlist_match_report(&playlist_id) {
+                                    Ok(value) => serde_json::json!(value),
+                                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                                };
+                            serde_json::json!({
+                                "summary": summary,
+                                "playlist": playlist,
+                                "matchReport": match_report,
+                            })
+                        })
+                        .collect(),
+                ),
+                Err(error) => serde_json::json!({"error": error.to_string()}),
+            };
+            diagnostics.insert("importedDjPlaylists".to_string(), playlists);
+            diagnostics.insert(
+                "matchingIdentityPolicy".to_string(),
+                serde_json::json!({
+                    "playlistFormatVersion": 2,
+                    "fields": ["title", "artistDisplay"],
+                    "neteaseTrackIdUsed": false,
+                    "neteaseAlbumIdUsed": false,
+                    "partialM3u8ExportAllowed": false,
+                    "reviewRequiredBeforeExport": true,
+                }),
+            );
+        }
+        Err(error) => {
+            database.insert("readable".to_string(), serde_json::json!(false));
+            database.insert("openError".to_string(), serde_json::json!(error.to_string()));
+            database.insert(
+                "rawFiles".to_string(),
+                read_raw_sqlite_files_for_full_runtime_report(path),
+            );
+        }
+    }
+    diagnostics.insert("database".to_string(), serde_json::Value::Object(database));
+    serde_json::Value::Object(diagnostics)
+}
+
+fn collect_netease_runtime_diagnostics(
+    bound: bool,
+    preferred: Option<&Path>,
+) -> serde_json::Value {
+    if !bound {
+        return serde_json::json!({
+            "bound": false,
+            "available": false,
+            "error": "网易云数据库未绑定",
+        });
+    }
+    let Some(path) = locate_supported_database(preferred) else {
+        return serde_json::json!({
+            "bound": true,
+            "available": false,
+            "error": "未找到可读取的网易云 SQLite 数据库",
+            "preferredPath": preferred.map(|value| value.display().to_string()),
+        });
+    };
+
+    let mut database = serde_json::Map::new();
+    database.insert("bound".to_string(), serde_json::json!(true));
+    database.insert("available".to_string(), serde_json::json!(true));
+    database.insert("path".to_string(), serde_json::json!(path));
+    database.insert("format".to_string(), serde_json::json!("SQLite 3"));
+    match w4dj::netease::sqlite_schema_snapshot(&path) {
+        Ok(schema) => {
+            database.insert("schema".to_string(), schema);
+        }
+        Err(error) => {
+            database.insert(
+                "schemaError".to_string(),
+                serde_json::json!(error.to_string()),
+            );
+        }
+    }
+    if let Ok(summary) = w4dj::netease::probe_netease_database(&path) {
+        database.insert("recordCount".to_string(), serde_json::json!(summary.record_count));
+        database.insert("supported".to_string(), serde_json::json!(summary.supported));
+    }
+    match w4dj::netease::sqlite_snapshot_bytes(&path) {
+        Ok(bytes) => {
+            database.insert("readable".to_string(), serde_json::json!(true));
+            database.insert(
+                "snapshotType".to_string(),
+                serde_json::json!("sqliteOnlineBackup"),
+            );
+            database.insert("snapshotBytes".to_string(), serde_json::json!(bytes.len()));
+            database.insert(
+                "snapshotBase64".to_string(),
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            );
+        }
+        Err(error) => {
+            database.insert("readable".to_string(), serde_json::json!(false));
+            database.insert("snapshotError".to_string(), serde_json::json!(error.to_string()));
+            database.insert(
+                "rawFiles".to_string(),
+                read_raw_sqlite_files_for_full_runtime_report(&path),
+            );
+        }
+    }
+    serde_json::Value::Object(database)
+}
+
+fn collect_history_runtime_diagnostics(path: &Path) -> serde_json::Value {
+    let path_string = path.display().to_string();
+    if path.as_os_str().is_empty() {
+        return serde_json::json!({
+            "available": false,
+            "path": path_string,
+            "error": "路径尚未初始化",
+        });
+    }
+    match load_history_file(path) {
+        Ok(entries) => serde_json::json!({
+            "available": path.is_file(),
+            "path": path_string,
+            "entries": entries,
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "path": path_string,
+            "error": error.to_string(),
+        }),
+    }
+}
+
+fn collect_runtime_sessions_diagnostics(root: &Path) -> serde_json::Value {
+    if root.as_os_str().is_empty() || !root.is_dir() {
+        return serde_json::json!({
+            "available": false,
+            "directory": root.display().to_string(),
+        });
+    }
+    let mut sessions = serde_json::Map::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return serde_json::json!({
+            "available": false,
+            "directory": root.display().to_string(),
+            "error": "运行会话目录无法读取",
+        });
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let key = fs::read_to_string(path.join("session.json"))
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+            .and_then(|session| {
+                session
+                    .get("batch_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                path.file_name()
+                    .map(|value| value.to_string_lossy().into_owned())
+            });
+        if let Some(key) = key {
+            sessions.insert(key, read_runtime_session_artifacts(&path));
+        }
+    }
+    serde_json::json!({
+        "available": true,
+        "directory": root.display().to_string(),
+        "sessions": sessions,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_full_runtime_diagnostics(
+    w4dj_path: &Path,
+    preferences_path: &Path,
+    history_path: &Path,
+    scan_cache_path: &Path,
+    runtime_sessions_path: &Path,
+    netease_database_bound: bool,
+    preferred_netease_database: Option<&Path>,
+    output_identity_roots: &[(usize, PathBuf)],
+) -> serde_json::Value {
+    let track_analysis = if history_path.as_os_str().is_empty() {
+        serde_json::json!({
+            "available": false,
+            "error": "路径尚未初始化",
+        })
+    } else {
+        read_json_artifact_for_full_runtime_report(&analysis_file_path(history_path))
+    };
+    let mut w4dj = collect_w4dj_runtime_diagnostics(w4dj_path);
+    if let Some(w4dj_object) = w4dj.as_object_mut() {
+        w4dj_object.insert(
+            "outputIdentityManifests".to_string(),
+            collect_output_identity_manifests_for_full_runtime_report(output_identity_roots),
+        );
+    }
+    serde_json::json!({
+        "schemaVersion": 1,
+        "w4dj": w4dj,
+        "netease": collect_netease_runtime_diagnostics(
+            netease_database_bound,
+            preferred_netease_database,
+        ),
+        "preferences": read_json_artifact_for_full_runtime_report(preferences_path),
+        "history": collect_history_runtime_diagnostics(history_path),
+        "trackAnalysis": track_analysis,
+        "scanCache": read_json_artifact_for_full_runtime_report(scan_cache_path),
+        "runtimeSessions": collect_runtime_sessions_diagnostics(runtime_sessions_path),
+    })
+}
+
 fn build_runtime_session_export(
     entry: &HistoryEntry,
     session_dir: Option<&Path>,
@@ -7120,8 +7767,40 @@ fn export_full_runtime_report(
         serde_json::json!({"path": path}),
         None,
     );
+    let preferences_path = state
+        .preferences_path
+        .lock()
+        .map_err(|_| "偏好设置路径锁损坏".to_string())?
+        .clone();
+    let history_path = state
+        .history_path
+        .lock()
+        .map_err(|_| "历史记录路径锁损坏".to_string())?
+        .clone();
+    let scan_cache_path = state
+        .scan_cache_path
+        .lock()
+        .map_err(|_| "扫描缓存路径锁损坏".to_string())?
+        .clone();
+    let runtime_sessions_path = state
+        .test_monitor_path
+        .lock()
+        .map_err(|_| "运行会话路径锁损坏".to_string())?
+        .clone();
+    let preferred_netease_database = manual_netease_database_path(state.inner());
+    let output_identity_roots = configured_output_roots_for_identity(state.inner());
+    let diagnostics = collect_full_runtime_diagnostics(
+        &library_catalog_path(&state),
+        &preferences_path,
+        &history_path,
+        &scan_cache_path,
+        &runtime_sessions_path,
+        netease_database_bound(state.inner()),
+        preferred_netease_database.as_deref(),
+        &output_identity_roots,
+    );
     journal
-        .export_full_report(Path::new(&path))
+        .export_full_report_with_diagnostics(Path::new(&path), Some(&diagnostics))
         .map_err(|error| format!("完整运行报告保存失败：{error}"))?;
     journal.record_event(
         "full_runtime_report_exported",
@@ -7606,6 +8285,9 @@ fn main() {
             match_imported_dj_playlist,
             load_imported_dj_playlist_matches,
             set_imported_dj_playlist_match,
+            set_imported_dj_playlist_match_by_path,
+            set_imported_dj_playlist_match_confirmed,
+            set_imported_dj_playlist_matches_excluded,
             clear_imported_dj_playlist_match,
             export_imported_dj_playlist_m3u8,
             load_headless_acceptance_config,
@@ -7931,7 +8613,7 @@ fn register_committed_output(
 fn register_committed_output_with_facts(
     library: &mut Option<W4djLibrary>,
     slot_index: usize,
-    _destination_root: &Path,
+    destination_root: &Path,
     candidate: &PreviewCandidate,
     _analyses: &HashMap<String, EmbeddedAnalysis>,
     naming_facts: &CommittedOutputFacts,
@@ -7969,12 +8651,11 @@ fn register_committed_output_with_facts(
                 .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         })
     });
-    library.upsert_committed_output(
+    library.upsert_committed_output_in_root(
         slot_index,
+        destination_root,
         Some(Path::new(&candidate.source_path)),
         Path::new(&candidate.destination_path),
-        candidate.netease_track_id.as_deref(),
-        candidate.netease_album_id.as_deref(),
         title,
         artist,
         &facts,
@@ -8217,10 +8898,17 @@ fn run_confirmed_sync_task(
     destination_coordinator: DestinationCoordinator,
     history_path: PathBuf,
     history_write_lock: Arc<Mutex<()>>,
-    job: ConfirmedSyncJob,
+    mut job: ConfirmedSyncJob,
     concurrency_budget: Arc<GlobalConcurrencyBudget>,
     ffmpeg_registry: Arc<w4dj::sync::ActiveFfmpegRegistry>,
 ) {
+    // The frontend may submit a preview created by an older build or a
+    // retry reconstructed from history. Resolve missing IDs once at the
+    // conversion boundary so final W4DJ registration and the runtime report
+    // still carry the same identity as a fresh scan.
+    for candidate in &mut job.candidates {
+        attach_netease_identity(candidate, job.metadata_context.netease.as_ref());
+    }
     let started_at = timestamp_string();
     let started = Instant::now();
     let history_id = format!("{}-slot{}", job.batch_id, job.slot_index + 1);
@@ -8359,7 +9047,7 @@ fn run_confirmed_sync_task(
                 None
             }
         };
-        let naming_facts = committed_output_naming_facts(
+        let mut naming_facts = committed_output_naming_facts(
             job.conversion_mode,
             job.mode,
             job.lossless_format,
@@ -8367,6 +9055,7 @@ fn run_confirmed_sync_task(
             job.netease_filename_format,
             filename_normalization_policy_for_slot(job.slot_index),
         );
+        naming_facts.conversion_batch_id = Some(job.batch_id.clone());
 
         if let Err(error) = cleanup_result {
             setup_error = Some(format!("无法清理临时文件：{error}"));
@@ -9064,6 +9753,7 @@ fn run_sync_task(
     ffmpeg_registry: Arc<w4dj::sync::ActiveFfmpegRegistry>,
     metadata_context: Arc<ConversionMetadataContext>,
 ) {
+    let conversion_batch_id = format!("slot{}-{}", slot_index + 1, unique_timestamp());
     let (
         source,
         destination,
@@ -9336,6 +10026,7 @@ fn run_sync_task(
                         netease_filename_format,
                         filename_normalization_policy_for_slot(slot_index),
                     );
+                    facts.conversion_batch_id = Some(conversion_batch_id.clone());
                     facts.source_size_bytes = source_files
                         .get(name)
                         .and_then(|(size, _)| size.parse::<u64>().ok());
@@ -9344,12 +10035,11 @@ fn run_sync_task(
                         .and_then(|metadata| metadata.modified().ok())
                         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
-                    library.upsert_committed_output(
+                    library.upsert_committed_output_in_root(
                         slot_index,
+                        Path::new(&destination),
                         Some(source_path),
                         &destination_path,
-                        identity.as_ref().and_then(|value| value.track_id.as_deref()),
-                        identity.as_ref().and_then(|value| value.album_id.as_deref()),
                         identity.as_ref().map_or("", |value| value.title.as_str()),
                         identity.as_ref().map_or("", |value| value.artists.as_str()),
                         &facts,
@@ -9525,6 +10215,7 @@ mod tests {
     use super::DestinationCoordinator;
     use super::CatalogLocalFile;
     use super::apply_preflight_summary;
+    use super::collect_full_runtime_diagnostics;
     use super::collect_processable_previews;
     use super::deduplicate_cross_slot_candidates;
     use super::history_status_for;
@@ -9546,8 +10237,12 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use base64::Engine as _;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
     use w4dj::config::{ConflictStrategy, Mode};
     use w4dj::desktop::{DesktopController, DesktopState};
+    use w4dj::dj_playlist::{ImportedDjPlaylist, ImportedDjPlaylistTrack};
     use w4dj::history::{AnalysisReport, FailedFile, HistoryEntry, HistoryStatus};
     use w4dj::m3u8::ResolvedDjPlaylistTrack;
     use w4dj::w4dj_library::W4djLibrary;
@@ -10079,6 +10774,123 @@ mod tests {
         assert_eq!(progress.processed, 24);
         assert_eq!(progress.total, Some(24));
         assert_eq!(progress.summary.as_ref().map(|summary| summary.track_count), Some(24));
+    }
+
+    #[test]
+    fn full_runtime_diagnostics_contains_sqlite_snapshot_and_playlist_match_data() {
+        let directory = tempdir().unwrap();
+        let output_root = directory.path().join("out");
+        fs::create_dir_all(&output_root).unwrap();
+        let output = output_root.join("song.mp3");
+        fs::write(&output, b"audio").unwrap();
+        let database_path = directory.path().join("w4dj.sqlite3");
+        let mut library = W4djLibrary::open(&database_path).unwrap();
+        library
+            .upsert_output_file(0, &output_root, None, &output)
+            .unwrap();
+        library
+            .upsert_imported_dj_playlist(&ImportedDjPlaylist {
+                playlist_id: "playlist-1".into(),
+                format_version: 2,
+                name: "Test playlist".into(),
+                source_path: None,
+                imported_at_ms: Some(1),
+                tracks: vec![ImportedDjPlaylistTrack {
+                    position: 1,
+                    title: "song".into(),
+                    artist_display: "Artist".into(),
+                    dedupe_key: "song::artist".into(),
+                    netease_import_line: "song - Artist".into(),
+                }],
+                warnings: Vec::new(),
+            })
+            .unwrap();
+        drop(library);
+
+        let diagnostics = collect_full_runtime_diagnostics(
+            &database_path,
+            &directory.path().join("preferences.json"),
+            &directory.path().join("history.json"),
+            &directory.path().join("scan-cache.json"),
+            &directory.path().join("runtime-sessions"),
+            false,
+            None,
+            &[(0, output_root.clone())],
+        );
+        let snapshot = diagnostics["w4dj"]["database"]["snapshotBase64"]
+            .as_str()
+            .and_then(|value| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .ok()
+            })
+            .expect("diagnostics include a decodable SQLite snapshot");
+        assert!(snapshot.starts_with(b"SQLite format 3\0"));
+        assert!(diagnostics["w4dj"]["database"]["schema"]["schemaVersion"]
+            .get("pragmaUserVersion")
+            .is_some());
+        assert!(diagnostics["w4dj"]["database"]["schema"]["tables"]
+            .as_array()
+            .is_some_and(|tables| tables.iter().any(|table| table["name"] == "tracks")));
+        assert_eq!(diagnostics["w4dj"]["outputCandidates"].as_array().unwrap().len(), 1);
+        assert_eq!(diagnostics["w4dj"]["importedDjPlaylists"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            diagnostics["w4dj"]["importedDjPlaylists"][0]["matchReport"]["total"],
+            1
+        );
+        assert_eq!(
+            diagnostics["w4dj"]["outputIdentityManifests"][0]["manifest"]["available"],
+            false
+        );
+        assert_eq!(
+            diagnostics["w4dj"]["matchingIdentityPolicy"]["fields"],
+            serde_json::json!(["title", "artistDisplay"])
+        );
+        assert_eq!(
+            diagnostics["w4dj"]["matchingIdentityPolicy"]["neteaseTrackIdUsed"],
+            false
+        );
+    }
+
+    #[test]
+    fn full_runtime_diagnostics_contains_the_netease_sqlite_snapshot() {
+        let directory = tempdir().unwrap();
+        let netease_database = directory.path().join("sqlite_storage.sqlite3");
+        let connection = Connection::open(&netease_database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE track (
+                    file TEXT, title TEXT, artist TEXT, album TEXT, tid TEXT
+                );
+                INSERT INTO track(file,title,artist,album,tid)
+                VALUES ('/music/song.mp3','Song','Artist','Album','42');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let diagnostics = super::collect_netease_runtime_diagnostics(
+            true,
+            Some(&netease_database),
+        );
+        let snapshot = diagnostics["snapshotBase64"]
+            .as_str()
+            .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+            .expect("diagnostics include a decodable NetEase SQLite snapshot");
+        assert!(diagnostics["schema"]["schemaVersion"]
+            .get("pragmaUserVersion")
+            .is_some());
+        assert!(diagnostics["schema"]["tables"]
+            .as_array()
+            .is_some_and(|tables| tables.iter().any(|table| table["name"] == "track")));
+        let snapshot_path = directory.path().join("snapshot.sqlite3");
+        fs::write(&snapshot_path, snapshot).unwrap();
+        let snapshot_connection = Connection::open(snapshot_path).unwrap();
+        assert_eq!(
+            snapshot_connection
+                .query_row("SELECT tid FROM track LIMIT 1", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "42"
+        );
     }
 
     #[test]

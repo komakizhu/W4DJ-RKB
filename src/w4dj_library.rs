@@ -10,7 +10,7 @@ use crate::dj_playlist::{
 };
 use crate::dj_playlist_match::{
     DjOutputCandidate, DjPlaylistMatchKind, DjPlaylistMatchReport, DjPlaylistTrackMatch,
-    match_imported_playlist,
+    candidate_filename, identity_key_for, match_imported_playlist_with_priority,
 };
 use crate::history::HistoryStatus;
 use crate::library_catalog::{
@@ -23,12 +23,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-pub const W4DJ_SCHEMA_VERSION: i64 = 3;
+pub const W4DJ_SCHEMA_VERSION: i64 = 4;
+pub const OUTPUT_IDENTITY_MANIFEST_FILE_NAME: &str = ".w4dj-output-identities.json";
+const OUTPUT_IDENTITY_MANIFEST_FORMAT: &str = "w4dj-output-identities";
+const OUTPUT_IDENTITY_MANIFEST_VERSION: u32 = 1;
+static OUTPUT_IDENTITY_MANIFEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommittedOutputFacts {
@@ -39,6 +44,9 @@ pub struct CommittedOutputFacts {
     pub filename_rule: Option<String>,
     pub netease_filename_format: Option<String>,
     pub filename_normalization_policy: Option<String>,
+    /// Identifier for the successful conversion operation that produced the
+    /// output. It is provenance for playlist matching, never song identity.
+    pub conversion_batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +68,60 @@ pub struct CommittedOutputBinding {
 pub struct OutputReconcileSummary {
     pub invalidated_paths: Vec<PathBuf>,
     pub removed_paths: Vec<PathBuf>,
+}
+
+/// Durable provenance for output files. SQLite remains the fast, rebuildable
+/// index; this small sidecar is materialized only by an explicit W4DJ playlist
+/// operation and is the recovery source when that index is cleared or
+/// recreated for that operation. It intentionally stores no audio hash and is
+/// kept beside the output root so copying the output folder keeps the matching
+/// identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OutputIdentityManifest {
+    format: String,
+    format_version: u32,
+    outputs: Vec<OutputIdentityManifestEntry>,
+    #[serde(default)]
+    playlists: Vec<OutputPlaylistManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OutputIdentityManifestEntry {
+    relative_path: String,
+    #[serde(default)]
+    source_path: Option<String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artist_display: String,
+}
+
+/// Active playlist bindings live beside output identities so a rebuilt W4DJ
+/// SQLite index can recover a user's export choices. This is a private sidecar
+/// contract, not the public `.w4dj` protocol, and intentionally has no NetEase
+/// identifiers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OutputPlaylistManifest {
+    playlist_id: String,
+    tracks: Vec<OutputPlaylistManifestTrack>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct OutputPlaylistManifestTrack {
+    position: u64,
+    relative_path: String,
+    title: String,
+    artist_display: String,
+    #[serde(default)]
+    score: Option<i32>,
+    #[serde(default)]
+    match_method: Option<String>,
+    #[serde(default)]
+    candidate_source: Option<String>,
 }
 
 /// Filesystem facts captured during the scan walk.  Reconciliation consumes
@@ -180,6 +242,14 @@ impl W4djLibrary {
         Ok(library)
     }
 
+    /// Open an existing output catalog for diagnostics without running the
+    /// normal migration/recovery path. This keeps report export read-only.
+    pub fn open_read_only(path: &Path) -> W4djResult<Self> {
+        Ok(Self {
+            catalog: LibraryCatalog::open_read_only(path)?,
+        })
+    }
+
     pub fn open_or_recover(path: &Path) -> W4djResult<(Self, Option<PathBuf>)> {
         let (catalog, backup) = LibraryCatalog::open_or_recover(path)?;
         let mut library = Self { catalog };
@@ -189,6 +259,18 @@ impl W4djLibrary {
 
     pub fn path(&self) -> &Path {
         self.catalog.path()
+    }
+
+    /// Return a consistent SQLite online-backup snapshot of the catalog.
+    /// Copying only `w4dj.sqlite3` can miss committed WAL pages, so the
+    /// snapshot is made through SQLite and can be embedded in a report.
+    pub fn sqlite_snapshot_bytes(&self) -> W4djResult<Vec<u8>> {
+        let directory = tempfile::tempdir()?;
+        let snapshot_path = directory.path().join("w4dj.sqlite3");
+        let mut destination = rusqlite::Connection::open(&snapshot_path)?;
+        rusqlite::backup::Backup::new(self.catalog.connection(), &mut destination)?
+            .run_to_completion(100, Duration::from_millis(10), None)?;
+        Ok(fs::read(snapshot_path)?)
     }
 
     /// Load all successful source→output bindings in one SQLite query. Scan
@@ -262,6 +344,8 @@ impl W4djLibrary {
                 filename_rule TEXT,
                 netease_filename_format TEXT,
                 filename_normalization_policy TEXT,
+                conversion_batch_id TEXT,
+                committed_at_ms INTEGER,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 FOREIGN KEY(track_key) REFERENCES tracks(track_key) ON DELETE CASCADE
@@ -296,7 +380,8 @@ impl W4djLibrary {
                 source_path TEXT,
                 created_at TEXT,
                 imported_at_ms INTEGER NOT NULL,
-                warnings_json TEXT NOT NULL
+                warnings_json TEXT NOT NULL,
+                claimed_batch_id TEXT
             );
             CREATE TABLE IF NOT EXISTS imported_dj_playlist_tracks (
                 playlist_id TEXT NOT NULL,
@@ -327,6 +412,9 @@ impl W4djLibrary {
                 score INTEGER,
                 candidates_json TEXT NOT NULL,
                 reason TEXT NOT NULL DEFAULT '',
+                candidate_source TEXT,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                excluded INTEGER NOT NULL DEFAULT 0,
                 matched_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (playlist_id, position),
                 FOREIGN KEY (playlist_id, position)
@@ -340,9 +428,20 @@ impl W4djLibrary {
             "#,
         )?;
         self.ensure_committed_output_columns()?;
-        // Add the v3 nullable facts before any legacy table rebuild so the
+        // Add the v4 nullable facts before any legacy table rebuild so the
         // migration can copy them forward instead of silently dropping them.
         self.migrate_track_meta_without_root_foreign_key()?;
+        let claimed_batch_id_exists: bool = self.catalog.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlists') WHERE name='claimed_batch_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !claimed_batch_id_exists {
+            self.catalog.connection().execute(
+                "ALTER TABLE imported_dj_playlists ADD COLUMN claimed_batch_id TEXT",
+                [],
+            )?;
+        }
         let netease_track_id_exists: bool = self.catalog.connection().query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlist_tracks') WHERE name='netease_track_id')",
             [],
@@ -365,6 +464,58 @@ impl W4djLibrary {
                 [],
             )?;
         }
+        let match_candidate_source_exists: bool = self.catalog.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlist_matches') WHERE name='candidate_source')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !match_candidate_source_exists {
+            self.catalog.connection().execute(
+                "ALTER TABLE imported_dj_playlist_matches ADD COLUMN candidate_source TEXT",
+                [],
+            )?;
+        }
+        let match_confirmed_exists: bool = self.catalog.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlist_matches') WHERE name='confirmed')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !match_confirmed_exists {
+            self.catalog.connection().execute(
+                "ALTER TABLE imported_dj_playlist_matches ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let match_excluded_exists: bool = self.catalog.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlist_matches') WHERE name='excluded')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !match_excluded_exists {
+            self.catalog.connection().execute(
+                "ALTER TABLE imported_dj_playlist_matches ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        self.catalog.connection().execute_batch(
+            "CREATE INDEX IF NOT EXISTS w4dj_track_meta_batch
+                ON w4dj_track_meta(conversion_batch_id, committed_at_ms);
+             CREATE INDEX IF NOT EXISTS imported_dj_playlists_claimed_batch
+                ON imported_dj_playlists(claimed_batch_id);",
+        )?;
+        // These columns are retained solely so older databases can migrate
+        // without a destructive table rewrite. W4DJ must never use legacy
+        // NetEase IDs as playlist/output identity, so scrub any historical
+        // values at the migration boundary. The shared catalog keeps its
+        // ordinary NetEase metadata for conversion retrieval; only rows owned
+        // by the W4DJ output projection are cleared here.
+        self.catalog.connection().execute_batch(
+            "UPDATE imported_dj_playlist_tracks SET netease_track_id=NULL;
+             UPDATE w4dj_output_identities
+                SET netease_track_id=NULL, netease_album_id=NULL;
+             UPDATE tracks SET netease_track_id=NULL
+              WHERE track_key IN (SELECT track_key FROM w4dj_track_meta);",
+        )?;
         self.catalog.connection().execute(
             "INSERT INTO library_meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -382,6 +533,8 @@ impl W4djLibrary {
             ("filename_rule", "TEXT"),
             ("netease_filename_format", "TEXT"),
             ("filename_normalization_policy", "TEXT"),
+            ("conversion_batch_id", "TEXT"),
+            ("committed_at_ms", "INTEGER"),
         ];
         for (name, ty) in columns {
             let exists: bool = self.catalog.connection().query_row(
@@ -435,6 +588,8 @@ impl W4djLibrary {
                 filename_rule TEXT,
                 netease_filename_format TEXT,
                 filename_normalization_policy TEXT,
+                conversion_batch_id TEXT,
+                committed_at_ms INTEGER,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 FOREIGN KEY(track_key) REFERENCES tracks(track_key) ON DELETE CASCADE
@@ -444,11 +599,13 @@ impl W4djLibrary {
                 status,analysis_status,analysis_error,measured_duration_seconds,
                 source_size_bytes,source_modified_at_ms,conversion_mode,lossless_format,
                 filename_rule,netease_filename_format,filename_normalization_policy,
+                conversion_batch_id,committed_at_ms,
                 created_at_ms,updated_at_ms
              ) SELECT track_key,source_path,destination_path,slot_index,output_root,
                 status,analysis_status,analysis_error,measured_duration_seconds,
                 source_size_bytes,source_modified_at_ms,conversion_mode,lossless_format,
                 filename_rule,netease_filename_format,filename_normalization_policy,
+                conversion_batch_id,committed_at_ms,
                 created_at_ms,updated_at_ms
              FROM w4dj_track_meta;
              DROP TABLE w4dj_track_meta;
@@ -543,7 +700,7 @@ impl W4djLibrary {
                     platform_refs_json,
                     stored_dedupe_key,
                     Option::<String>::None,
-                    track.netease_track_id,
+                    Option::<String>::None,
                     track.netease_import_line,
                 ],
             )?;
@@ -600,7 +757,7 @@ impl W4djLibrary {
             return Ok(None);
         };
         let mut statement = self.catalog.connection().prepare(
-            "SELECT position,title,artist_display,dedupe_key,netease_track_id,netease_import_line
+            "SELECT position,title,artist_display,dedupe_key,netease_import_line
              FROM imported_dj_playlist_tracks WHERE playlist_id=?1 ORDER BY position",
         )?;
         let rows = statement.query_map([playlist_id], |row| {
@@ -611,8 +768,7 @@ impl W4djLibrary {
                 title: row.get(1)?,
                 artist_display: row.get(2)?,
                 dedupe_key: restore_dedupe_key(&stored_dedupe_key, position),
-                netease_track_id: row.get(4)?,
-                netease_import_line: row.get(5)?,
+                netease_import_line: row.get(4)?,
             })
         })?;
         let tracks = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -636,58 +792,153 @@ impl W4djLibrary {
     pub fn available_dj_output_candidates(&self) -> W4djResult<Vec<DjOutputCandidate>> {
         let mut statement = self.catalog.connection().prepare(
             "SELECT m.track_key,t.title,t.artists,
-                    (SELECT netease_track_id FROM w4dj_output_identities oi
-                     WHERE oi.destination_path=m.destination_path),
                     COALESCE(m.measured_duration_seconds,t.effective_duration_seconds),
                     m.destination_path,m.status,
                     COALESCE((SELECT readable FROM local_files lf
-                              WHERE lf.path=m.destination_path LIMIT 1), 1)
+                              WHERE lf.path=m.destination_path LIMIT 1), 1),
+                    m.conversion_batch_id,m.committed_at_ms
              FROM w4dj_track_meta m
              JOIN tracks t ON t.track_key=m.track_key
-             ORDER BY m.destination_path, m.track_key",
+             WHERE m.status='available'
+             ORDER BY COALESCE(m.committed_at_ms, 0) DESC, m.destination_path, m.track_key",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(DjOutputCandidate {
                 track_key: row.get(0)?,
                 title: row.get(1)?,
                 artist_display: row.get(2)?,
-                netease_track_id: row.get(3)?,
-                duration_seconds: row.get(4)?,
-                destination_path: PathBuf::from(row.get::<_, String>(5)?),
-                status: row.get(6)?,
-                readable: row.get::<_, i64>(7)? != 0,
+                duration_seconds: row.get(3)?,
+                destination_path: PathBuf::from(row.get::<_, String>(4)?),
+                status: row.get(5)?,
+                readable: row.get::<_, i64>(6)? != 0,
+                conversion_batch_id: row.get(7)?,
+                committed_at_ms: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn compute_imported_dj_playlist_matches(
+    /// Atomically reserve the newest successful conversion batch for a W4DJ
+    /// playlist. A batch is claimed at most once, which prevents a later
+    /// playlist import from stealing the outputs intended for an earlier one.
+    pub fn claim_latest_conversion_batch(
+        &mut self,
+        playlist_id: &str,
+    ) -> W4djResult<Option<String>> {
+        let transaction = self.catalog.connection_mut().transaction()?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT claimed_batch_id FROM imported_dj_playlists WHERE playlist_id=?1",
+                [playlist_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(current_id) = current.as_deref()
+            && transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM w4dj_track_meta
+                     WHERE status='available' AND conversion_batch_id=?1
+                 )",
+                [current_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        if current.is_some() {
+            transaction.execute(
+                "UPDATE imported_dj_playlists SET claimed_batch_id=NULL WHERE playlist_id=?1",
+                [playlist_id],
+            )?;
+        }
+        let latest: Option<String> = transaction
+            .query_row(
+                "SELECT conversion_batch_id
+                 FROM w4dj_track_meta
+                 WHERE status='available'
+                   AND conversion_batch_id IS NOT NULL
+                   AND TRIM(conversion_batch_id)<>''
+                 GROUP BY conversion_batch_id
+                 ORDER BY MAX(COALESCE(committed_at_ms, 0)) DESC, conversion_batch_id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(batch_id) = latest else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let already_claimed: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM imported_dj_playlists
+                 WHERE claimed_batch_id=?1 AND playlist_id<>?2
+             )",
+            params![batch_id, playlist_id],
+            |row| row.get(0),
+        )?;
+        if already_claimed {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let updated = transaction.execute(
+            "UPDATE imported_dj_playlists SET claimed_batch_id=?1
+             WHERE playlist_id=?2 AND claimed_batch_id IS NULL",
+            params![batch_id, playlist_id],
+        )?;
+        transaction.commit()?;
+        Ok((updated == 1).then_some(batch_id))
+    }
+
+    pub fn dj_output_candidates_for_batch(
         &self,
+        batch_id: &str,
+    ) -> W4djResult<Vec<DjOutputCandidate>> {
+        Ok(self
+            .available_dj_output_candidates()?
+            .into_iter()
+            .filter(|candidate| candidate.conversion_batch_id.as_deref() == Some(batch_id))
+            .collect())
+    }
+
+    pub fn has_imported_dj_playlist_matches(&self, playlist_id: &str) -> W4djResult<bool> {
+        Ok(self.catalog.connection().query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM imported_dj_playlist_matches WHERE playlist_id=?1
+             )",
+            [playlist_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn compute_imported_dj_playlist_matches(
+        &mut self,
         playlist_id: &str,
     ) -> W4djResult<DjPlaylistMatchReport> {
         let playlist = self
             .get_imported_dj_playlist(playlist_id)?
             .ok_or_else(|| W4djLibraryError::Invalid("未找到指定 DJ 歌单".to_string()))?;
         let candidates = self.available_dj_output_candidates()?;
-        Ok(match_imported_playlist(&playlist, &candidates))
-    }
-
-    fn load_manual_dj_playlist_overrides(
-        &self,
-        playlist_id: &str,
-    ) -> W4djResult<std::collections::HashMap<u64, String>> {
-        let mut statement = self.catalog.connection().prepare(
-            "SELECT position, track_key
-             FROM imported_dj_playlist_matches
-             WHERE playlist_id=?1 AND match_method='manual' AND track_key IS NOT NULL",
-        )?;
-        let rows = statement.query_map([playlist_id], |row| {
-            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        Ok(rows
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .collect())
+        let recent = self
+            .claim_latest_conversion_batch(playlist_id)?
+            .map(|batch_id| {
+                candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.conversion_batch_id.as_deref() == Some(batch_id.as_str())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(match_imported_playlist_with_priority(
+            &playlist,
+            &recent,
+            &candidates,
+        ))
     }
 
     pub fn replace_imported_dj_playlist_matches(
@@ -704,48 +955,45 @@ impl W4djLibrary {
             .get_imported_dj_playlist(playlist_id)?
             .ok_or_else(|| W4djLibraryError::Invalid("未找到指定 DJ 歌单".to_string()))?;
         let candidates = self.available_dj_output_candidates()?;
-        let manual_overrides = self.load_manual_dj_playlist_overrides(playlist_id)?;
         let mut effective_report = report.clone();
         let available_by_key = candidates
             .iter()
             .map(|candidate| (candidate.track_key.as_str(), candidate))
             .collect::<std::collections::HashMap<_, _>>();
         for row in &mut effective_report.matches {
-            let Some(manual_key) = manual_overrides.get(&row.position) else {
+            if row.status != "matched" {
+                row.destination_path = None;
+                row.candidate_source = None;
+                row.confirmed = false;
+                continue;
+            }
+            let Some(track_key) = row.track_key.as_deref() else {
+                row.status = "unmatched".to_string();
+                row.kind = DjPlaylistMatchKind::Unmatched;
+                row.destination_path = None;
+                row.candidate_source = None;
+                row.confirmed = false;
                 continue;
             };
-            let Some(candidate) = available_by_key.get(manual_key.as_str()) else {
+            let Some(candidate) = available_by_key.get(track_key) else {
                 row.status = "missing".to_string();
+                row.kind = DjPlaylistMatchKind::Missing;
                 row.track_key = None;
-                row.match_method = Some("manual".to_string());
+                row.destination_path = None;
+                row.candidate_source = None;
+                row.confirmed = false;
                 row.score = None;
-                row.reason = "此前的手动输出已不可用".to_string();
-                row.manual = true;
+                row.reason = "匹配的输出已不可用".to_string();
                 continue;
             };
-            row.status = "matched".to_string();
-            row.track_key = Some(manual_key.clone());
-            row.match_method = Some("manual".to_string());
-            row.score = Some(100);
-            row.reason = "用户手动确认".to_string();
-            row.manual = true;
-            if !row
-                .candidates
-                .iter()
-                .any(|item| item.track_key == *manual_key)
-            {
-                row.candidates
-                    .push(crate::dj_playlist_match::DjPlaylistMatchCandidate {
-                        track_key: candidate.track_key.clone(),
-                        title: candidate.title.clone(),
-                        artist_display: candidate.artist_display.clone(),
-                        duration_seconds: candidate.duration_seconds,
-                        destination_filename: crate::dj_playlist_match::candidate_filename(
-                            candidate,
-                        ),
-                        score: 100,
-                        reason: "用户手动确认".to_string(),
-                    });
+            row.destination_path = Some(candidate.destination_path.clone());
+            row.confirmed = candidate.readable;
+            if row.candidate_source.is_none() {
+                row.candidate_source = Some(if row.manual {
+                    "manual".to_string()
+                } else {
+                    "library".to_string()
+                });
             }
         }
         validate_match_report(&playlist, &effective_report, &candidates)?;
@@ -762,8 +1010,8 @@ impl W4djLibrary {
             transaction.execute(
                 "INSERT INTO imported_dj_playlist_matches(
                     playlist_id,position,track_key,status,match_method,score,
-                    candidates_json,reason,matched_at_ms
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    candidates_json,reason,candidate_source,confirmed,excluded,matched_at_ms
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     playlist_id,
                     row.position,
@@ -773,6 +1021,9 @@ impl W4djLibrary {
                     row.score,
                     candidates_json,
                     row.reason,
+                    row.candidate_source,
+                    i64::from(row.confirmed),
+                    i64::from(row.excluded),
                     matched_at_ms,
                 ],
             )?;
@@ -789,7 +1040,8 @@ impl W4djLibrary {
             .get_imported_dj_playlist(playlist_id)?
             .ok_or_else(|| W4djLibraryError::Invalid("未找到指定 DJ 歌单".to_string()))?;
         let mut statement = self.catalog.connection().prepare(
-            "SELECT position,track_key,status,match_method,score,candidates_json,reason
+            "SELECT position,track_key,status,match_method,score,candidates_json,reason,
+                    candidate_source,confirmed,excluded
              FROM imported_dj_playlist_matches WHERE playlist_id=?1 ORDER BY position",
         )?;
         let rows = statement.query_map([playlist_id], |row| {
@@ -803,12 +1055,15 @@ impl W4djLibrary {
             let reason: String = row.get(6)?;
             let status: String = row.get(2)?;
             let match_method: Option<String> = row.get(3)?;
+            let candidate_source: Option<String> = row.get(7)?;
+            let confirmed: bool = row.get::<_, i64>(8)? != 0;
+            let excluded: bool = row.get::<_, i64>(9)? != 0;
+            let manual = match_method.as_deref() == Some("manual");
             Ok(DjPlaylistTrackMatch {
                 position,
                 dedupe_key: track.dedupe_key.clone(),
                 title: track.title.clone(),
                 artist_display: track.artist_display.clone(),
-                netease_track_id: track.netease_track_id.clone(),
                 kind: persisted_match_kind(&status, match_method.as_deref()),
                 status,
                 track_key: row.get(1)?,
@@ -822,7 +1077,11 @@ impl W4djLibrary {
                         Box::new(error),
                     )
                 })?,
-                manual: row.get::<_, Option<String>>(3)?.as_deref() == Some("manual"),
+                manual,
+                destination_path: None,
+                candidate_source,
+                confirmed,
+                excluded,
             })
         })?;
         let stored = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -844,7 +1103,7 @@ impl W4djLibrary {
                     }
                     continue;
                 }
-                let Some(track_key) = row.track_key.as_deref() else {
+                let Some(track_key) = row.track_key.clone() else {
                     row.status = "missing".to_string();
                     row.match_method = row
                         .match_method
@@ -854,7 +1113,7 @@ impl W4djLibrary {
                     row.reason = "已保存匹配缺少输出引用".to_string();
                     continue;
                 };
-                if !available_by_key.contains_key(track_key) {
+                if !available_by_key.contains_key(track_key.as_str()) {
                     row.status = "missing".to_string();
                     row.track_key = None;
                     row.score = None;
@@ -863,13 +1122,22 @@ impl W4djLibrary {
                     } else {
                         "此前匹配的输出已不可用".to_string()
                     };
+                    row.destination_path = None;
+                    row.candidate_source = None;
+                    row.confirmed = false;
                 } else if row.reason.trim().is_empty() {
                     row.reason = "标题、歌手和可用时长均匹配".to_string();
+                }
+                if row.status == "matched"
+                    && let Some(candidate) = available_by_key.get(track_key.as_str())
+                {
+                    row.destination_path = Some(candidate.destination_path.clone());
+                    row.confirmed = candidate.readable;
                 }
             }
             return Ok(build_match_report(playlist_id, refreshed));
         }
-        Ok(match_imported_playlist(
+        Ok(crate::dj_playlist_match::match_imported_playlist(
             &playlist,
             &self.available_dj_output_candidates()?,
         ))
@@ -887,21 +1155,28 @@ impl W4djLibrary {
             .iter()
             .find(|candidate| candidate.track_key == track_key)
             .ok_or_else(|| W4djLibraryError::Invalid("只能选择当前可用且可读的输出".to_string()))?;
-        let duplicate_manual_allowed = report
+        let duplicate_rows = report
             .matches
             .iter()
             .filter(|row| row.position != position && row.track_key.as_deref() == Some(track_key))
-            .all(|row| {
-                row.netease_track_id.is_some() && row.netease_track_id == candidate.netease_track_id
-            });
-        if report
-            .matches
+            .collect::<Vec<_>>();
+        let playlist = self
+            .get_imported_dj_playlist(playlist_id)?
+            .ok_or_else(|| W4djLibraryError::Invalid("未找到指定 DJ 歌单".to_string()))?;
+        let selected_track = playlist
+            .tracks
             .iter()
-            .any(|row| row.position != position && row.track_key.as_deref() == Some(track_key))
-            && !duplicate_manual_allowed
-        {
+            .find(|track| track.position == position)
+            .ok_or_else(|| W4djLibraryError::Invalid("未找到歌单位置".to_string()))?;
+        if duplicate_rows.iter().any(|row| {
+            crate::dj_playlist_match::identity_key_for(&row.title, &row.artist_display)
+                != crate::dj_playlist_match::identity_key_for(
+                    &selected_track.title,
+                    &selected_track.artist_display,
+                )
+        }) {
             return Err(W4djLibraryError::Invalid(
-                "同一个输出不能分配给多个歌单歌曲".to_string(),
+                "同一个输出只能复用于标题和歌手相同的歌单歌曲".to_string(),
             ));
         }
         let row = report
@@ -916,6 +1191,10 @@ impl W4djLibrary {
         row.score = Some(100);
         row.reason = "用户手动确认".to_string();
         row.manual = true;
+        row.destination_path = Some(candidate.destination_path.clone());
+        row.candidate_source = Some("manual".to_string());
+        row.confirmed = true;
+        row.excluded = false;
         if !row
             .candidates
             .iter()
@@ -939,6 +1218,81 @@ impl W4djLibrary {
         self.replace_imported_dj_playlist_matches(playlist_id, &report)
     }
 
+    /// Bind a playlist row to an explicitly selected local audio file. The
+    /// file is indexed as a W4DJ output when it is not already known, so a
+    /// previously converted song can be recovered without guessing an ID.
+    pub fn set_imported_dj_playlist_match_by_path(
+        &mut self,
+        playlist_id: &str,
+        position: u64,
+        destination_path: &Path,
+    ) -> W4djResult<()> {
+        let metadata = fs::symlink_metadata(destination_path)
+            .map_err(|error| W4djLibraryError::Invalid(format!("无法读取所选本地歌曲：{error}")))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            return Err(W4djLibraryError::Invalid(
+                "所选路径必须是非空的本地音频文件，不能是符号链接".to_string(),
+            ));
+        }
+        if !is_audio_path(destination_path) {
+            return Err(W4djLibraryError::Invalid(
+                "所选文件不是支持的音频格式".to_string(),
+            ));
+        }
+        let normalized = normalize_path(destination_path);
+        let candidate = self
+            .available_dj_output_candidates()?
+            .into_iter()
+            .find(|candidate| normalize_path(&candidate.destination_path) == normalized);
+        if candidate.is_none() {
+            let root = destination_path.parent().unwrap_or_else(|| Path::new("."));
+            self.upsert_output_file(0, root, None, destination_path)?;
+        }
+        let candidate = self
+            .available_dj_output_candidates()?
+            .into_iter()
+            .find(|candidate| normalize_path(&candidate.destination_path) == normalized)
+            .ok_or_else(|| W4djLibraryError::Invalid("所选本地歌曲无法登记".to_string()))?;
+        self.set_imported_dj_playlist_match(playlist_id, position, &candidate.track_key)
+    }
+
+    /// Compatibility endpoint for older clients. The current review flow treats
+    /// a valid binding as accepted by default; the exporter does not gate on
+    /// this legacy flag.
+    pub fn set_imported_dj_playlist_match_confirmed(
+        &mut self,
+        playlist_id: &str,
+        position: u64,
+        confirmed: bool,
+    ) -> W4djResult<()> {
+        let mut report = self.get_imported_dj_playlist_match_report(playlist_id)?;
+        let row = report
+            .matches
+            .iter_mut()
+            .find(|row| row.position == position)
+            .ok_or_else(|| W4djLibraryError::Invalid("未找到歌单位置".to_string()))?;
+        if confirmed {
+            let Some(path) = row.destination_path.as_deref() else {
+                return Err(W4djLibraryError::Invalid(
+                    "请先为该歌单歌曲选择本地输出".to_string(),
+                ));
+            };
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                W4djLibraryError::Invalid(format!("复核的本地歌曲不可读取：{error}"))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+                return Err(W4djLibraryError::Invalid(
+                    "复核的本地歌曲已不存在或不是有效文件".to_string(),
+                ));
+            }
+            row.status = "matched".to_string();
+            row.confirmed = true;
+        } else {
+            row.confirmed = false;
+        }
+        self.replace_imported_dj_playlist_matches(playlist_id, &report)
+    }
+
     pub fn clear_imported_dj_playlist_match(
         &mut self,
         playlist_id: &str,
@@ -957,6 +1311,47 @@ impl W4djLibrary {
         row.score = None;
         row.reason = "已清除手动匹配，等待下一次识别".to_string();
         row.manual = false;
+        row.destination_path = None;
+        row.candidate_source = None;
+        row.confirmed = false;
+        row.excluded = false;
+        self.replace_imported_dj_playlist_matches(playlist_id, &report)
+    }
+
+    /// Add or remove rows from this playlist's export list. This is a review
+    /// decision only: it never deletes an output file or a W4DJ library row.
+    pub fn set_imported_dj_playlist_matches_excluded(
+        &mut self,
+        playlist_id: &str,
+        positions: &[u64],
+        excluded: bool,
+    ) -> W4djResult<()> {
+        if positions.is_empty() {
+            return Err(W4djLibraryError::Invalid(
+                "至少需要选择一首歌曲".to_string(),
+            ));
+        }
+        let requested = positions.iter().copied().collect::<HashSet<_>>();
+        if requested.len() != positions.len() {
+            return Err(W4djLibraryError::Invalid("歌单位置不能重复".to_string()));
+        }
+        let mut report = self.get_imported_dj_playlist_match_report(playlist_id)?;
+        if requested
+            .iter()
+            .any(|position| !report.matches.iter().any(|row| row.position == *position))
+        {
+            return Err(W4djLibraryError::Invalid(
+                "包含不存在的歌单位置".to_string(),
+            ));
+        }
+        for row in &mut report.matches {
+            if requested.contains(&row.position) {
+                row.excluded = excluded;
+                if row.status == "matched" {
+                    row.confirmed = true;
+                }
+            }
+        }
         self.replace_imported_dj_playlist_matches(playlist_id, &report)
     }
 
@@ -1060,8 +1455,6 @@ impl W4djLibrary {
         slot_index: usize,
         source_path: Option<&Path>,
         destination_path: &Path,
-        netease_track_id: Option<&str>,
-        netease_album_id: Option<&str>,
         title: &str,
         artist: &str,
     ) -> W4djResult<String> {
@@ -1069,8 +1462,7 @@ impl W4djLibrary {
             slot_index,
             source_path,
             destination_path,
-            netease_track_id,
-            netease_album_id,
+            None,
             title,
             artist,
             None,
@@ -1083,8 +1475,7 @@ impl W4djLibrary {
         slot_index: usize,
         source_path: Option<&Path>,
         destination_path: &Path,
-        netease_track_id: Option<&str>,
-        netease_album_id: Option<&str>,
+        output_root: Option<&Path>,
         title: &str,
         artist: &str,
         facts: Option<&CommittedOutputFacts>,
@@ -1093,19 +1484,40 @@ impl W4djLibrary {
         if destination.is_empty() {
             return Err(W4djLibraryError::Invalid("输出路径不能为空".to_string()));
         }
-        let source = source_path.map(normalize_index_path);
-        let track_id = nonempty_identity(netease_track_id);
-        let album_id = nonempty_identity(netease_album_id);
+        let output_root = output_root
+            .map(normalize_index_path)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                Path::new(&destination)
+                    .parent()
+                    .map(normalize_index_path)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| ".".to_string())
+            });
+        let stored_database_source: Option<String> = self
+            .catalog
+            .connection()
+            .query_row(
+                "SELECT source_path FROM w4dj_track_meta
+                 WHERE destination_path=?1 LIMIT 1",
+                [&destination],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let database_source = stored_database_source;
+        let requested_source = source_path.map(normalize_index_path);
+        let source = requested_source.clone().or_else(|| database_source.clone());
         let title = title.trim();
         let artist = artist.trim();
         let fallback_title = Path::new(&destination)
             .file_stem()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| destination.clone());
-        let title = if title.is_empty() {
-            fallback_title.as_str()
-        } else {
+        let title = if !title.is_empty() {
             title
+        } else {
+            fallback_title.as_str()
         };
         let artist_list_json = serde_json::to_string(
             &artist
@@ -1115,43 +1527,13 @@ impl W4djLibrary {
                 .collect::<Vec<_>>(),
         )
         .unwrap_or_else(|_| "[]".to_string());
-        let output_root = Path::new(&destination)
-            .parent()
-            .map(normalize_index_path)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| ".".to_string());
         let now = now_ms();
 
         let transaction = self.catalog.connection_mut().transaction()?;
 
-        // Resolve the stable identity in the documented priority order.  The
-        // side table is consulted as well because older rows may have stored
-        // the NetEase ID there before the wide `tracks` projection was
-        // updated.
+        // Resolve stable output identity from local source/path provenance
+        // only. NetEase IDs are intentionally absent from this path.
         let mut existing_key: Option<String> = None;
-        if let Some(track_id) = track_id.as_deref() {
-            existing_key = transaction
-                .query_row(
-                    "SELECT track_key FROM tracks WHERE netease_track_id=?1 LIMIT 1",
-                    [track_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if existing_key.is_none() {
-                existing_key = transaction
-                    .query_row(
-                        "SELECT m.track_key
-                         FROM w4dj_output_identities oi
-                         JOIN w4dj_track_meta m ON m.destination_path=oi.destination_path
-                         WHERE oi.netease_track_id=?1
-                         ORDER BY oi.updated_at_ms DESC
-                         LIMIT 1",
-                        [track_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?;
-            }
-        }
         if existing_key.is_none()
             && let Some(source) = source.as_deref()
         {
@@ -1173,10 +1555,9 @@ impl W4djLibrary {
                 .optional()?;
         }
         let track_key = existing_key.unwrap_or_else(|| {
-            track_id
+            source
                 .as_deref()
-                .map(|value| format!("netease:{value}"))
-                .or_else(|| source.as_deref().map(|value| format!("source:{value}")))
+                .map(|value| format!("source:{value}"))
                 .unwrap_or_else(|| format!("output:{destination}"))
         });
 
@@ -1195,35 +1576,19 @@ impl W4djLibrary {
             transaction.execute("DELETE FROM tracks WHERE track_key=?1", [&destination_key])?;
         }
 
-        // Capture all previous paths before replacing the binding so their
-        // identity rows can be removed without probing the old files.
-        let previous_destinations = {
-            let mut statement = transaction
-                .prepare("SELECT destination_path FROM w4dj_track_meta WHERE track_key=?1")?;
-            let rows = statement.query_map([&track_key], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-
         transaction.execute(
             "INSERT INTO tracks(
-                track_key, netease_track_id, title, artists, artist_list_json,
+                track_key, title, artists, artist_list_json,
                 local_status, updated_at_ms
-             ) VALUES (?1,?2,?3,?4,?5,'available',?6)
+             ) VALUES (?1,?2,?3,?4,'available',?5)
              ON CONFLICT(track_key) DO UPDATE SET
-                netease_track_id=excluded.netease_track_id,
                 title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE tracks.title END,
                 artists=CASE WHEN excluded.artists<>'' THEN excluded.artists ELSE tracks.artists END,
                 artist_list_json=CASE WHEN excluded.artists<>'' THEN excluded.artist_list_json ELSE tracks.artist_list_json END,
                 local_status='available', updated_at_ms=excluded.updated_at_ms",
-            params![track_key, track_id, title, artist, artist_list_json, now],
+            params![track_key, title, artist, artist_list_json, now],
         )?;
 
-        for previous in previous_destinations {
-            transaction.execute(
-                "DELETE FROM w4dj_output_identities WHERE destination_path=?1",
-                [previous],
-            )?;
-        }
         transaction.execute("DELETE FROM local_files WHERE track_key=?1", [&track_key])?;
         transaction.execute(
             "INSERT INTO local_files(
@@ -1239,9 +1604,9 @@ impl W4djLibrary {
                 status,analysis_status,analysis_error,measured_duration_seconds,
                 source_size_bytes,source_modified_at_ms,conversion_mode,lossless_format,
                 filename_rule,netease_filename_format,filename_normalization_policy,
-                created_at_ms,updated_at_ms
+                conversion_batch_id,committed_at_ms,created_at_ms,updated_at_ms
              ) VALUES (?1,?2,?3,?4,?5,'available','notAnalyzed',NULL,NULL,
-                       ?6,?7,?8,?9,?10,?11,?12,?13,?13)
+                       ?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)
              ON CONFLICT(track_key) DO UPDATE SET
                 source_path=excluded.source_path,
                 destination_path=excluded.destination_path,
@@ -1258,6 +1623,8 @@ impl W4djLibrary {
                 filename_rule=COALESCE(excluded.filename_rule,w4dj_track_meta.filename_rule),
                 netease_filename_format=COALESCE(excluded.netease_filename_format,w4dj_track_meta.netease_filename_format),
                 filename_normalization_policy=COALESCE(excluded.filename_normalization_policy,w4dj_track_meta.filename_normalization_policy),
+                conversion_batch_id=COALESCE(excluded.conversion_batch_id,w4dj_track_meta.conversion_batch_id),
+                committed_at_ms=COALESCE(excluded.committed_at_ms,w4dj_track_meta.committed_at_ms),
                 updated_at_ms=excluded.updated_at_ms",
             params![
                 track_key,
@@ -1272,20 +1639,11 @@ impl W4djLibrary {
                 facts.and_then(|facts| facts.filename_rule.as_deref()),
                 facts.and_then(|facts| facts.netease_filename_format.as_deref()),
                 facts.and_then(|facts| facts.filename_normalization_policy.as_deref()),
-                now
+                facts.and_then(|facts| facts.conversion_batch_id.as_deref()),
+                facts.map(|_| now),
+                now,
             ],
         )?;
-        transaction.execute(
-            "INSERT INTO w4dj_output_identities(
-                destination_path,netease_track_id,netease_album_id,updated_at_ms
-             ) VALUES (?1,?2,?3,?4)
-             ON CONFLICT(destination_path) DO UPDATE SET
-                netease_track_id=excluded.netease_track_id,
-                netease_album_id=excluded.netease_album_id,
-                updated_at_ms=excluded.updated_at_ms",
-            params![destination, track_id, album_id, now],
-        )?;
-
         // The bytes behind this output were just safely committed. Any
         // previous projection therefore belongs to the old bytes, even when
         // the destination path itself did not change.
@@ -1321,8 +1679,6 @@ impl W4djLibrary {
         slot_index: usize,
         source_path: Option<&Path>,
         destination_path: &Path,
-        netease_track_id: Option<&str>,
-        netease_album_id: Option<&str>,
         title: &str,
         artist: &str,
         facts: &CommittedOutputFacts,
@@ -1331,8 +1687,34 @@ impl W4djLibrary {
             slot_index,
             source_path,
             destination_path,
-            netease_track_id,
-            netease_album_id,
+            None,
+            title,
+            artist,
+            Some(facts),
+        )
+    }
+
+    /// Register a committed output while preserving the configured output
+    /// root so a later explicit W4DJ operation can materialize its recovery
+    /// sidecar. This matters when a filename is emitted below a nested
+    /// subdirectory: the identity manifest belongs beside the root, not beside
+    /// the individual file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_committed_output_in_root(
+        &mut self,
+        slot_index: usize,
+        output_root: &Path,
+        source_path: Option<&Path>,
+        destination_path: &Path,
+        title: &str,
+        artist: &str,
+        facts: &CommittedOutputFacts,
+    ) -> W4djResult<String> {
+        self.upsert_lightweight_output_inner(
+            slot_index,
+            source_path,
+            destination_path,
+            Some(output_root),
             title,
             artist,
             Some(facts),
@@ -1356,7 +1738,7 @@ impl W4djLibrary {
         }
         let destination = normalize_path(destination_path);
         let root = normalize_path(output_root);
-        let source = source_path.map(normalize_path);
+        let requested_source = source_path.map(normalize_path);
         let track_key = format!("output:{destination}");
         let now = now_ms();
         let measured_format = destination_path
@@ -1373,11 +1755,26 @@ impl W4djLibrary {
             .map(|facts| facts.format.clone())
             .or(measured_format);
         let metadata_values = read_embedded_track_metadata(destination_path);
+        let existing_source = self
+            .catalog
+            .connection()
+            .query_row(
+                "SELECT source_path FROM w4dj_track_meta WHERE track_key=?1 LIMIT 1",
+                [&track_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let known_database_source = existing_source;
+        let source = requested_source.clone().or(known_database_source);
         let mut track = self
             .catalog
             .track_detail(&track_key)?
             .unwrap_or_else(CatalogTrack::default);
         track.track_key = track_key.clone();
+        // This is an output-library record, not a NetEase retrieval record.
+        // Do not carry an old source ID into W4DJ just because the same path
+        // was indexed by an earlier build.
         track.netease_track_id = None;
         if !metadata_values.title.trim().is_empty() {
             track.title = metadata_values.title;
@@ -1497,40 +1894,6 @@ impl W4djLibrary {
             )?;
         }
         Ok(track_key)
-    }
-
-    /// Persist the source identity against the final output path. The
-    /// existing track projection keeps the optional NetEase track ID, while
-    /// the side table carries the optional album ID without requiring a
-    /// destructive migration of the legacy wide `tracks` row.
-    pub fn set_output_identity(
-        &mut self,
-        destination_path: &Path,
-        netease_track_id: Option<&str>,
-        netease_album_id: Option<&str>,
-    ) -> W4djResult<()> {
-        if netease_track_id.is_none() && netease_album_id.is_none() {
-            return Ok(());
-        }
-        let destination = normalize_path(destination_path);
-        let track_key = format!("output:{destination}");
-        if let Some(track_id) = netease_track_id {
-            self.catalog.connection().execute(
-                "UPDATE tracks SET netease_track_id = ?1 WHERE track_key = ?2",
-                params![track_id, track_key],
-            )?;
-        }
-        self.catalog.connection().execute(
-            "INSERT INTO w4dj_output_identities(
-                destination_path, netease_track_id, netease_album_id, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(destination_path) DO UPDATE SET
-                netease_track_id = COALESCE(excluded.netease_track_id, w4dj_output_identities.netease_track_id),
-                netease_album_id = COALESCE(excluded.netease_album_id, w4dj_output_identities.netease_album_id),
-                updated_at_ms = excluded.updated_at_ms",
-            params![destination, netease_track_id, netease_album_id, now_ms()],
-        )?;
-        Ok(())
     }
 
     pub fn apply_analysis_for_destination(
@@ -1838,6 +2201,7 @@ impl W4djLibrary {
                         .extension()
                         .and_then(|value| value.to_str())
                         .map(str::to_ascii_lowercase),
+                    identity: None,
                 });
             }
             snapshots.push(ScannedOutputRoot {
@@ -1848,7 +2212,7 @@ impl W4djLibrary {
             });
         }
 
-        self.reconcile_scanned_output_roots(snapshots)
+        self.reconcile_scanned_output_roots(snapshots, true)
     }
 
     /// Reconcile output roots from the snapshots collected by the scan walk.
@@ -1896,6 +2260,7 @@ impl W4djLibrary {
                         .extension()
                         .and_then(|value| value.to_str())
                         .map(str::to_ascii_lowercase),
+                    identity: None,
                 });
             }
             snapshots.push(ScannedOutputRoot {
@@ -1906,12 +2271,424 @@ impl W4djLibrary {
             });
         }
 
-        self.reconcile_scanned_output_roots(snapshots)
+        self.reconcile_scanned_output_roots(snapshots, true)
+    }
+
+    /// Rehydrate output rows from the durable sidecars without treating the
+    /// sidecar as a complete filesystem snapshot. This is used at the playlist
+    /// matching boundary after the derived SQLite index was cleared: it adds
+    /// existing sidecar-backed files and never removes unrelated rows.
+    fn output_identity_roots_with_stored(
+        &self,
+        roots: &[(usize, PathBuf)],
+    ) -> W4djResult<Vec<(usize, PathBuf)>> {
+        let mut roots_to_use = roots.to_vec();
+        let mut known_roots = roots
+            .iter()
+            .map(|(_, root)| normalize_index_path(root))
+            .collect::<HashSet<_>>();
+        let mut add_root = |slot_index: usize, root: String| {
+            let root = normalize_index_path(Path::new(&root));
+            if !root.is_empty() && known_roots.insert(root.clone()) {
+                roots_to_use.push((slot_index, PathBuf::from(root)));
+            }
+        };
+        let stored_slot_roots = {
+            let mut statement = self.catalog.connection().prepare(
+                "SELECT slot_index,root_path FROM slot_output_roots
+                 ORDER BY slot_index",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (slot_index, root) in stored_slot_roots {
+            add_root(slot_index, root);
+        }
+        let stored_roots = {
+            let mut statement = self
+                .catalog
+                .connection()
+                .prepare("SELECT root_path FROM output_roots ORDER BY root_path")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for root in stored_roots {
+            add_root(0, root);
+        }
+        Ok(roots_to_use)
+    }
+
+    /// Materialize the current output identities and active playlist
+    /// bindings into the adjacent recovery sidecars. This is intentionally an
+    /// explicit W4DJ boundary: ordinary conversion, scanning, and library
+    /// maintenance update SQLite only. Output entries are merged so a
+    /// temporary or partially rebuilt index cannot erase recovery data;
+    /// playlist entries are replaced per known playlist so a changed manual
+    /// binding cannot resurrect an obsolete path.
+    pub fn persist_output_identity_manifests(
+        &self,
+        roots: &[(usize, PathBuf)],
+    ) -> W4djResult<usize> {
+        let roots = self.output_identity_roots_with_stored(roots)?;
+        if roots.is_empty() {
+            return Ok(0);
+        }
+        let rows = {
+            let mut statement = self.catalog.connection().prepare(
+                "SELECT m.destination_path,m.source_path,t.title,t.artists
+                 FROM w4dj_track_meta m
+                 JOIN tracks t ON t.track_key=m.track_key
+                 WHERE m.destination_path IS NOT NULL
+                 ORDER BY m.destination_path",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut entries_by_root = HashMap::<String, Vec<OutputIdentityManifestEntry>>::new();
+        for (destination, source, title, artists) in rows {
+            let Some(root) = roots
+                .iter()
+                .map(|(_, root)| normalize_index_path(root))
+                .filter(|root| {
+                    Path::new(&destination)
+                        .strip_prefix(Path::new(root))
+                        .is_ok()
+                })
+                .max_by_key(String::len)
+            else {
+                continue;
+            };
+            let Some(relative_path) = safe_manifest_relative_path(&relative_manifest_path(
+                Path::new(&destination),
+                Path::new(&root),
+            )) else {
+                continue;
+            };
+            entries_by_root
+                .entry(root)
+                .or_default()
+                .push(OutputIdentityManifestEntry {
+                    relative_path,
+                    source_path: source.filter(|value| !value.trim().is_empty()),
+                    title: title.trim().to_string(),
+                    artist_display: artists.trim().to_string(),
+                });
+        }
+
+        let playlist_ids = {
+            let mut statement = self
+                .catalog
+                .connection()
+                .prepare("SELECT playlist_id FROM imported_dj_playlists")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut playlist_updates_by_root =
+            HashMap::<String, HashMap<String, Vec<OutputPlaylistManifestTrack>>>::new();
+        let mut statement = self.catalog.connection().prepare(
+            "SELECT p.playlist_id,m.position,o.destination_path,p_track.title,
+                    p_track.artist_display,m.score,m.match_method,m.candidate_source,
+                    o.status
+             FROM imported_dj_playlists p
+             JOIN imported_dj_playlist_matches m ON m.playlist_id=p.playlist_id
+             JOIN imported_dj_playlist_tracks p_track
+               ON p_track.playlist_id=m.playlist_id AND p_track.position=m.position
+             JOIN w4dj_track_meta o ON o.track_key=m.track_key
+             WHERE m.status='matched' AND m.excluded=0
+             ORDER BY p.playlist_id,m.position",
+        )?;
+        let reviewed_rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i32>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+        for row in reviewed_rows {
+            let row = row?;
+            let (
+                playlist_id,
+                position,
+                destination,
+                title,
+                artist_display,
+                score,
+                match_method,
+                candidate_source,
+                status,
+            ) = (
+                row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8,
+            );
+            if status != "available" {
+                continue;
+            }
+            let Some(root) = roots
+                .iter()
+                .map(|(_, root)| normalize_index_path(root))
+                .filter(|root| {
+                    Path::new(&destination)
+                        .strip_prefix(Path::new(root))
+                        .is_ok()
+                })
+                .max_by_key(String::len)
+            else {
+                continue;
+            };
+            let Some(relative_path) = safe_manifest_relative_path(&relative_manifest_path(
+                Path::new(&destination),
+                Path::new(&root),
+            )) else {
+                continue;
+            };
+            playlist_updates_by_root
+                .entry(root)
+                .or_default()
+                .entry(playlist_id)
+                .or_default()
+                .push(OutputPlaylistManifestTrack {
+                    position,
+                    relative_path,
+                    title,
+                    artist_display,
+                    score,
+                    match_method,
+                    candidate_source,
+                });
+        }
+
+        let mut persisted = 0;
+        for (_, root_path) in roots {
+            let root = normalize_index_path(&root_path);
+            let entries = entries_by_root.remove(&root).unwrap_or_default();
+            let updates = playlist_updates_by_root
+                .remove(&root)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(playlist_id, mut tracks)| {
+                    tracks.sort_unstable_by_key(|track| track.position);
+                    OutputPlaylistManifest {
+                        playlist_id,
+                        tracks,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let manifest_exists = output_identity_manifest_path(Path::new(&root)).is_file();
+            if entries.is_empty()
+                && updates.is_empty()
+                && (!manifest_exists || playlist_ids.is_empty())
+            {
+                continue;
+            }
+            persisted += entries.len();
+            persist_output_identity_manifest_updates(
+                Path::new(&root),
+                entries,
+                updates,
+                &playlist_ids,
+            )?;
+        }
+        Ok(persisted)
+    }
+
+    /// Restore active playlist bindings from the explicit W4DJ sidecars
+    /// after the output index has been rebuilt. Bindings are accepted only
+    /// when their stored title/artist still identifies the current playlist
+    /// row and their relative path resolves to a real local audio file.
+    pub fn restore_imported_dj_playlist_review_manifests(
+        &mut self,
+        playlist_id: &str,
+        roots: &[(usize, PathBuf)],
+    ) -> W4djResult<usize> {
+        if playlist_id.trim().is_empty() {
+            return Err(W4djLibraryError::Invalid("DJ 歌单 ID 不能为空".to_string()));
+        }
+        let roots_to_restore = self.output_identity_roots_with_stored(roots)?;
+        let mut bindings = Vec::new();
+        for (_, root_path) in roots_to_restore {
+            let root = normalize_path(&root_path);
+            if root.is_empty() {
+                continue;
+            }
+            let manifest = load_output_identity_manifest(Path::new(&root));
+            for playlist in manifest
+                .playlists
+                .into_iter()
+                .filter(|playlist| playlist.playlist_id == playlist_id)
+            {
+                for binding in playlist.tracks {
+                    let Some(relative_path) = safe_manifest_relative_path(&binding.relative_path)
+                    else {
+                        continue;
+                    };
+                    let destination = Path::new(&root).join(relative_path);
+                    let Ok(metadata) = fs::symlink_metadata(&destination) else {
+                        continue;
+                    };
+                    if metadata.file_type().is_symlink()
+                        || !metadata.is_file()
+                        || metadata.len() == 0
+                        || !is_audio_path(&destination)
+                    {
+                        continue;
+                    }
+                    bindings.push((root.clone(), destination, binding));
+                }
+            }
+        }
+        if bindings.is_empty() {
+            return Ok(0);
+        }
+
+        let mut report = self.get_imported_dj_playlist_match_report(playlist_id)?;
+        let mut candidates = self.available_dj_output_candidates()?;
+        let mut restored = 0;
+        for (root, destination, binding) in bindings {
+            let normalized_destination = normalize_path(&destination);
+            if !candidates.iter().any(|candidate| {
+                normalize_path(&candidate.destination_path) == normalized_destination
+            }) {
+                self.upsert_output_file(0, Path::new(&root), None, &destination)?;
+                candidates = self.available_dj_output_candidates()?;
+            }
+            let Some(candidate) = candidates.iter().find(|candidate| {
+                normalize_path(&candidate.destination_path) == normalized_destination
+            }) else {
+                continue;
+            };
+            let Some(row) = report
+                .matches
+                .iter_mut()
+                .find(|row| row.position == binding.position)
+            else {
+                continue;
+            };
+            if identity_key_for(&row.title, &row.artist_display)
+                != identity_key_for(&binding.title, &binding.artist_display)
+            {
+                continue;
+            }
+            let manual = binding.match_method.as_deref() == Some("manual");
+            row.kind = if manual {
+                DjPlaylistMatchKind::Manual
+            } else if binding.match_method.as_deref() == Some("recentBm25f") {
+                DjPlaylistMatchKind::RecentBm25f
+            } else {
+                DjPlaylistMatchKind::LibraryBm25f
+            };
+            row.status = "matched".to_string();
+            row.track_key = Some(candidate.track_key.clone());
+            row.match_method = binding.match_method.clone();
+            row.score = binding.score;
+            row.reason = "从 W4DJ 隐藏复核清单恢复".to_string();
+            row.manual = manual;
+            row.destination_path = Some(candidate.destination_path.clone());
+            row.candidate_source = binding.candidate_source.clone();
+            row.confirmed = true;
+            if !row
+                .candidates
+                .iter()
+                .any(|item| item.track_key == candidate.track_key)
+            {
+                row.candidates
+                    .push(crate::dj_playlist_match::DjPlaylistMatchCandidate {
+                        track_key: candidate.track_key.clone(),
+                        title: candidate.title.clone(),
+                        artist_display: candidate.artist_display.clone(),
+                        duration_seconds: candidate.duration_seconds,
+                        destination_filename: candidate_filename(candidate),
+                        score: binding.score.unwrap_or(100),
+                        reason: "从 W4DJ 隐藏复核清单恢复".to_string(),
+                    });
+            }
+            restored += 1;
+        }
+        if restored > 0 {
+            self.replace_imported_dj_playlist_matches(playlist_id, &report)?;
+        }
+        Ok(restored)
+    }
+
+    pub fn restore_output_identity_manifests(
+        &mut self,
+        roots: &[(usize, PathBuf)],
+    ) -> W4djResult<usize> {
+        let roots_to_restore = self.output_identity_roots_with_stored(roots)?;
+
+        let mut snapshots = Vec::with_capacity(roots_to_restore.len());
+        let mut restored = 0;
+        for (slot_index, root_path) in &roots_to_restore {
+            let root = normalize_path(root_path);
+            if root.is_empty() {
+                continue;
+            }
+            let manifest = load_output_identity_manifest(Path::new(&root));
+            let mut destinations = HashSet::new();
+            let mut files = Vec::new();
+            for identity in manifest.outputs {
+                let Some(relative_path) = safe_manifest_relative_path(&identity.relative_path)
+                else {
+                    continue;
+                };
+                let destination_path = Path::new(&root).join(&relative_path);
+                let Ok(metadata) = fs::metadata(&destination_path) else {
+                    continue;
+                };
+                if !metadata.is_file() || metadata.len() == 0 {
+                    continue;
+                }
+                let destination = normalize_path(&destination_path);
+                if !destinations.insert(destination.clone()) {
+                    continue;
+                }
+                files.push(ScannedOutputFile {
+                    destination,
+                    title: destination_path
+                        .file_stem()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| destination_path.display().to_string()),
+                    size_bytes: metadata.len().min(i64::MAX as u64) as i64,
+                    modified_at_ms: modified_at_ms(&metadata),
+                    measured_format: destination_path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_ascii_lowercase),
+                    identity: Some(OutputIdentityManifestEntry {
+                        relative_path,
+                        ..identity
+                    }),
+                });
+                restored += 1;
+            }
+            snapshots.push(ScannedOutputRoot {
+                slot_index: *slot_index,
+                root,
+                destinations,
+                files,
+            });
+        }
+        self.reconcile_scanned_output_roots(snapshots, false)?;
+        Ok(restored)
     }
 
     fn reconcile_scanned_output_roots(
         &mut self,
         snapshots: Vec<ScannedOutputRoot>,
+        prune_missing: bool,
     ) -> W4djResult<OutputReconcileSummary> {
         let transaction = self.catalog.connection_mut().transaction()?;
         let now = now_ms();
@@ -1959,12 +2736,101 @@ impl W4djLibrary {
                 let track_key = existing_key
                     .clone()
                     .unwrap_or_else(|| format!("output:{}", file.destination));
+                let stored_track_metadata = existing_key
+                    .as_deref()
+                    .map(|track_key| {
+                        transaction
+                            .query_row(
+                                "SELECT title,artists
+                                 FROM tracks WHERE track_key=?1 LIMIT 1",
+                                [track_key],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .optional()
+                    })
+                    .transpose()?
+                    .flatten();
+                let stored_source_path = existing_key
+                    .as_deref()
+                    .map(|track_key| {
+                        transaction
+                            .query_row(
+                                "SELECT source_path
+                                 FROM w4dj_track_meta WHERE track_key=?1 LIMIT 1",
+                                [track_key],
+                                |row| row.get::<_, Option<String>>(0),
+                            )
+                            .optional()
+                    })
+                    .transpose()?
+                    .flatten()
+                    .flatten();
+                let title = file
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.title.trim())
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        stored_track_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.0.trim())
+                            .filter(|value| !value.is_empty())
+                    })
+                    .unwrap_or(file.title.as_str())
+                    .to_string();
+                let artists = file
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.artist_display.trim())
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        stored_track_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.1.trim())
+                            .filter(|value| !value.is_empty())
+                    })
+                    .unwrap_or("")
+                    .to_string();
+                let artist_list_json = serde_json::to_string(
+                    &artists
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|_| "[]".to_string());
+                let source_path = file
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.source_path.clone());
+                let source_path = source_path.or(stored_source_path);
                 transaction.execute(
-                    "INSERT INTO tracks(track_key,title,artist_list_json,local_status,updated_at_ms)
-                     VALUES (?1,?2,'[]','available',?3)
-                     ON CONFLICT(track_key) DO UPDATE SET local_status='available',updated_at_ms=excluded.updated_at_ms",
-                    params![track_key, file.title, now],
+                    "INSERT INTO tracks(
+                        track_key,title,artists,artist_list_json,
+                        local_status,updated_at_ms
+                     ) VALUES (?1,?2,?3,?4,'available',?5)
+                     ON CONFLICT(track_key) DO UPDATE SET
+                        local_status='available',updated_at_ms=excluded.updated_at_ms",
+                    params![track_key, title, artists, artist_list_json, now],
                 )?;
+                if let Some(identity) = file.identity.as_ref()
+                    && (!identity.title.trim().is_empty()
+                        || !identity.artist_display.trim().is_empty())
+                {
+                    transaction.execute(
+                        "UPDATE tracks SET
+                            title=CASE WHEN TRIM(?1)<>'' THEN ?1 ELSE title END,
+                            artists=CASE WHEN TRIM(?2)<>'' THEN ?2 ELSE artists END,
+                            artist_list_json=CASE WHEN TRIM(?2)<>'' THEN ?3 ELSE artist_list_json END
+                         WHERE track_key=?4",
+                        params![
+                            identity.title.trim(),
+                            identity.artist_display.trim(),
+                            artist_list_json,
+                            track_key
+                        ],
+                    )?;
+                }
                 transaction.execute(
                     "INSERT INTO local_files(track_key,path,size_bytes,modified_at_ms,measured_format,readable,probe_error)
                      VALUES (?1,?2,?3,?4,?5,1,NULL)
@@ -1983,12 +2849,14 @@ impl W4djLibrary {
                     "INSERT INTO w4dj_track_meta(
                         track_key,source_path,destination_path,slot_index,output_root,status,
                         analysis_status,analysis_error,created_at_ms,updated_at_ms
-                     ) VALUES (?1,NULL,?2,?3,?4,'available','notAnalyzed',NULL,?5,?5)
-                     ON CONFLICT(track_key) DO UPDATE SET destination_path=excluded.destination_path,
+                     ) VALUES (?1,?2,?3,?4,?5,'available','notAnalyzed',NULL,?6,?6)
+                     ON CONFLICT(track_key) DO UPDATE SET source_path=COALESCE(excluded.source_path,w4dj_track_meta.source_path),
+                        destination_path=excluded.destination_path,
                         slot_index=excluded.slot_index,output_root=excluded.output_root,
                         status='available',updated_at_ms=excluded.updated_at_ms",
                     params![
                         track_key,
+                        source_path,
                         file.destination,
                         snapshot.slot_index as i64,
                         snapshot.root,
@@ -2003,24 +2871,23 @@ impl W4djLibrary {
                 }
             }
 
-            let stale = {
-                let mut statement = transaction.prepare(
-                    "SELECT track_key,destination_path FROM w4dj_track_meta WHERE output_root=?1",
-                )?;
-                statement
-                    .query_map([snapshot.root.as_str()], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            for (track_key, destination) in stale {
-                if !snapshot.destinations.contains(&destination) {
-                    transaction.execute(
-                        "DELETE FROM w4dj_output_identities WHERE destination_path=?1",
-                        [&destination],
+            if prune_missing {
+                let stale = {
+                    let mut statement = transaction.prepare(
+                        "SELECT track_key,destination_path FROM w4dj_track_meta WHERE output_root=?1",
                     )?;
-                    transaction.execute("DELETE FROM tracks WHERE track_key=?1", [&track_key])?;
-                    summary.removed_paths.push(PathBuf::from(destination));
+                    statement
+                        .query_map([snapshot.root.as_str()], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for (track_key, destination) in stale {
+                    if !snapshot.destinations.contains(&destination) {
+                        transaction
+                            .execute("DELETE FROM tracks WHERE track_key=?1", [&track_key])?;
+                        summary.removed_paths.push(PathBuf::from(destination));
+                    }
                 }
             }
         }
@@ -2032,11 +2899,13 @@ impl W4djLibrary {
     /// playlists, history, preferences and source scan caches untouched.
     pub fn clear_output_library(&mut self) -> W4djResult<()> {
         let transaction = self.catalog.connection_mut().transaction()?;
-        transaction.execute("DELETE FROM w4dj_output_identities", [])?;
+        // Output identities are durable provenance, not a rebuildable index.
+        // Keep them (and the adjacent sidecars) so a later scan can restore
+        // NetEase IDs after the derived SQLite rows have been cleared. Keep
+        // the last known output roots as discovery hints as well; the normal
+        // UI configuration remains authoritative when it is available.
         transaction.execute("DELETE FROM tracks WHERE EXISTS (SELECT 1 FROM w4dj_track_meta WHERE w4dj_track_meta.track_key=tracks.track_key)", [])?;
         transaction.execute("DELETE FROM w4dj_track_meta", [])?;
-        transaction.execute("DELETE FROM slot_output_roots", [])?;
-        transaction.execute("DELETE FROM output_roots", [])?;
         transaction.commit()?;
         Ok(())
     }
@@ -2370,6 +3239,7 @@ struct ScannedOutputFile {
     size_bytes: i64,
     modified_at_ms: Option<i64>,
     measured_format: Option<String>,
+    identity: Option<OutputIdentityManifestEntry>,
 }
 
 #[derive(Debug)]
@@ -2410,6 +3280,169 @@ fn relative_manifest_path(destination: &Path, root: &Path) -> String {
         })
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn output_identity_manifest_path(root: &Path) -> PathBuf {
+    root.join(OUTPUT_IDENTITY_MANIFEST_FILE_NAME)
+}
+
+fn empty_output_identity_manifest() -> OutputIdentityManifest {
+    OutputIdentityManifest {
+        format: OUTPUT_IDENTITY_MANIFEST_FORMAT.to_string(),
+        format_version: OUTPUT_IDENTITY_MANIFEST_VERSION,
+        outputs: Vec::new(),
+        playlists: Vec::new(),
+    }
+}
+
+/// An output identity sidecar is optional recovery data. A missing or damaged
+/// sidecar must never prevent a normal output scan; the current audio files
+/// can still be indexed by their filesystem facts.
+fn load_output_identity_manifest(root: &Path) -> OutputIdentityManifest {
+    let path = output_identity_manifest_path(root);
+    let Ok(contents) = fs::read(path) else {
+        return empty_output_identity_manifest();
+    };
+    let Ok(manifest) = serde_json::from_slice::<OutputIdentityManifest>(&contents) else {
+        return empty_output_identity_manifest();
+    };
+    if manifest.format != OUTPUT_IDENTITY_MANIFEST_FORMAT
+        || manifest.format_version != OUTPUT_IDENTITY_MANIFEST_VERSION
+    {
+        return empty_output_identity_manifest();
+    }
+    manifest
+}
+
+fn safe_manifest_relative_path(value: &str) -> Option<String> {
+    let value = value.trim().replace('\\', "/");
+    let value = value.trim_start_matches("./");
+    if value.is_empty() {
+        return None;
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn merge_output_identity_manifest_entry(
+    manifest: &mut OutputIdentityManifest,
+    incoming: OutputIdentityManifestEntry,
+) {
+    if let Some(existing) = manifest
+        .outputs
+        .iter_mut()
+        .find(|entry| entry.relative_path == incoming.relative_path)
+    {
+        let source_changed = match (
+            existing.source_path.as_deref(),
+            incoming.source_path.as_deref(),
+        ) {
+            (Some(existing), Some(incoming)) => !indexed_paths_equal(existing, incoming),
+            _ => false,
+        };
+        let metadata_changed_without_source = existing.source_path.is_none()
+            && incoming.source_path.is_some()
+            && ((!existing.title.trim().is_empty()
+                && !incoming.title.trim().is_empty()
+                && !existing
+                    .title
+                    .trim()
+                    .eq_ignore_ascii_case(incoming.title.trim()))
+                || (!existing.artist_display.trim().is_empty()
+                    && !incoming.artist_display.trim().is_empty()
+                    && !existing
+                        .artist_display
+                        .trim()
+                        .eq_ignore_ascii_case(incoming.artist_display.trim())));
+        if source_changed || metadata_changed_without_source {
+            *existing = incoming;
+            return;
+        }
+        if incoming.source_path.is_some() {
+            existing.source_path = incoming.source_path;
+        }
+        if !incoming.title.is_empty() {
+            existing.title = incoming.title;
+        }
+        if !incoming.artist_display.is_empty() {
+            existing.artist_display = incoming.artist_display;
+        }
+    } else {
+        manifest.outputs.push(incoming);
+    }
+}
+
+fn write_output_identity_manifest(
+    root: &Path,
+    mut manifest: OutputIdentityManifest,
+) -> W4djResult<()> {
+    manifest
+        .outputs
+        .sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    manifest
+        .playlists
+        .sort_unstable_by(|left, right| left.playlist_id.cmp(&right.playlist_id));
+    for playlist in &mut manifest.playlists {
+        playlist.tracks.sort_unstable_by_key(|track| track.position);
+    }
+    let contents = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| W4djLibraryError::Invalid(format!("序列化输出身份清单失败：{error}")))?;
+    let manifest_path = output_identity_manifest_path(root);
+    let temp_path = root.join(format!(
+        "{OUTPUT_IDENTITY_MANIFEST_FILE_NAME}.tmp-{}",
+        std::process::id()
+    ));
+    let result = (|| {
+        fs::write(&temp_path, contents)?;
+        fs::rename(&temp_path, manifest_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn persist_output_identity_manifest_updates<I, J>(
+    root: &Path,
+    entries: I,
+    playlists: J,
+    replace_playlist_ids: &[String],
+) -> W4djResult<()>
+where
+    I: IntoIterator<Item = OutputIdentityManifestEntry>,
+    J: IntoIterator<Item = OutputPlaylistManifest>,
+{
+    let _lock = OUTPUT_IDENTITY_MANIFEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| W4djLibraryError::Invalid("输出身份清单锁已损坏".to_string()))?;
+    fs::create_dir_all(root)?;
+    let mut manifest = load_output_identity_manifest(root);
+    for entry in entries {
+        merge_output_identity_manifest_entry(&mut manifest, entry);
+    }
+    for playlist_id in replace_playlist_ids {
+        manifest
+            .playlists
+            .retain(|playlist| playlist.playlist_id != *playlist_id);
+    }
+    for playlist in playlists {
+        if !playlist.tracks.is_empty() {
+            manifest.playlists.push(playlist);
+        }
+    }
+    write_output_identity_manifest(root, manifest)
 }
 
 fn evaluation_clip_window(
@@ -2475,8 +3508,10 @@ fn peak_energy_clip_start(destination: &Path, clip_duration: f64, max_start: f64
     }
     let samples = output
         .stdout
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect::<Vec<_>>();
     let hop = SAMPLE_RATE;
     let max_sample_start = ((max_start * SAMPLE_RATE as f64).round() as usize)
@@ -2704,10 +3739,11 @@ fn build_match_report(
 fn persisted_match_kind(status: &str, method: Option<&str>) -> DjPlaylistMatchKind {
     match (status, method) {
         ("matched", Some("manual")) => DjPlaylistMatchKind::Manual,
-        ("matched", Some("neteaseTrackId")) => DjPlaylistMatchKind::NeteaseTrackId,
-        ("matched", Some("uniqueTitleArtistFallback")) => {
-            DjPlaylistMatchKind::UniqueTitleArtistFallback
-        }
+        ("matched", Some("recentBm25f")) => DjPlaylistMatchKind::RecentBm25f,
+        ("matched", Some("libraryBm25f")) => DjPlaylistMatchKind::LibraryBm25f,
+        // Legacy methods are interpreted as ordinary title/artist matches;
+        // their old IDs are never loaded or used.
+        ("matched", Some(_)) => DjPlaylistMatchKind::LibraryBm25f,
         ("ambiguous", _) => DjPlaylistMatchKind::Ambiguous,
         ("missing", _) => DjPlaylistMatchKind::Missing,
         _ => DjPlaylistMatchKind::Unmatched,
@@ -2734,7 +3770,7 @@ fn validate_match_report(
         .map(|track| track.position)
         .collect::<std::collections::HashSet<_>>();
     let mut seen_positions = std::collections::HashSet::new();
-    let mut seen_keys = std::collections::HashMap::<String, Option<String>>::new();
+    let mut seen_keys = std::collections::HashMap::<String, (String, Vec<String>)>::new();
     for row in &report.matches {
         if !expected.contains(&row.position) || !seen_positions.insert(row.position) {
             return Err(W4djLibraryError::Invalid(
@@ -2753,31 +3789,42 @@ fn validate_match_report(
                     "matched 行必须包含 track_key".to_string(),
                 ));
             };
-            let Some(candidate) = candidates
+            if !candidates
                 .iter()
-                .find(|candidate| candidate.track_key == track_key)
-            else {
+                .any(|candidate| candidate.track_key == track_key)
+            {
                 return Err(W4djLibraryError::Invalid(
                     "匹配引用了不可用的输出".to_string(),
                 ));
-            };
-            let duplicate_allowed = seen_keys.get(track_key).is_some_and(|previous_id| {
-                previous_id.is_some()
-                    && previous_id == &candidate.netease_track_id
-                    && row.netease_track_id.as_ref() == previous_id.as_ref()
-                    && row.match_method.as_deref() == Some("neteaseTrackId")
-            });
-            if !available.contains(track_key)
-                || (seen_keys.contains_key(track_key) && !duplicate_allowed)
-            {
+            }
+            let playlist_track = playlist
+                .tracks
+                .iter()
+                .find(|track| track.position == row.position)
+                .ok_or_else(|| W4djLibraryError::Invalid("匹配位置不存在".to_string()))?;
+            let identity = crate::dj_playlist_match::identity_key_for(
+                &playlist_track.title,
+                &playlist_track.artist_display,
+            );
+            if !available.contains(track_key) {
                 return Err(W4djLibraryError::Invalid(
-                    "匹配只能引用当前可用输出；只有同一网易云 ID 的重复 position 可以复用"
+                    "匹配只能引用当前可用输出；只有标题和歌手相同的重复 position 可以复用"
                         .to_string(),
                 ));
             }
-            seen_keys
-                .entry(track_key.to_string())
-                .or_insert_with(|| candidate.netease_track_id.clone());
+            if !row.excluded
+                && seen_keys
+                    .get(track_key)
+                    .is_some_and(|previous_identity| previous_identity != &identity)
+            {
+                return Err(W4djLibraryError::Invalid(
+                    "匹配只能引用当前可用输出；只有标题和歌手相同的重复 position 可以复用"
+                        .to_string(),
+                ));
+            }
+            if !row.excluded {
+                seen_keys.entry(track_key.to_string()).or_insert(identity);
+            }
         } else if row.track_key.is_some() {
             return Err(W4djLibraryError::Invalid(
                 "未完成匹配状态不能携带 track_key".to_string(),
@@ -2807,6 +3854,10 @@ fn normalize_index_path(path: &Path) -> String {
     path.to_string_lossy().trim().to_string()
 }
 
+fn indexed_paths_equal(left: &str, right: &str) -> bool {
+    normalize_index_path(Path::new(left)) == normalize_index_path(Path::new(right))
+}
+
 fn snapshot_path_key(root_path: &Path, normalized_root: &str, path: &Path) -> String {
     if let Ok(relative) = path.strip_prefix(root_path) {
         return Path::new(normalized_root)
@@ -2821,13 +3872,6 @@ fn snapshot_path_key(root_path: &Path, normalized_root: &str, path: &Path) -> St
             .into_owned();
     }
     normalize_index_path(path)
-}
-
-fn nonempty_identity(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn restore_dedupe_key(stored: &str, position: u64) -> String {
@@ -2895,7 +3939,7 @@ fn is_audio_path(path: &Path) -> bool {
         .is_some_and(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
-                "mp3" | "flac" | "wav" | "aif" | "aiff"
+                "mp3" | "flac" | "wav" | "aif" | "aiff" | "m4a"
             )
         })
 }
@@ -2946,6 +3990,7 @@ mod tests {
         assert!(!is_audio_path(std::path::Path::new("._song.mp3")));
         assert!(!is_audio_path(std::path::Path::new("source.ncm")));
         assert!(is_audio_path(std::path::Path::new("song.mp3")));
+        assert!(is_audio_path(std::path::Path::new("song.m4a")));
     }
 
     #[test]
@@ -3059,7 +4104,7 @@ mod tests {
         let output = fs::canonicalize(output).unwrap();
         let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
         let original_key = library
-            .upsert_lightweight_output(0, Some(&source), &output, None, None, "Song", "Artist")
+            .upsert_lightweight_output(0, Some(&source), &output, "Song", "Artist")
             .unwrap();
         assert!(original_key.starts_with("source:"));
 

@@ -35,23 +35,18 @@ fn parse_value(
 }
 
 #[test]
-fn parses_minimal_v2_and_preserves_string_id() {
+fn parses_minimal_v2_and_ignores_legacy_string_id() {
     let playlist = parse_value(minimal_playlist()).unwrap();
     assert_eq!(playlist.playlist_id, "playlist-1");
     assert_eq!(playlist.format_version, 2);
     assert_eq!(playlist.tracks.len(), 2);
     assert_eq!(playlist.tracks[0].position, 1);
-    assert_eq!(playlist.tracks[0].netease_track_id, None);
-    assert_eq!(
-        playlist.tracks[1].netease_track_id.as_deref(),
-        Some("123456789012345678")
-    );
     assert_eq!(playlist.tracks[0].netease_import_line, "First - Artist One");
     assert_eq!(
         playlist.tracks[1].netease_import_line,
         "Second Song - Artist Two"
     );
-    assert_eq!(playlist.tracks[1].dedupe_key, "netease:123456789012345678");
+    assert_ne!(playlist.tracks[0].dedupe_key, playlist.tracks[1].dedupe_key);
     assert_eq!(playlist.source_path, None);
 }
 
@@ -102,14 +97,7 @@ fn rejects_non_string_netease_id() {
         Err(DjPlaylistError::InvalidField(_))
     ));
 
-    let mut value = minimal_playlist();
-    value["tracks"][0]["netease_track_id"] = serde_json::Value::Null;
-    assert!(matches!(
-        parse_value(value),
-        Err(DjPlaylistError::InvalidField(_))
-    ));
-
-    for invalid_id in ["", " 42", "42 "] {
+    for invalid_id in [serde_json::json!(true), serde_json::json!([1, 2, 3])] {
         let mut value = minimal_playlist();
         value["tracks"][0]["netease_track_id"] = serde_json::json!(invalid_id);
         assert!(matches!(
@@ -120,26 +108,25 @@ fn rejects_non_string_netease_id() {
 }
 
 #[test]
-fn preserves_same_track_id_at_distinct_positions() {
+fn accepts_missing_and_null_id_fields_without_using_them_as_identity() {
     let mut value = minimal_playlist();
     value["tracks"] = serde_json::json!([
         {
             "position": 1,
             "title": "Song",
             "artist_display": "Artist",
-            "netease_track_id": "42"
+            "netease_track_id": null
         },
         {
             "position": 2,
             "title": "Song",
-            "artist_display": "Artist",
-            "netease_track_id": "42"
+            "artist_display": "Artist"
         }
     ]);
     let playlist = parse_value(value).unwrap();
     assert_eq!(playlist.tracks.len(), 2);
-    assert_eq!(playlist.tracks[0].dedupe_key, "netease:42");
-    assert_eq!(playlist.tracks[1].dedupe_key, "netease:42");
+    assert_eq!(playlist.tracks[0].dedupe_key, "title-artist:song:artist");
+    assert_eq!(playlist.tracks[1].dedupe_key, "title-artist:song:artist");
     assert!(playlist.warnings.is_empty());
 }
 
@@ -171,6 +158,14 @@ fn serializes_only_minimal_v2_fields_and_round_trips() {
     let bytes = serialize_w4dj_playlist(&playlist).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["format_version"], 2);
+    assert_eq!(
+        value["tracks"][0]["netease_track_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        value["tracks"][1]["netease_track_id"],
+        serde_json::Value::Null
+    );
     assert!(value.get("created_at").is_none());
     assert!(value["tracks"][0].get("dedupe_key").is_none());
     assert!(value["tracks"][0].get("platform_refs").is_none());
@@ -248,18 +243,17 @@ fn persists_v2_playlist_and_reimports_atomically() {
         2
     );
 
-    let mut repeated_id = parse_value(minimal_playlist()).unwrap();
-    let mut repeated_id_track = repeated_id.tracks[1].clone();
-    repeated_id_track.position = 3;
-    repeated_id.tracks.push(repeated_id_track);
-    library.upsert_imported_dj_playlist(&repeated_id).unwrap();
+    let mut repeated_title_artist = parse_value(minimal_playlist()).unwrap();
+    let mut repeated_track = repeated_title_artist.tracks[1].clone();
+    repeated_track.position = 3;
+    repeated_title_artist.tracks.push(repeated_track);
+    library
+        .upsert_imported_dj_playlist(&repeated_title_artist)
+        .unwrap();
     let loaded = library
         .get_imported_dj_playlist("playlist-1")
         .unwrap()
         .unwrap();
     assert_eq!(loaded.tracks.len(), 3);
-    assert_eq!(
-        loaded.tracks[1].netease_track_id,
-        loaded.tracks[2].netease_track_id
-    );
+    assert_eq!(loaded.tracks[1].dedupe_key, loaded.tracks[2].dedupe_key);
 }

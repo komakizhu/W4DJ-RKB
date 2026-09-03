@@ -26,7 +26,6 @@ fn track(position: u64, title: &str, artist: &str) -> ImportedDjPlaylistTrack {
         title: title.to_string(),
         artist_display: artist.to_string(),
         dedupe_key: format!("key-{position}"),
-        netease_track_id: None,
         netease_import_line: format!("{title} - {artist}"),
     }
 }
@@ -69,7 +68,6 @@ fn renders_ordered_utf8_relative_extended_m3u8() {
             resolved(2, "第二\n首", "歌手 2", Some(91.4), second),
         ],
         &playlist_path,
-        false,
     )
     .unwrap();
 
@@ -82,33 +80,21 @@ fn renders_ordered_utf8_relative_extended_m3u8() {
 }
 
 #[test]
-fn rejects_incomplete_export_and_reports_partial_rows() {
+fn rejects_incomplete_export_instead_of_reporting_a_partial_success() {
     let root = tempdir().unwrap();
     let path = root.path().join("one.mp3");
     fs::write(&path, b"audio").unwrap();
     let playlist = playlist(vec![track(1, "One", "A"), track(2, "Two", "B")]);
     let resolved_tracks = vec![resolved(1, "One", "A", None, path)];
 
-    let error = build_relative_m3u8(
-        &playlist,
-        &resolved_tracks,
-        &root.path().join("x.m3u8"),
-        false,
-    )
-    .unwrap_err();
+    let error =
+        build_relative_m3u8(&playlist, &resolved_tracks, &root.path().join("x.m3u8")).unwrap_err();
     assert!(matches!(error, M3u8Error::Incomplete { .. }));
 
-    let (contents, summary) = build_relative_m3u8_with_summary(
-        &playlist,
-        &resolved_tracks,
-        &root.path().join("x.m3u8"),
-        true,
-    )
-    .unwrap();
-    assert_eq!(summary.matched_count, 1);
-    assert_eq!(summary.total, 2);
-    assert_eq!(summary.omitted[0].position, 2);
-    assert!(contents.contains("#EXTINF:-1,A - One"));
+    let error =
+        build_relative_m3u8_with_summary(&playlist, &resolved_tracks, &root.path().join("x.m3u8"))
+            .unwrap_err();
+    assert!(matches!(error, M3u8Error::Incomplete { .. }));
 }
 
 #[test]
@@ -125,7 +111,6 @@ fn missing_output_is_never_silently_omitted_from_complete_export() {
             root.path().join("gone.mp3"),
         )],
         &root.path().join("x.m3u8"),
-        false,
     );
     assert!(matches!(result, Err(M3u8Error::Incomplete { .. })));
     assert!(matches!(
@@ -139,9 +124,8 @@ fn missing_output_is_never_silently_omitted_from_complete_export() {
                 root.path().join("gone.mp3"),
             )],
             &root.path().join("x.m3u8"),
-            true,
         ),
-        Err(M3u8Error::Empty)
+        Err(M3u8Error::Incomplete { .. })
     ));
 }
 
@@ -159,7 +143,6 @@ fn preserves_repeated_positions_for_the_same_output_path() {
             resolved(2, "Same", "Artist", None, path),
         ],
         &root.path().join("playlist.m3u8"),
-        false,
     )
     .unwrap();
 

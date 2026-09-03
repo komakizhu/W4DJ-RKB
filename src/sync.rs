@@ -1818,7 +1818,7 @@ pub fn sync_music_library_transactional_with_observer_and_context(
     );
 
     let mut queued_files = new_songs.iter().collect::<Vec<_>>();
-    queued_files.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+    queued_files.sort_by_key(|(left_name, _)| *left_name);
     let mut failed_files = 0usize;
     let mut last_error: Option<io::Error> = None;
 
@@ -4860,11 +4860,7 @@ fn normalize_unicode_punctuation(value: &str) -> String {
 fn strip_promotional_suffixes(value: &str) -> String {
     let mut text = value.trim().to_string();
 
-    loop {
-        let Some((open, close)) = trailing_bracket_pair(&text) else {
-            break;
-        };
-
+    while let Some((open, close)) = trailing_bracket_pair(&text) {
         let Some((start, inner)) = extract_trailing_bracket_content(&text, open, close) else {
             break;
         };
@@ -4886,11 +4882,7 @@ fn strip_promotional_suffixes(value: &str) -> String {
 fn strip_common_trailing_tokens(value: &str) -> String {
     let mut text = value.trim().to_string();
 
-    loop {
-        let Some(last_token) = text.split_whitespace().last() else {
-            break;
-        };
-
+    while let Some(last_token) = text.split_whitespace().last() {
         let normalized = last_token
             .trim_matches(|ch: char| {
                 matches!(

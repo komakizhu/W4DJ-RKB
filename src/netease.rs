@@ -7,7 +7,7 @@
 //! explicitly named neighbouring cover image.  The converter can then merge
 //! the recovered values into the output tags.
 
-use rusqlite::{Connection, OpenFlags, Row, types::ValueRef};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, types::ValueRef};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
@@ -19,7 +19,7 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 const MAX_COVER_BYTES: u64 = 32 * 1024 * 1024;
@@ -504,6 +504,85 @@ impl NeteaseMetadataResolver {
         })
     }
 
+    /// Match playlist/output metadata directly against the loaded NetEase
+    /// rows.  This is intentionally separate from `track_identity`, whose
+    /// contract is to identify a local source file by path and fingerprint.
+    /// Playlist exports often contain only title/artist values, and converted
+    /// outputs may no longer have the original source path.
+    pub fn playlist_track_identities(
+        &self,
+        title: &str,
+        artists: &str,
+    ) -> Vec<NeteaseTrackIdentity> {
+        self.playlist_track_identity_matches(title, artists)
+            .into_iter()
+            .map(|(_, identity)| identity)
+            .collect()
+    }
+
+    fn playlist_track_identity_matches(
+        &self,
+        title: &str,
+        artists: &str,
+    ) -> Vec<(i32, NeteaseTrackIdentity)> {
+        let mut matches = Vec::<(i32, NeteaseTrackIdentity)>::new();
+        for record in self.records.iter() {
+            let Some(track_id) = non_empty_string(&record.track_id) else {
+                continue;
+            };
+            let Some(score) = crate::dj_playlist_match::title_artist_match_score(
+                title,
+                artists,
+                &record.title,
+                &record.artist,
+            ) else {
+                continue;
+            };
+            let identity = NeteaseTrackIdentity {
+                track_id: Some(track_id),
+                album_id: non_empty_string(&record.album_id),
+                title: record.title.clone(),
+                artists: record.artist.clone(),
+                album: record.album.clone(),
+            };
+            if let Some((existing_score, existing)) = matches
+                .iter_mut()
+                .find(|(_, existing)| existing.track_id == identity.track_id)
+            {
+                if score > *existing_score {
+                    *existing_score = score;
+                    *existing = identity;
+                }
+            } else {
+                matches.push((score, identity));
+            }
+        }
+        matches.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.track_id.cmp(&right.1.track_id))
+        });
+        matches
+    }
+
+    /// Return an identity only when title/artist metadata resolves to one
+    /// unique NetEase track ID.  Multiple same-title records remain
+    /// ambiguous and are left for manual confirmation.
+    pub fn track_identity_for_playlist(
+        &self,
+        title: &str,
+        artists: &str,
+    ) -> Option<NeteaseTrackIdentity> {
+        let matches = self.playlist_track_identity_matches(title, artists);
+        let (best_score, best) = matches.first()?.clone();
+        let best_is_unique = matches
+            .iter()
+            .skip(1)
+            .all(|(score, identity)| *score != best_score || identity.track_id == best.track_id);
+        best_is_unique.then_some(best)
+    }
+
     /// Resolve the stable identity used by a cancellable scan. This path
     /// avoids opening SQLite for every candidate and checks cancellation while
     /// ranking records, so a large preview cannot hold the cancel button up.
@@ -963,6 +1042,143 @@ pub fn probe_netease_database(path: &Path) -> rusqlite::Result<NeteaseDatabaseSu
         record_count,
         fingerprint: database_fingerprint_view(path),
     })
+}
+
+/// Return a consistent read-only SQLite online-backup snapshot of the local
+/// NetEase database, including committed WAL pages.  The raw source database
+/// is never modified; callers may embed this snapshot in a user-requested
+/// diagnostic report when a cross-machine investigation needs the actual IDs.
+pub fn sqlite_snapshot_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "网易云数据库文件不存在",
+        ));
+    }
+    let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| io::Error::other(format!("打开网易云数据库失败：{error}")))?;
+    let directory = tempfile::tempdir()?;
+    let snapshot_path = directory.path().join("sqlite_storage.sqlite3");
+    let mut destination = Connection::open(&snapshot_path)
+        .map_err(|error| io::Error::other(format!("创建网易云数据库快照失败：{error}")))?;
+    rusqlite::backup::Backup::new(&source, &mut destination)
+        .map_err(|error| io::Error::other(format!("复制网易云数据库快照失败：{error}")))?
+        .run_to_completion(100, Duration::from_millis(10), None)
+        .map_err(|error| io::Error::other(format!("完成网易云数据库快照失败：{error}")))?;
+    fs::read(snapshot_path)
+}
+
+/// Return the read-only SQLite version and table/object definitions needed to
+/// decode a full runtime report on another machine. The source database is
+/// never migrated or otherwise modified.
+pub fn sqlite_schema_snapshot(path: &Path) -> io::Result<serde_json::Value> {
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "SQLite 数据库文件不存在",
+        ));
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| io::Error::other(format!("打开 SQLite 数据库失败：{error}")))?;
+    let user_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| io::Error::other(format!("读取 SQLite user_version 失败：{error}")))?;
+    let application_id: i64 = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(|error| io::Error::other(format!("读取 SQLite application_id 失败：{error}")))?;
+
+    let objects = {
+        let mut statement = connection
+            .prepare(
+                "SELECT type,name,tbl_name,sql
+                 FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%'
+                 ORDER BY type,name",
+            )
+            .map_err(|error| io::Error::other(format!("读取 SQLite schema 失败：{error}")))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|error| io::Error::other(format!("读取 SQLite 对象失败：{error}")))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| io::Error::other(format!("读取 SQLite 对象失败：{error}")))?
+    };
+
+    let mut tables = Vec::new();
+    let mut declared_versions = serde_json::Map::new();
+    for (object_type, name, _table_name, sql) in &objects {
+        if object_type != "table" {
+            continue;
+        }
+        let columns = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT cid,name,type,\"notnull\",dflt_value,pk
+                     FROM pragma_table_info(?1)
+                     ORDER BY cid",
+                )
+                .map_err(|error| io::Error::other(format!("读取表结构失败：{error}")))?;
+            let rows = statement
+                .query_map([name], |row| {
+                    Ok(serde_json::json!({
+                        "cid": row.get::<_, i64>(0)?,
+                        "name": row.get::<_, String>(1)?,
+                        "declaredType": row.get::<_, String>(2)?,
+                        "notNull": row.get::<_, i64>(3)? != 0,
+                        "defaultValue": row.get::<_, Option<String>>(4)?,
+                        "primaryKey": row.get::<_, i64>(5)? != 0,
+                    }))
+                })
+                .map_err(|error| io::Error::other(format!("读取表结构失败：{error}")))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| io::Error::other(format!("读取表结构失败：{error}")))?
+        };
+        if name == "library_meta" || name == "catalog_meta" {
+            let version = connection
+                .query_row(
+                    &format!("SELECT value FROM {name} WHERE key='schema_version' LIMIT 1"),
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| io::Error::other(format!("读取 {name} 版本失败：{error}")))?;
+            if let Some(version) = version {
+                declared_versions.insert(name.clone(), serde_json::Value::String(version));
+            }
+        }
+        tables.push(serde_json::json!({
+            "name": name,
+            "sql": sql,
+            "columns": columns,
+        }));
+    }
+
+    let objects = objects
+        .into_iter()
+        .map(|(object_type, name, table_name, sql)| {
+            serde_json::json!({
+                "type": object_type,
+                "name": name,
+                "tableName": table_name,
+                "sql": sql,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schemaVersion": {
+            "pragmaUserVersion": user_version,
+            "applicationId": application_id,
+            "declared": declared_versions,
+        },
+        "tables": tables,
+        "objects": objects,
+    }))
 }
 
 pub fn load_records_from_db_observed<Observe>(
@@ -1628,10 +1844,7 @@ fn strip_lrc_timestamps(value: &str) -> String {
     let mut output = String::new();
     for line in value.lines() {
         let mut rest = line;
-        loop {
-            let Some(close) = rest.strip_prefix('[').and_then(|text| text.find(']')) else {
-                break;
-            };
+        while let Some(close) = rest.strip_prefix('[').and_then(|text| text.find(']')) {
             // `close` is measured in the string after the leading `[`, so
             // skip both the leading bracket and the closing bracket.
             rest = &rest[close + 2..];
@@ -1898,7 +2111,7 @@ fn choose_record_with_method_and_size<'a>(
         })
         .filter(|(score, _, _)| *score >= 500)
         .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.0.cmp(&left.0));
+    ranked.sort_by_key(|left| std::cmp::Reverse(left.0));
 
     let Some((best_score, method, best)) = ranked.first().copied() else {
         return RecordMatch::NoMatch;
@@ -1958,7 +2171,7 @@ fn choose_record_with_method_cancellable<'a>(
     if cancel.load(Ordering::SeqCst) {
         return None;
     }
-    ranked.sort_by(|left, right| right.0.cmp(&left.0));
+    ranked.sort_by_key(|left| std::cmp::Reverse(left.0));
     let Some((best_score, method, best)) = ranked.first().copied() else {
         return Some(RecordMatch::NoMatch);
     };
@@ -2029,7 +2242,7 @@ fn choose_locator_with_method_cancellable(
     if cancel.load(Ordering::SeqCst) {
         return None;
     }
-    ranked.sort_by(|left, right| right.0.cmp(&left.0));
+    ranked.sort_by_key(|left| std::cmp::Reverse(left.0));
     let (best_score, _method, best_index) = ranked.first().copied()?;
     if best_score < 780 {
         return None;
@@ -3113,6 +3326,80 @@ mod tests {
             recovery.metadata.as_ref().map(|value| value.title.as_str()),
             Some("Song")
         );
+    }
+
+    #[test]
+    fn playlist_identity_lookup_accepts_relaxed_version_and_artist_metadata() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("sqlite_storage.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE track (
+                    file TEXT, title TEXT, artist TEXT, album TEXT, tid TEXT
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO track(file, title, artist, album, tid)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "/music/Eat Your Man.mp3",
+                    "Eat Your Man (with Nelly Furtado) [Extended]",
+                    "Dom Dolla",
+                    "Album",
+                    "42",
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let resolver = NeteaseMetadataResolver::load_exact(&database).unwrap();
+        let identity = resolver
+            .track_identity_for_playlist(
+                "Eat Your Man (with Nelly Furtado) Extended Mix",
+                "Dom Dolla, Nelly Furtado",
+            )
+            .expect("the relaxed metadata match should identify one track");
+        assert_eq!(identity.track_id.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn playlist_identity_lookup_prefers_unique_exact_artist_set_over_relaxed_candidate() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("sqlite_storage.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE track (
+                    file TEXT, title TEXT, artist TEXT, album TEXT, tid TEXT
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO track(file, title, artist, album, tid)
+                 VALUES (?1, ?2, ?3, ?4, ?5), (?6, ?2, ?7, ?4, ?8)",
+                params![
+                    "/music/eat-your-man-full.mp3",
+                    "Eat Your Man [Extended]",
+                    "Dom Dolla, Nelly Furtado",
+                    "Album",
+                    "42",
+                    "/music/eat-your-man-main.mp3",
+                    "Dom Dolla",
+                    "99",
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let resolver = NeteaseMetadataResolver::load_exact(&database).unwrap();
+        let identity = resolver
+            .track_identity_for_playlist("Eat Your Man Extended Mix", "Dom Dolla, Nelly Furtado")
+            .expect("the unique exact artist set should win");
+        assert_eq!(identity.track_id.as_deref(), Some("42"));
     }
 
     #[test]

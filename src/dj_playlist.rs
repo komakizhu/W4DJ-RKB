@@ -27,15 +27,16 @@ pub struct DjPlaylistImportWarning {
 
 /// A normalized track row used by the local W4DJ workflow.
 ///
-/// `dedupe_key` and `netease_import_line` are derived application fields; they
-/// are never accepted from or emitted to `.w4dj` files.
+/// NetEase IDs intentionally do not exist on this boundary.  They are only
+/// conversion-retrieval data and must never influence playlist matching or
+/// export. `dedupe_key` and `netease_import_line` are derived application
+/// fields; they are never accepted from or emitted to `.w4dj` files.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedDjPlaylistTrack {
     pub position: u64,
     pub title: String,
     pub artist_display: String,
-    pub netease_track_id: Option<String>,
     pub dedupe_key: String,
     pub netease_import_line: String,
 }
@@ -118,7 +119,13 @@ struct WireTrack {
     position: u64,
     title: String,
     artist_display: String,
-    netease_track_id: Option<String>,
+    /// Kept only as a v2 wire compatibility slot. It is deliberately ignored
+    /// after parsing, whether it is null, missing, or a string from an older
+    /// exporter. Numeric IDs remain invalid so malformed data is not silently
+    /// accepted as a protocol value.
+    #[serde(default)]
+    #[serde(rename = "netease_track_id")]
+    _netease_track_id: Option<String>,
 }
 
 pub fn parse_w4dj_playlist(
@@ -176,17 +183,12 @@ pub fn parse_w4dj_playlist(
             &track.artist_display,
             &format!("track[{position}].artist_display"),
         )?;
-        let netease_track_id = normalize_netease_track_id(
-            track.netease_track_id,
-            &format!("track[{position}].netease_track_id"),
-        )?;
         normalized.push(ImportedDjPlaylistTrack {
             position,
             title: title.clone(),
             artist_display: artist_display.clone(),
-            dedupe_key: dedupe_key(&title, &artist_display, netease_track_id.as_deref()),
+            dedupe_key: dedupe_key(&title, &artist_display),
             netease_import_line: netease_import_line(&title, &artist_display)?,
-            netease_track_id,
         });
     }
     normalized.sort_by_key(|track| track.position);
@@ -222,7 +224,9 @@ struct MinimalW4djTrack {
     position: u64,
     title: String,
     artist_display: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The v2 handoff keeps the key explicit and empty. It documents that an
+    /// ID was intentionally not supplied and prevents consumers from treating
+    /// a missing value as an invitation to look it up during export.
     netease_track_id: Option<String>,
 }
 
@@ -249,7 +253,7 @@ pub fn serialize_w4dj_playlist(playlist: &ImportedDjPlaylist) -> Result<Vec<u8>,
                 position: track.position,
                 title: track.title.clone(),
                 artist_display: track.artist_display.clone(),
-                netease_track_id: track.netease_track_id.clone(),
+                netease_track_id: None,
             })
             .collect(),
     };
@@ -281,7 +285,7 @@ fn reject_non_string_netease_ids(value: &Value) -> Result<(), DjPlaylistError> {
         else {
             continue;
         };
-        if !id.is_string() {
+        if !id.is_null() && !id.is_string() {
             return Err(DjPlaylistError::InvalidField(format!(
                 "track[{index}].netease_track_id 必须是字符串"
             )));
@@ -290,28 +294,7 @@ fn reject_non_string_netease_ids(value: &Value) -> Result<(), DjPlaylistError> {
     Ok(())
 }
 
-fn normalize_netease_track_id(
-    value: Option<String>,
-    field: &str,
-) -> Result<Option<String>, DjPlaylistError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.is_empty()
-        || value.chars().any(char::is_control)
-        || value.chars().any(char::is_whitespace)
-    {
-        return Err(DjPlaylistError::InvalidField(format!(
-            "{field} 必须是非空且无空白的字符串"
-        )));
-    }
-    Ok(Some(value))
-}
-
-fn dedupe_key(title: &str, artist_display: &str, netease_track_id: Option<&str>) -> String {
-    if let Some(id) = netease_track_id {
-        return format!("netease:{id}");
-    }
+fn dedupe_key(title: &str, artist_display: &str) -> String {
     format!(
         "title-artist:{}:{}",
         normalize_dedupe_component(title),

@@ -1,6 +1,8 @@
 mod analysis;
 mod concurrency;
 mod config;
+mod dj_playlist;
+mod dj_playlist_match;
 mod filename_policy;
 pub mod gui;
 mod lyrics;

@@ -204,13 +204,6 @@ fn stone_kold_duplicate_tracks_convert_to_distinct_outputs_with_metadata() {
                 destination,
             )
             .expect("register output");
-        library
-            .set_output_identity(
-                destination,
-                candidate.netease_track_id.as_deref(),
-                candidate.netease_album_id.as_deref(),
-            )
-            .expect("register source identity");
         let key = format!(
             "output:{}",
             fs::canonicalize(destination).unwrap().display()
@@ -220,7 +213,7 @@ fn stone_kold_duplicate_tracks_convert_to_distinct_outputs_with_metadata() {
             .expect("query output")
             .expect("track row");
         assert_eq!(track.album, source_metadata.album);
-        assert_eq!(track.netease_track_id, candidate.netease_track_id);
+        assert_eq!(track.netease_track_id, None);
     }
 
     if let Ok(existing_path) = env::var("W4DJ_DUPLICATE_EXISTING_OUTPUT") {

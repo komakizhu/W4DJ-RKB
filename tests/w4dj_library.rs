@@ -6,7 +6,732 @@ use w4dj::analysis::{
     AnalysisLabel, ContinuousEmotionResult, DiscogsEffnetAnalysis, DiscogsEffnetHeadResult,
     EmotionCandidates, EmotionHeadStatus, HighLevelAnalysis, TrackAnalysis,
 };
+use w4dj::dj_playlist::{ImportedDjPlaylist, ImportedDjPlaylistTrack};
+use w4dj::m3u8::{ResolvedDjPlaylistTrack, build_relative_m3u8_with_summary};
 use w4dj::w4dj_library::{CommittedOutputFacts, OutputFileSnapshot, W4djLibrary};
+
+#[test]
+fn sqlite_snapshot_is_readable_and_contains_output_index() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("out");
+    fs::create_dir_all(&output_root).unwrap();
+    let output = output_root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let database_path = directory.path().join("w4dj.sqlite3");
+    let mut library = W4djLibrary::open(&database_path).unwrap();
+    library
+        .upsert_output_file(0, &output_root, None, &output)
+        .unwrap();
+
+    let snapshot = library.sqlite_snapshot_bytes().unwrap();
+    assert!(snapshot.starts_with(b"SQLite format 3\0"));
+    let snapshot_path = directory.path().join("snapshot.sqlite3");
+    fs::write(&snapshot_path, snapshot).unwrap();
+    let connection = Connection::open(&snapshot_path).unwrap();
+    let output_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM w4dj_track_meta", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(output_count, 1);
+    drop(connection);
+
+    let read_only = W4djLibrary::open_read_only(&database_path).unwrap();
+    assert_eq!(read_only.stats().unwrap().available, 1);
+}
+
+#[test]
+fn w4dj_output_and_playlist_rows_never_backfill_netease_identity() {
+    let directory = tempdir().unwrap();
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+    let output = directory.path().join("exports/eat-your-man.mp3");
+    library
+        .upsert_lightweight_output(
+            0,
+            None,
+            &output,
+            "Eat Your Man (with Nelly Furtado) Extended Mix",
+            "Dom Dolla, Nelly Furtado",
+        )
+        .unwrap();
+    let playlist = ImportedDjPlaylist {
+        playlist_id: "playlist-backfill".to_string(),
+        format_version: 2,
+        name: "Backfill".to_string(),
+        source_path: None,
+        imported_at_ms: None,
+        tracks: vec![ImportedDjPlaylistTrack {
+            position: 1,
+            title: "Eat Your Man (with Nelly Furtado) Extended Mix".to_string(),
+            artist_display: "Dom Dolla, Nelly Furtado".to_string(),
+            dedupe_key: "title-artist:eatyourmanwithnellyfurtadoextendedmix:domdollanellyfurtado"
+                .to_string(),
+            netease_import_line:
+                "Eat Your Man (with Nelly Furtado) Extended Mix - Dom Dolla, Nelly Furtado"
+                    .to_string(),
+        }],
+        warnings: Vec::new(),
+    };
+    library.upsert_imported_dj_playlist(&playlist).unwrap();
+
+    assert_eq!(
+        library.available_dj_output_candidates().unwrap()[0].title,
+        "Eat Your Man (with Nelly Furtado) Extended Mix"
+    );
+    let loaded = library
+        .get_imported_dj_playlist("playlist-backfill")
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.tracks[0].dedupe_key, playlist.tracks[0].dedupe_key);
+}
+
+#[test]
+fn ordinary_output_indexing_does_not_write_w4dj_manifest() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let output_root = fs::canonicalize(output_root).unwrap();
+    let output = output_root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let source = directory.path().join("downloads/song.ncm");
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+
+    library
+        .upsert_lightweight_output(0, Some(&source), &output, "Song", "Artist")
+        .unwrap();
+    library
+        .reconcile_output_roots(&[(0, output_root.clone(), vec![output])])
+        .unwrap();
+    let scanned_output = output_root.join("scanned.mp3");
+    fs::write(&scanned_output, b"scanned audio").unwrap();
+    library
+        .upsert_output_file(0, &output_root, None, &scanned_output)
+        .unwrap();
+
+    assert!(!output_root.join(".w4dj-output-identities.json").exists());
+}
+
+#[test]
+fn explicit_w4dj_operation_persists_output_manifest() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let output_root = fs::canonicalize(output_root).unwrap();
+    let output = output_root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let source = directory.path().join("downloads/song.ncm");
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+
+    library
+        .upsert_lightweight_output(0, Some(&source), &output, "Song", "Artist")
+        .unwrap();
+    assert!(!output_root.join(".w4dj-output-identities.json").exists());
+
+    assert_eq!(
+        library
+            .persist_output_identity_manifests(&[(0, output_root.clone())])
+            .unwrap(),
+        1
+    );
+    let manifest_path = output_root.join(".w4dj-output-identities.json");
+    assert!(manifest_path.is_file());
+    let manifest_before_ordinary_update = fs::read(&manifest_path).unwrap();
+    let second_output = output_root.join("second.mp3");
+    fs::write(&second_output, b"second audio").unwrap();
+    library
+        .upsert_lightweight_output(
+            0,
+            Some(&directory.path().join("downloads/second.ncm")),
+            &second_output,
+            "Second",
+            "Artist",
+        )
+        .unwrap();
+    assert_eq!(
+        fs::read(&manifest_path).unwrap(),
+        manifest_before_ordinary_update
+    );
+}
+
+#[test]
+fn ordinary_rescan_does_not_restore_w4dj_manifest() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let output_root = fs::canonicalize(output_root).unwrap();
+    let output = output_root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let source = directory.path().join("downloads/song.ncm");
+
+    let database = directory.path().join("w4dj.sqlite3");
+    let mut w4dj_library = W4djLibrary::open(&database).unwrap();
+    w4dj_library
+        .upsert_lightweight_output(0, Some(&source), &output, "Song", "Artist")
+        .unwrap();
+    assert_eq!(
+        w4dj_library
+            .persist_output_identity_manifests(&[(0, output_root.clone())])
+            .unwrap(),
+        1
+    );
+    assert!(output_root.join(".w4dj-output-identities.json").is_file());
+    drop(w4dj_library);
+
+    let mut ordinary_library =
+        W4djLibrary::open(&directory.path().join("ordinary.sqlite3")).unwrap();
+    ordinary_library
+        .reconcile_output_roots(&[(0, output_root, vec![output])])
+        .unwrap();
+    assert_eq!(
+        ordinary_library
+            .available_dj_output_candidates()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn output_identity_survives_library_clear_and_output_rescan() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let output_root = fs::canonicalize(output_root).unwrap();
+    let output = output_root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let source = directory.path().join("downloads/song.ncm");
+    let database = directory.path().join("w4dj.sqlite3");
+
+    let mut library = W4djLibrary::open(&database).unwrap();
+    library
+        .upsert_lightweight_output(0, Some(&source), &output, "Song", "Artist")
+        .unwrap();
+    assert_eq!(
+        library
+            .persist_output_identity_manifests(&[(0, output_root.clone())])
+            .unwrap(),
+        1
+    );
+    assert!(output_root.join(".w4dj-output-identities.json").is_file());
+    library
+        .reconcile_output_roots(&[(0, output_root.clone(), vec![output.clone()])])
+        .unwrap();
+
+    library.clear_output_library().unwrap();
+    assert!(output_root.join(".w4dj-output-identities.json").is_file());
+    assert_eq!(library.restore_output_identity_manifests(&[]).unwrap(), 1);
+
+    library
+        .reconcile_output_roots(&[(0, output_root.clone(), vec![output.clone()])])
+        .unwrap();
+    let candidates = library.available_dj_output_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].title, "Song");
+    assert_eq!(candidates[0].artist_display, "Artist");
+
+    drop(library);
+    let mut rebuilt_library = W4djLibrary::open(&directory.path().join("rebuilt.sqlite3")).unwrap();
+    assert_eq!(
+        rebuilt_library
+            .restore_output_identity_manifests(&[(0, output_root)])
+            .unwrap(),
+        1
+    );
+    let rebuilt_candidates = rebuilt_library.available_dj_output_candidates().unwrap();
+    assert_eq!(rebuilt_candidates[0].title, "Song");
+}
+
+#[test]
+fn reviewed_playlist_binding_survives_explicit_manifest_restore() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let output_root = fs::canonicalize(output_root).unwrap();
+    let output = output_root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let database = directory.path().join("w4dj.sqlite3");
+
+    let playlist = ImportedDjPlaylist {
+        playlist_id: "reviewed-playlist".to_string(),
+        format_version: 2,
+        name: "Reviewed playlist".to_string(),
+        source_path: None,
+        imported_at_ms: None,
+        tracks: vec![ImportedDjPlaylistTrack {
+            position: 1,
+            title: "Song".to_string(),
+            artist_display: "Artist".to_string(),
+            dedupe_key: "title-artist:song:artist".to_string(),
+            netease_import_line: "Song - Artist".to_string(),
+        }],
+        warnings: Vec::new(),
+    };
+
+    let mut library = W4djLibrary::open(&database).unwrap();
+    library
+        .upsert_lightweight_output(0, None, &output, "Song", "Artist")
+        .unwrap();
+    library.upsert_imported_dj_playlist(&playlist).unwrap();
+    let report = library
+        .compute_imported_dj_playlist_matches(&playlist.playlist_id)
+        .unwrap();
+    library
+        .replace_imported_dj_playlist_matches(&playlist.playlist_id, &report)
+        .unwrap();
+    library
+        .set_imported_dj_playlist_match_confirmed(&playlist.playlist_id, 1, true)
+        .unwrap();
+    assert_eq!(
+        library
+            .persist_output_identity_manifests(&[(0, output_root.clone())])
+            .unwrap(),
+        1
+    );
+    let manifest_path = output_root.join(".w4dj-output-identities.json");
+    let manifest = fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest.contains("reviewed-playlist"));
+    assert!(manifest.contains("relativePath"));
+    assert!(!manifest.contains("netease_track_id"));
+    drop(library);
+
+    let rebuilt_database = directory.path().join("rebuilt-w4dj.sqlite3");
+    let mut rebuilt = W4djLibrary::open(&rebuilt_database).unwrap();
+    assert_eq!(
+        rebuilt
+            .restore_output_identity_manifests(&[(0, output_root.clone())])
+            .unwrap(),
+        1
+    );
+    rebuilt.upsert_imported_dj_playlist(&playlist).unwrap();
+    assert_eq!(
+        rebuilt
+            .restore_imported_dj_playlist_review_manifests(
+                &playlist.playlist_id,
+                &[(0, output_root)],
+            )
+            .unwrap(),
+        1
+    );
+    let restored = rebuilt
+        .get_imported_dj_playlist_match_report(&playlist.playlist_id)
+        .unwrap();
+    assert_eq!(restored.matched_count, 1);
+    assert!(restored.matches[0].confirmed);
+    assert_eq!(
+        restored.matches[0].match_method.as_deref(),
+        Some("libraryBm25f")
+    );
+    assert_eq!(
+        restored.matches[0].destination_path.as_deref(),
+        Some(output.as_path())
+    );
+}
+
+#[test]
+fn playlist_with_existing_and_new_outputs_matches_both_after_index_rebuild() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let first = output_root.join("a.mp3");
+    let second = output_root.join("b.mp3");
+    fs::write(&first, b"a").unwrap();
+    fs::write(&second, b"b").unwrap();
+    let database = directory.path().join("w4dj.sqlite3");
+    let mut library = W4djLibrary::open(&database).unwrap();
+    for (path, title) in [(&first, "Song A"), (&second, "Song B")] {
+        library
+            .upsert_lightweight_output(0, None, path, title, "Artist")
+            .unwrap();
+    }
+    assert_eq!(
+        library
+            .persist_output_identity_manifests(&[(0, output_root.clone())])
+            .unwrap(),
+        2
+    );
+    library.clear_output_library().unwrap();
+    library
+        .restore_output_identity_manifests(&[(0, output_root)])
+        .unwrap();
+
+    let playlist = ImportedDjPlaylist {
+        playlist_id: "a-plus-b".to_string(),
+        format_version: 2,
+        name: "A + B".to_string(),
+        source_path: None,
+        imported_at_ms: None,
+        tracks: vec![
+            ImportedDjPlaylistTrack {
+                position: 1,
+                title: "Song A".to_string(),
+                artist_display: "Artist".to_string(),
+                dedupe_key: "title-artist:songa:artist".to_string(),
+                netease_import_line: "Song A - Artist".to_string(),
+            },
+            ImportedDjPlaylistTrack {
+                position: 2,
+                title: "Song B".to_string(),
+                artist_display: "Artist".to_string(),
+                dedupe_key: "title-artist:songb:artist".to_string(),
+                netease_import_line: "Song B - Artist".to_string(),
+            },
+        ],
+        warnings: Vec::new(),
+    };
+    library.upsert_imported_dj_playlist(&playlist).unwrap();
+    let report = library
+        .compute_imported_dj_playlist_matches("a-plus-b")
+        .unwrap();
+    assert_eq!(report.matched_count, 2);
+    assert!(report.matches.iter().all(|row| row.status == "matched"));
+
+    let candidates = library.available_dj_output_candidates().unwrap();
+    let resolved = report
+        .matches
+        .iter()
+        .filter_map(|row| {
+            let track_key = row.track_key.as_deref()?;
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.track_key == track_key)?;
+            Some(ResolvedDjPlaylistTrack {
+                position: row.position,
+                title: row.title.clone(),
+                artist_display: row.artist_display.clone(),
+                duration_seconds: candidate.duration_seconds,
+                destination_path: candidate.destination_path.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let (contents, summary) = build_relative_m3u8_with_summary(
+        &playlist,
+        &resolved,
+        &directory.path().join("a-plus-b.m3u8"),
+    )
+    .unwrap();
+    assert_eq!(summary.matched_count, 2);
+    assert!(contents.contains("outputs/a.mp3"));
+    assert!(contents.contains("outputs/b.mp3"));
+}
+
+#[test]
+fn playlist_claims_the_latest_unclaimed_committed_batch() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("outputs");
+    fs::create_dir_all(&root).unwrap();
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+    library
+        .upsert_committed_output_in_root(
+            0,
+            &root,
+            None,
+            &root.join("old.mp3"),
+            "Old",
+            "Artist",
+            &CommittedOutputFacts {
+                conversion_batch_id: Some("batch-old".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    library
+        .upsert_committed_output_in_root(
+            0,
+            &root,
+            None,
+            &root.join("new.mp3"),
+            "New",
+            "Artist",
+            &CommittedOutputFacts {
+                conversion_batch_id: Some("batch-new".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let playlist = ImportedDjPlaylist {
+        playlist_id: "playlist-a".to_string(),
+        format_version: 2,
+        name: "Playlist A".to_string(),
+        source_path: None,
+        imported_at_ms: None,
+        tracks: vec![ImportedDjPlaylistTrack {
+            position: 1,
+            title: "New".to_string(),
+            artist_display: "Artist".to_string(),
+            dedupe_key: "title-artist:new:artist".to_string(),
+            netease_import_line: "New - Artist".to_string(),
+        }],
+        warnings: Vec::new(),
+    };
+    library.upsert_imported_dj_playlist(&playlist).unwrap();
+    assert_eq!(
+        library
+            .claim_latest_conversion_batch("playlist-a")
+            .unwrap()
+            .as_deref(),
+        Some("batch-new")
+    );
+    assert_eq!(
+        library
+            .claim_latest_conversion_batch("playlist-a")
+            .unwrap()
+            .as_deref(),
+        Some("batch-new")
+    );
+
+    let mut second_playlist = playlist.clone();
+    second_playlist.playlist_id = "playlist-b".to_string();
+    library
+        .upsert_imported_dj_playlist(&second_playlist)
+        .unwrap();
+    assert_eq!(
+        library.claim_latest_conversion_batch("playlist-b").unwrap(),
+        None
+    );
+}
+
+#[test]
+fn changing_a_manual_file_keeps_the_new_binding_exportable() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("outputs");
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("first.mp3");
+    let second = root.join("second.mp3");
+    fs::write(&first, b"first audio").unwrap();
+    fs::write(&second, b"second audio").unwrap();
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+    library
+        .upsert_lightweight_output(0, None, &first, "First", "Artist")
+        .unwrap();
+    library
+        .upsert_lightweight_output(0, None, &second, "Second", "Artist")
+        .unwrap();
+    let playlist = ImportedDjPlaylist {
+        playlist_id: "manual-playlist".to_string(),
+        format_version: 2,
+        name: "Manual playlist".to_string(),
+        source_path: None,
+        imported_at_ms: None,
+        tracks: vec![ImportedDjPlaylistTrack {
+            position: 1,
+            title: "First".to_string(),
+            artist_display: "Artist".to_string(),
+            dedupe_key: "title-artist:first:artist".to_string(),
+            netease_import_line: "First - Artist".to_string(),
+        }],
+        warnings: Vec::new(),
+    };
+    library.upsert_imported_dj_playlist(&playlist).unwrap();
+    let report = library
+        .compute_imported_dj_playlist_matches("manual-playlist")
+        .unwrap();
+    library
+        .replace_imported_dj_playlist_matches("manual-playlist", &report)
+        .unwrap();
+    library
+        .set_imported_dj_playlist_match_confirmed("manual-playlist", 1, true)
+        .unwrap();
+    library
+        .set_imported_dj_playlist_match_by_path("manual-playlist", 1, &second)
+        .unwrap();
+    let row = &library
+        .get_imported_dj_playlist_match_report("manual-playlist")
+        .unwrap()
+        .matches[0];
+    assert_eq!(row.destination_path.as_deref(), Some(second.as_path()));
+    assert!(row.confirmed);
+    assert_eq!(row.match_method.as_deref(), Some("manual"));
+}
+
+#[test]
+fn excluding_playlist_rows_persists_only_in_the_export_review() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let output_root = fs::canonicalize(output_root).unwrap();
+    let outputs = [
+        output_root.join("song-a.mp3"),
+        output_root.join("song-b.mp3"),
+        output_root.join("song-c.mp3"),
+    ];
+    for (index, output) in outputs.iter().enumerate() {
+        fs::write(output, format!("audio-{index}")).unwrap();
+    }
+    let playlist = ImportedDjPlaylist {
+        playlist_id: "excluded-playlist".to_string(),
+        format_version: 2,
+        name: "Excluded playlist".to_string(),
+        source_path: None,
+        imported_at_ms: None,
+        tracks: ["A", "B", "C"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, suffix)| ImportedDjPlaylistTrack {
+                position: (index + 1) as u64,
+                title: format!("Song {suffix}"),
+                artist_display: "Artist".to_string(),
+                dedupe_key: format!("song-{suffix}"),
+                netease_import_line: format!("Song {suffix} - Artist"),
+            })
+            .collect(),
+        warnings: Vec::new(),
+    };
+    let database = directory.path().join("w4dj.sqlite3");
+    let mut library = W4djLibrary::open(&database).unwrap();
+    for (index, output) in outputs.iter().enumerate() {
+        library
+            .upsert_lightweight_output(
+                0,
+                None,
+                output,
+                &format!("Song {}", ["A", "B", "C"][index]),
+                "Artist",
+            )
+            .unwrap();
+    }
+    library.upsert_imported_dj_playlist(&playlist).unwrap();
+    let report = library
+        .compute_imported_dj_playlist_matches(&playlist.playlist_id)
+        .unwrap();
+    assert_eq!(report.matched_count, 3);
+    library
+        .replace_imported_dj_playlist_matches(&playlist.playlist_id, &report)
+        .unwrap();
+
+    library
+        .set_imported_dj_playlist_matches_excluded(&playlist.playlist_id, &[2], true)
+        .unwrap();
+    let excluded_report = library
+        .get_imported_dj_playlist_match_report(&playlist.playlist_id)
+        .unwrap();
+    assert!(
+        excluded_report
+            .matches
+            .iter()
+            .find(|row| row.position == 2)
+            .unwrap()
+            .excluded
+    );
+    assert_eq!(library.available_dj_output_candidates().unwrap().len(), 3);
+    assert!(outputs[1].is_file());
+
+    library
+        .persist_output_identity_manifests(&[(0, output_root.clone())])
+        .unwrap();
+    let manifest = fs::read_to_string(output_root.join(".w4dj-output-identities.json")).unwrap();
+    assert!(manifest.contains("song-a.mp3"));
+    assert!(manifest.contains("song-c.mp3"));
+    assert!(!manifest.contains("\"position\": 2"));
+
+    drop(library);
+    let mut reopened = W4djLibrary::open(&database).unwrap();
+    let reopened_report = reopened
+        .get_imported_dj_playlist_match_report(&playlist.playlist_id)
+        .unwrap();
+    assert!(
+        reopened_report
+            .matches
+            .iter()
+            .find(|row| row.position == 2)
+            .unwrap()
+            .excluded
+    );
+    reopened
+        .set_imported_dj_playlist_matches_excluded(&playlist.playlist_id, &[2], false)
+        .unwrap();
+    let restored_report = reopened
+        .get_imported_dj_playlist_match_report(&playlist.playlist_id)
+        .unwrap();
+    assert!(
+        !restored_report
+            .matches
+            .iter()
+            .find(|row| row.position == 2)
+            .unwrap()
+            .excluded
+    );
+}
+
+#[test]
+fn replacing_a_converted_path_with_a_new_source_does_not_reuse_the_old_id() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("outputs/song.mp3");
+    let source_a = directory.path().join("downloads/a.ncm");
+    let source_b = directory.path().join("downloads/b.ncm");
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+
+    library
+        .upsert_lightweight_output(0, Some(&source_a), &output, "Song A", "Artist")
+        .unwrap();
+    library
+        .upsert_lightweight_output(0, Some(&source_b), &output, "Song B", "Artist")
+        .unwrap();
+
+    let candidate = &library.available_dj_output_candidates().unwrap()[0];
+    assert_eq!(candidate.title, "Song B");
+}
+
+#[test]
+fn committed_nested_output_uses_the_configured_root_manifest() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    let output = output_root.join("house/song.mp3");
+    fs::create_dir_all(output.parent().unwrap()).unwrap();
+    fs::write(&output, b"audio").unwrap();
+    let source = directory.path().join("downloads/song.ncm");
+    let database = directory.path().join("w4dj.sqlite3");
+
+    let mut library = W4djLibrary::open(&database).unwrap();
+    library
+        .upsert_committed_output_in_root(
+            0,
+            &output_root,
+            Some(&source),
+            &output,
+            "Song",
+            "Artist",
+            &CommittedOutputFacts::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        library
+            .persist_output_identity_manifests(&[(0, output_root.clone())])
+            .unwrap(),
+        1
+    );
+    assert!(output_root.join(".w4dj-output-identities.json").is_file());
+    assert!(
+        !output
+            .parent()
+            .unwrap()
+            .join(".w4dj-output-identities.json")
+            .is_file()
+    );
+    drop(library);
+
+    let mut rebuilt = W4djLibrary::open(&directory.path().join("rebuilt.sqlite3")).unwrap();
+    assert_eq!(
+        rebuilt
+            .restore_output_identity_manifests(&[(0, output_root)])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        rebuilt.available_dj_output_candidates().unwrap()[0].title,
+        "Song"
+    );
+}
+
+#[test]
+fn output_metadata_is_not_replaced_by_a_netease_identity_backfill() {
+    let directory = tempdir().unwrap();
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+    let output = directory.path().join("exports/song.mp3");
+    library
+        .upsert_lightweight_output(0, None, &output, "Song", "Artist")
+        .unwrap();
+    let candidate = &library.available_dj_output_candidates().unwrap()[0];
+    assert_eq!(candidate.title, "Song");
+    assert_eq!(candidate.artist_display, "Artist");
+}
 
 #[test]
 fn high_level_json_round_trips_old_and_new_emotion_fields() {
@@ -158,23 +883,15 @@ fn lightweight_output_registration_never_requires_the_files_to_exist() {
     let mut library = W4djLibrary::open(&database_path).unwrap();
 
     let key = library
-        .upsert_lightweight_output(
-            1,
-            Some(&source),
-            &destination,
-            Some("28712318"),
-            Some("3409113568"),
-            "Song",
-            "Artist",
-        )
+        .upsert_lightweight_output(1, Some(&source), &destination, "Song", "Artist")
         .unwrap();
 
-    assert_eq!(key, "netease:28712318");
+    assert!(key.starts_with("source:"));
     assert_eq!(library.stats().unwrap().total, 1);
     let track = library.track_detail(&key).unwrap().unwrap();
     assert_eq!(track.title, "Song");
     assert_eq!(track.artists, "Artist");
-    assert_eq!(track.netease_track_id.as_deref(), Some("28712318"));
+    assert_eq!(track.netease_track_id, None);
     assert_eq!(
         library.local_files_for_track(&key).unwrap()[0].path,
         destination
@@ -217,26 +934,10 @@ fn lightweight_registration_updates_one_identity_when_output_moves() {
     let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
 
     let first_key = library
-        .upsert_lightweight_output(
-            0,
-            Some(&source),
-            &first,
-            Some("42"),
-            None,
-            "First",
-            "Artist",
-        )
+        .upsert_lightweight_output(0, Some(&source), &first, "First", "Artist")
         .unwrap();
     let second_key = library
-        .upsert_lightweight_output(
-            0,
-            Some(&source),
-            &second,
-            Some("42"),
-            None,
-            "Second",
-            "Artist",
-        )
+        .upsert_lightweight_output(0, Some(&source), &second, "Second", "Artist")
         .unwrap();
 
     assert_eq!(first_key, second_key);
@@ -244,7 +945,6 @@ fn lightweight_registration_updates_one_identity_when_output_moves() {
     let candidates = library.available_dj_output_candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].destination_path, second);
-    assert_eq!(candidates[0].netease_track_id.as_deref(), Some("42"));
 }
 
 #[test]
@@ -256,10 +956,10 @@ fn lightweight_registration_without_netease_id_reuses_source_identity() {
     let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
 
     let first_key = library
-        .upsert_lightweight_output(0, Some(&source), &first, None, None, "First", "Artist")
+        .upsert_lightweight_output(0, Some(&source), &first, "First", "Artist")
         .unwrap();
     let second_key = library
-        .upsert_lightweight_output(0, Some(&source), &second, None, None, "Second", "Artist")
+        .upsert_lightweight_output(0, Some(&source), &second, "Second", "Artist")
         .unwrap();
 
     assert_eq!(first_key, "source:".to_string() + &source.to_string_lossy());
@@ -290,18 +990,10 @@ fn committed_output_bindings_store_fingerprint_and_naming_context() {
         filename_rule: Some("title_artist".into()),
         netease_filename_format: Some("title_artist".into()),
         filename_normalization_policy: Some("soundcloud".into()),
+        conversion_batch_id: Some("batch-1".into()),
     };
     library
-        .upsert_committed_output(
-            0,
-            Some(&source),
-            &destination,
-            Some("track-1"),
-            None,
-            "Song",
-            "Artist",
-            &facts,
-        )
+        .upsert_committed_output(0, Some(&source), &destination, "Song", "Artist", &facts)
         .unwrap();
 
     let bindings = library.committed_output_bindings().unwrap();
@@ -314,7 +1006,7 @@ fn committed_output_bindings_store_fingerprint_and_naming_context() {
 }
 
 #[test]
-fn schema_v2_track_meta_migration_preserves_rows_and_adds_v3_facts() {
+fn schema_v2_track_meta_migration_preserves_rows_and_adds_v4_facts() {
     let directory = tempdir().unwrap();
     let database_path = directory.path().join("w4dj-v2.sqlite3");
     let root = directory.path().join("out");

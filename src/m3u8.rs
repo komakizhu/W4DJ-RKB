@@ -76,19 +76,18 @@ pub fn build_relative_m3u8(
     playlist: &ImportedDjPlaylist,
     resolved_tracks: &[ResolvedDjPlaylistTrack],
     playlist_path: &Path,
-    allow_partial: bool,
 ) -> Result<String, M3u8Error> {
-    build_relative_m3u8_with_summary(playlist, resolved_tracks, playlist_path, allow_partial)
+    build_relative_m3u8_with_summary(playlist, resolved_tracks, playlist_path)
         .map(|(contents, _)| contents)
 }
 
-/// Render an extended M3U8 and return the exact omitted positions for an
-/// explicit partial export.
+/// Render an extended M3U8. Every playlist row must have a valid resolved
+/// output; omitted positions are returned as an error and can never be
+/// silently exported.
 pub fn build_relative_m3u8_with_summary(
     playlist: &ImportedDjPlaylist,
     resolved_tracks: &[ResolvedDjPlaylistTrack],
     playlist_path: &Path,
-    allow_partial: bool,
 ) -> Result<(String, M3u8ExportSummary), M3u8Error> {
     if !playlist_path.is_absolute() {
         return Err(M3u8Error::InvalidPath(
@@ -156,7 +155,7 @@ pub fn build_relative_m3u8_with_summary(
         });
     }
 
-    if !omitted.is_empty() && !allow_partial {
+    if !omitted.is_empty() {
         return Err(M3u8Error::Incomplete { omitted });
     }
     if matched_count == 0 {

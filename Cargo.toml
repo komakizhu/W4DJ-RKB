@@ -1,6 +1,6 @@
 [package]
 name = "w4dj"
-version = "3.2.2"
+version = "3.2.3"
 edition = "2024"
 
 [features]
@@ -23,4 +23,4 @@ id3 = "1.16.3"
 anyhow = "1.0.98"
 libc = "0.2"
 tempfile = "3.10.1"
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "backup"] }

@@ -13,7 +13,6 @@ function track(position: number, line = `Song ${position} - Artist ${position}`)
     position,
     title: `Song ${position}`,
     artistDisplay: `Artist ${position}`,
-    neteaseTrackId: null,
     dedupeKey: `key-${position}`,
     neteaseImportLine: line,
   };

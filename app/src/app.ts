@@ -49,6 +49,11 @@ import {
   type ImportedDjPlaylistSummary,
   type NeteaseQrPage,
 } from './dj-playlist';
+import {
+  canExportReviewedPlaylist,
+  renderDjPlaylistReview,
+  type DjPlaylistReviewCopy,
+} from './dj-playlist-review';
 import { renderPlaintextQrDataUrl } from './qr-code';
 
 export const DJ_PLAYLIST_QR_CONCURRENCY = 3;
@@ -365,8 +370,7 @@ export type DjPlaylistTrackMatch = {
   dedupeKey: string;
   title: string;
   artistDisplay: string;
-  neteaseTrackId: string | null;
-  kind: 'neteaseTrackId' | 'uniqueTitleArtistFallback' | 'ambiguous' | 'unmatched' | 'missing' | 'manual';
+  kind: 'recentBm25f' | 'libraryBm25f' | 'ambiguous' | 'unmatched' | 'missing' | 'manual';
   status: 'matched' | 'unmatched' | 'ambiguous' | 'missing';
   trackKey: string | null;
   matchMethod: string | null;
@@ -374,6 +378,10 @@ export type DjPlaylistTrackMatch = {
   reason: string;
   candidates: DjPlaylistMatchCandidate[];
   manual: boolean;
+  destinationPath: string | null;
+  candidateSource: string | null;
+  confirmed: boolean;
+  excluded: boolean;
 };
 
 export type DjPlaylistMatchReport = {
@@ -394,7 +402,6 @@ export type DjPlaylistM3u8ExportResult = {
   copiedCount: number;
   copyAudio: boolean;
   portable: boolean;
-  omitted: Array<{ position: number; reason: string }>;
 };
 
 export type DjPlaylistUiState = {
@@ -414,6 +421,9 @@ export type DjPlaylistUiState = {
   qrRevision: number;
   matchBusy: boolean;
   matchReport: DjPlaylistMatchReport | null;
+  /** Playlist-review selections used only for removing rows from this export. */
+  selectedPositions: number[];
+  reviewBusy?: boolean;
   exportBusy: boolean;
   dropActive: boolean;
 };
@@ -653,6 +663,7 @@ export type AppServices = {
   cancelInvalidLibraryScan?: () => Promise<LibraryInvalidScanProgress>;
   listenInvalidLibraryScanProgress?: (handler: (progress: LibraryInvalidScanProgress) => void) => Promise<UnlistenFn>;
   pickW4djPlaylist?: () => Promise<string | null>;
+  pickDjPlaylistAudio?: () => Promise<string | null>;
   importW4djPlaylist?: (path: string) => Promise<ImportedDjPlaylist>;
   listImportedDjPlaylists?: () => Promise<ImportedDjPlaylistSummary[]>;
   loadImportedDjPlaylist?: (playlistId: string) => Promise<ImportedDjPlaylist>;
@@ -661,8 +672,11 @@ export type AppServices = {
   matchImportedDjPlaylist?: (playlistId: string) => Promise<DjPlaylistMatchReport>;
   loadImportedDjPlaylistMatches?: (playlistId: string) => Promise<DjPlaylistMatchReport>;
   setImportedDjPlaylistMatch?: (playlistId: string, position: number, trackKey: string) => Promise<DjPlaylistMatchReport>;
+  setImportedDjPlaylistMatchByPath?: (playlistId: string, position: number, destinationPath: string) => Promise<DjPlaylistMatchReport>;
+  setImportedDjPlaylistMatchConfirmed?: (playlistId: string, position: number, confirmed: boolean) => Promise<DjPlaylistMatchReport>;
+  setImportedDjPlaylistMatchesExcluded?: (playlistId: string, positions: number[], excluded: boolean) => Promise<DjPlaylistMatchReport>;
   clearImportedDjPlaylistMatch?: (playlistId: string, position: number) => Promise<DjPlaylistMatchReport>;
-  exportImportedDjPlaylistM3u8?: (playlistId: string, path: string, allowPartial: boolean, copyAudio?: boolean) => Promise<DjPlaylistM3u8ExportResult>;
+  exportImportedDjPlaylistM3u8?: (playlistId: string, path: string, copyAudio?: boolean) => Promise<DjPlaylistM3u8ExportResult>;
 };
 
 export type EssentiaModelStatus = {
@@ -976,12 +990,15 @@ const translations = {
     djPlaylistChooseRecent: '选择最近歌单',
     djPlaylistCopyAudioTitle: '是否复制歌单中的音频？',
     djPlaylistCopyAudio: '是，复制音频并导出',
+    djPlaylistCopyAudioPartial: '是，复制已匹配音频并导出',
     djPlaylistUseExistingAudio: '否，仅导出歌单',
+    djPlaylistUseExistingAudioPartial: '否，仅导出已匹配歌曲',
     djPlaylistCopyAudioExplanation: '是，复制音频并导出：歌曲会复制到导出文件夹，歌单可独立使用，但会占用更多磁盘空间。',
     djPlaylistUseExistingAudioExplanation: '否，仅导出歌单：不会复制歌曲。请勿移动或删除原音频，否则歌单可能无法播放。',
     djPlaylistExportPreparing: '正在准备播放列表…',
     djPlaylistExportCopied: '已复制 {copied}/{matched} 首音频',
     djPlaylistExportReferenced: '未复制音频，仅导出歌单',
+    djPlaylistExportOmitted: '另有 {count} 首未导出',
     djPlaylistExportPortableError: '复制导出未生成完整的跨账户歌单，请重新导出。',
     djPlaylistInstructions: '1. 如何把歌单导入到网易云：导入 .w4dj 之后，扫描二维码，打开网易云-我的-三竖点-一键导入外部歌单-文字导入，粘贴结果即可导入歌单\n2. 如何把播放列表导入到Rekordbox：在 W4DJ RKB 进行成功转换之后，可以一键导出 m3u8。然后打开Rekordbox-文件-导入-导入播放列表',
     djPlaylistDrop: '松开导入 DJ 歌单',
@@ -999,12 +1016,39 @@ const translations = {
     djPlaylistRematch: '重新识别',
     djPlaylistExportM3u8: '生成 M3U8',
     djPlaylistPartialExport: '仅导出已匹配',
+    djPlaylistPartialExportNotice: '当前已匹配 {matched}/{total} 首；导出时只会写入已匹配歌曲，未匹配歌曲将被省略。',
     djPlaylistMatched: '已匹配 {matched}/{total}',
     djPlaylistUnresolved: '未解决歌曲',
     djPlaylistClose: '关闭',
     djPlaylistImportError: 'DJ 歌单导入失败',
     djPlaylistExportSuccess: 'M3U8 已导出',
     djPlaylistPartialConfirm: '仍有 {count} 首未匹配。只导出已匹配歌曲吗？',
+    djPlaylistReviewTitle: '复核歌单对应歌曲',
+    djPlaylistReviewHint: '可移除不需要导出的歌曲；未匹配歌曲可手动选择本地文件。',
+    djPlaylistReviewPlaylistColumn: '歌单歌曲',
+    djPlaylistReviewOutputColumn: '转换后本地歌曲',
+    djPlaylistReviewEmpty: '未选择本地歌曲',
+    djPlaylistReviewPickLocal: '选择本地歌曲',
+    djPlaylistReviewRecent: '最近转换',
+    djPlaylistReviewLibrary: '已有曲库',
+    djPlaylistReviewManual: '手动选择',
+    djPlaylistReviewUnmatched: '未绑定',
+    djPlaylistReviewMissing: '文件不可用',
+    djPlaylistReviewScore: '匹配度',
+    djPlaylistReviewSelectAll: '全选',
+    djPlaylistReviewClearSelection: '取消全选',
+    djPlaylistReviewSelected: '已选 {count} 首',
+    djPlaylistReviewDeleteSelected: '删除选中',
+    djPlaylistReviewDeleteRow: '删除此首',
+    djPlaylistReviewRestoreExcluded: '恢复已移除',
+    djPlaylistReviewExcludedSummary: '已移除 {count} 首',
+    djPlaylistReviewEmptyList: '导出列表为空，请恢复歌曲或重新匹配。',
+    djPlaylistReviewSelectRow: '选择第 {position} 首',
+    djPlaylistReviewIncomplete: '请先为所有要导出的歌曲选择本地文件。',
+    djPlaylistReviewDeleteConfirm: '从导出列表移除此首？不会删除歌曲库或本地文件。',
+    djPlaylistReviewDeleteSelectedConfirm: '从导出列表移除选中的 {count} 首？不会删除歌曲库或本地文件。',
+    djPlaylistReviewDeleted: '已从导出列表移除 {count} 首',
+    djPlaylistReviewRestored: '已恢复 {count} 首',
   },
   en: {
     eyebrow: 'W4DJ RKB',
@@ -1227,12 +1271,15 @@ const translations = {
     djPlaylistChooseRecent: 'Choose a recent playlist',
     djPlaylistCopyAudioTitle: 'Copy audio files with the playlist?',
     djPlaylistCopyAudio: 'Yes, copy audio and export',
+    djPlaylistCopyAudioPartial: 'Yes, copy matched audio and export',
     djPlaylistUseExistingAudio: 'No, export playlist only',
+    djPlaylistUseExistingAudioPartial: 'No, export matched tracks only',
     djPlaylistCopyAudioExplanation: 'Yes, copy audio and export: Songs will be copied to the export folder so the playlist can be used independently, but this uses more disk space.',
     djPlaylistUseExistingAudioExplanation: 'No, export playlist only: Songs will not be copied. Do not move or delete the original audio, or the playlist may stop playing.',
     djPlaylistExportPreparing: 'Preparing playlist…',
     djPlaylistExportCopied: 'Copied {copied}/{matched} audio files',
     djPlaylistExportReferenced: 'Playlist exported without copying audio',
+    djPlaylistExportOmitted: '{count} tracks were omitted',
     djPlaylistExportPortableError: 'The copied export is not a complete cross-account playlist. Please export it again.',
     djPlaylistInstructions: '1. Import a playlist into NetEase Cloud Music: import the .w4dj file, scan the QR code, open NetEase Cloud Music → My → ⋮ → Import external playlist → Text import, then paste the result.\n2. Import the playlist into Rekordbox: after a successful conversion in W4DJ RKB, export the m3u8, then open Rekordbox → File → Import → Import playlist.',
     djPlaylistDrop: 'Drop to import DJ playlist',
@@ -1250,12 +1297,39 @@ const translations = {
     djPlaylistRematch: 'Recognize again',
     djPlaylistExportM3u8: 'Generate M3U8',
     djPlaylistPartialExport: 'Export matched only',
+    djPlaylistPartialExportNotice: '{matched}/{total} tracks are matched; the export will include matched tracks only and omit unresolved tracks.',
     djPlaylistMatched: 'Matched {matched}/{total}',
     djPlaylistUnresolved: 'Unresolved tracks',
     djPlaylistClose: 'Close',
     djPlaylistImportError: 'DJ playlist import failed',
     djPlaylistExportSuccess: 'M3U8 exported',
     djPlaylistPartialConfirm: '{count} tracks are unresolved. Export matched tracks only?',
+    djPlaylistReviewTitle: 'Review playlist matches',
+    djPlaylistReviewHint: 'Remove songs you do not want to export; choose a local file for unmatched rows.',
+    djPlaylistReviewPlaylistColumn: 'Playlist song',
+    djPlaylistReviewOutputColumn: 'Converted local song',
+    djPlaylistReviewEmpty: 'No local song selected',
+    djPlaylistReviewPickLocal: 'Choose local song',
+    djPlaylistReviewRecent: 'Recent conversion',
+    djPlaylistReviewLibrary: 'Existing library',
+    djPlaylistReviewManual: 'Manual selection',
+    djPlaylistReviewUnmatched: 'Unbound',
+    djPlaylistReviewMissing: 'File unavailable',
+    djPlaylistReviewScore: 'Match',
+    djPlaylistReviewSelectAll: 'Select all',
+    djPlaylistReviewClearSelection: 'Clear selection',
+    djPlaylistReviewSelected: '{count} selected',
+    djPlaylistReviewDeleteSelected: 'Delete selected',
+    djPlaylistReviewDeleteRow: 'Delete this song',
+    djPlaylistReviewRestoreExcluded: 'Restore removed',
+    djPlaylistReviewExcludedSummary: '{count} removed',
+    djPlaylistReviewEmptyList: 'The export list is empty. Restore a song or match the playlist again.',
+    djPlaylistReviewSelectRow: 'Select song {position}',
+    djPlaylistReviewIncomplete: 'Choose a local file for every song kept in the export list.',
+    djPlaylistReviewDeleteConfirm: 'Remove this song from the export list? The library and local file will not be deleted.',
+    djPlaylistReviewDeleteSelectedConfirm: 'Remove {count} selected songs from the export list? The library and local files will not be deleted.',
+    djPlaylistReviewDeleted: 'Removed {count} songs from the export list',
+    djPlaylistReviewRestored: 'Restored {count} songs',
   },
 } as const;
 
@@ -1745,6 +1819,19 @@ const defaultServices: AppServices = {
     });
     return typeof selected === 'string' ? selected : null;
   },
+  pickDjPlaylistAudio: async () => {
+    const lang = (localStorage.getItem('w4dj_lang') as AppLanguage) || 'zh';
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      title: lang === 'zh' ? '选择歌单对应的本地歌曲' : 'Choose the local song for this playlist row',
+      filters: [{
+        name: lang === 'zh' ? '支持的音频文件' : 'Supported audio files',
+        extensions: ['mp3', 'flac', 'wav', 'aif', 'aiff', 'm4a'],
+      }],
+    });
+    return typeof selected === 'string' ? selected : null;
+  },
   importW4djPlaylist: (path) => invoke<ImportedDjPlaylist>('import_w4dj_playlist', { path }),
   listImportedDjPlaylists: () => invoke<ImportedDjPlaylistSummary[]>('list_imported_dj_playlists'),
   loadImportedDjPlaylist: (playlistId) => invoke<ImportedDjPlaylist>('load_imported_dj_playlist', { playlistId }),
@@ -1755,13 +1842,18 @@ const defaultServices: AppServices = {
   loadImportedDjPlaylistMatches: (playlistId) => invoke<DjPlaylistMatchReport>('load_imported_dj_playlist_matches', { playlistId }),
   setImportedDjPlaylistMatch: (playlistId, position, trackKey) =>
     invoke<DjPlaylistMatchReport>('set_imported_dj_playlist_match', { playlistId, position, trackKey }),
+  setImportedDjPlaylistMatchByPath: (playlistId, position, destinationPath) =>
+    invoke<DjPlaylistMatchReport>('set_imported_dj_playlist_match_by_path', { playlistId, position, destinationPath }),
+  setImportedDjPlaylistMatchConfirmed: (playlistId, position, confirmed) =>
+    invoke<DjPlaylistMatchReport>('set_imported_dj_playlist_match_confirmed', { playlistId, position, confirmed }),
+  setImportedDjPlaylistMatchesExcluded: (playlistId, positions, excluded) =>
+    invoke<DjPlaylistMatchReport>('set_imported_dj_playlist_matches_excluded', { playlistId, positions, excluded }),
   clearImportedDjPlaylistMatch: (playlistId, position) =>
     invoke<DjPlaylistMatchReport>('clear_imported_dj_playlist_match', { playlistId, position }),
-  exportImportedDjPlaylistM3u8: (playlistId, path, allowPartial, copyAudio = false) =>
+  exportImportedDjPlaylistM3u8: (playlistId, path, copyAudio = false) =>
     invoke<DjPlaylistM3u8ExportResult>('export_imported_dj_playlist_m3u8', {
       playlistId,
       path,
-      allowPartial,
       copyAudio,
     }),
 };
@@ -2337,6 +2429,35 @@ function djPlaylistText(key: keyof typeof translations.zh, lang: AppLanguage, va
   );
 }
 
+function djPlaylistReviewCopy(lang: AppLanguage): DjPlaylistReviewCopy {
+  return {
+    title: t('djPlaylistReviewTitle', lang),
+    hint: t('djPlaylistReviewHint', lang),
+    playlistColumn: t('djPlaylistReviewPlaylistColumn', lang),
+    outputColumn: t('djPlaylistReviewOutputColumn', lang),
+    emptyOutput: t('djPlaylistReviewEmpty', lang),
+    chooseLocal: t('djPlaylistReviewPickLocal', lang),
+    recent: t('djPlaylistReviewRecent', lang),
+    library: t('djPlaylistReviewLibrary', lang),
+    manual: t('djPlaylistReviewManual', lang),
+    unmatched: t('djPlaylistReviewUnmatched', lang),
+    matchScore: t('djPlaylistReviewScore', lang),
+    selectAll: t('djPlaylistReviewSelectAll', lang),
+    clearSelection: t('djPlaylistReviewClearSelection', lang),
+    selected: t('djPlaylistReviewSelected', lang),
+    deleteSelected: t('djPlaylistReviewDeleteSelected', lang),
+    deleteRow: t('djPlaylistReviewDeleteRow', lang),
+    restoreExcluded: t('djPlaylistReviewRestoreExcluded', lang),
+    excludedSummary: t('djPlaylistReviewExcludedSummary', lang),
+    emptyList: t('djPlaylistReviewEmptyList', lang),
+    selectRow: t('djPlaylistReviewSelectRow', lang),
+    exportCopy: t('djPlaylistCopyAudio', lang),
+    exportExisting: t('djPlaylistUseExistingAudio', lang),
+    exportDisabled: t('djPlaylistReviewIncomplete', lang),
+    busy: t('djPlaylistExportPreparing', lang),
+  };
+}
+
 function renderDjPlaylistModal(
   state: DjPlaylistUiState | null,
   lang: AppLanguage,
@@ -2364,22 +2485,19 @@ function renderDjPlaylistModal(
   if (state.exportChoice) {
     const playlistName = state.playlist?.name || t('djPlaylistDialogTitle', lang);
     const report = state.matchReport;
+    const activeRows = report?.matches.filter((row) => !row.excluded) || [];
+    const activeMatchedCount = activeRows.filter((row) => row.status === 'matched').length;
     return `${overlay}
-      <div class="dj-playlist-modal" data-role="dj-playlist-export-choice" role="dialog" aria-modal="true" aria-label="${t('djPlaylistCopyAudioTitle', lang)}">
-        <div class="dj-playlist-dialog dj-playlist-export-choice-dialog">
+      <div class="dj-playlist-modal" data-role="dj-playlist-export-choice" role="dialog" aria-modal="true" aria-label="${t('djPlaylistReviewTitle', lang)}">
+        <div class="dj-playlist-dialog dj-playlist-export-choice-dialog dj-playlist-review-dialog">
           <header class="dj-playlist-head">
-            <div><p class="panel-kicker">${escapedProductName}</p><h2>${t('djPlaylistCopyAudioTitle', lang)}</h2></div>
+            <div><p class="panel-kicker">${escapedProductName}</p><h2>${escapeHtml(playlistName)}</h2></div>
             <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
           </header>
-          <p class="dj-playlist-export-name">${escapeHtml(playlistName)}${report ? ` · ${report.matchedCount}/${report.total}` : ''}</p>
-          <ul class="dj-playlist-export-explanation">
-            <li>${t('djPlaylistCopyAudioExplanation', lang)}</li>
-            <li>${t('djPlaylistUseExistingAudioExplanation', lang)}</li>
-          </ul>
-          <div class="dj-playlist-export-choice-actions">
-            <button type="button" class="global-action" data-action="dj-playlist-export-copy" ${state.exportBusy ? 'disabled' : ''}>${t('djPlaylistCopyAudio', lang)}</button>
-            <button type="button" class="secondary-action" data-action="dj-playlist-export-existing" ${state.exportBusy ? 'disabled' : ''}>${t('djPlaylistUseExistingAudio', lang)}</button>
-          </div>
+          <p class="dj-playlist-export-name">${escapeHtml(playlistName)}${report ? ` · ${activeMatchedCount}/${activeRows.length}` : ''}</p>
+          ${state.error ? `<p class="library-error" role="alert">${escapeHtml(state.error)}</p>` : ''}
+          ${state.notice ? `<p class="dj-playlist-notice">${escapeHtml(state.notice)}</p>` : ''}
+          ${renderDjPlaylistReview(report, djPlaylistReviewCopy(lang), state.exportBusy || Boolean(state.reviewBusy), new Set(state.selectedPositions || []))}
         </div>
       </div>`;
   }
@@ -3106,6 +3224,19 @@ export function bindApp(
         productName,
       ),
     );
+
+    const selectAllPlaylistRows = root.querySelector<HTMLInputElement>('input[data-action="dj-playlist-select-all"]');
+    if (selectAllPlaylistRows && djPlaylistState?.matchReport) {
+      const activePositions = djPlaylistState.matchReport.matches
+        .filter((row) => !row.excluded)
+        .map((row) => row.position);
+      const selectedCount = activePositions.filter((position) =>
+        (djPlaylistState?.selectedPositions || []).includes(position),
+      ).length;
+      const isPartial = selectedCount > 0 && selectedCount < activePositions.length;
+      selectAllPlaylistRows.indeterminate = isPartial;
+      selectAllPlaylistRows.setAttribute('aria-checked', isPartial ? 'mixed' : String(selectedCount === activePositions.length && activePositions.length > 0));
+    }
 
     if (onboardingVisible) {
       root.querySelector<HTMLButtonElement>('[data-action="onboarding-next"]')?.focus();
@@ -4633,6 +4764,7 @@ export function bindApp(
       qrRevision: 0,
       matchBusy: false,
       matchReport: report,
+      selectedPositions: [],
       exportBusy: false,
       dropActive: false,
     };
@@ -4654,6 +4786,7 @@ export function bindApp(
       qrRevision: 0,
       matchBusy: false,
       matchReport: null,
+      selectedPositions: [],
       exportBusy: false,
       dropActive: false,
     };
@@ -4685,6 +4818,7 @@ export function bindApp(
       qrRevision: 0,
       matchBusy: false,
       matchReport: null,
+      selectedPositions: [],
       exportBusy: false,
       dropActive: false,
     };
@@ -4724,6 +4858,7 @@ export function bindApp(
           qrRevision: 0,
           matchBusy: false,
           matchReport: null,
+          selectedPositions: [],
           exportBusy: false,
           dropActive: false,
         }),
@@ -4752,6 +4887,7 @@ export function bindApp(
       qrRevision: 0,
       matchBusy: false,
       matchReport: null,
+      selectedPositions: [],
       exportBusy: false,
       dropActive: false,
     };
@@ -4773,6 +4909,7 @@ export function bindApp(
         qrRevision: 0,
         matchBusy: false,
         matchReport: null,
+        selectedPositions: [],
         exportBusy: false,
         dropActive: false,
       }),
@@ -4790,8 +4927,8 @@ export function bindApp(
     try {
       const playlist = await services.loadImportedDjPlaylist(playlistId);
       const report = await services.matchImportedDjPlaylist(playlistId);
-      if (report.matchedCount !== report.total || report.total === 0) {
-        throw new Error(`歌单仍有 ${report.total - report.matchedCount} 首歌曲无法在两个输出目录中找到`);
+      if (report.total === 0) {
+        throw new Error('歌单没有歌曲，无法导出 M3U8');
       }
       djPlaylistState = {
         ...djPlaylistState!,
@@ -4799,6 +4936,7 @@ export function bindApp(
         exportChoice: true,
         playlist,
         matchReport: report,
+        selectedPositions: [],
         pages: [],
         qrDataUrl: null,
         qrDataUrls: [],
@@ -4853,12 +4991,16 @@ export function bindApp(
     }
   };
 
-  const exportDjPlaylistM3u8 = async (allowPartial: boolean, copyAudio = false) => {
+  const exportDjPlaylistM3u8 = async (copyAudio = false) => {
     const playlist = djPlaylistState?.playlist;
     if (!playlist || !services.exportImportedDjPlaylistM3u8 || djPlaylistExportInFlight) return;
-    if (allowPartial && djPlaylistState?.matchReport) {
-      const omitted = djPlaylistState.matchReport.total - djPlaylistState.matchReport.matchedCount;
-      if (omitted > 0 && !window.confirm(djPlaylistText('djPlaylistPartialConfirm', state.lang, { count: omitted }))) return;
+    if (!canExportReviewedPlaylist(djPlaylistState?.matchReport)) {
+      djPlaylistState = {
+        ...djPlaylistState!,
+        error: t('djPlaylistReviewIncomplete', state.lang),
+      };
+      render();
+      return;
     }
     djPlaylistExportInFlight = true;
     djPlaylistState = { ...djPlaylistState!, exportBusy: true, error: null };
@@ -4870,7 +5012,7 @@ export function bindApp(
         title: t('djPlaylistExportButton', state.lang),
       });
       if (typeof path !== 'string') return;
-      const result = await services.exportImportedDjPlaylistM3u8(playlist.playlistId, path, allowPartial, copyAudio);
+      const result = await services.exportImportedDjPlaylistM3u8(playlist.playlistId, path, copyAudio);
       if (copyAudio && (!result.copyAudio || !result.portable || result.copiedCount !== result.matchedCount)) {
         throw new Error(t('djPlaylistExportPortableError', state.lang));
       }
@@ -4899,6 +5041,43 @@ export function bindApp(
     }
   };
 
+  const updateDjPlaylistExcluded = async (positions: number[], excluded: boolean) => {
+    const current = djPlaylistState;
+    const playlist = current?.playlist;
+    const updateExcluded = services.setImportedDjPlaylistMatchesExcluded;
+    const uniquePositions = [...new Set(positions.filter((position) => Number.isInteger(position)))];
+    if (!playlist || !updateExcluded || uniquePositions.length === 0 || current?.reviewBusy) return;
+    const playlistId = playlist.playlistId;
+    djPlaylistState = { ...current, reviewBusy: true, error: null };
+    render();
+    try {
+      const report = await updateExcluded(playlistId, uniquePositions, excluded);
+      if (djPlaylistState?.playlist?.playlistId !== playlistId) return;
+      djPlaylistState = {
+        ...djPlaylistState,
+        reviewBusy: false,
+        matchReport: report,
+        selectedPositions: (djPlaylistState.selectedPositions || [])
+          .filter((position) => !uniquePositions.includes(position)),
+        notice: djPlaylistText(
+          excluded ? 'djPlaylistReviewDeleted' : 'djPlaylistReviewRestored',
+          state.lang,
+          { count: uniquePositions.length },
+        ),
+      };
+      render();
+    } catch (error) {
+      if (djPlaylistState?.playlist?.playlistId === playlistId) {
+        djPlaylistState = {
+          ...djPlaylistState,
+          reviewBusy: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+        render();
+      }
+    }
+  };
+
   const matchDjPlaylist = async () => {
     const playlist = djPlaylistState?.playlist;
     if (!playlist || !services.matchImportedDjPlaylist) return;
@@ -4906,9 +5085,14 @@ export function bindApp(
     render();
     try {
       const report = await services.matchImportedDjPlaylist(playlist.playlistId);
-      djPlaylistState = { ...djPlaylistState!, matchBusy: false, matchReport: report };
+      djPlaylistState = {
+        ...djPlaylistState!,
+        matchBusy: false,
+        matchReport: report,
+        selectedPositions: [],
+        exportChoice: true,
+      };
       render();
-      if (report.matchedCount === report.total && report.total > 0) void exportDjPlaylistM3u8(false);
     } catch (error) {
       djPlaylistState = { ...djPlaylistState!, matchBusy: false, error: error instanceof Error ? error.message : String(error) };
       render();
@@ -6178,12 +6362,51 @@ export function bindApp(
     }
 
     if (action === 'dj-playlist-export-copy') {
-      void exportDjPlaylistM3u8(false, true);
+      void exportDjPlaylistM3u8(true);
       return;
     }
 
     if (action === 'dj-playlist-export-existing') {
-      void exportDjPlaylistM3u8(false, false);
+      void exportDjPlaylistM3u8(false);
+      return;
+    }
+
+    if (action === 'open-dj-playlist-local') {
+      const path = button.dataset.path;
+      if (path) void services.openDestinationFile(path);
+      return;
+    }
+
+    if (action === 'dj-playlist-delete-selected') {
+      const report = djPlaylistState?.matchReport;
+      const positions = (djPlaylistState?.selectedPositions || []).filter((position) =>
+        report?.matches.some((row) => row.position === position && !row.excluded),
+      );
+      if (positions.length === 0) return;
+      const confirmed = window.confirm(djPlaylistText(
+        'djPlaylistReviewDeleteSelectedConfirm',
+        state.lang,
+        { count: positions.length },
+      ));
+      if (confirmed) void updateDjPlaylistExcluded(positions, true);
+      return;
+    }
+
+    if (action === 'dj-playlist-delete-row') {
+      const position = Number(button.dataset.position);
+      const row = djPlaylistState?.matchReport?.matches.find((item) => item.position === position);
+      if (!row || row.excluded) return;
+      if (window.confirm(t('djPlaylistReviewDeleteConfirm', state.lang))) {
+        void updateDjPlaylistExcluded([position], true);
+      }
+      return;
+    }
+
+    if (action === 'dj-playlist-restore-excluded') {
+      const positions = (djPlaylistState?.matchReport?.matches || [])
+        .filter((row) => row.excluded)
+        .map((row) => row.position);
+      if (positions.length > 0) void updateDjPlaylistExcluded(positions, false);
       return;
     }
 
@@ -6237,8 +6460,32 @@ export function bindApp(
       return;
     }
 
-    if (action === 'dj-playlist-export-partial') {
-      void exportDjPlaylistM3u8(true);
+    if (action === 'dj-playlist-pick-local') {
+      const position = Number(button.dataset.position);
+      if (djPlaylistState?.playlist && Number.isInteger(position) && services.pickDjPlaylistAudio) {
+        void services.pickDjPlaylistAudio()
+          .then((path) => {
+            if (!path || !djPlaylistState?.playlist || !services.setImportedDjPlaylistMatchByPath) return;
+            return services.setImportedDjPlaylistMatchByPath(djPlaylistState.playlist.playlistId, position, path)
+              .then((report) => {
+                if (djPlaylistState) {
+                  djPlaylistState = {
+                    ...djPlaylistState,
+                    matchReport: report,
+                    selectedPositions: (djPlaylistState.selectedPositions || []).filter((item) => item !== position),
+                    error: null,
+                  };
+                }
+                render();
+              });
+          })
+          .catch((error) => {
+            if (djPlaylistState) {
+              djPlaylistState = { ...djPlaylistState, error: error instanceof Error ? error.message : String(error) };
+              render();
+            }
+          });
+      }
       return;
     }
 
@@ -6247,7 +6494,16 @@ export function bindApp(
       const trackKey = button.dataset.trackKey;
       if (djPlaylistState?.playlist && Number.isInteger(position) && trackKey && services.setImportedDjPlaylistMatch) {
         void services.setImportedDjPlaylistMatch(djPlaylistState.playlist.playlistId, position, trackKey)
-          .then((report) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, matchReport: report }; render(); } })
+          .then((report) => {
+            if (djPlaylistState) {
+              djPlaylistState = {
+                ...djPlaylistState,
+                matchReport: report,
+                selectedPositions: (djPlaylistState.selectedPositions || []).filter((item) => item !== position),
+              };
+              render();
+            }
+          })
           .catch((error) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, error: error instanceof Error ? error.message : String(error) }; render(); } });
       }
       return;
@@ -6257,7 +6513,16 @@ export function bindApp(
       const position = Number(button.dataset.position);
       if (djPlaylistState?.playlist && Number.isInteger(position) && services.clearImportedDjPlaylistMatch) {
         void services.clearImportedDjPlaylistMatch(djPlaylistState.playlist.playlistId, position)
-          .then((report) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, matchReport: report }; render(); } })
+          .then((report) => {
+            if (djPlaylistState) {
+              djPlaylistState = {
+                ...djPlaylistState,
+                matchReport: report,
+                selectedPositions: (djPlaylistState.selectedPositions || []).filter((item) => item !== position),
+              };
+              render();
+            }
+          })
           .catch((error) => { if (djPlaylistState) { djPlaylistState = { ...djPlaylistState, error: error instanceof Error ? error.message : String(error) }; render(); } });
       }
       return;
@@ -6804,6 +7069,32 @@ export function bindApp(
   }, true);
 
   root.addEventListener('change', (event) => {
+    const playlistSelect = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
+      'input[data-action="dj-playlist-select-row"], input[data-action="dj-playlist-select-all"]',
+    );
+    if (playlistSelect && djPlaylistState?.matchReport && !djPlaylistState.reviewBusy) {
+      const activePositions = djPlaylistState.matchReport.matches
+        .filter((row) => !row.excluded)
+        .map((row) => row.position);
+      const selected = new Set(djPlaylistState.selectedPositions || []);
+      if (playlistSelect.dataset.action === 'dj-playlist-select-all') {
+        activePositions.forEach((position) => {
+          if (playlistSelect.checked) selected.add(position);
+          else selected.delete(position);
+        });
+      } else {
+        const position = Number(playlistSelect.dataset.position);
+        if (!Number.isInteger(position) || !activePositions.includes(position)) return;
+        if (playlistSelect.checked) selected.add(position);
+        else selected.delete(position);
+      }
+      djPlaylistState = {
+        ...djPlaylistState,
+        selectedPositions: [...selected].sort((left, right) => left - right),
+      };
+      render();
+      return;
+    }
     const checkbox = (event.target as HTMLElement | null)?.closest<HTMLInputElement>('input[data-action="library-confirm-clear-invalid"]');
     if (checkbox && libraryState) {
       libraryState = { ...libraryState, confirmClearInvalid: checkbox.checked, notice: null };
@@ -6957,6 +7248,7 @@ export function bindApp(
           qrRevision: 0,
           matchBusy: false,
           matchReport: null,
+          selectedPositions: [],
           exportBusy: false,
           dropActive: true,
         };

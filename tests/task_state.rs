@@ -6,6 +6,10 @@ mod analysis;
 mod concurrency;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/dj_playlist.rs"]
+mod dj_playlist;
+#[path = "../src/dj_playlist_match.rs"]
+mod dj_playlist_match;
 #[path = "../src/filename_policy.rs"]
 mod filename_policy;
 #[path = "../src/metadata.rs"]
