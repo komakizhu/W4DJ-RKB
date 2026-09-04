@@ -119,6 +119,7 @@ struct AppState {
     controller: Arc<Mutex<DesktopController>>,
     preferences_path: Arc<Mutex<PathBuf>>,
     history_path: Arc<Mutex<PathBuf>>,
+    analysis_path_override: Arc<Mutex<Option<PathBuf>>>,
     models_path: Arc<Mutex<PathBuf>>,
     bundled_models_path: Arc<Mutex<PathBuf>>,
     scan_cache_path: Arc<Mutex<PathBuf>>,
@@ -2129,6 +2130,14 @@ fn get_audio_file_fingerprint(path: String) -> Result<AudioFileFingerprint, Stri
 }
 
 fn current_analysis_path(state: &tauri::State<'_, AppState>) -> PathBuf {
+    if let Some(path) = state
+        .analysis_path_override
+        .lock()
+        .expect("analysis path lock poisoned")
+        .clone()
+    {
+        return path;
+    }
     let history_path = state
         .history_path
         .lock()
@@ -6787,10 +6796,64 @@ fn build_library_analysis_candidates(
         .collect()
 }
 
+fn headless_library_analysis_candidates(
+    input_path: &Path,
+    database_path: &Path,
+) -> Result<Vec<LibraryAnalysisCandidate>, String> {
+    if !input_path.is_absolute() || !database_path.is_absolute() {
+        return Err("隐藏验收输入和数据库必须使用绝对路径".to_string());
+    }
+    let input_root = fs::canonicalize(input_path)
+        .map_err(|error| format!("无法定位隐藏验收输入：{error}"))?;
+    let mut files = Vec::new();
+    collect_analyzable_audio_files(&input_root, &mut files)
+        .map_err(|error| format!("扫描隐藏验收输入失败：{error}"))?;
+    files.sort();
+
+    let mut library = W4djLibrary::open(database_path)
+        .map_err(|error| format!("打开隐藏验收 W4DJ 数据库失败：{error}"))?;
+    let mut candidates = Vec::new();
+    for file in files {
+        let path = PathBuf::from(file);
+        // This directory is explicitly supplied by the headless acceptance
+        // caller.  Do not re-apply the normal hidden-path policy here:
+        // macOS canonicalizes /var/folders to /private/var/folders, whose
+        // /private ancestor is Finder-hidden even though the selected input
+        // itself is valid user data.
+        if !is_analyzable_audio_file(&path) {
+            continue;
+        }
+        library
+            .upsert_output_file(0, &input_root, None, &path)
+            .map_err(|error| format!("登记隐藏验收音频失败：{error}"))?;
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("读取隐藏验收音频信息失败：{error}"))?;
+        candidates.push(LibraryAnalysisCandidate {
+            name: path
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+            path: path.to_string_lossy().into_owned(),
+            size_bytes: metadata.len(),
+            slot_index: Some(0),
+        });
+    }
+    Ok(candidates)
+}
+
 #[tauri::command]
 fn list_library_analysis_candidates(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<LibraryAnalysisCandidate>, String> {
+    if let Some(config) = state.headless_config.as_ref()
+        && let (Some(input_path), Some(database_path)) =
+            (config.input_path.as_deref(), config.database_path.as_deref())
+    {
+        return headless_library_analysis_candidates(
+            Path::new(input_path),
+            Path::new(database_path),
+        );
+    }
     let path = library_catalog_path(&state);
     let (catalog, _) = open_w4dj_library(&path)?;
     let output_roots = state
@@ -8171,6 +8234,12 @@ fn main() {
             controller: Arc::new(Mutex::new(controller)),
             preferences_path: Arc::new(Mutex::new(PathBuf::new())),
             history_path: Arc::new(Mutex::new(PathBuf::new())),
+            analysis_path_override: Arc::new(Mutex::new(
+                headless_config
+                    .as_ref()
+                    .and_then(|config| config.output_path.as_deref())
+                    .map(PathBuf::from),
+            )),
             models_path: Arc::new(Mutex::new(PathBuf::new())),
             bundled_models_path: Arc::new(Mutex::new(PathBuf::new())),
             scan_cache_path: Arc::new(Mutex::new(PathBuf::new())),
@@ -8320,10 +8389,17 @@ fn main() {
                 .app_config_dir()
                 .expect("failed to resolve app config directory")
                 .join("preferences.json");
-            let history_path = preferences_path
-                .parent()
-                .expect("preferences path should have a parent")
-                .join("history.json");
+            let history_path = headless_config
+                .as_ref()
+                .and_then(|config| config.output_path.as_deref())
+                .and_then(|path| Path::new(path).parent())
+                .map(|parent| parent.join("headless-history.json"))
+                .unwrap_or_else(|| {
+                    preferences_path
+                        .parent()
+                        .expect("preferences path should have a parent")
+                        .join("history.json")
+                });
             let models_path = preferences_path
                 .parent()
                 .expect("preferences path should have a parent")
@@ -8337,10 +8413,16 @@ fn main() {
                 .parent()
                 .expect("preferences path should have a parent")
                 .join("scan-cache.json");
-            let w4dj_library_path = preferences_path
-                .parent()
-                .expect("preferences path should have a parent")
-                .join("w4dj.sqlite3");
+            let w4dj_library_path = headless_config
+                .as_ref()
+                .and_then(|config| config.database_path.as_deref())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    preferences_path
+                        .parent()
+                        .expect("preferences path should have a parent")
+                        .join("w4dj.sqlite3")
+                });
             let startup_library_path = w4dj_library_path.clone();
             let test_monitor_path = app
                 .path()
@@ -10194,7 +10276,10 @@ fn fail_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_headless_acceptance_args, HeadlessAcceptanceConfig};
+    use super::{
+        headless_library_analysis_candidates, parse_headless_acceptance_args,
+        HeadlessAcceptanceConfig,
+    };
     use super::essentia_model_import::known_import_model_ids;
     use super::essentia_model_specs;
     use super::LibraryRefreshProgress;
@@ -10321,6 +10406,10 @@ mod tests {
             "/private/tmp/w4dj-headless.jsonl".into(),
             "--input".into(),
             "/tmp/input".into(),
+            "--output".into(),
+            "/tmp/track-analysis.json".into(),
+            "--database".into(),
+            "/tmp/w4dj.sqlite3".into(),
         ];
         let config = parse_headless_acceptance_args(&args)
             .expect("arguments should parse")
@@ -10328,7 +10417,52 @@ mod tests {
         assert_eq!(config.scenario, "libraryAnalysis");
         assert!(config.exercise_cancel_resume);
         assert_eq!(config.input_path.as_deref(), Some("/tmp/input"));
+        assert_eq!(
+            config.output_path.as_deref(),
+            Some("/tmp/track-analysis.json")
+        );
+        assert_eq!(config.database_path.as_deref(), Some("/tmp/w4dj.sqlite3"));
         assert_eq!(config.report_path, "/private/tmp/w4dj-headless.jsonl");
+    }
+
+    #[test]
+    fn headless_candidates_seed_only_the_explicit_input_and_database() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "w4dj-headless-candidates-{}-{suffix}",
+            std::process::id()
+        ));
+        let input = directory.join("input");
+        let database = directory.join("state/w4dj.sqlite3");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        write_valid_audio(&input.join("a.mp3"), "libmp3lame", "A", "Artist A");
+        write_valid_audio(&input.join("b.flac"), "flac", "B", "Artist B");
+        fs::write(input.join("ignored.txt"), b"not audio").unwrap();
+
+        let candidates = headless_library_analysis_candidates(&input, &database).unwrap();
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.mp3", "b.flac"]
+        );
+        assert!(candidates.iter().all(|candidate| candidate.slot_index == Some(0)));
+        let library = W4djLibrary::open(&database).unwrap();
+        let files = library.readable_local_files().unwrap();
+        assert_eq!(files.len(), 2);
+        let canonical_input = fs::canonicalize(&input).unwrap();
+        assert!(files
+            .iter()
+            .all(|file| file.path.starts_with(&canonical_input)));
+
+        drop(library);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

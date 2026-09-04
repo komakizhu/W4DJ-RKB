@@ -6,6 +6,7 @@ import type {
   EssentiaModelFile,
 } from './analysis';
 import { modelWeightDataBuffer } from './analysis';
+import { analysisErrorMessage, isFatalAnalysisRuntimeMessage } from './analysis-runtime';
 
 export type EmotionModelId = 'emomusic' | 'muse' | 'mirex';
 
@@ -207,6 +208,7 @@ export async function runEmotionHeads(
         emotionCandidates[id] = continuousResult(id, values);
       }
     } catch (error) {
+      if (isFatalAnalysisRuntimeMessage(analysisErrorMessage(error))) throw error;
       const reason = error instanceof Error ? error.message : String(error);
       emotionCandidates[id] = options.isCancelled?.()
         ? cancelledContinuous(id)
@@ -260,6 +262,7 @@ export async function runEmotionHeads(
       moodClusterReason = undefined;
     }
   } catch (error) {
+    if (isFatalAnalysisRuntimeMessage(analysisErrorMessage(error))) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     moodClusterStatus = options.isCancelled?.() ? 'cancelled' : 'failed';
     moodClusterReason = options.isCancelled?.() ? '分析已取消' : reason;

@@ -5,8 +5,13 @@ import {
   batchMusiCnnMelBuffer,
   batchMusiCnnMelRows,
   musicCnnInferenceBatches,
+  MUSICCNN_CPU_INFERENCE_BATCH_SIZE,
+  MUSICCNN_INFERENCE_BATCH_SIZE,
+  padMusiCnnInferenceBatch,
   computeDiscogsEffnetMelBatches,
+  streamDiscogsEffnetMelBatches,
   computeMusiCnnMelRows,
+  analyzeChunkedBasicAudio,
   configureTensorflowBackend,
   deriveBroadGenreFromMsdTags,
   filterHighLevelLabels,
@@ -16,10 +21,35 @@ import {
   shouldUseCpuTensorflowBackend,
   normalizeEssentiaModel,
   executeEssentiaModel,
+  planAnalysisAudio,
   type HighLevelAnalysis,
 } from './analysis';
 
 describe('Essentia model IPC payloads', () => {
+  it('puts a 1108-second stereo track on the bounded full-track analysis path', () => {
+    expect(planAnalysisAudio({
+      durationSeconds: 1108.866,
+      sampleRate: 44_100,
+      channelCount: 2,
+    })).toEqual({
+      mode: 'chunked',
+      sampleRate: 16_000,
+      channelCount: 1,
+    });
+  });
+
+  it('keeps ordinary tracks on the native-resolution path', () => {
+    expect(planAnalysisAudio({
+      durationSeconds: 240,
+      sampleRate: 44_100,
+      channelCount: 2,
+    })).toEqual({
+      mode: 'native',
+      sampleRate: 44_100,
+      channelCount: 2,
+    });
+  });
+
   it('decodes compact base64 weights without retaining the wire string', () => {
     const encoded = btoa(String.fromCharCode(0, 7, 128, 255));
     const model = normalizeEssentiaModel({
@@ -96,13 +126,18 @@ describe('MusiCNN broad genre projection', () => {
     expect(progress).toEqual([{ processed: rows.length, total: rows.length }]);
   });
 
-  it('bounds native Essentia lifetime by processing long signals in chunks', async () => {
+  it('uses bounded extraction-local Essentia instances with bounded frame generators', async () => {
     const signal = new Float32Array((256 * 2) * 256 + 512);
     const lifecycle = { created: 0, deleted: 0, generators: 0 };
     let nextFrameIndex = 0;
+    let nextOutputIndex = 0;
     const makeEssentia = () => {
       lifecycle.created += 1;
       return {
+        arrayToVector: () => ({
+          set: () => undefined,
+          delete: () => undefined,
+        }),
         FrameGenerator: (audio: Float32Array) => {
           const count = Math.max(0, Math.floor((audio.length - 512) / 256) + 1);
           const base = nextFrameIndex;
@@ -117,12 +152,15 @@ describe('MusiCNN broad genre projection', () => {
             delete: () => undefined,
           };
         },
-        TensorflowInputMusiCNN: (frame: { index: number }) => ({
-          bands: {
-            values: [frame.index, frame.index + 0.5],
-            delete: () => undefined,
-          },
-        }),
+        TensorflowInputMusiCNN: () => {
+          const index = nextOutputIndex++;
+          return {
+            bands: {
+              values: [index, index + 0.5],
+              delete: () => undefined,
+            },
+          };
+        },
         vectorToArray: (value: { values: number[] }) => Float32Array.from(value.values),
         delete: () => { lifecycle.deleted += 1; },
       } as never;
@@ -133,9 +171,124 @@ describe('MusiCNN broad genre projection', () => {
     expect(result.frameCount).toBe(513);
     expect(result.melRows[0]).toEqual([0, 0.5]);
     expect(result.melRows.at(-1)).toEqual([512, 512.5]);
-    expect(lifecycle.created).toBe(4);
-    expect(lifecycle.deleted).toBe(3);
-    expect(lifecycle.generators).toBe(3);
+    expect(lifecycle.created).toBe(3);
+    expect(lifecycle.deleted).toBe(2);
+    expect(lifecycle.generators).toBe(2);
+  });
+
+  it('copies one native MusiCNN frame at a time from bounded containers', async () => {
+    const frameCount = 514;
+    const signal = new Float32Array(512 + (frameCount - 1) * 256);
+    const lifecycle = { created: 0, deleted: 0, shutdowns: 0, reinstantiates: 0, generators: 0 };
+    const makeEssentia = () => {
+      lifecycle.created += 1;
+      return {
+        arrayToVector: () => ({
+          set: () => undefined,
+          delete: () => undefined,
+        }),
+        FrameGenerator: (audio: Float32Array) => {
+          lifecycle.generators += 1;
+          const count = Math.max(0, Math.floor((audio.length - 512) / 256) + 1);
+          return {
+            size: () => count,
+            get: () => ({ delete: () => undefined }),
+            delete: () => undefined,
+          };
+        },
+        TensorflowInputMusiCNN: () => ({
+          bands: {
+            size: () => 1,
+            get: () => 1,
+            delete: () => undefined,
+          },
+        }),
+        vectorToArray: () => Float32Array.of(1),
+        shutdown: () => { lifecycle.shutdowns += 1; },
+        reinstantiate: () => { lifecycle.reinstantiates += 1; },
+        flushPendingDeletes: () => undefined,
+        delete: () => { lifecycle.deleted += 1; },
+      } as never;
+    };
+    const essentia = makeEssentia();
+    essentia.createInstance = makeEssentia;
+
+    const result = await computeMusiCnnMelRows(essentia, signal, undefined, { collectRows: false });
+
+    expect(result.frameCount).toBe(frameCount);
+    expect(lifecycle).toEqual({
+      created: 3,
+      deleted: 2,
+      shutdowns: 0,
+      reinstantiates: 0,
+      generators: 2,
+    });
+  });
+
+  it('finishes the tail while rebuilding only bounded native frame generators', async () => {
+    const frameCount = 9960;
+    const signal = new Float32Array(512 + (frameCount - 1) * 256);
+    const lifecycle = {
+      created: 0,
+      deleted: 0,
+      convertedFrames: 0,
+      frameWrites: 0,
+      flushed: 0,
+      generatedFrames: 0,
+      generators: 0,
+    };
+    const makeEssentia = () => {
+      lifecycle.created += 1;
+      return {
+        arrayToVector: () => {
+          lifecycle.convertedFrames += 1;
+          return {
+            index: 0,
+            set: () => { lifecycle.frameWrites += 1; },
+            delete: () => undefined,
+          };
+        },
+        FrameGenerator: (audio: Float32Array) => {
+          lifecycle.generators += 1;
+          const count = Math.max(0, Math.floor((audio.length - 512) / 256) + 1);
+          return {
+            size: () => count,
+            get: () => ({
+                index: lifecycle.generatedFrames++,
+                delete: () => undefined,
+              }),
+            delete: () => undefined,
+          };
+        },
+        TensorflowInputMusiCNN: (frame: { index: number }) => ({
+          bands: {
+            values: [frame.index],
+            delete: () => undefined,
+          },
+        }),
+        vectorToArray: (value: { values: number[] }) => Float32Array.from(value.values),
+        flushPendingDeletes: () => { lifecycle.flushed += 1; },
+        delete: () => { lifecycle.deleted += 1; },
+      } as never;
+    };
+    const essentia = makeEssentia();
+    essentia.createInstance = makeEssentia;
+    const progress: Array<{ processed: number; total: number }> = [];
+
+    await expect(computeMusiCnnMelRows(essentia, signal, (value) => {
+      progress.push(value);
+    }, { collectRows: false })).resolves.toMatchObject({ frameCount });
+
+    expect(progress.at(-1)).toEqual({ processed: frameCount, total: frameCount });
+    expect(lifecycle).toEqual({
+      created: 21,
+      deleted: 20,
+      convertedFrames: 0,
+      frameWrites: 0,
+      flushed: frameCount + 40,
+      generatedFrames: frameCount,
+      generators: 20,
+    });
   });
 
   it('projects the strongest MSD tag into the existing broad genre labels', () => {
@@ -172,24 +325,46 @@ describe('MusiCNN broad genre projection', () => {
 
   it.each([
     { patches: 1, expected: [{ offset: 0, validPatches: 1 }] },
-    { patches: 64, expected: [{ offset: 0, validPatches: 64 }] },
     {
-      patches: 65,
+      patches: 8,
+      expected: [{ offset: 0, validPatches: 8 }],
+    },
+    {
+      patches: 9,
       expected: [
-        { offset: 0, validPatches: 64 },
-        { offset: 64, validPatches: 1 },
+        { offset: 0, validPatches: 8 },
+        { offset: 8, validPatches: 1 },
       ],
     },
     {
-      patches: 130,
+      patches: 18,
       expected: [
-        { offset: 0, validPatches: 64 },
-        { offset: 64, validPatches: 64 },
-        { offset: 128, validPatches: 2 },
+        { offset: 0, validPatches: 8 },
+        { offset: 8, validPatches: 8 },
+        { offset: 16, validPatches: 2 },
       ],
     },
   ])('partitions $patches MusiCNN patches without dropping the tail', ({ patches, expected }) => {
     expect(musicCnnInferenceBatches(patches)).toEqual(expected);
+  });
+
+  it('keeps the MusiCNN tail input at the fixed eight-patch shape', () => {
+    const patchStride = 2;
+    const values = Float32Array.from({ length: 10 * patchStride }, (_, index) => index + 1);
+    const padded = padMusiCnnInferenceBatch(values, 8, 2, patchStride, MUSICCNN_INFERENCE_BATCH_SIZE);
+    expect(padded.length).toBe(MUSICCNN_INFERENCE_BATCH_SIZE * patchStride);
+    expect(Array.from(padded.slice(0, 4))).toEqual([17, 18, 19, 20]);
+    expect(Array.from(padded.slice(4))).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  });
+
+  it('uses one-patch CPU inference groups without changing the eight-patch WebGL default', () => {
+    expect(MUSICCNN_CPU_INFERENCE_BATCH_SIZE).toBe(1);
+    expect(musicCnnInferenceBatches(3, MUSICCNN_CPU_INFERENCE_BATCH_SIZE)).toEqual([
+      { offset: 0, validPatches: 1 },
+      { offset: 1, validPatches: 1 },
+      { offset: 2, validPatches: 1 },
+    ]);
+    expect(musicCnnInferenceBatches(10)).toHaveLength(2);
   });
 
   it('builds independent Discogs [N,128,96] batches and pads the tail', async () => {
@@ -227,6 +402,115 @@ describe('MusiCNN broad genre projection', () => {
     expect(deleted).toEqual({ frames: frameCount, bands: frameCount, generator: 1 });
     expect(progress.at(-1)).toEqual({ processedPatches: 2, totalPatches: 2 });
   });
+
+  it('keeps the production Discogs tail at the fixed bs64 tensor size', async () => {
+    const frameCount = 129;
+    const signal = new Float32Array(512 + (frameCount - 1) * 256);
+    const batches = [] as Array<{ values: Float32Array; validPatches: number }>;
+    for await (const batch of streamDiscogsEffnetMelBatches(
+      {} as never,
+      signal,
+      undefined,
+      { tensorRuntime: { signal: { stft: true } } },
+    )) {
+      batches.push(batch);
+    }
+    expect(batches).toHaveLength(1);
+    expect(batches[0].validPatches).toBe(2);
+    expect(batches[0].values.length).toBe(64 * 128 * 96);
+    expect(batches[0].values[2 * 128 * 96]).toBe(0);
+  });
+
+  it('reuses one production Discogs frame without native frame generators', async () => {
+    const frameCount = 300;
+    const signal = new Float32Array(512 + (frameCount - 1) * 256);
+    const lifecycle = {
+      created: 0,
+      deleted: 0,
+      flushed: 0,
+      frameVectors: 0,
+      frameWrites: 0,
+      generators: 0,
+    };
+    let nextOutputIndex = 0;
+    const makeEssentia = () => {
+      lifecycle.created += 1;
+      return {
+        arrayToVector: () => {
+          lifecycle.frameVectors += 1;
+          return {
+            set: () => { lifecycle.frameWrites += 1; },
+            delete: () => undefined,
+          };
+        },
+        FrameGenerator: (audio: Float32Array) => {
+          lifecycle.generators += 1;
+          const count = Math.max(0, Math.floor((audio.length - 512) / 256) + 1);
+          return {
+            size: () => count,
+            get: (index: number) => ({ index, delete: () => undefined }),
+            delete: () => undefined,
+          };
+        },
+        TensorflowInputDiscogsEffNet: () => {
+          const index = nextOutputIndex++;
+          return {
+            bands: {
+              values: Array.from({ length: 96 }, (_, band) => index + band / 100),
+              delete: () => undefined,
+            },
+          };
+        },
+        vectorToArray: (value: { values: number[] }) => Float32Array.from(value.values),
+        flushPendingDeletes: () => { lifecycle.flushed += 1; },
+        delete: () => { lifecycle.deleted += 1; },
+      } as never;
+    };
+    const essentia = makeEssentia();
+    essentia.createInstance = makeEssentia;
+
+    const batches = await computeDiscogsEffnetMelBatches(essentia, signal);
+
+    expect(batches).toHaveLength(1);
+    expect(batches[0].validPatches).toBe(3);
+    expect(lifecycle).toEqual({
+      created: 2,
+      deleted: 1,
+      flushed: frameCount + 2,
+      frameVectors: 0,
+      frameWrites: 0,
+      generators: 1,
+    });
+  });
+
+  it('processes every basic-analysis chunk and translates beats to track time', async () => {
+    const signal = Float32Array.from({ length: 65 * 10 }, (_, index) => index % 10 / 10);
+    const essentia = {
+      arrayToVector: (input: Float32Array) => ({ input, delete: () => undefined }),
+      vectorToArray: (value: number[] | Float32Array) => Float32Array.from(value),
+      RhythmExtractor2013: () => ({ bpm: 120, ticks: [1, 2] }),
+      KeyExtractor: () => ({ key: 'C', scale: 'major', strength: 0.8 }),
+      LoudnessEBUR128: () => ({ integratedLoudness: -12, loudnessRange: 4 }),
+      Danceability: () => ({ danceability: 0.5 }),
+      BeatsLoudness: () => ({ loudness: [-3, -4] }),
+    } as never;
+    const progress: Array<{ processed?: number; total?: number }> = [];
+
+    const result = await analyzeChunkedBasicAudio(essentia, {
+      sampleRate: 10,
+      duration: 65,
+      channels: [signal],
+      musicnnSignal: null,
+      basicAnalysisMode: 'chunked',
+    }, (event) => progress.push(event));
+
+    expect(result.bpm).toBe(120);
+    expect(result.key).toBe('C');
+    expect(result.integratedLoudnessLufs).toBeCloseTo(-12);
+    expect(result.energy).toBeGreaterThan(0);
+    expect(result.beatPositions).toEqual([1, 2, 31, 32, 61, 62]);
+    expect(progress.at(-1)).toMatchObject({ processed: signal.length, total: signal.length });
+  });
 });
 
 describe('TensorFlow.js backend selection', () => {
@@ -242,15 +526,20 @@ describe('TensorFlow.js backend selection', () => {
 
   it('waits for the selected backend before returning its name', async () => {
     const calls: string[] = [];
+    let backend = 'webgl';
     const tf = {
-      setBackend: async (name: string) => { calls.push(`set:${name}`); return true; },
+      setBackend: async (name: string) => {
+        calls.push(`set:${name}`);
+        backend = name;
+        return true;
+      },
       ready: async () => { calls.push('ready'); },
-      getBackend: () => 'webgl',
+      getBackend: () => backend,
     };
     await expect(configureTensorflowBackend(tf,
       'Mozilla/5.0 AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15'))
-      .resolves.toBe('webgl');
-    expect(calls).toEqual(['set:webgl', 'ready']);
+      .resolves.toBe('wasm');
+    expect(calls).toEqual(['set:wasm', 'ready']);
   });
 });
 

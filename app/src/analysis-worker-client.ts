@@ -15,6 +15,8 @@ import {
   serializeDecodedAudio,
   serializeEssentiaModels,
 } from './analysis-worker-protocol';
+import { analysisErrorMessage, isFatalAnalysisRuntimeMessage } from './analysis-runtime';
+import { ANALYSIS_PROGRESS_STALL_TIMEOUT_MS } from './analysis-timeout';
 
 export type AnalysisWorkerLike = {
   postMessage: (message: AnalysisWorkerRequest, transfer?: Transferable[]) => void;
@@ -33,10 +35,32 @@ export class AnalysisWorkerCancelledError extends Error {
 }
 
 export class AnalysisWorkerClientError extends Error {
-  constructor(message: string) {
+  readonly stage?: string;
+
+  constructor(message: string, stage?: string) {
     super(message);
     this.name = 'AnalysisWorkerClientError';
+    this.stage = stage;
   }
+}
+
+export class AnalysisWorkerFatalRuntimeError extends AnalysisWorkerClientError {
+  readonly stage: string;
+  readonly path?: string;
+  readonly elapsedMs?: number;
+
+  constructor(message: string, stage: string, path?: string, elapsedMs?: number) {
+    super(message, stage);
+    this.name = 'AnalysisWorkerFatalRuntimeError';
+    this.stage = stage;
+    this.path = path;
+    this.elapsedMs = elapsedMs;
+  }
+}
+
+export function isFatalAnalysisRuntimeError(error: unknown): boolean {
+  return error instanceof AnalysisWorkerFatalRuntimeError
+    || isFatalAnalysisRuntimeMessage(analysisErrorMessage(error));
 }
 
 export class AnalysisWorkerTimeoutError extends AnalysisWorkerClientError {
@@ -81,7 +105,11 @@ type AnalysisRequest = {
 };
 
 export type AnalysisWorkerSession = AnalysisWorkerClientLike & {
-  start: (jobId: string, models: EssentiaModelFile[]) => Promise<void>;
+  start: (
+    jobId: string,
+    models: EssentiaModelFile[],
+    tensorflowBackend?: 'cpu' | 'webgl' | 'wasm',
+  ) => Promise<void>;
   terminate: (reason?: unknown) => void;
 };
 
@@ -89,7 +117,8 @@ type PendingAnalysis = {
   resolve: (analysis: TrackAnalysis) => void;
   reject: (error: unknown) => void;
   onProgress?: (progress: AnalysisWorkerProgress) => void;
-  timer: ReturnType<typeof setTimeout>;
+  totalTimer: ReturnType<typeof setTimeout>;
+  stallTimer: ReturnType<typeof setTimeout>;
   startedAt: number;
   stage: string;
   path: string;
@@ -110,7 +139,7 @@ function defaultWorkerFactory(): AnalysisWorkerLike {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return analysisErrorMessage(error);
 }
 
 export class AnalysisWorkerClient implements AnalysisWorkerSession {
@@ -139,6 +168,7 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
           pending.stage = response.progress.stage;
           pending.lastProgress = response.progress;
           pending.lastProgressAt = new Date().toISOString();
+          this.resetProgressWatchdog(response.requestId, pending);
           pending.onProgress?.(response.progress);
         }
       }
@@ -150,7 +180,7 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
         return;
       }
       this.pending.delete(response.requestId);
-      clearTimeout(pending.timer);
+      this.clearPendingTimers(pending);
       pending.resolve(response.analysis);
       return;
     }
@@ -161,20 +191,46 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
           return;
         }
         this.pending.delete(response.requestId);
-        clearTimeout(pending.timer);
-        pending.reject(new AnalysisWorkerClientError(response.message));
+        this.clearPendingTimers(pending);
+        const error = response.fatal || isFatalAnalysisRuntimeMessage(response.message)
+          ? new AnalysisWorkerFatalRuntimeError(
+            response.message,
+            response.stage ?? pending.stage,
+            pending.path,
+            Date.now() - pending.startedAt,
+          )
+          : new AnalysisWorkerClientError(response.message, response.stage ?? pending.stage);
+        pending.reject(error);
+        if (error instanceof AnalysisWorkerFatalRuntimeError) {
+          this.rejectPending(error);
+          this.detachAndTerminate();
+        }
       } else {
-        const error = new AnalysisWorkerClientError(response.message);
+        const error = response.fatal || isFatalAnalysisRuntimeMessage(response.message)
+          ? new AnalysisWorkerFatalRuntimeError(response.message, response.stage ?? 'loadingModels')
+          : new AnalysisWorkerClientError(response.message, response.stage ?? 'loadingModels');
         this.readyReject?.(error);
         this.clearReadyPromise();
         this.rejectPending(error);
+        if (error instanceof AnalysisWorkerFatalRuntimeError) {
+          this.detachAndTerminate();
+        }
       }
     }
   };
   private readonly handleError = (event: Event) => {
-    const error = new AnalysisWorkerClientError(
-      errorMessage((event as ErrorEvent).error || (event as ErrorEvent).message || '分析 Worker 发生错误'),
+    const message = errorMessage(
+      (event as ErrorEvent).error || (event as ErrorEvent).message || '分析 Worker 发生错误',
     );
+    const pending = this.pending.values().next().value as PendingAnalysis | undefined;
+    const error = isFatalAnalysisRuntimeMessage(message)
+      ? new AnalysisWorkerFatalRuntimeError(
+        message,
+        pending?.stage ?? 'loadingModels',
+        pending?.path,
+        pending ? Date.now() - pending.startedAt : undefined,
+      )
+      : new AnalysisWorkerClientError(message, pending?.stage ?? 'loadingModels');
     this.readyReject?.(error);
     this.clearReadyPromise();
     this.rejectPending(error);
@@ -185,7 +241,11 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
     this.factory = factory;
   }
 
-  async start(jobId: string, models: EssentiaModelFile[]): Promise<void> {
+  async start(
+    jobId: string,
+    models: EssentiaModelFile[],
+    tensorflowBackend?: 'cpu' | 'webgl' | 'wasm',
+  ): Promise<void> {
     if (this.worker && this.activeJobId === jobId && !this.readyPromise) {
       return;
     }
@@ -204,9 +264,13 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
         type: 'start',
         jobId,
         models: serialized.payload,
+        tensorflowBackend,
       }, serialized.transfer);
     } catch (error) {
-      const wrapped = new AnalysisWorkerClientError(errorMessage(error));
+      const message = errorMessage(error);
+      const wrapped = isFatalAnalysisRuntimeMessage(message)
+        ? new AnalysisWorkerFatalRuntimeError(message, 'loadingModels')
+        : new AnalysisWorkerClientError(message, 'loadingModels');
       this.readyReject?.(wrapped);
       this.clearReadyPromise();
       this.detachAndTerminate();
@@ -245,28 +309,18 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
     return new Promise<TrackAnalysis>((resolve, reject) => {
       const startedAt = Date.now();
       const timeoutMs = request.timeoutMs ?? WORKER_START_TIMEOUT_MS;
-      const timer = setTimeout(() => {
-        const pending = this.pending.get(requestId);
-        if (!pending) {
-          return;
-        }
-        this.pending.delete(requestId);
-        const error = new AnalysisWorkerTimeoutError(
-          pending.path,
-          Date.now() - pending.startedAt,
-          pending.stage,
-          pending.lastProgress ?? {},
-          pending.lastProgressAt,
-        );
-        clearTimeout(pending.timer);
-        pending.reject(error);
-        this.terminate(error);
-      }, timeoutMs);
+      const totalTimer = setTimeout(() => {
+        this.timeoutPending(requestId);
+      }, Math.max(1, timeoutMs));
+      const stallTimer = setTimeout(() => {
+        this.timeoutPending(requestId);
+      }, ANALYSIS_PROGRESS_STALL_TIMEOUT_MS);
       this.pending.set(requestId, {
         resolve,
         reject,
         onProgress: request.onProgress,
-        timer,
+        totalTimer,
+        stallTimer,
         startedAt,
         stage: 'preparing',
         path: request.path,
@@ -285,9 +339,18 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
           audio: serialized.payload,
         }, serialized.transfer);
       } catch (error) {
+        const pending = this.pending.get(requestId);
         this.pending.delete(requestId);
-        clearTimeout(timer);
-        reject(new AnalysisWorkerClientError(errorMessage(error)));
+        if (pending) {
+          this.clearPendingTimers(pending);
+        }
+        const message = errorMessage(error);
+        reject(isFatalAnalysisRuntimeMessage(message)
+          ? new AnalysisWorkerFatalRuntimeError(message, 'preparing', request.path)
+          : new AnalysisWorkerClientError(message, 'preparing'));
+        if (isFatalAnalysisRuntimeMessage(message)) {
+          this.detachAndTerminate();
+        }
       }
     });
   }
@@ -299,12 +362,42 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
     this.detachAndTerminate();
   }
 
+  private timeoutPending(requestId: string): void {
+    const pending = this.pending.get(requestId);
+    if (!pending) {
+      return;
+    }
+    this.pending.delete(requestId);
+    const error = new AnalysisWorkerTimeoutError(
+      pending.path,
+      Date.now() - pending.startedAt,
+      pending.stage,
+      pending.lastProgress ?? {},
+      pending.lastProgressAt,
+    );
+    this.clearPendingTimers(pending);
+    pending.reject(error);
+    this.terminate(error);
+  }
+
+  private clearPendingTimers(pending: PendingAnalysis): void {
+    clearTimeout(pending.totalTimer);
+    clearTimeout(pending.stallTimer);
+  }
+
+  private resetProgressWatchdog(requestId: string, pending: PendingAnalysis): void {
+    clearTimeout(pending.stallTimer);
+    pending.stallTimer = setTimeout(() => {
+      this.timeoutPending(requestId);
+    }, ANALYSIS_PROGRESS_STALL_TIMEOUT_MS);
+  }
+
   private rejectPending(reason: unknown): void {
     const pending = Array.from(this.pending.values());
     this.pending.clear();
-    pending.forEach(({ reject, timer }) => {
-      clearTimeout(timer);
-      reject(reason);
+    pending.forEach((entry) => {
+      this.clearPendingTimers(entry);
+      entry.reject(reason);
     });
   }
 
