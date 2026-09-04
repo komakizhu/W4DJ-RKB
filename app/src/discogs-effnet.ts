@@ -7,6 +7,7 @@ import {
   type DiscogsEffnetHeadResult,
   type EssentiaModelFile,
 } from './analysis';
+import { analysisErrorMessage, isFatalAnalysisRuntimeMessage } from './analysis-runtime';
 
 export type TensorflowRuntime = {
   tensor2d: (values: ArrayLike<number> | number[] | number[][], shape?: [number, number], dtype?: string) => any;
@@ -149,6 +150,7 @@ export async function runDiscogsEffnetHeads(
         model.version,
       );
     } catch (error) {
+      if (isFatalAnalysisRuntimeMessage(analysisErrorMessage(error))) throw error;
       heads[contract.id] = {
         model: contract.id,
         status: 'failed',
@@ -202,6 +204,7 @@ export async function runDiscogsEffnetHeadsStream(
       });
       versions.set(contract.id, spec.version);
     } catch (error) {
+      if (isFatalAnalysisRuntimeMessage(analysisErrorMessage(error))) throw error;
       heads[contract.id] = {
         model: contract.id,
         status: 'failed',
@@ -243,6 +246,7 @@ export async function runDiscogsEffnetHeadsStream(
             totalRowsByHead.set(contract.id, (totalRowsByHead.get(contract.id) ?? 0) + validRows);
           }
         } catch (error) {
+          if (isFatalAnalysisRuntimeMessage(analysisErrorMessage(error))) throw error;
           heads[contract.id] = {
             model: contract.id,
             status: 'failed',

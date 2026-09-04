@@ -4,6 +4,7 @@ import {
   summarizeLibraryAnalysisResult,
   type LibraryAnalysisRunResult,
 } from './library-analysis-runner';
+import { AnalysisWorkerFatalRuntimeError } from './analysis-worker-client';
 
 export type HeadlessAcceptanceScenario =
   | 'libraryAnalysis'
@@ -133,6 +134,11 @@ async function run(): Promise<void> {
       runId,
       candidates,
       resumeIncomplete: false,
+      // Exercise the same WebKit/native CPU path used by the desktop
+      // application. WASM is TensorFlow.js' accelerated CPU backend; WebGL
+      // can be used for an additional comparison, but must not be the only
+      // evidence for the long-song acceptance.
+      tensorflowBackend: 'wasm',
       cancelAfterNewCompleted: config.exerciseCancelResume ? 1 : undefined,
       onEvent: async (event) => {
         await writeEvent(config, {
@@ -145,7 +151,7 @@ async function run(): Promise<void> {
   } catch (error) {
     await emit({
       status: 'error',
-      stage: 'runnerError',
+      stage: error instanceof AnalysisWorkerFatalRuntimeError ? error.stage : 'runnerError',
       message: error instanceof Error ? error.message : String(error),
       timestampMs: Date.now(),
     });
@@ -167,6 +173,7 @@ async function run(): Promise<void> {
       runId,
       candidates,
       resumeIncomplete: true,
+      tensorflowBackend: 'wasm',
       onEvent: async (event) => {
         await writeEvent(config, {
           ...event,

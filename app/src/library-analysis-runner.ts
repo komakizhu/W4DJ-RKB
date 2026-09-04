@@ -10,8 +10,11 @@ import {
 } from './analysis';
 import {
   AnalysisWorkerCancelledError,
+  AnalysisWorkerClientError,
   AnalysisWorkerClient,
+  AnalysisWorkerFatalRuntimeError,
   AnalysisWorkerTimeoutError,
+  isFatalAnalysisRuntimeError,
 } from './analysis-worker-client';
 import type { HeadlessAcceptanceEvent } from './headless-acceptance';
 
@@ -26,6 +29,7 @@ export type LibraryAnalysisRunOptions = {
   runId: string;
   candidates: LibraryAnalysisCandidate[];
   resumeIncomplete: boolean;
+  tensorflowBackend?: 'cpu' | 'webgl' | 'wasm';
   cancelAfterNewCompleted?: number;
   onEvent: (event: HeadlessAcceptanceEvent) => Promise<void> | void;
 };
@@ -154,11 +158,13 @@ async function loadModels(onEvent: LibraryAnalysisRunOptions['onEvent']): Promis
   return models;
 }
 
-function failureDetails(error: unknown): {
+function failureDetails(error: unknown, fallbackStage = 'failed'): {
   message: string;
   status: 'failed' | 'timeout';
   stage?: string;
   elapsedMs?: number;
+  fatal?: boolean;
+  cause?: unknown;
 } {
   if (error instanceof AnalysisWorkerTimeoutError) {
     return {
@@ -168,9 +174,18 @@ function failureDetails(error: unknown): {
       elapsedMs: error.elapsedMs,
     };
   }
+  const fatal = isFatalAnalysisRuntimeError(error);
   return {
     message: error instanceof Error ? error.message : String(error),
     status: 'failed',
+    stage: fatal && error instanceof AnalysisWorkerFatalRuntimeError
+      ? error.stage
+      : fatal
+        ? fallbackStage
+        : error instanceof AnalysisWorkerClientError ? error.stage : undefined,
+    elapsedMs: fatal && error instanceof AnalysisWorkerFatalRuntimeError ? error.elapsedMs : undefined,
+    fatal,
+    cause: error,
   };
 }
 
@@ -180,6 +195,9 @@ async function persistAnalysis(
   analysis: TrackAnalysis | null,
   failure: ReturnType<typeof failureDetails> | null,
 ): Promise<void> {
+  if (analysis) {
+    await invoke('save_track_analyses', { entries: [analysis] });
+  }
   await invoke('apply_track_analysis_results', {
     batchId: runId,
     previews: [preview],
@@ -282,7 +300,7 @@ export async function runLibraryAnalysis(
       lastProgressEventAt = 0;
       lastProgressStage = '';
       progressEventChain = Promise.resolve();
-      await worker.start(workerJobId, models);
+      await worker.start(workerJobId, models, options.tensorflowBackend);
       await options.onEvent({
         runId: options.runId,
         scenario: 'libraryAnalysis',
@@ -312,6 +330,7 @@ export async function runLibraryAnalysis(
         highLevelModels: models,
         workerClient: worker,
         workerJobId,
+        forceChunked: true,
         onProgress: (progress) => {
           const now = Date.now();
           const stageChanged = progress.stage !== lastProgressStage;
@@ -380,7 +399,7 @@ export async function runLibraryAnalysis(
         cancellationRequested = true;
         cancelled += 1;
       } else {
-        const failure = failureDetails(error);
+        const failure = failureDetails(error, lastProgressStage || 'decoding');
         try {
           await persistAnalysis(options.runId, preview, null, failure);
         } catch {
@@ -393,14 +412,23 @@ export async function runLibraryAnalysis(
         await options.onEvent({
           runId: options.runId,
           scenario: 'libraryAnalysis',
-          status: 'partial',
-          stage: failure.stage ?? 'failed',
+          status: failure.fatal ? 'error' : 'partial',
+          stage: failure.stage ?? (failure.fatal ? 'fatalRuntime' : 'failed'),
           processed,
           total,
           currentItem: candidate.name,
           message: failure.message,
           timestampMs: Date.now(),
         });
+        if (failure.fatal) {
+          throw failure.cause instanceof AnalysisWorkerFatalRuntimeError
+            ? failure.cause
+            : new AnalysisWorkerFatalRuntimeError(
+              failure.message,
+              failure.stage ?? (lastProgressStage || 'decoding'),
+              candidate.path,
+            );
+        }
       }
     } finally {
       worker.terminate();

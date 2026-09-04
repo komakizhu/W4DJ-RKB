@@ -19,6 +19,7 @@ export type SerializedDecodedAudio = {
   duration: number;
   channels: ArrayBuffer[];
   musicnnSignal: ArrayBuffer | null;
+  basicAnalysisMode?: 'chunked';
 };
 
 export type SerializedEssentiaModel = Omit<EssentiaModelFile, 'weightData'> & {
@@ -29,6 +30,7 @@ export type AnalysisWorkerStartRequest = {
   type: 'start';
   jobId: string;
   models: SerializedEssentiaModel[];
+  tensorflowBackend?: 'cpu' | 'webgl' | 'wasm';
 };
 
 export type AnalysisWorkerTrackRequest = {
@@ -95,6 +97,8 @@ export type AnalysisWorkerErrorResponse = {
   type: 'error';
   jobId: string;
   requestId?: string;
+  stage?: string;
+  fatal?: boolean;
   message: string;
 };
 
@@ -129,11 +133,12 @@ export function serializeDecodedAudio(audio: DecodedAudioData): {
       duration: audio.duration,
       channels,
       musicnnSignal,
+      basicAnalysisMode: audio.basicAnalysisMode,
     },
-    transfer: [
+    transfer: Array.from(new Set([
       ...channels,
       ...(musicnnSignal ? [musicnnSignal] : []),
-    ],
+    ])),
   };
 }
 
@@ -143,6 +148,7 @@ export function deserializeDecodedAudio(audio: SerializedDecodedAudio): DecodedA
     duration: audio.duration,
     channels: audio.channels.map((channel) => new Float32Array(channel)),
     musicnnSignal: audio.musicnnSignal ? new Float32Array(audio.musicnnSignal) : null,
+    basicAnalysisMode: audio.basicAnalysisMode,
   };
 }
 

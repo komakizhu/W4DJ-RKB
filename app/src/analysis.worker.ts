@@ -6,6 +6,7 @@ import {
   type AnalysisWorkerRequest,
   type AnalysisWorkerResponse,
 } from './analysis-worker-protocol';
+import { analysisErrorMessage, isFatalAnalysisRuntimeMessage } from './analysis-runtime';
 
 type WorkerScope = {
   postMessage: (message: AnalysisWorkerResponse) => void;
@@ -15,6 +16,7 @@ type WorkerScope = {
 const workerScope = globalThis as unknown as WorkerScope;
 let activeJobId: string | null = null;
 let models = [] as ReturnType<typeof deserializeEssentiaModels>;
+let tensorflowBackend: 'cpu' | 'webgl' | 'wasm' | undefined;
 let processing = false;
 let currentStage = '';
 let stageStartedAtMs = 0;
@@ -49,10 +51,28 @@ function yieldToWorker(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function postAnalysisError(
+  jobId: string,
+  requestId: string | undefined,
+  error: unknown,
+  fallbackStage = 'analyzingBasic',
+): void {
+  const message = analysisErrorMessage(error);
+  post({
+    type: 'error',
+    jobId,
+    requestId,
+    stage: currentStage || fallbackStage,
+    fatal: isFatalAnalysisRuntimeMessage(message),
+    message,
+  });
+}
+
 workerScope.onmessage = async (event) => {
   const request = event.data;
   if (request.type === 'start') {
     activeJobId = request.jobId;
+    tensorflowBackend = request.tensorflowBackend;
     postProgress(request.jobId, undefined, {
       stage: 'loadingModels',
       message: request.models.length > 0 ? '正在准备 Essentia 预训练模型' : '正在准备 Essentia 分析',
@@ -60,11 +80,7 @@ workerScope.onmessage = async (event) => {
     try {
       models = deserializeEssentiaModels(request.models);
     } catch (error) {
-      post({
-        type: 'error',
-        jobId: request.jobId,
-        message: error instanceof Error ? error.message : String(error),
-      });
+      postAnalysisError(request.jobId, undefined, error, 'loadingModels');
       return;
     }
     await yieldToWorker();
@@ -76,12 +92,7 @@ workerScope.onmessage = async (event) => {
     return;
   }
   if (processing) {
-    post({
-      type: 'error',
-      jobId: request.jobId,
-      requestId: request.requestId,
-      message: '分析 Worker 正在处理上一首歌曲',
-    });
+    postAnalysisError(request.jobId, request.requestId, '分析 Worker 正在处理上一首歌曲');
     return;
   }
 
@@ -101,6 +112,7 @@ workerScope.onmessage = async (event) => {
         neteaseFilenameFormat: request.neteaseFilenameFormat,
         highLevel: request.highLevel,
         highLevelModels: models,
+        tensorflowBackend,
         onProgress: (progress) => {
           postProgress(request.jobId, request.requestId, progress);
         },
@@ -117,12 +129,7 @@ workerScope.onmessage = async (event) => {
       analysis,
     });
   } catch (error) {
-    post({
-      type: 'error',
-      jobId: request.jobId,
-      requestId: request.requestId,
-      message: error instanceof Error ? error.message : String(error),
-    });
+    postAnalysisError(request.jobId, request.requestId, error);
   } finally {
     processing = false;
   }
