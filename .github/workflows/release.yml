@@ -199,7 +199,7 @@ jobs:
 
           mv "$rebuilt" "$dmg"
 
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           version="${version%-legacy}"
           asset_name='${{ matrix.asset_name_prefix }}[version]${{ steps.variant.outputs.asset_suffix }}${{ matrix.asset_extension }}'
           asset_name="${asset_name//\[version\]/$version}"
