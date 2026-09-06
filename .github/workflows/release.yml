@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing version tag to build and publish'
+        required: true
+        type: string
 
 jobs:
   release:
@@ -74,8 +79,10 @@ jobs:
       - name: Select release variant
         id: variant
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          case "$GITHUB_REF_NAME" in
+          case "$RELEASE_TAG" in
             *-legacy)
               echo 'tauri_args=-- --no-default-features --features legacy' >> "$GITHUB_OUTPUT"
               echo 'config_args=--config src-tauri/tauri.legacy.conf.json' >> "$GITHUB_OUTPUT"
@@ -92,8 +99,10 @@ jobs:
 
       - name: Prepare release notes
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           notes="$(awk -v version="$version" '
             $0 == "## v" version { found=1; next }
             found && /^## v/ { exit }
@@ -114,11 +123,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'W4DJ ${{ github.ref_name }}'
+          tagName: ${{ inputs.release_tag || github.ref_name }}
+          releaseName: 'W4DJ ${{ inputs.release_tag || github.ref_name }}'
           releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: false
-          prerelease: true
+          prerelease: false
           args: ${{ matrix.args }} ${{ steps.variant.outputs.config_args }} ${{ steps.variant.outputs.tauri_args }}
           releaseAssetNamePattern: '${{ matrix.asset_name_prefix }}[version]${{ steps.variant.outputs.asset_suffix }}${{ matrix.asset_extension }}'
 
@@ -127,6 +136,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
@@ -196,4 +206,4 @@ jobs:
           asset_name="${asset_name//\[ext\]/.dmg}"
           renamed_dmg="$workdir/$asset_name"
           mv "$dmg" "$renamed_dmg"
-          gh release upload "$GITHUB_REF_NAME" "$renamed_dmg" --clobber
+          gh release upload "$RELEASE_TAG" "$renamed_dmg" --clobber
