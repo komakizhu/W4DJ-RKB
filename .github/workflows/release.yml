@@ -175,7 +175,7 @@ jobs:
             end tell
           end tell
           APPLESCRIPT
-          hdiutil detach "$mountpoint"
+          hdiutil detach "$mountpoint" -force
 
           rebuilt="$workdir/w4dj-final.dmg"
           hdiutil convert "$rw_image" -format UDZO -o "$rebuilt"
