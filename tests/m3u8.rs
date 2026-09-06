@@ -11,6 +11,8 @@ use w4dj::m3u8::{
 fn playlist(tracks: Vec<ImportedDjPlaylistTrack>) -> ImportedDjPlaylist {
     ImportedDjPlaylist {
         playlist_id: "playlist-1".to_string(),
+        source_export_id: "playlist-1".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "测试歌单".to_string(),
         source_path: None,

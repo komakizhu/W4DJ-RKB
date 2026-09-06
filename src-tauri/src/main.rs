@@ -4372,17 +4372,17 @@ fn import_w4dj_playlist(path: String, state: tauri::State<'_, AppState>) -> Resu
     let path = library_catalog_path(&state);
     let mut library = W4djLibrary::open(&path).map_err(|error| error.to_string())?;
     let output_roots = prepare_w4dj_output_identity_state(&mut library, state.inner())?;
-    library
-        .upsert_imported_dj_playlist(&playlist)
+    let stored_playlist = library
+        .insert_imported_dj_playlist_version(&playlist)
         .map_err(|error| error.to_string())?;
     library
-        .restore_imported_dj_playlist_review_manifests(&playlist.playlist_id, &output_roots)
+        .restore_imported_dj_playlist_review_manifests(&stored_playlist.playlist_id, &output_roots)
         .map_err(|error| error.to_string())?;
     library
         .persist_output_identity_manifests(&output_roots)
         .map_err(|error| error.to_string())?;
     library
-        .get_imported_dj_playlist(&playlist.playlist_id)
+        .get_imported_dj_playlist(&stored_playlist.playlist_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "导入后的 DJ 歌单无法重新读取".to_string())
 }
@@ -10925,6 +10925,8 @@ mod tests {
         library
             .upsert_imported_dj_playlist(&ImportedDjPlaylist {
                 playlist_id: "playlist-1".into(),
+                source_export_id: "playlist-1".into(),
+                import_version: 1,
                 format_version: 2,
                 name: "Test playlist".into(),
                 source_path: None,

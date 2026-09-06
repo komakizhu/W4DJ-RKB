@@ -38,6 +38,8 @@ fn parse_value(
 fn parses_minimal_v2_and_ignores_legacy_string_id() {
     let playlist = parse_value(minimal_playlist()).unwrap();
     assert_eq!(playlist.playlist_id, "playlist-1");
+    assert_eq!(playlist.source_export_id, "playlist-1");
+    assert_eq!(playlist.import_version, 1);
     assert_eq!(playlist.format_version, 2);
     assert_eq!(playlist.tracks.len(), 2);
     assert_eq!(playlist.tracks[0].position, 1);
@@ -174,6 +176,20 @@ fn serializes_only_minimal_v2_fields_and_round_trips() {
     assert_eq!(
         round_trip.source_path.as_deref(),
         Some(Path::new("/tmp/list.w4dj"))
+    );
+}
+
+#[test]
+fn serializes_original_export_id_after_internal_instance_id_changes() {
+    let mut playlist = parse_value(minimal_playlist()).unwrap();
+    playlist.playlist_id = "w4dj-import-123-0".to_string();
+    let bytes = serialize_w4dj_playlist(&playlist).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["export_id"], "playlist-1");
+    assert_eq!(value["playlist"]["name"], "Club");
+    assert_eq!(
+        value["tracks"][0]["netease_track_id"],
+        serde_json::Value::Null
     );
 }
 

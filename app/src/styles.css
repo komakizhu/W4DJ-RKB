@@ -3399,11 +3399,26 @@ h1 {
 }
 
 .dj-playlist-head h2 { margin: 0; }
+.dj-playlist-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .dj-playlist-summary { color: var(--muted); }
 .dj-playlist-launcher-dialog { width: min(760px, 100%); }
 .dj-playlist-export-picker-dialog,
 .dj-playlist-export-choice-dialog { width: min(680px, 100%); }
 .dj-playlist-recent-list { display: grid; gap: 10px; margin-top: 22px; }
+.dj-playlist-empty {
+  margin: 22px 0 0;
+  padding: 32px 18px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 14px;
+  color: var(--muted);
+  text-align: center;
+}
 .dj-playlist-recent-item {
   display: flex;
   align-items: center;
@@ -3428,8 +3443,31 @@ h1 {
 .dj-playlist-export-choice-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
 .dj-playlist-launcher-source { margin: 20px 0 0; color: var(--muted); font-size: 1rem; }
 .dj-playlist-launcher-source a { color: var(--accent); font-weight: 700; }
-.dj-playlist-launcher-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 24px 0; }
+.dj-playlist-launcher-actions { display: grid; gap: 14px; margin: 24px 0; }
 .dj-playlist-launcher-button { min-height: 72px; font-size: 1.1rem; }
+.dj-playlist-dropzone {
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 190px;
+  margin: 24px 0 0;
+  padding: 28px;
+  border: 2px dashed var(--line-strong);
+  border-radius: 18px;
+  background: var(--surface-muted);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 180ms ease, background 180ms ease, transform 180ms ease;
+}
+.dj-playlist-dropzone:hover,
+.dj-playlist-dropzone:focus-visible {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface-muted));
+}
+.dj-playlist-dropzone:active { transform: scale(.99); }
+.dj-playlist-dropzone strong { font-size: 1.15rem; }
 .dj-playlist-launcher-instructions { margin: 0; padding: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-muted); color: var(--muted); line-height: 1.7; white-space: pre-line; }
 .dj-playlist-qr-panel { margin-top: 18px; }
 .dj-playlist-qr-grid {
@@ -3502,6 +3540,8 @@ h1 {
 
 @media (max-width: 720px) {
   .dj-playlist-launcher-actions { grid-template-columns: 1fr; }
+  .dj-playlist-head { align-items: flex-start; }
+  .dj-playlist-head-actions { justify-content: flex-end; }
 
   .scan-modal {
     padding: 12px;
@@ -3567,6 +3607,7 @@ h1 {
 
   .dj-playlist-modal { padding: 12px; }
   .dj-playlist-dialog { max-height: calc(100vh - 24px); padding: 18px; border-radius: 18px; }
+  .dj-playlist-dropzone { min-height: 150px; padding: 22px 16px; }
   .dj-playlist-review-grid { overflow-x: auto; }
   .dj-playlist-qr-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .dj-playlist-qr-image { min-height: 150px; }

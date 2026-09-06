@@ -19,6 +19,8 @@ fn track(position: u64, title: &str, artist: &str) -> ImportedDjPlaylistTrack {
 fn playlist(tracks: Vec<ImportedDjPlaylistTrack>) -> ImportedDjPlaylist {
     ImportedDjPlaylist {
         playlist_id: "playlist-1".to_string(),
+        source_export_id: "playlist-1".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "Test".to_string(),
         source_path: None,

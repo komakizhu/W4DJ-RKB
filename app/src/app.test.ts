@@ -292,7 +292,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '3.2.3',
+    version: '3.2.4',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -423,8 +423,10 @@ describe('renderApp', () => {
     );
     expect(root.querySelector('[data-action="import-dj-playlist"]')?.textContent).toContain('导入.w4dj');
     expect(root.querySelector('[data-role="dj-playlist-launcher"]')).not.toBeNull();
-    expect(root.querySelector('[data-action="dj-playlist-open-import"]')?.textContent).toContain('导入.w4dj');
+    expect(root.querySelector('[data-action="dj-playlist-open-import"]')?.textContent).toContain('将 .w4dj 文件拖入，或点击打开');
     expect(root.querySelector('[data-action="dj-playlist-open-export"]')?.textContent).toContain('导出播放列表');
+    expect(root.querySelector('[data-action="dj-playlist-open-history"][data-history-action="qr"]')?.textContent).toBe('历史二维码');
+    expect(root.querySelector('[data-action="dj-playlist-open-history"][data-history-action="w4dj"]')?.textContent).toBe('导出历史 W4DJ');
     expect(root.querySelector('a[data-action="open-dj-crate-digger-link"]')?.getAttribute('href')).toBe('https://github.com/komakizhu/dj-crate-digger-skill');
     expect(root.querySelector('.dj-playlist-launcher-source')?.textContent).toContain('如何获得 .w4dj？使用这个老炮DJ Skill： dj-crate-digger');
     expect(root.querySelector('.dj-playlist-launcher-instructions')?.textContent).toBe('1. 如何把歌单导入到网易云：导入 .w4dj 之后，扫描二维码，打开网易云-我的-三竖点-一键导入外部歌单-文字导入，粘贴结果即可导入歌单\n2. 如何把播放列表导入到Rekordbox：在 W4DJ RKB 进行成功转换之后，可以一键导出 m3u8。然后打开Rekordbox-文件-导入-导入播放列表');
@@ -439,6 +441,111 @@ describe('renderApp', () => {
     expect(root.querySelector('[data-role="dj-playlist-launcher"]')).not.toBeNull();
     (root.querySelector('[data-action="dj-playlist-open-import"]') as HTMLButtonElement).click();
     await vi.waitFor(() => expect(pickW4djPlaylist).toHaveBeenCalledTimes(1));
+  });
+
+  it('uses the shared history list for QR and historical W4DJ actions without matching', async () => {
+    const playlist = {
+      playlistId: 'w4dj-import-1',
+      sourceExportId: 'source-playlist',
+      importVersion: 2,
+      formatVersion: 2,
+      name: 'Club Set',
+      sourcePath: null,
+      importedAtMs: 2,
+      tracks: [{
+        position: 1,
+        title: 'Anchor Point',
+        artistDisplay: 'Ahmed Spins',
+        dedupeKey: 'anchor',
+        neteaseImportLine: 'Anchor Point - Ahmed Spins',
+      }],
+      warnings: [],
+    };
+    const listImportedDjPlaylists = vi.fn().mockResolvedValue([{
+      playlistId: playlist.playlistId,
+      name: playlist.name,
+      displayName: 'Club Set（2）',
+      sourceExportId: 'source-playlist',
+      importVersion: 2,
+      trackCount: 1,
+      warningCount: 0,
+      importedAtMs: 2,
+      sourcePath: null,
+    }]);
+    const loadImportedDjPlaylist = vi.fn().mockResolvedValue(playlist);
+    const matchImportedDjPlaylist = vi.fn();
+    const saveFile = vi.fn().mockResolvedValue('/tmp/Club Set（2）.w4dj');
+    const exportImportedDjPlaylistW4dj = vi.fn().mockResolvedValue(undefined);
+    const services = makeMockServices({
+      listImportedDjPlaylists,
+      loadImportedDjPlaylist,
+      matchImportedDjPlaylist,
+      saveFile,
+      exportImportedDjPlaylistW4dj,
+    });
+    const root = document.createElement('div');
+    bindApp(root, makeViewState(), services);
+    await vi.waitFor(() => expect(root.querySelector('[data-action="import-dj-playlist"]')).not.toBeNull());
+    (root.querySelector('[data-action="import-dj-playlist"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-launcher"]')).not.toBeNull());
+    (root.querySelector('[data-action="dj-playlist-open-history"][data-history-action="w4dj"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-export-picker"]')).not.toBeNull());
+    expect(root.querySelector('.dj-playlist-recent-item strong')?.textContent).toBe('Club Set（2）');
+    (root.querySelector('[data-action="dj-playlist-select-recent"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(exportImportedDjPlaylistW4dj).toHaveBeenCalledWith(
+      'w4dj-import-1',
+      '/tmp/Club Set（2）.w4dj',
+    ));
+    expect(matchImportedDjPlaylist).not.toHaveBeenCalled();
+    expect(root.querySelector('[data-role="dj-playlist-export-picker"]')).not.toBeNull();
+  });
+
+  it('opens the selected historical playlist as QR pages without matching or importing it again', async () => {
+    const root = document.createElement('div');
+    const playlist = {
+      playlistId: 'w4dj-import-qr',
+      sourceExportId: 'source-qr',
+      importVersion: 1,
+      formatVersion: 2,
+      name: 'QR History',
+      sourcePath: null,
+      importedAtMs: 1,
+      tracks: [{
+        position: 1,
+        title: 'Anchor Point',
+        artistDisplay: 'Ahmed Spins',
+        dedupeKey: 'anchor',
+        neteaseImportLine: 'Anchor Point - Ahmed Spins',
+      }],
+      warnings: [],
+    };
+    const listImportedDjPlaylists = vi.fn().mockResolvedValue([{
+      playlistId: playlist.playlistId,
+      name: playlist.name,
+      displayName: playlist.name,
+      importVersion: 1,
+      trackCount: 1,
+      warningCount: 0,
+      importedAtMs: 1,
+      sourcePath: null,
+    }]);
+    const loadImportedDjPlaylist = vi.fn().mockResolvedValue(playlist);
+    const matchImportedDjPlaylist = vi.fn();
+    bindApp(root, makeViewState(), makeMockServices({
+      listImportedDjPlaylists,
+      loadImportedDjPlaylist,
+      matchImportedDjPlaylist,
+    }));
+    await vi.waitFor(() => expect(root.querySelector('[data-action="import-dj-playlist"]')).not.toBeNull());
+    (root.querySelector('[data-action="import-dj-playlist"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-launcher"]')).not.toBeNull());
+    (root.querySelector('[data-action="dj-playlist-open-history"][data-history-action="qr"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-export-picker"]')).not.toBeNull());
+    (root.querySelector('[data-action="dj-playlist-select-recent"]') as HTMLButtonElement).click();
+    await vi.waitFor(() => expect(root.querySelector('[data-role="dj-playlist-dialog"]')).not.toBeNull());
+    expect(root.querySelector('.dj-playlist-qr-panel')).not.toBeNull();
+    expect(matchImportedDjPlaylist).not.toHaveBeenCalled();
+    expect(listImportedDjPlaylists).toHaveBeenCalled();
   });
 
   it('renders all playlist QR codes side by side without the removed controls', () => {
@@ -2065,13 +2172,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '3.2.3',
+        version: '3.2.4',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.3');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.4');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
     expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();

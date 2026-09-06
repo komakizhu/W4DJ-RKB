@@ -15,6 +15,9 @@ export type DjPlaylistImportWarning = {
 
 export type ImportedDjPlaylist = {
   playlistId: string;
+  /** Original playlist-level v2 export_id; playlistId is the internal instance identity. */
+  sourceExportId?: string;
+  importVersion?: number;
   formatVersion: number;
   name: string;
   sourcePath: string | null;
@@ -26,6 +29,9 @@ export type ImportedDjPlaylist = {
 export type ImportedDjPlaylistSummary = {
   playlistId: string;
   name: string;
+  displayName?: string;
+  sourceExportId?: string;
+  importVersion?: number;
   trackCount: number;
   warningCount: number;
   importedAtMs: number;

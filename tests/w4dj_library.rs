@@ -1,14 +1,183 @@
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::PathBuf;
 use tempfile::tempdir;
 use w4dj::analysis::{
     AnalysisLabel, ContinuousEmotionResult, DiscogsEffnetAnalysis, DiscogsEffnetHeadResult,
     EmotionCandidates, EmotionHeadStatus, HighLevelAnalysis, TrackAnalysis,
 };
 use w4dj::dj_playlist::{ImportedDjPlaylist, ImportedDjPlaylistTrack};
+use w4dj::dj_playlist_match::DjPlaylistMatchKind;
 use w4dj::m3u8::{ResolvedDjPlaylistTrack, build_relative_m3u8_with_summary};
 use w4dj::w4dj_library::{CommittedOutputFacts, OutputFileSnapshot, W4djLibrary};
+
+fn test_playlist(playlist_id: &str, source_export_id: &str, name: &str) -> ImportedDjPlaylist {
+    ImportedDjPlaylist {
+        playlist_id: playlist_id.to_string(),
+        source_export_id: source_export_id.to_string(),
+        import_version: 1,
+        format_version: 2,
+        name: name.to_string(),
+        source_path: Some(PathBuf::from("/tmp/source.w4dj")),
+        imported_at_ms: Some(1),
+        tracks: vec![ImportedDjPlaylistTrack {
+            position: 1,
+            title: "Song".to_string(),
+            artist_display: "Artist".to_string(),
+            dedupe_key: "title-artist:song:artist".to_string(),
+            netease_import_line: "Song - Artist".to_string(),
+        }],
+        warnings: Vec::new(),
+    }
+}
+
+#[test]
+fn repeated_w4dj_imports_keep_independent_history_versions() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("w4dj.sqlite3");
+    let mut library = W4djLibrary::open(&database).unwrap();
+    let source = test_playlist("source-export-id", "source-export-id", "Club Set");
+
+    let first = library
+        .insert_imported_dj_playlist_version(&source)
+        .unwrap();
+    let second = library
+        .insert_imported_dj_playlist_version(&source)
+        .unwrap();
+    for _ in 0..98 {
+        library
+            .insert_imported_dj_playlist_version(&source)
+            .unwrap();
+    }
+
+    assert_ne!(first.playlist_id, second.playlist_id);
+    assert_eq!(first.source_export_id, "source-export-id");
+    assert_eq!(first.import_version, 1);
+    assert_eq!(second.import_version, 2);
+    assert_eq!(library.list_imported_dj_playlists().unwrap().len(), 100);
+    let summaries = library.list_imported_dj_playlists().unwrap();
+    let first_summary = summaries
+        .iter()
+        .find(|summary| summary.playlist_id == first.playlist_id)
+        .unwrap();
+    let second_summary = summaries
+        .iter()
+        .find(|summary| summary.playlist_id == second.playlist_id)
+        .unwrap();
+    assert_eq!(first_summary.display_name, "Club Set");
+    assert_eq!(second_summary.display_name, "Club Set（2）");
+    let hundredth = summaries
+        .iter()
+        .find(|summary| summary.import_version == 100)
+        .unwrap();
+    assert_eq!(hundredth.display_name, "Club Set（100）");
+    assert_eq!(
+        library
+            .get_imported_dj_playlist(&first.playlist_id)
+            .unwrap()
+            .unwrap()
+            .tracks,
+        source.tracks
+    );
+    assert_eq!(
+        library
+            .get_imported_dj_playlist(&second.playlist_id)
+            .unwrap()
+            .unwrap()
+            .tracks,
+        source.tracks
+    );
+}
+
+#[test]
+fn repeated_import_does_not_reclaim_the_first_version_conversion_batch() {
+    let directory = tempdir().unwrap();
+    let output_root = directory.path().join("outputs");
+    fs::create_dir_all(&output_root).unwrap();
+    let output = output_root.join("song.mp3");
+    fs::write(&output, b"audio").unwrap();
+    let mut library = W4djLibrary::open(&directory.path().join("w4dj.sqlite3")).unwrap();
+    library
+        .upsert_committed_output_in_root(
+            0,
+            &output_root,
+            None,
+            &output,
+            "Song",
+            "Artist",
+            &CommittedOutputFacts {
+                conversion_batch_id: Some("batch-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let source = test_playlist("source-export-id", "source-export-id", "Club Set");
+    let first = library
+        .insert_imported_dj_playlist_version(&source)
+        .unwrap();
+    let first_report = library
+        .compute_imported_dj_playlist_matches(&first.playlist_id)
+        .unwrap();
+    assert_eq!(
+        first_report.matches[0].kind,
+        DjPlaylistMatchKind::RecentBm25f
+    );
+
+    let second = library
+        .insert_imported_dj_playlist_version(&source)
+        .unwrap();
+    let second_report = library
+        .compute_imported_dj_playlist_matches(&second.playlist_id)
+        .unwrap();
+    assert_eq!(
+        second_report.matches[0].kind,
+        DjPlaylistMatchKind::LibraryBm25f
+    );
+}
+
+#[test]
+fn legacy_imported_playlist_rows_backfill_source_identity_idempotently() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("legacy.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE imported_dj_playlists (
+                playlist_id TEXT PRIMARY KEY,
+                format_version INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                output_mode TEXT,
+                scenario TEXT,
+                target_region TEXT,
+                platform_priority_json TEXT NOT NULL,
+                source_path TEXT,
+                created_at TEXT,
+                imported_at_ms INTEGER NOT NULL,
+                warnings_json TEXT NOT NULL
+            );
+            INSERT INTO imported_dj_playlists(
+                playlist_id,format_version,name,platform_priority_json,
+                imported_at_ms,warnings_json
+            ) VALUES ('legacy-id',2,'Legacy Set','[]',123,'[]');",
+        )
+        .unwrap();
+    drop(connection);
+
+    let library = W4djLibrary::open(&database).unwrap();
+    let reopened = W4djLibrary::open(&database).unwrap();
+    let summary = library.list_imported_dj_playlists().unwrap().pop().unwrap();
+    let reopened_summary = reopened
+        .list_imported_dj_playlists()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(summary.playlist_id, "legacy-id");
+    assert_eq!(summary.source_export_id, "legacy-id");
+    assert_eq!(summary.import_version, 1);
+    assert_eq!(summary.display_name, "Legacy Set");
+    assert_eq!(reopened_summary, summary);
+}
 
 #[test]
 fn sqlite_snapshot_is_readable_and_contains_output_index() {
@@ -54,6 +223,8 @@ fn w4dj_output_and_playlist_rows_never_backfill_netease_identity() {
         .unwrap();
     let playlist = ImportedDjPlaylist {
         playlist_id: "playlist-backfill".to_string(),
+        source_export_id: "playlist-backfill".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "Backfill".to_string(),
         source_path: None,
@@ -251,6 +422,8 @@ fn reviewed_playlist_binding_survives_explicit_manifest_restore() {
 
     let playlist = ImportedDjPlaylist {
         playlist_id: "reviewed-playlist".to_string(),
+        source_export_id: "reviewed-playlist".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "Reviewed playlist".to_string(),
         source_path: None,
@@ -354,6 +527,8 @@ fn playlist_with_existing_and_new_outputs_matches_both_after_index_rebuild() {
 
     let playlist = ImportedDjPlaylist {
         playlist_id: "a-plus-b".to_string(),
+        source_export_id: "a-plus-b".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "A + B".to_string(),
         source_path: None,
@@ -448,6 +623,8 @@ fn playlist_claims_the_latest_unclaimed_committed_batch() {
         .unwrap();
     let playlist = ImportedDjPlaylist {
         playlist_id: "playlist-a".to_string(),
+        source_export_id: "playlist-a".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "Playlist A".to_string(),
         source_path: None,
@@ -479,6 +656,7 @@ fn playlist_claims_the_latest_unclaimed_committed_batch() {
 
     let mut second_playlist = playlist.clone();
     second_playlist.playlist_id = "playlist-b".to_string();
+    second_playlist.source_export_id = "playlist-b".to_string();
     library
         .upsert_imported_dj_playlist(&second_playlist)
         .unwrap();
@@ -506,6 +684,8 @@ fn changing_a_manual_file_keeps_the_new_binding_exportable() {
         .unwrap();
     let playlist = ImportedDjPlaylist {
         playlist_id: "manual-playlist".to_string(),
+        source_export_id: "manual-playlist".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "Manual playlist".to_string(),
         source_path: None,
@@ -557,6 +737,8 @@ fn excluding_playlist_rows_persists_only_in_the_export_review() {
     }
     let playlist = ImportedDjPlaylist {
         playlist_id: "excluded-playlist".to_string(),
+        source_export_id: "excluded-playlist".to_string(),
+        import_version: 1,
         format_version: 2,
         name: "Excluded playlist".to_string(),
         source_path: None,

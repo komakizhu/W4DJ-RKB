@@ -25,15 +25,17 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-pub const W4DJ_SCHEMA_VERSION: i64 = 4;
+pub const W4DJ_SCHEMA_VERSION: i64 = 5;
 pub const OUTPUT_IDENTITY_MANIFEST_FILE_NAME: &str = ".w4dj-output-identities.json";
 const OUTPUT_IDENTITY_MANIFEST_FORMAT: &str = "w4dj-output-identities";
 const OUTPUT_IDENTITY_MANIFEST_VERSION: u32 = 1;
 static OUTPUT_IDENTITY_MANIFEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static IMPORTED_DJ_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommittedOutputFacts {
@@ -371,6 +373,8 @@ impl W4djLibrary {
             );
             CREATE TABLE IF NOT EXISTS imported_dj_playlists (
                 playlist_id TEXT PRIMARY KEY,
+                source_export_id TEXT NOT NULL,
+                import_version INTEGER NOT NULL DEFAULT 1,
                 format_version INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 output_mode TEXT,
@@ -427,6 +431,7 @@ impl W4djLibrary {
                 ON imported_dj_playlist_matches(playlist_id, position);
             "#,
         )?;
+        self.migrate_imported_dj_playlist_identity()?;
         self.ensure_committed_output_columns()?;
         // Add the v4 nullable facts before any legacy table rebuild so the
         // migration can copy them forward instead of silently dropping them.
@@ -521,6 +526,50 @@ impl W4djLibrary {
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [W4DJ_SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    fn migrate_imported_dj_playlist_identity(&mut self) -> W4djResult<()> {
+        let transaction = self.catalog.connection_mut().transaction()?;
+        let source_export_id_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlists') WHERE name='source_export_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !source_export_id_exists {
+            transaction.execute(
+                "ALTER TABLE imported_dj_playlists ADD COLUMN source_export_id TEXT",
+                [],
+            )?;
+        }
+        let import_version_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('imported_dj_playlists') WHERE name='import_version')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !import_version_exists {
+            transaction.execute(
+                "ALTER TABLE imported_dj_playlists ADD COLUMN import_version INTEGER",
+                [],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE imported_dj_playlists
+             SET source_export_id=playlist_id
+             WHERE source_export_id IS NULL OR TRIM(source_export_id)=''",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE imported_dj_playlists
+             SET import_version=1
+             WHERE import_version IS NULL OR import_version<1",
+            [],
+        )?;
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS imported_dj_playlists_source_version
+                ON imported_dj_playlists(source_export_id, import_version);",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -619,99 +668,55 @@ impl W4djLibrary {
         Ok(())
     }
 
-    pub fn upsert_imported_dj_playlist(&mut self, playlist: &ImportedDjPlaylist) -> W4djResult<()> {
-        if playlist.playlist_id.trim().is_empty() || playlist.name.trim().is_empty() {
-            return Err(W4djLibraryError::Invalid(
-                "DJ 歌单 ID 和名称不能为空".to_string(),
-            ));
-        }
-        let warnings_json = serde_json::to_string(&playlist.warnings)
-            .map_err(|error| W4djLibraryError::Invalid(format!("序列化导入警告失败：{error}")))?;
+    /// Store one imported file as a new immutable playlist instance.
+    ///
+    /// The source export id is deliberately not used as the primary key:
+    /// importing the same file again must retain both versions and their
+    /// mutable matching/review state independently.
+    pub fn insert_imported_dj_playlist_version(
+        &mut self,
+        playlist: &ImportedDjPlaylist,
+    ) -> W4djResult<ImportedDjPlaylist> {
+        validate_imported_dj_playlist(playlist)?;
+        let source_export_id = source_export_id_for(playlist);
         let imported_at_ms = playlist.imported_at_ms.unwrap_or_else(now_ms);
-        let source_path = playlist
-            .source_path
-            .as_ref()
-            .map(|path| normalize_path(path));
         let transaction = self.catalog.connection_mut().transaction()?;
-        transaction.execute(
-            "INSERT INTO imported_dj_playlists(
-                playlist_id,format_version,name,output_mode,scenario,target_region,
-                platform_priority_json,source_path,created_at,imported_at_ms,warnings_json
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,?10)
-             ON CONFLICT(playlist_id) DO UPDATE SET
-                format_version=excluded.format_version,
-                name=excluded.name,
-                output_mode=excluded.output_mode,
-                scenario=excluded.scenario,
-                target_region=excluded.target_region,
-                platform_priority_json=excluded.platform_priority_json,
-                source_path=excluded.source_path,
-                imported_at_ms=excluded.imported_at_ms,
-                warnings_json=excluded.warnings_json",
-            params![
-                playlist.playlist_id,
-                playlist.format_version,
-                playlist.name,
-                Option::<String>::None,
-                Option::<String>::None,
-                Option::<String>::None,
-                "[]",
-                source_path,
-                imported_at_ms,
-                warnings_json,
-            ],
+        let import_version: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(import_version), 0) + 1
+             FROM imported_dj_playlists WHERE source_export_id=?1",
+            [&source_export_id],
+            |row| row.get(0),
         )?;
-        transaction.execute(
-            "DELETE FROM imported_dj_playlist_matches WHERE playlist_id=?1",
-            [&playlist.playlist_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM imported_dj_playlist_tracks WHERE playlist_id=?1",
-            [&playlist.playlist_id],
-        )?;
-        for track in &playlist.tracks {
-            let artists_json =
-                serde_json::to_string(&[track.artist_display.as_str()]).map_err(|error| {
-                    W4djLibraryError::Invalid(format!("序列化歌手列表失败：{error}"))
-                })?;
-            let platform_refs_json = "[]";
-            // Older local database schemas made dedupe_key unique per playlist.
-            // Keep the normalized key in memory, but suffix the storage key by
-            // position so repeated positions remain representable without a
-            // destructive database migration.
-            let stored_dedupe_key = format!("{}:position:{}", track.dedupe_key, track.position);
-            transaction.execute(
-                "INSERT INTO imported_dj_playlist_tracks(
-                    playlist_id,position,record_id,title,artist_display,artists_json,
-                    album_or_ep,duration_seconds,bpm,musical_key,platform_refs_json,
-                    dedupe_key,expected_filename_hint,netease_track_id,netease_import_line
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                params![
-                    playlist.playlist_id,
-                    track.position,
-                    Option::<String>::None,
-                    track.title,
-                    track.artist_display,
-                    artists_json,
-                    Option::<String>::None,
-                    Option::<u64>::None,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    platform_refs_json,
-                    stored_dedupe_key,
-                    Option::<String>::None,
-                    Option::<String>::None,
-                    track.netease_import_line,
-                ],
-            )?;
+        let playlist_id = next_imported_dj_playlist_id(&transaction, imported_at_ms)?;
+        let mut stored = playlist.clone();
+        stored.playlist_id = playlist_id;
+        stored.source_export_id = source_export_id;
+        stored.import_version = import_version;
+        stored.imported_at_ms = Some(imported_at_ms);
+        write_imported_dj_playlist(&transaction, &stored)?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    /// Update one already-created internal playlist instance. Real file
+    /// imports must use insert_imported_dj_playlist_version so they cannot
+    /// overwrite an earlier history entry.
+    pub fn upsert_imported_dj_playlist(&mut self, playlist: &ImportedDjPlaylist) -> W4djResult<()> {
+        validate_imported_dj_playlist(playlist)?;
+        let mut stored = playlist.clone();
+        stored.source_export_id = source_export_id_for(playlist);
+        if stored.import_version < 1 {
+            stored.import_version = 1;
         }
+        let transaction = self.catalog.connection_mut().transaction()?;
+        write_imported_dj_playlist(&transaction, &stored)?;
         transaction.commit()?;
         Ok(())
     }
 
     pub fn list_imported_dj_playlists(&self) -> W4djResult<Vec<ImportedDjPlaylistSummary>> {
         let mut statement = self.catalog.connection().prepare(
-            "SELECT p.playlist_id,p.name,COUNT(t.position),
+            "SELECT p.playlist_id,p.name,p.source_export_id,p.import_version,COUNT(t.position),
                     json_array_length(p.warnings_json),p.imported_at_ms,p.source_path
              FROM imported_dj_playlists p
              LEFT JOIN imported_dj_playlist_tracks t ON t.playlist_id=p.playlist_id
@@ -719,13 +724,18 @@ impl W4djLibrary {
              ORDER BY p.imported_at_ms DESC, p.playlist_id ASC",
         )?;
         let rows = statement.query_map([], |row| {
+            let name: String = row.get(1)?;
+            let import_version: i64 = row.get(3)?;
             Ok(ImportedDjPlaylistSummary {
                 playlist_id: row.get(0)?,
-                name: row.get(1)?,
-                track_count: row.get::<_, i64>(2)?.max(0) as usize,
-                warning_count: row.get::<_, i64>(3)?.max(0) as usize,
-                imported_at_ms: row.get(4)?,
-                source_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                name: name.clone(),
+                display_name: history_display_name(&name, import_version),
+                source_export_id: row.get(2)?,
+                import_version,
+                track_count: row.get::<_, i64>(4)?.max(0) as usize,
+                warning_count: row.get::<_, i64>(5)?.max(0) as usize,
+                imported_at_ms: row.get(6)?,
+                source_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -735,20 +745,31 @@ impl W4djLibrary {
         &self,
         playlist_id: &str,
     ) -> W4djResult<Option<ImportedDjPlaylist>> {
-        let Some((format_version, name, source_path, imported_at_ms, warnings_json)) = self
+        let Some((
+            source_export_id,
+            import_version,
+            format_version,
+            name,
+            source_path,
+            imported_at_ms,
+            warnings_json,
+        )) = self
             .catalog
             .connection()
             .query_row(
-                "SELECT format_version,name,source_path,imported_at_ms,warnings_json
+                "SELECT source_export_id,import_version,format_version,name,source_path,
+                        imported_at_ms,warnings_json
              FROM imported_dj_playlists WHERE playlist_id=?1",
                 [playlist_id],
                 |row| {
                     Ok((
-                        row.get::<_, u32>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
@@ -776,6 +797,8 @@ impl W4djLibrary {
             .map_err(|error| W4djLibraryError::Invalid(format!("读取导入警告失败：{error}")))?;
         Ok(Some(ImportedDjPlaylist {
             playlist_id: playlist_id.to_string(),
+            source_export_id,
+            import_version,
             format_version,
             name,
             source_path: source_path.map(PathBuf::from),
@@ -922,18 +945,25 @@ impl W4djLibrary {
             .get_imported_dj_playlist(playlist_id)?
             .ok_or_else(|| W4djLibraryError::Invalid("未找到指定 DJ 歌单".to_string()))?;
         let candidates = self.available_dj_output_candidates()?;
-        let recent = self
-            .claim_latest_conversion_batch(playlist_id)?
-            .map(|batch_id| {
-                candidates
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.conversion_batch_id.as_deref() == Some(batch_id.as_str())
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let recent = if playlist.import_version > 1 {
+            // A repeated import is a new history instance, but it must not
+            // claim the conversion batch already assigned to the first
+            // instance. It can still match every available output through
+            // the ordinary library candidate set below.
+            Vec::new()
+        } else {
+            self.claim_latest_conversion_batch(playlist_id)?
+                .map(|batch_id| {
+                    candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.conversion_batch_id.as_deref() == Some(batch_id.as_str())
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
         Ok(match_imported_playlist_with_priority(
             &playlist,
             &recent,
@@ -3921,6 +3951,148 @@ fn invalidate_analysis_projection(
         params![now, track_key],
     )?;
     Ok(())
+}
+
+fn validate_imported_dj_playlist(playlist: &ImportedDjPlaylist) -> W4djResult<()> {
+    if playlist.playlist_id.trim().is_empty() || playlist.name.trim().is_empty() {
+        return Err(W4djLibraryError::Invalid(
+            "DJ 歌单 ID 和名称不能为空".to_string(),
+        ));
+    }
+    if source_export_id_for(playlist).trim().is_empty() {
+        return Err(W4djLibraryError::Invalid(
+            "DJ 歌单原始 export_id 不能为空".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn source_export_id_for(playlist: &ImportedDjPlaylist) -> String {
+    if playlist.source_export_id.trim().is_empty() {
+        playlist.playlist_id.clone()
+    } else {
+        playlist.source_export_id.clone()
+    }
+}
+
+fn write_imported_dj_playlist(
+    transaction: &rusqlite::Transaction<'_>,
+    playlist: &ImportedDjPlaylist,
+) -> W4djResult<()> {
+    let warnings_json = serde_json::to_string(&playlist.warnings)
+        .map_err(|error| W4djLibraryError::Invalid(format!("序列化导入警告失败：{error}")))?;
+    let imported_at_ms = playlist.imported_at_ms.unwrap_or_else(now_ms);
+    let source_path = playlist
+        .source_path
+        .as_ref()
+        .map(|path| normalize_path(path));
+    let source_export_id = source_export_id_for(playlist);
+    let import_version = playlist.import_version.max(1);
+    transaction.execute(
+        "INSERT INTO imported_dj_playlists(
+            playlist_id,source_export_id,import_version,format_version,name,
+            output_mode,scenario,target_region,platform_priority_json,source_path,
+            created_at,imported_at_ms,warnings_json
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL,?11,?12)
+         ON CONFLICT(playlist_id) DO UPDATE SET
+            source_export_id=excluded.source_export_id,
+            import_version=excluded.import_version,
+            format_version=excluded.format_version,
+            name=excluded.name,
+            output_mode=excluded.output_mode,
+            scenario=excluded.scenario,
+            target_region=excluded.target_region,
+            platform_priority_json=excluded.platform_priority_json,
+            source_path=excluded.source_path,
+            imported_at_ms=excluded.imported_at_ms,
+            warnings_json=excluded.warnings_json",
+        params![
+            playlist.playlist_id,
+            source_export_id,
+            import_version,
+            playlist.format_version,
+            playlist.name,
+            Option::<String>::None,
+            Option::<String>::None,
+            Option::<String>::None,
+            "[]",
+            source_path,
+            imported_at_ms,
+            warnings_json,
+        ],
+    )?;
+    transaction.execute(
+        "DELETE FROM imported_dj_playlist_matches WHERE playlist_id=?1",
+        [&playlist.playlist_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM imported_dj_playlist_tracks WHERE playlist_id=?1",
+        [&playlist.playlist_id],
+    )?;
+    for track in &playlist.tracks {
+        let artists_json = serde_json::to_string(&[track.artist_display.as_str()])
+            .map_err(|error| W4djLibraryError::Invalid(format!("序列化歌手列表失败：{error}")))?;
+        let platform_refs_json = "[]";
+        // Older local database schemas made dedupe_key unique per playlist.
+        // Keep the normalized key in memory, but suffix the storage key by
+        // position so repeated positions remain representable without a
+        // destructive database migration.
+        let stored_dedupe_key = format!("{}:position:{}", track.dedupe_key, track.position);
+        transaction.execute(
+            "INSERT INTO imported_dj_playlist_tracks(
+                playlist_id,position,record_id,title,artist_display,artists_json,
+                album_or_ep,duration_seconds,bpm,musical_key,platform_refs_json,
+                dedupe_key,expected_filename_hint,netease_track_id,netease_import_line
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                playlist.playlist_id,
+                track.position,
+                Option::<String>::None,
+                track.title,
+                track.artist_display,
+                artists_json,
+                Option::<String>::None,
+                Option::<u64>::None,
+                Option::<String>::None,
+                Option::<String>::None,
+                platform_refs_json,
+                stored_dedupe_key,
+                Option::<String>::None,
+                Option::<String>::None,
+                track.netease_import_line,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn next_imported_dj_playlist_id(
+    transaction: &rusqlite::Transaction<'_>,
+    imported_at_ms: i64,
+) -> W4djResult<String> {
+    let seed = IMPORTED_DJ_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    for offset in 0..10_000_u64 {
+        let candidate = format!("w4dj-import-{imported_at_ms}-{}", seed + offset);
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM imported_dj_playlists WHERE playlist_id=?1)",
+            [&candidate],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+    Err(W4djLibraryError::Invalid(
+        "无法生成唯一的 DJ 歌单内部 ID".to_string(),
+    ))
+}
+
+fn history_display_name(name: &str, import_version: i64) -> String {
+    if import_version > 1 {
+        format!("{name}（{import_version}）")
+    } else {
+        name.to_string()
+    }
 }
 
 fn now_ms() -> i64 {

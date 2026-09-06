@@ -44,7 +44,15 @@ pub struct ImportedDjPlaylistTrack {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedDjPlaylist {
+    /// Internal identity of this imported playlist instance. A repeated
+    /// import receives a new value; it is never written back to the v2 wire
+    /// format as the source playlist identity.
     pub playlist_id: String,
+    /// The original v2 playlist-level export_id. This is intentionally
+    /// separate from track-level NetEase IDs and is used only when exporting
+    /// the playlist file again.
+    pub source_export_id: String,
+    pub import_version: i64,
     pub format_version: u32,
     pub name: String,
     pub source_path: Option<PathBuf>,
@@ -58,6 +66,9 @@ pub struct ImportedDjPlaylist {
 pub struct ImportedDjPlaylistSummary {
     pub playlist_id: String,
     pub name: String,
+    pub display_name: String,
+    pub source_export_id: String,
+    pub import_version: i64,
     pub track_count: usize,
     pub warning_count: usize,
     pub imported_at_ms: i64,
@@ -194,7 +205,9 @@ pub fn parse_w4dj_playlist(
     normalized.sort_by_key(|track| track.position);
 
     Ok(ImportedDjPlaylist {
-        playlist_id,
+        playlist_id: playlist_id.clone(),
+        source_export_id: playlist_id,
+        import_version: 1,
         format_version: W4DJ_PLAYLIST_FORMAT_VERSION,
         name,
         source_path: source_path.map(Path::to_path_buf),
@@ -231,7 +244,12 @@ struct MinimalW4djTrack {
 }
 
 pub fn serialize_w4dj_playlist(playlist: &ImportedDjPlaylist) -> Result<Vec<u8>, DjPlaylistError> {
-    if playlist.playlist_id.trim().is_empty() || playlist.name.trim().is_empty() {
+    let export_id = if playlist.source_export_id.trim().is_empty() {
+        playlist.playlist_id.clone()
+    } else {
+        playlist.source_export_id.clone()
+    };
+    if export_id.trim().is_empty() || playlist.name.trim().is_empty() {
         return Err(DjPlaylistError::InvalidField(
             "export_id 和 playlist.name 不能为空".to_string(),
         ));
@@ -242,7 +260,7 @@ pub fn serialize_w4dj_playlist(playlist: &ImportedDjPlaylist) -> Result<Vec<u8>,
     let export = MinimalW4djExport {
         format: W4DJ_PLAYLIST_FORMAT,
         format_version: W4DJ_PLAYLIST_FORMAT_VERSION,
-        export_id: playlist.playlist_id.clone(),
+        export_id,
         playlist: MinimalW4djPlaylist {
             name: playlist.name.clone(),
         },

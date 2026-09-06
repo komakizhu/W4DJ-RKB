@@ -408,6 +408,7 @@ export type DjPlaylistUiState = {
   visible: boolean;
   launcher?: boolean;
   exportPicker?: boolean;
+  historyAction?: 'm3u8' | 'qr' | 'w4dj';
   exportChoice?: boolean;
   recentPlaylists?: ImportedDjPlaylistSummary[];
   busy: boolean;
@@ -988,6 +989,10 @@ const translations = {
     djPlaylistImportButton: '导入.w4dj',
     djPlaylistExportButton: '导出播放列表',
     djPlaylistChooseRecent: '选择最近歌单',
+    djPlaylistHistoryQr: '历史二维码',
+    djPlaylistHistoryW4dj: '导出历史 W4DJ',
+    djPlaylistDropOpen: '将 .w4dj 文件拖入，或点击打开',
+    djPlaylistNoRecent: '暂无历史歌单',
     djPlaylistCopyAudioTitle: '是否复制歌单中的音频？',
     djPlaylistCopyAudio: '是，复制音频并导出',
     djPlaylistCopyAudioPartial: '是，复制已匹配音频并导出',
@@ -1269,6 +1274,10 @@ const translations = {
     djPlaylistImportButton: 'Import .w4dj',
     djPlaylistExportButton: 'Export playlist',
     djPlaylistChooseRecent: 'Choose a recent playlist',
+    djPlaylistHistoryQr: 'Historical QR',
+    djPlaylistHistoryW4dj: 'Export historical W4DJ',
+    djPlaylistDropOpen: 'Drop a .w4dj file here, or click to open',
+    djPlaylistNoRecent: 'No historical playlists yet',
     djPlaylistCopyAudioTitle: 'Copy audio files with the playlist?',
     djPlaylistCopyAudio: 'Yes, copy audio and export',
     djPlaylistCopyAudioPartial: 'Yes, copy matched audio and export',
@@ -2471,14 +2480,24 @@ function renderDjPlaylistModal(
   if (!state.visible) return overlay;
   if (state.exportPicker) {
     const recent = state.recentPlaylists || [];
+    const historyAction = state.historyAction || 'm3u8';
+    const pickerTitle = historyAction === 'qr'
+      ? t('djPlaylistHistoryQr', lang)
+      : historyAction === 'w4dj'
+        ? t('djPlaylistHistoryW4dj', lang)
+        : t('djPlaylistChooseRecent', lang);
     return `${overlay}
-      <div class="dj-playlist-modal" data-role="dj-playlist-export-picker" role="dialog" aria-modal="true" aria-label="${t('djPlaylistChooseRecent', lang)}">
+      <div class="dj-playlist-modal" data-role="dj-playlist-export-picker" role="dialog" aria-modal="true" aria-label="${pickerTitle}">
         <div class="dj-playlist-dialog dj-playlist-export-picker-dialog">
           <header class="dj-playlist-head">
-            <div><p class="panel-kicker">${escapedProductName}</p><h2>${t('djPlaylistChooseRecent', lang)}</h2></div>
+            <div><p class="panel-kicker">${escapedProductName}</p><h2>${pickerTitle}</h2></div>
             <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
           </header>
-          <div class="dj-playlist-recent-list">${recent.map((summary) => `<button type="button" class="dj-playlist-recent-item" data-action="dj-playlist-select-recent" data-playlist-id="${escapeHtml(summary.playlistId)}"><strong>${escapeHtml(summary.name)}</strong><span>${summary.trackCount} ${t('djPlaylistTracks', lang)}</span></button>`).join('')}</div>
+          ${state.error ? `<p class="library-error" role="alert">${escapeHtml(state.error)}</p>` : ''}
+          ${state.notice ? `<p class="dj-playlist-notice" role="status">${escapeHtml(state.notice)}</p>` : ''}
+          <div class="dj-playlist-recent-list">${recent.length > 0
+            ? recent.map((summary) => `<button type="button" class="dj-playlist-recent-item" data-action="dj-playlist-select-recent" data-playlist-id="${escapeHtml(summary.playlistId)}"><strong>${escapeHtml(summary.displayName || summary.name)}</strong><span>${summary.trackCount} ${t('djPlaylistTracks', lang)}</span></button>`).join('')
+            : `<p class="dj-playlist-empty">${t('djPlaylistNoRecent', lang)}</p>`}</div>
         </div>
       </div>`;
   }
@@ -2507,13 +2526,22 @@ function renderDjPlaylistModal(
         <div class="dj-playlist-dialog dj-playlist-launcher-dialog">
           <header class="dj-playlist-head">
             <div><p class="panel-kicker">${escapedProductName}</p><h2>${t('djPlaylistDialogTitle', lang)}</h2></div>
-            <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
+            <div class="dj-playlist-head-actions">
+              <button type="button" class="secondary-action" data-action="dj-playlist-open-history" data-history-action="qr">${t('djPlaylistHistoryQr', lang)}</button>
+              <button type="button" class="secondary-action" data-action="dj-playlist-open-history" data-history-action="w4dj">${t('djPlaylistHistoryW4dj', lang)}</button>
+              <button type="button" class="secondary-action" data-action="close-dj-playlist">${t('djPlaylistClose', lang)}</button>
+            </div>
           </header>
           <p class="dj-playlist-launcher-source">${t('djPlaylistSource', lang)} <a href="https://github.com/komakizhu/dj-crate-digger-skill" data-action="open-dj-crate-digger-link" target="_blank" rel="noreferrer">${t('djPlaylistSourceLink', lang)}</a></p>
+          <button type="button" class="dj-playlist-dropzone" data-action="dj-playlist-open-import" aria-label="${escapeHtml(t('djPlaylistDropOpen', lang))}">
+            <span class="panel-kicker">W4DJ</span>
+            <strong>${t('djPlaylistDropOpen', lang)}</strong>
+          </button>
           <div class="dj-playlist-launcher-actions">
-            <button type="button" class="global-action dj-playlist-launcher-button" data-action="dj-playlist-open-import">${t('djPlaylistImportButton', lang)}</button>
             <button type="button" class="global-action dj-playlist-launcher-button" data-action="dj-playlist-open-export">${t('djPlaylistExportButton', lang)}</button>
           </div>
+          ${state.error ? `<p class="library-error" role="alert">${escapeHtml(state.error)}</p>` : ''}
+          ${state.notice ? `<p class="dj-playlist-notice" role="status">${escapeHtml(state.notice)}</p>` : ''}
           <p class="dj-playlist-launcher-instructions">${escapeHtml(t('djPlaylistInstructions', lang))}</p>
         </div>
       </div>`;
@@ -3265,6 +3293,41 @@ export function bindApp(
     historyDetails?.querySelector('summary')?.addEventListener('click', () => {
       historyExpanded = !historyDetails.open;
     });
+  };
+
+  const createDjPlaylistState = (overrides: Partial<DjPlaylistUiState> = {}): DjPlaylistUiState => ({
+    visible: true,
+    launcher: false,
+    exportPicker: false,
+    exportChoice: false,
+    busy: false,
+    error: null,
+    notice: null,
+    playlist: null,
+    pages: [],
+    pageIndex: 0,
+    qrDataUrl: null,
+    qrDataUrls: [],
+    qrRevision: 0,
+    matchBusy: false,
+    matchReport: null,
+    selectedPositions: [],
+    exportBusy: false,
+    dropActive: false,
+    ...overrides,
+  });
+
+  const renderDjPlaylistState = () => {
+    const currentModal = root.querySelector<HTMLElement>('.dj-playlist-modal');
+    const markup = renderDjPlaylistModal(djPlaylistState, state.lang, productName);
+    const template = document.createElement('template');
+    template.innerHTML = markup.trim();
+    const nextModal = template.content.querySelector<HTMLElement>('.dj-playlist-modal');
+    if (currentModal && nextModal) {
+      currentModal.replaceWith(nextModal);
+      return;
+    }
+    render();
   };
 
   const updateNeteaseSituationDom = (): boolean => {
@@ -4734,62 +4797,37 @@ export function bindApp(
       qrDataUrl: null,
       qrDataUrls: current.pages.map(() => null),
     };
-    render();
+    renderDjPlaylistState();
     try {
       const qrDataUrls = await renderDjPlaylistQrPages(current.pages);
       if (djPlaylistState?.visible && djPlaylistState.qrRevision === revision) {
         djPlaylistState = { ...djPlaylistState, qrDataUrls };
-        render();
+        renderDjPlaylistState();
       }
     } catch (error) {
       if (djPlaylistState?.visible && djPlaylistState.qrRevision === revision) {
         djPlaylistState = { ...djPlaylistState, error: error instanceof Error ? error.message : String(error) };
-        render();
+        renderDjPlaylistState();
       }
     }
   };
 
   const showDjPlaylist = (playlist: ImportedDjPlaylist, report: DjPlaylistMatchReport | null = null) => {
     const pages = splitNeteaseQrPages(playlist.tracks);
-    djPlaylistState = {
-      visible: true,
+    djPlaylistState = createDjPlaylistState({
       launcher: false,
-      busy: false,
-      error: null,
-      notice: null,
       playlist,
       pages,
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
       matchReport: report,
-      selectedPositions: [],
-      exportBusy: false,
-      dropActive: false,
-    };
-    render();
+    });
+    renderDjPlaylistState();
     void refreshDjPlaylistQrs();
   };
 
   const openDjPlaylistLauncher = () => {
-    djPlaylistState = {
-      visible: true,
+    djPlaylistState = createDjPlaylistState({
       launcher: true,
-      busy: false,
-      error: null,
-      notice: null,
-      playlist: null,
-      pages: [],
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: null,
-      selectedPositions: [],
-      exportBusy: false,
-      dropActive: false,
-    };
+    });
     render();
   };
 
@@ -4797,39 +4835,78 @@ export function bindApp(
     if (!services.listImportedDjPlaylists) return;
     try {
       importedDjPlaylistSummaries = await services.listImportedDjPlaylists();
-      render();
+      if (djPlaylistState?.visible) renderDjPlaylistState();
     } catch (error) {
       console.warn('Failed to load imported DJ playlists:', error);
     }
   };
 
-  const importDjPlaylistPath = async (path: string) => {
-    if (!services.importW4djPlaylist) return;
+  const openDjPlaylistHistory = async (historyAction: 'm3u8' | 'qr' | 'w4dj') => {
+    if (services.listImportedDjPlaylists) {
+      try {
+        importedDjPlaylistSummaries = await services.listImportedDjPlaylists();
+      } catch (error) {
+        djPlaylistState = {
+          ...(djPlaylistState || createDjPlaylistState()),
+          visible: true,
+          launcher: true,
+          exportPicker: false,
+          exportChoice: false,
+          historyAction,
+          error: error instanceof Error ? error.message : String(error),
+          notice: null,
+        };
+        renderDjPlaylistState();
+        return;
+      }
+    }
+    if (importedDjPlaylistSummaries.length === 0) {
+      djPlaylistState = {
+        ...(djPlaylistState || createDjPlaylistState()),
+        visible: true,
+        launcher: true,
+        exportPicker: false,
+        exportChoice: false,
+        historyAction,
+        error: null,
+        notice: state.lang === 'zh' ? '请先导入 .w4dj 歌单。' : 'Import a .w4dj playlist first.',
+      };
+      renderDjPlaylistState();
+      return;
+    }
     djPlaylistState = {
+      ...(djPlaylistState || createDjPlaylistState()),
       visible: true,
       launcher: false,
-      busy: true,
+      exportPicker: true,
+      exportChoice: false,
+      historyAction,
+      recentPlaylists: importedDjPlaylistSummaries,
+      busy: false,
       error: null,
       notice: null,
       playlist: null,
       pages: [],
-      pageIndex: 0,
       qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: null,
-      selectedPositions: [],
-      exportBusy: false,
-      dropActive: false,
+      qrDataUrls: [],
     };
-    render();
+    renderDjPlaylistState();
+  };
+
+  const importDjPlaylistPath = async (path: string) => {
+    if (!services.importW4djPlaylist) return;
+    djPlaylistState = createDjPlaylistState({
+      launcher: false,
+      busy: true,
+    });
+    renderDjPlaylistState();
     try {
       const playlist = await services.importW4djPlaylist(path);
       showDjPlaylist(playlist);
       void loadImportedDjPlaylistList();
     } catch (error) {
       djPlaylistState = { ...djPlaylistState!, busy: false, error: error instanceof Error ? error.message : String(error) };
-      render();
+      renderDjPlaylistState();
     }
   };
 
@@ -4844,75 +4921,15 @@ export function bindApp(
   };
 
   const openDjPlaylistExport = async () => {
-    if (importedDjPlaylistSummaries.length === 0) {
-      djPlaylistState = {
-        ...(djPlaylistState || {
-          visible: true,
-          busy: false,
-          error: null,
-          notice: null,
-          playlist: null,
-          pages: [],
-          pageIndex: 0,
-          qrDataUrl: null,
-          qrRevision: 0,
-          matchBusy: false,
-          matchReport: null,
-          selectedPositions: [],
-          exportBusy: false,
-          dropActive: false,
-        }),
-        visible: true,
-        launcher: true,
-        exportPicker: false,
-        exportChoice: false,
-        notice: state.lang === 'zh' ? '请先导入 .w4dj 歌单。' : 'Import a .w4dj playlist first.',
-      };
-      render();
-      return;
-    }
-    djPlaylistState = {
-      visible: true,
-      launcher: false,
-      exportPicker: true,
-      exportChoice: false,
-      recentPlaylists: importedDjPlaylistSummaries,
-      busy: false,
-      error: null,
-      notice: null,
-      playlist: null,
-      pages: [],
-      pageIndex: 0,
-      qrDataUrl: null,
-      qrRevision: 0,
-      matchBusy: false,
-      matchReport: null,
-      selectedPositions: [],
-      exportBusy: false,
-      dropActive: false,
-    };
-    render();
+    await openDjPlaylistHistory('m3u8');
   };
 
   const selectRecentDjPlaylistForExport = async (playlistId: string) => {
-    if (!services.loadImportedDjPlaylist || !services.matchImportedDjPlaylist) return;
+    if (!services.loadImportedDjPlaylist) return;
+    const historyAction = djPlaylistState?.historyAction || 'm3u8';
+    const summary = importedDjPlaylistSummaries.find((item) => item.playlistId === playlistId);
     djPlaylistState = {
-      ...(djPlaylistState || {
-        visible: true,
-        busy: false,
-        error: null,
-        notice: null,
-        playlist: null,
-        pages: [],
-        pageIndex: 0,
-        qrDataUrl: null,
-        qrRevision: 0,
-        matchBusy: false,
-        matchReport: null,
-        selectedPositions: [],
-        exportBusy: false,
-        dropActive: false,
-      }),
+      ...(djPlaylistState || createDjPlaylistState()),
       visible: true,
       launcher: false,
       exportPicker: false,
@@ -4923,9 +4940,45 @@ export function bindApp(
       pages: [],
       qrDataUrls: [],
     };
-    render();
+    renderDjPlaylistState();
     try {
       const playlist = await services.loadImportedDjPlaylist(playlistId);
+      if (historyAction === 'qr') {
+        showDjPlaylist(playlist);
+        return;
+      }
+      if (historyAction === 'w4dj') {
+        if (!services.exportImportedDjPlaylistW4dj) {
+          throw new Error(state.lang === 'zh' ? '当前环境不支持历史 W4DJ 导出。' : 'Historical W4DJ export is unavailable.');
+        }
+        const saveFile = services.saveFile ?? ((options: SaveFileOptions) => save(options));
+        const path = await saveFile({
+          defaultPath: sanitizedDjPlaylistName(summary?.displayName || playlist.name, 'w4dj'),
+          title: state.lang === 'zh' ? '导出历史 W4DJ' : 'Export historical W4DJ',
+        });
+        if (typeof path !== 'string') {
+          djPlaylistState = {
+            ...djPlaylistState!,
+            busy: false,
+            exportPicker: true,
+            notice: null,
+          };
+          renderDjPlaylistState();
+          return;
+        }
+        await services.exportImportedDjPlaylistW4dj(playlist.playlistId, path);
+        djPlaylistState = {
+          ...djPlaylistState!,
+          busy: false,
+          exportPicker: true,
+          notice: state.lang === 'zh' ? `已导出：${path}` : `Exported: ${path}`,
+        };
+        renderDjPlaylistState();
+        return;
+      }
+      if (!services.matchImportedDjPlaylist) {
+        throw new Error(state.lang === 'zh' ? '当前环境不支持歌单匹配。' : 'Playlist matching is unavailable.');
+      }
       const report = await services.matchImportedDjPlaylist(playlistId);
       if (report.total === 0) {
         throw new Error('歌单没有歌曲，无法导出 M3U8');
@@ -4941,14 +4994,17 @@ export function bindApp(
         qrDataUrl: null,
         qrDataUrls: [],
       };
-      render();
+      renderDjPlaylistState();
     } catch (error) {
       djPlaylistState = {
         ...djPlaylistState!,
         busy: false,
+        exportPicker: historyAction !== 'm3u8',
+        historyAction,
+        recentPlaylists: importedDjPlaylistSummaries,
         error: error instanceof Error ? error.message : String(error),
       };
-      render();
+      renderDjPlaylistState();
     }
   };
 
@@ -6350,6 +6406,14 @@ export function bindApp(
       return;
     }
 
+    if (action === 'dj-playlist-open-history') {
+      const historyAction = button.dataset.historyAction;
+      if (historyAction === 'qr' || historyAction === 'w4dj') {
+        void openDjPlaylistHistory(historyAction);
+      }
+      return;
+    }
+
     if (action === 'open-latest-dj-playlist') {
       void openDjPlaylistExport();
       return;
@@ -7236,22 +7300,7 @@ export function bindApp(
     if (active) {
       djPlaylistState = djPlaylistState
         ? { ...djPlaylistState, dropActive: true }
-        : {
-          visible: false,
-          busy: false,
-          error: null,
-          notice: null,
-          playlist: null,
-          pages: [],
-          pageIndex: 0,
-          qrDataUrl: null,
-          qrRevision: 0,
-          matchBusy: false,
-          matchReport: null,
-          selectedPositions: [],
-          exportBusy: false,
-          dropActive: true,
-        };
+        : createDjPlaylistState({ visible: false, dropActive: true });
     } else if (djPlaylistState) {
       djPlaylistState = { ...djPlaylistState, dropActive: false };
     }
