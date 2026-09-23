@@ -57,6 +57,7 @@ pub struct NeteaseRecoveryDiagnostic {
     pub database_record_count: usize,
     pub matched: bool,
     pub match_method: Option<NeteaseRecordMatchMethod>,
+    pub source_table: Option<String>,
     pub track_id: Option<String>,
     pub album_id: Option<String>,
     pub cover_source: Option<NeteaseCoverSource>,
@@ -682,6 +683,7 @@ impl NeteaseMetadataResolver {
                     &[],
                     self.database_path.as_deref(),
                     self.database_loaded,
+                    self.locators.len(),
                 );
             };
             if let Some(database_path) = self.database_path.as_deref()
@@ -692,6 +694,7 @@ impl NeteaseMetadataResolver {
                     &[record],
                     self.database_path.as_deref(),
                     self.database_loaded,
+                    self.locators.len(),
                 );
             }
             return recover_with_records(
@@ -699,6 +702,7 @@ impl NeteaseMetadataResolver {
                 &[],
                 self.database_path.as_deref(),
                 self.database_loaded,
+                self.locators.len(),
             );
         }
         recover_with_records(
@@ -706,6 +710,7 @@ impl NeteaseMetadataResolver {
             &self.records,
             self.database_path.as_deref(),
             self.database_loaded,
+            self.records.len(),
         )
     }
 }
@@ -725,7 +730,14 @@ fn locator_match_identity(locator: &NeteaseTrackLocator) -> NeteaseTrackIdentity
 /// Recover local NetEase metadata without contacting the network.
 pub(crate) fn recover_local_metadata(source_path: &Path) -> Option<RecoveredMetadata> {
     let records = load_cached_records();
-    recover_with_records(source_path, &records, None, !records.is_empty()).metadata
+    recover_with_records(
+        source_path,
+        &records,
+        None,
+        !records.is_empty(),
+        records.len(),
+    )
+    .metadata
 }
 
 pub(crate) fn recover_local_metadata_with_resolver(
@@ -740,6 +752,7 @@ fn recover_with_records(
     records: &[NeteaseRecord],
     database_path: Option<&Path>,
     database_loaded: bool,
+    database_record_count: usize,
 ) -> MetadataRecovery {
     let match_result = choose_record_with_method(source_path, records);
     let (record, match_method, match_message) = match match_result {
@@ -756,9 +769,10 @@ fn recover_with_records(
     let mut diagnostic = NeteaseRecoveryDiagnostic {
         database_path: database_path.map(|path| path.display().to_string()),
         database_loaded,
-        database_record_count: records.len(),
+        database_record_count,
         matched: record.is_some(),
         match_method,
+        source_table: record.and_then(|record| non_empty_string(&record.source_table)),
         track_id: record.and_then(|record| non_empty_string(&record.track_id)),
         album_id: record.and_then(|record| non_empty_string(&record.album_id)),
         cover_source: embedded_cover
@@ -1318,15 +1332,31 @@ where
                 "path",
             ),
             select_expression(&available, &["dir", "parentdir"], "directory"),
-            select_expression(&available, &["file", "track", "relative_path"], "file_name"),
-            select_expression(&available, &["title", "name", "track_name"], "title"),
-            select_expression(&available, &["artist", "artist_name"], "artist"),
-            select_expression(&available, &["album", "album_name"], "album"),
-            select_expression(&available, &["filesize", "size"], "size_bytes"),
-            select_expression(&available, &["tid", "track_id", "id"], "track_id"),
             select_expression(
                 &available,
-                &["detail", "track", "source_text", "source_extra"],
+                &["file", "track", "relative_path", "newrelativepath"],
+                "file_name",
+            ),
+            select_expression(
+                &available,
+                &["title", "name", "track_name", "trackname"],
+                "title",
+            ),
+            select_expression(
+                &available,
+                &["artist", "artist_name", "artistname"],
+                "artist",
+            ),
+            select_expression(&available, &["album", "album_name", "albumname"], "album"),
+            select_expression(&available, &["filesize", "size"], "size_bytes"),
+            select_expression(
+                &available,
+                &["tid", "track_id", "trackid", "id"],
+                "track_id",
+            ),
+            select_expression(
+                &available,
+                &["detail", "track", "source_text", "source_extra", "jsonstr"],
                 "metadata_json",
             ),
         ]
@@ -1341,7 +1371,11 @@ where
             let raw_file_name = row_text(row, 3);
             let raw_json = row_text(row, 9);
             let json_metadata = track_json_metadata(&raw_json);
-            let path = combine_path(&path_value, &directory);
+            let path = if table.eq_ignore_ascii_case("offlineTrack") {
+                String::new()
+            } else {
+                combine_path(&path_value, &directory)
+            };
             let file_name = Path::new(&raw_file_name.replace('\\', "/"))
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -1354,15 +1388,32 @@ where
                         .map(str::to_string)
                 })
                 .unwrap_or_default();
-            let title = prefer_nonempty(row_text(row, 4), &json_metadata.title);
-            let artist = prefer_nonempty(row_text(row, 5), &json_metadata.artist);
-            let album = prefer_nonempty(row_text(row, 6), &json_metadata.album);
+            let modern_download = table.eq_ignore_ascii_case("offlineTrack");
+            let row_title = row_text(row, 4);
+            let row_artist = row_text(row, 5);
+            let row_album = row_text(row, 6);
+            let title = if modern_download {
+                prefer_nonempty(json_metadata.title.clone(), &row_title)
+            } else {
+                prefer_nonempty(row_title, &json_metadata.title)
+            };
+            let artist = if modern_download {
+                prefer_nonempty(json_metadata.artist.clone(), &row_artist)
+            } else {
+                prefer_nonempty(row_artist, &json_metadata.artist)
+            };
+            let album = if modern_download {
+                prefer_nonempty(json_metadata.album.clone(), &row_album)
+            } else {
+                prefer_nonempty(row_album, &json_metadata.album)
+            };
             let track_id = prefer_nonempty(row_text(row, 8), &json_metadata.track_id);
             // `web_track.track` is a JSON payload, not a filename. When the
             // database has no local path, retain the same conservative
             // title/artist key used by the full-record loader so the lazy
             // locator cache can match ordinary downloaded files.
-            let locator_file_name = if path.trim().is_empty()
+            let locator_file_name = if !table.eq_ignore_ascii_case("offlineTrack")
+                && path.trim().is_empty()
                 && !title.trim().is_empty()
                 && !artist.trim().is_empty()
             {
@@ -1413,16 +1464,28 @@ where
 #[allow(dead_code)]
 pub(crate) fn has_supported_netease_table(path: &Path) -> rusqlite::Result<bool> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    ["track", "web_offline_track", "web_cloud_track", "web_track"]
-        .iter()
-        .try_fold(false, |found, table| {
-            Ok(found || table_exists(&connection, table)?)
-        })
+    [
+        "offlineTrack",
+        "track",
+        "web_offline_track",
+        "web_cloud_track",
+        "web_track",
+    ]
+    .iter()
+    .try_fold(false, |found, table| {
+        Ok(found || table_exists(&connection, table)?)
+    })
 }
 
 fn supported_table_names(connection: &Connection) -> rusqlite::Result<Vec<&'static str>> {
     let mut tables = Vec::new();
-    for table in ["track", "web_offline_track", "web_cloud_track", "web_track"] {
+    for table in [
+        "offlineTrack",
+        "track",
+        "web_offline_track",
+        "web_cloud_track",
+        "web_track",
+    ] {
         if table_exists(connection, table)? {
             tables.push(table);
         }
@@ -1443,7 +1506,12 @@ fn merge_table_records(
     mut table_records: HashMap<&'static str, Vec<NeteaseRecord>>,
 ) -> Vec<NeteaseRecord> {
     let mut records = Vec::new();
-    for table in ["track", "web_offline_track", "web_cloud_track"] {
+    for table in [
+        "offlineTrack",
+        "track",
+        "web_offline_track",
+        "web_cloud_track",
+    ] {
         if let Some(mut loaded) = table_records.remove(table) {
             records.append(&mut loaded);
         }
@@ -1488,7 +1556,7 @@ where
     let select = record_select_sql(&available);
     let sql = format!("SELECT {select} FROM \"{table}\" LIMIT 200000");
     let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map([], record_from_row)?;
+    let rows = statement.query_map([], |row| record_from_row(row, table))?;
     let mut processed = 0usize;
     let mut records = Vec::new();
     for row in rows {
@@ -1496,10 +1564,9 @@ where
         if processed == total || processed.is_multiple_of(128) {
             observe(processed, total);
         }
-        let Ok(mut record) = row else {
+        let Ok(record) = row else {
             continue;
         };
-        record.source_table = table.to_string();
         let has_any_value = !record.path.is_empty()
             || !record.file_name.is_empty()
             || !record.title.is_empty()
@@ -1522,14 +1589,26 @@ fn record_select_sql(available: &HashSet<String>) -> String {
         "rowid AS source_primary_key".to_string(),
         select_expression(available, &["file", "librarypath", "relative_path"], "path"),
         select_expression(available, &["dir", "parentdir"], "directory"),
-        select_expression(available, &["file", "track", "relative_path"], "file_name"),
-        select_expression(available, &["title", "name", "track_name"], "title"),
-        select_expression(available, &["artist", "artist_name"], "artist"),
-        select_expression(available, &["album", "album_name"], "album"),
+        select_expression(
+            available,
+            &["file", "track", "relative_path", "newrelativepath"],
+            "file_name",
+        ),
+        select_expression(
+            available,
+            &["title", "name", "track_name", "trackname"],
+            "title",
+        ),
+        select_expression(
+            available,
+            &["artist", "artist_name", "artistname"],
+            "artist",
+        ),
+        select_expression(available, &["album", "album_name", "albumname"], "album"),
         select_expression(available, &["filesize", "size"], "size_bytes"),
         select_expression(available, &["duration", "duration_ms"], "duration_ms"),
-        select_expression(available, &["tid", "track_id", "id"], "track_id"),
-        select_expression(available, &["album_id", "aid"], "album_id"),
+        select_expression(available, &["tid", "track_id", "trackid", "id"], "track_id"),
+        select_expression(available, &["album_id", "albumid", "aid"], "album_id"),
         select_expression(
             available,
             &["cover_path", "cover", "album_cover", "pic", "picture"],
@@ -1537,7 +1616,7 @@ fn record_select_sql(available: &HashSet<String>) -> String {
         ),
         select_expression(
             available,
-            &["detail", "track", "source_text", "source_extra"],
+            &["detail", "track", "source_text", "source_extra", "jsonstr"],
             "metadata_json",
         ),
     ]
@@ -1550,7 +1629,7 @@ fn load_record_by_locator(
 ) -> rusqlite::Result<Option<NeteaseRecord>> {
     if !matches!(
         locator.source_table.as_str(),
-        "track" | "web_offline_track" | "web_cloud_track" | "web_track"
+        "offlineTrack" | "track" | "web_offline_track" | "web_cloud_track" | "web_track"
     ) {
         return Ok(None);
     }
@@ -1566,10 +1645,10 @@ fn load_record_by_locator(
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let mut record = record_from_row(row)?;
-    record.source_table = locator.source_table.clone();
+    let mut record = record_from_row(row, &locator.source_table)?;
     record.source_version = locator.source_version.clone();
-    if record.path.trim().is_empty()
+    if !locator.source_table.eq_ignore_ascii_case("offlineTrack")
+        && record.path.trim().is_empty()
         && !record.title.trim().is_empty()
         && !record.artist.trim().is_empty()
     {
@@ -1596,7 +1675,7 @@ fn select_expression(columns: &HashSet<String>, candidates: &[&str], alias: &str
         .unwrap_or_else(|| format!("NULL AS \"{alias}\""))
 }
 
-fn record_from_row(row: &Row<'_>) -> rusqlite::Result<NeteaseRecord> {
+fn record_from_row(row: &Row<'_>, source_table: &str) -> rusqlite::Result<NeteaseRecord> {
     let source_primary_key = row_text(row, 0);
     let path_value = row_text(row, 1);
     let directory = row_text(row, 2);
@@ -1631,19 +1710,38 @@ fn record_from_row(row: &Row<'_>) -> rusqlite::Result<NeteaseRecord> {
     let cover_data = row_blob(row, 11).filter(|bytes| is_supported_image(bytes));
     let cover_references = cover_references_from_json(&metadata_json);
 
+    let row_title = row_text(row, 4);
+    let row_artist = row_text(row, 5);
+    let row_album = row_text(row, 6);
+    let row_track_id = row_text(row, 9);
+    let row_album_id = row_text(row, 10);
+    let modern_download = source_table.eq_ignore_ascii_case("offlineTrack");
+
     Ok(NeteaseRecord {
-        source_table: String::new(),
+        source_table: source_table.to_string(),
         source_primary_key,
         source_version: None,
         path,
         file_name,
-        title: prefer_nonempty(row_text(row, 4), &json_metadata.title),
-        artist: prefer_nonempty(row_text(row, 5), &json_metadata.artist),
-        album: prefer_nonempty(row_text(row, 6), &json_metadata.album),
+        title: if modern_download {
+            prefer_nonempty(json_metadata.title.clone(), &row_title)
+        } else {
+            prefer_nonempty(row_title, &json_metadata.title)
+        },
+        artist: if modern_download {
+            prefer_nonempty(json_metadata.artist.clone(), &row_artist)
+        } else {
+            prefer_nonempty(row_artist, &json_metadata.artist)
+        },
+        album: if modern_download {
+            prefer_nonempty(json_metadata.album.clone(), &row_album)
+        } else {
+            prefer_nonempty(row_album, &json_metadata.album)
+        },
         size_bytes: row_u64(row, 7),
         duration_ms: row_u64(row, 8),
-        track_id: prefer_nonempty(row_text(row, 9), &json_metadata.track_id),
-        album_id: prefer_nonempty(row_text(row, 10), &json_metadata.album_id),
+        track_id: prefer_nonempty(row_track_id, &json_metadata.track_id),
+        album_id: prefer_nonempty(row_album_id, &json_metadata.album_id),
         cover_path: row_text(row, 11),
         cover_data,
         cover_references,
@@ -1674,10 +1772,14 @@ fn track_json_metadata(raw: &str) -> TrackJsonMetadata {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return TrackJsonMetadata::default();
     };
-    let track = value
-        .get("track")
+    let detail = value
+        .get("detail")
         .filter(|value| value.is_object())
         .unwrap_or(&value);
+    let track = detail
+        .get("track")
+        .filter(|value| value.is_object())
+        .unwrap_or(detail);
     let album = track
         .get("album")
         .or_else(|| track.get("al"))
@@ -1700,28 +1802,28 @@ fn track_json_metadata(raw: &str) -> TrackJsonMetadata {
         .or_else(|| track.get("aid").and_then(json_scalar_text))
         .unwrap_or_default();
 
-    let genre = json_find_text(&value, &["genre", "musicType", "music_type"]).unwrap_or_default();
-    let aliases_json = json_find_array_or_text(&value, &["alias", "aliases", "transNames"])
+    let genre = json_find_text(detail, &["genre", "musicType", "music_type"]).unwrap_or_default();
+    let aliases_json = json_find_array_or_text(detail, &["alias", "aliases", "transNames"])
         .map(|values| serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_string()))
         .unwrap_or_else(|| "[]".to_string());
     let copyright_text = json_find_text(
-        &value,
+        detail,
         &["copyright", "copyrightText", "copyrightDesc", "rightInfo"],
     )
     .unwrap_or_default();
     let publish_date = json_find_text(
-        &value,
+        detail,
         &["publishDate", "publish_date", "publishTime", "releaseDate"],
     )
     .unwrap_or_default();
     let original_lrc =
-        json_find_text(&value, &["lyric", "lyrics", "lrc", "originalLyric"]).unwrap_or_default();
+        json_find_text(detail, &["lyric", "lyrics", "lrc", "originalLyric"]).unwrap_or_default();
     let translated_lrc =
-        json_find_text(&value, &["tlyric", "translatedLyric", "translation"]).unwrap_or_default();
+        json_find_text(detail, &["tlyric", "translatedLyric", "translation"]).unwrap_or_default();
     let romanized_lrc =
-        json_find_text(&value, &["romalrc", "romanizedLyric", "romanLyric"]).unwrap_or_default();
+        json_find_text(detail, &["romalrc", "romanizedLyric", "romanLyric"]).unwrap_or_default();
     let lyric_plain_text = strip_lrc_timestamps(&original_lrc);
-    let lyric_language = json_find_text(&value, &["language", "lyricLanguage"]).unwrap_or_default();
+    let lyric_language = json_find_text(detail, &["language", "lyricLanguage"]).unwrap_or_default();
     let lyric_sync_type = if original_lrc.contains('[') {
         "timed"
     } else {
@@ -1734,6 +1836,7 @@ fn track_json_metadata(raw: &str) -> TrackJsonMetadata {
             .get("name")
             .or_else(|| track.get("title"))
             .or_else(|| track.get("musicName"))
+            .or_else(|| track.get("trackName"))
             .and_then(json_scalar_text)
             .unwrap_or_default(),
         artist,
@@ -2316,17 +2419,28 @@ fn locator_match_evidence_for_scan(
 }
 
 fn same_locator_identity(left: &NeteaseTrackLocator, right: &NeteaseTrackLocator) -> bool {
-    match (
+    let same_track = match (
         non_empty_string(&left.track_id),
         non_empty_string(&right.track_id),
     ) {
-        (Some(left_id), Some(right_id)) => return left_id == right_id,
+        (Some(left_id), Some(right_id)) => left_id == right_id,
         (Some(_), None) | (None, Some(_)) => return false,
-        (None, None) => {}
+        (None, None) => {
+            tolerant_comparison_key(&left.title_key) == tolerant_comparison_key(&right.title_key)
+                && tolerant_comparison_key(&left.artist_key)
+                    == tolerant_comparison_key(&right.artist_key)
+                && tolerant_comparison_key(&left.album_key)
+                    == tolerant_comparison_key(&right.album_key)
+        }
+    };
+    if !same_track {
+        return false;
     }
-    tolerant_comparison_key(&left.title_key) == tolerant_comparison_key(&right.title_key)
-        && tolerant_comparison_key(&left.artist_key) == tolerant_comparison_key(&right.artist_key)
-        && tolerant_comparison_key(&left.album_key) == tolerant_comparison_key(&right.album_key)
+
+    if has_path_identity(&left.normalized_path) && has_path_identity(&right.normalized_path) {
+        return left.normalized_path == right.normalized_path;
+    }
+    false
 }
 
 fn record_match_evidence_for_scan(
@@ -2472,17 +2586,33 @@ fn record_match_evidence_with_size(
 }
 
 fn same_record_identity(left: &NeteaseRecord, right: &NeteaseRecord) -> bool {
-    match (
+    let same_track = match (
         non_empty_string(&left.track_id),
         non_empty_string(&right.track_id),
     ) {
-        (Some(left_id), Some(right_id)) => return left_id == right_id,
+        (Some(left_id), Some(right_id)) => left_id == right_id,
         (Some(_), None) | (None, Some(_)) => return false,
-        (None, None) => {}
+        (None, None) => {
+            tolerant_comparison_key(&left.title) == tolerant_comparison_key(&right.title)
+                && tolerant_comparison_key(&left.artist) == tolerant_comparison_key(&right.artist)
+                && tolerant_comparison_key(&left.album) == tolerant_comparison_key(&right.album)
+        }
+    };
+    if !same_track || tolerant_comparison_key(&left.title) != tolerant_comparison_key(&right.title)
+    {
+        return false;
     }
-    tolerant_comparison_key(&left.title) == tolerant_comparison_key(&right.title)
-        && tolerant_comparison_key(&left.artist) == tolerant_comparison_key(&right.artist)
-        && tolerant_comparison_key(&left.album) == tolerant_comparison_key(&right.album)
+
+    let left_path = normalized_path_for_scan(&left.path);
+    let right_path = normalized_path_for_scan(&right.path);
+    if has_path_identity(&left_path) && has_path_identity(&right_path) {
+        return left_path == right_path;
+    }
+    false
+}
+
+fn has_path_identity(value: &str) -> bool {
+    !value.trim().is_empty() && Path::new(value).components().count() > 1
 }
 
 fn normalized_path(value: &str) -> String {
@@ -3036,6 +3166,7 @@ fn append_track_cover_names(names: &mut Vec<String>, id: &str) {
     }
 
     append_image_names(names, id);
+    append_image_names(names, &format!("track-{id}"));
     if !id.to_ascii_lowercase().starts_with("offline-") {
         append_image_names(names, &format!("offline-{id}"));
     }
@@ -3078,7 +3209,7 @@ fn find_adjacent_cover(source_path: &Path, record: &NeteaseRecord) -> Option<Vec
     }
     for id in [record.track_id.as_str(), record.album_id.as_str()] {
         if !id.trim().is_empty() {
-            for prefix in ["cover_", "album_", ""] {
+            for prefix in ["cover_", "album_", "track-", ""] {
                 for extension in ["jpg", "jpeg", "png", "webp"] {
                     names.push(format!("{prefix}{id}.{extension}"));
                 }
@@ -3144,10 +3275,11 @@ fn is_supported_image(bytes: &[u8]) -> bool {
 mod tests {
     use super::{
         NeteaseCoverSource, NeteaseMetadataResolver, NeteaseRecord, NeteaseRecordMatchMethod,
-        choose_record, choose_record_with_method, cover_from_record, cover_references_from_json,
-        find_adjacent_cover, find_cover_by_name_in_roots, find_source_directory_cover,
-        load_records_from_connection, persistent_metadata_key, record_match_score,
-        tolerant_comparison_key,
+        choose_record, choose_record_with_method, choose_record_with_method_and_size,
+        cover_from_record, cover_references_from_json, find_adjacent_cover,
+        find_cover_by_name_in_roots, find_source_directory_cover, load_locators_from_db_observed,
+        load_records_from_connection, persistent_metadata_key, probe_netease_database,
+        record_match_score, tolerant_comparison_key,
     };
     use rusqlite::{Connection, params};
     use std::fs;
@@ -3170,6 +3302,7 @@ mod tests {
             database_record_count: 3,
             matched: true,
             match_method: Some(NeteaseRecordMatchMethod::FileNameAndSize),
+            source_table: Some("offlineTrack".into()),
             track_id: Some("42".into()),
             album_id: Some("7".into()),
             cover_source: Some(NeteaseCoverSource::DatabaseBlob),
@@ -3180,6 +3313,7 @@ mod tests {
         assert_eq!(json["databaseLoaded"], true);
         assert_eq!(json["databaseRecordCount"], 3);
         assert_eq!(json["matchMethod"], "fileNameAndSize");
+        assert_eq!(json["sourceTable"], "offlineTrack");
         assert_eq!(json["coverSource"], "databaseBlob");
         assert!(json.get("database_loaded").is_none());
 
@@ -3187,6 +3321,7 @@ mod tests {
         assert!(!legacy.database_loaded);
         assert_eq!(legacy.database_record_count, 0);
         assert_eq!(legacy.cover_source, None);
+        assert_eq!(legacy.source_table, None);
     }
 
     #[test]
@@ -3486,6 +3621,7 @@ mod tests {
             &[record],
             Some(Path::new("/readonly/sqlite_storage.sqlite3")),
             true,
+            1,
         );
         assert_eq!(
             recovery.diagnostic.cover_source,
@@ -3572,6 +3708,199 @@ mod tests {
         }];
 
         assert!(choose_record(&source, &records).is_some());
+    }
+
+    #[test]
+    fn refuses_same_track_id_when_equal_candidates_point_to_different_paths() {
+        let source = Path::new("/music/Song - Artist.flac");
+        let records = vec![
+            NeteaseRecord {
+                path: String::from("/download-a/Song - Artist.flac"),
+                file_name: String::from("Song - Artist.flac"),
+                title: String::from("Song"),
+                artist: String::from("Artist"),
+                track_id: String::from("42"),
+                size_bytes: Some(5),
+                ..NeteaseRecord::default()
+            },
+            NeteaseRecord {
+                path: String::from("/download-b/Song - Artist.flac"),
+                file_name: String::from("Song - Artist.flac"),
+                title: String::from("Song"),
+                artist: String::from("Artist"),
+                track_id: String::from("42"),
+                size_bytes: Some(5),
+                ..NeteaseRecord::default()
+            },
+        ];
+
+        assert!(matches!(
+            choose_record_with_method_and_size(source, &records, Some(5)),
+            super::RecordMatch::Ambiguous { candidates: 2 }
+        ));
+    }
+
+    #[test]
+    fn refuses_same_track_id_when_only_one_candidate_has_path_evidence() {
+        let source = Path::new("/music/Song - Artist.flac");
+        let records = vec![
+            NeteaseRecord {
+                path: String::from("/download-a/Song - Artist.flac"),
+                file_name: String::from("Song - Artist.flac"),
+                title: String::from("Song"),
+                artist: String::from("Artist"),
+                track_id: String::from("42"),
+                size_bytes: Some(5),
+                ..NeteaseRecord::default()
+            },
+            NeteaseRecord {
+                file_name: String::from("Song - Artist.flac"),
+                title: String::from("Song"),
+                artist: String::from("Artist"),
+                track_id: String::from("42"),
+                size_bytes: Some(5),
+                ..NeteaseRecord::default()
+            },
+        ];
+
+        assert!(matches!(
+            choose_record_with_method_and_size(source, &records, Some(5)),
+            super::RecordMatch::Ambiguous { candidates: 2 }
+        ));
+
+        let locators = vec![
+            super::NeteaseTrackLocator {
+                track_id: String::from("42"),
+                source_table: String::from("web_offline_track"),
+                source_primary_key: String::from("download-a"),
+                normalized_path: String::from("/download-a/song - artist.flac"),
+                normalized_file_name: String::from("song - artist.flac"),
+                size_bytes: Some(5),
+                title_key: persistent_metadata_key("Song"),
+                artist_key: persistent_metadata_key("Artist"),
+                ..super::NeteaseTrackLocator::default()
+            },
+            super::NeteaseTrackLocator {
+                track_id: String::from("42"),
+                source_table: String::from("offlineTrack"),
+                source_primary_key: String::from("modern-download"),
+                normalized_file_name: String::from("song - artist.flac"),
+                size_bytes: Some(5),
+                title_key: persistent_metadata_key("Song"),
+                artist_key: persistent_metadata_key("Artist"),
+                ..super::NeteaseTrackLocator::default()
+            },
+        ];
+        let index = super::LocatorIndex::build(&locators);
+        assert!(
+            super::choose_locator_with_method_cancellable(
+                source,
+                &locators,
+                &index,
+                Some(5),
+                &AtomicBool::new(false),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn loads_offline_track_detail_and_lazy_locator_without_trusting_its_path() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("sqlite_storage.sqlite3");
+        let source = directory.path().join("Song - Artist One.flac");
+        fs::write(&source, b"audio").unwrap();
+        let detail = r#"{"detail":{"id":42,"name":"Song","artists":[{"name":"Artist One"},{"name":"Artist Two"}],"album":{"id":7,"name":"Album","picUrl":"https://p1.music.126.net/42.jpg"}}}"#;
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE offlineTrack (
+                    type TEXT, state INTEGER, completeTime INTEGER,
+                    newRelativePath TEXT, trackName TEXT, artistName TEXT,
+                    albumName TEXT, size INTEGER, id TEXT PRIMARY KEY, jsonStr TEXT
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO offlineTrack(type,state,newRelativePath,trackName,artistName,albumName,size,id,jsonStr)
+                 VALUES ('track',4,?1,'Song','Artist One','Album',5,'42',?2)",
+                params!["/Song - Artist One.ncm", detail],
+            )
+            .unwrap();
+        for (id, filename, title) in [
+            ("43", "/Unrelated Song - Artist.ncm", "Unrelated Song"),
+            ("44", "/Another Song - Artist.ncm", "Another Song"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO offlineTrack(type,state,newRelativePath,trackName,artistName,albumName,size,id,jsonStr)
+                     VALUES ('track',4,?1,?2,'Artist','Other Album',5,?3,?4)",
+                    params![
+                        filename,
+                        title,
+                        id,
+                        format!("{{\"detail\":{{\"id\":{id},\"name\":\"{title}\",\"artists\":[{{\"name\":\"Artist\"}}]}}}}"),
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "CREATE TABLE web_offline_track (
+                    relative_path TEXT, track_name TEXT, artist_name TEXT,
+                    album_name TEXT, track_id INTEGER, album_id INTEGER, size INTEGER
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO web_offline_track(relative_path,track_name,artist_name,album_name,track_id,album_id,size)
+                 VALUES ('/archive/Other Version.ncm','Song','Artist One','Album',42,7,5)",
+                [],
+            )
+            .unwrap();
+
+        let records = load_records_from_connection(&connection).unwrap();
+        assert_eq!(records.len(), 4);
+        let modern_record = records
+            .iter()
+            .find(|record| record.track_id == "42" && record.source_table == "offlineTrack")
+            .expect("the modern download row should be loaded");
+        assert!(modern_record.path.is_empty());
+        assert_eq!(modern_record.file_name, "Song - Artist One.ncm");
+        assert_eq!(modern_record.artist, "Artist One, Artist Two");
+        assert_eq!(modern_record.album, "Album");
+        assert_eq!(modern_record.album_id, "7");
+        assert_eq!(
+            modern_record.cover_references,
+            vec!["https://p1.music.126.net/42.jpg"]
+        );
+
+        drop(connection);
+        let summary = probe_netease_database(&database).unwrap();
+        assert!(summary.supported);
+        assert_eq!(summary.record_count, 4);
+        let locators = load_locators_from_db_observed(&database, |_, _, _| true).unwrap();
+        assert_eq!(locators.len(), 4);
+        let modern_locator = locators
+            .iter()
+            .find(|locator| locator.source_table == "offlineTrack" && locator.track_id == "42")
+            .expect("the modern locator should be included");
+        assert!(modern_locator.normalized_path.is_empty());
+        assert_eq!(modern_locator.normalized_file_name, "song - artist one.ncm");
+        assert_eq!(modern_locator.size_bytes, Some(5));
+
+        let resolver = NeteaseMetadataResolver::from_locators(&database, locators, None);
+        let recovery = resolver.recover(&source);
+        let recovered = recovery.metadata.expect("filename and size should match");
+        assert_eq!(recovered.title, "Song");
+        assert_eq!(recovered.artist, "Artist One, Artist Two");
+        assert_eq!(recovery.diagnostic.database_record_count, 4);
+        assert_eq!(
+            recovery.diagnostic.source_table.as_deref(),
+            Some("offlineTrack")
+        );
     }
 
     #[test]
@@ -3873,6 +4202,25 @@ mod tests {
         };
         let cover = find_source_directory_cover(&source, Some(&record))
             .expect("the source directory meta cover should be found");
+        assert_eq!(cover, vec![0xFF, 0xD8, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn finds_track_prefix_cover_in_meta_without_guessing_an_unrelated_image() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("Song - Artist.flac");
+        let meta = directory.path().join("meta");
+        fs::write(&source, b"audio").unwrap();
+        fs::create_dir_all(&meta).unwrap();
+        fs::write(meta.join("track-42.jpg"), [0xFF, 0xD8, 0xFF, 0x00]).unwrap();
+        fs::write(meta.join("unrelated.jpg"), [0xFF, 0xD8, 0xFF, 0x01]).unwrap();
+
+        let record = NeteaseRecord {
+            track_id: String::from("42"),
+            ..NeteaseRecord::default()
+        };
+        let cover = find_source_directory_cover(&source, Some(&record))
+            .expect("the track-ID cache cover should be selected by its explicit name");
         assert_eq!(cover, vec![0xFF, 0xD8, 0xFF, 0x00]);
     }
 

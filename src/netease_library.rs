@@ -120,7 +120,13 @@ where
         NeteasePathLookupError::Failed(format!("无法只读打开网易云数据库：{error}"))
     })?;
     let mut tables = Vec::new();
-    for table in ["track", "web_track", "web_offline_track", "web_cloud_track"] {
+    for table in [
+        "track",
+        "web_track",
+        "offlineTrack",
+        "web_offline_track",
+        "web_cloud_track",
+    ] {
         if is_cancelled() {
             return Err(NeteasePathLookupError::Cancelled);
         }

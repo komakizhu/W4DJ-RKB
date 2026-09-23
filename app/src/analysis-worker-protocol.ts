@@ -41,6 +41,7 @@ export type AnalysisWorkerTrackRequest = {
   metadata?: TrackMetadata;
   fingerprint?: AnalysisFingerprint;
   neteaseFilenameFormat: NeteaseFilenameFormat;
+  neteaseSource?: boolean;
   highLevel?: HighLevelAnalysis;
   audio: SerializedDecodedAudio;
 };

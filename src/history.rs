@@ -846,7 +846,7 @@ pub fn format_error_report_with_runtime(
 
     for (index, diagnostic) in entry.metadata_diagnostics.iter().enumerate() {
         report.push_str(&format!(
-            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n校验依据：{}\n输出标签实际匹配：{}\n标题来源：{}\n歌手来源：{}\n专辑来源：{}\n标题差异：{}\n歌手差异：{}\n专辑差异：{}\n源封面：{}\n输出封面：{}\n网易云匹配方式：{}\n网易云封面来源：{}\n网易云曲目 ID：{}\n网易云专辑 ID：{}\n网易云终止原因：{}\n最终校验：{}\n\n",
+            "{}. 源文件：{}\n目标文件：{}\n源文件名：{}\n源格式：{}\n源大小：{}\n输出大小：{}\n源标题：{}\n源歌手：{}\n源专辑：{}\n输出标题：{}\n输出歌手：{}\n输出专辑：{}\n文件名判断：{}\n识别结论：{}\n校验依据：{}\n输出标签实际匹配：{}\n标题来源：{}\n歌手来源：{}\n专辑来源：{}\n标题差异：{}\n歌手差异：{}\n专辑差异：{}\n源封面：{}\n输出封面：{}\n网易云匹配表：{}\n网易云匹配方式：{}\n网易云封面来源：{}\n网易云曲目 ID：{}\n网易云专辑 ID：{}\n网易云终止原因：{}\n最终校验：{}\n\n",
             index + 1,
             diagnostic.source_path,
             diagnostic.destination_path,
@@ -875,6 +875,11 @@ pub fn format_error_report_with_runtime(
             diagnostic.album_difference.as_deref().unwrap_or("旧版未记录"),
             if diagnostic.source_artwork { "有（有效图片）" } else { "无或无效" },
             match diagnostic.output_artwork { Some(true) => "有（有效图片）", Some(false) => "无或无效", None => "无法读取" },
+            diagnostic
+                .netease_recovery
+                .as_ref()
+                .and_then(|recovery| recovery.source_table.as_deref())
+                .unwrap_or("旧版未记录"),
             diagnostic
                 .netease_recovery
                 .as_ref()

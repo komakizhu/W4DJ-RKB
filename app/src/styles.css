@@ -1583,6 +1583,13 @@ h1 {
   letter-spacing: 0.04em;
 }
 
+.output-settings .input-format-hint {
+  color: var(--rail-muted);
+  font-size: 8px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+
 .output-settings select {
   width: 100%;
   min-height: 34px;

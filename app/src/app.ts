@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { message, open, save } from '@tauri-apps/plugin-dialog';
 import { getCurrentWindow, type DragDropEvent } from '@tauri-apps/api/window';
 import {
+  analysisNeteaseFilenameOptions,
   analyzeAudioFile,
   assessTrackAnalysisCompleteness,
   ESSENTIA_MODEL_IDS,
@@ -569,6 +570,7 @@ export type AppServices = {
   chooseEnhancedMode: (enabled: boolean) => Promise<DesktopState>;
   chooseConflictStrategy: (strategy: AppConflictStrategy) => Promise<DesktopState>;
   chooseFilenameRule: (rule: AppFilenameRule) => Promise<DesktopState>;
+  chooseNeteaseFilenameFormat: (format: AppNeteaseFilenameFormat) => Promise<DesktopState>;
   chooseConcurrencyLimit: (value: string) => Promise<DesktopState>;
   previewAllSync: () => Promise<AppPreview[]>;
   startScan: () => Promise<AppScanProgress>;
@@ -887,6 +889,9 @@ const translations = {
     conflictOverwrite: '覆盖',
     conflictMetadata: '仅更新元数据',
     filenameRule: '输出文件名规则',
+    neteaseInputFormat: '网易云输入文件名格式',
+    neteaseInputFormatHint: '仅用于补全源标签和数据库缺失的字段；混合命名请核对预览。',
+    titleOnly: '仅歌曲名',
     titleArtist: '歌曲名 - 歌手（默认）',
     artistTitle: '歌手 - 歌曲名',
     originalName: '保留原文件名',
@@ -1172,6 +1177,9 @@ const translations = {
     conflictOverwrite: 'Overwrite',
     conflictMetadata: 'Update metadata only',
     filenameRule: 'Output filename rule',
+    neteaseInputFormat: 'NetEase input filename format',
+    neteaseInputFormatHint: 'Used only for fields missing from tags and the database; review mixed-name previews.',
+    titleOnly: 'Title only',
     titleArtist: 'Title - Artist (default)',
     artistTitle: 'Artist - Title',
     originalName: 'Keep original filename',
@@ -1670,6 +1678,8 @@ const defaultServices: AppServices = {
   chooseConflictStrategy: (strategy) =>
     invoke<DesktopState>('choose_conflict_strategy', { strategy }),
   chooseFilenameRule: (rule) => invoke<DesktopState>('choose_filename_rule', { rule }),
+  chooseNeteaseFilenameFormat: (format) =>
+    invoke<DesktopState>('choose_netease_filename_format', { format }),
   chooseConcurrencyLimit: (value) =>
     invoke<DesktopState>('choose_concurrency_limit', { value }),
   previewAllSync: () => invoke<AppPreview[]>('preview_all_sync'),
@@ -5589,6 +5599,7 @@ export function bindApp(
       for (const [slotIndex, group] of groups) {
         let groupFailedCount = 0;
         let groupResultCount = 0;
+        const inputFilenameFormat = state.neteaseFilenameFormat;
         analysisState = {
           ...analysisState,
           slotIndex,
@@ -5650,7 +5661,7 @@ export function bindApp(
               && canReuseTrackAnalysis(
                 cached,
                 fingerprint,
-                state.neteaseFilenameFormat,
+                inputFilenameFormat,
                 modelStatus.version || null,
                 highLevelModelsAvailable,
                 state.enhancedMode,
@@ -5729,7 +5740,7 @@ export function bindApp(
                 metadata,
                 {
                   fingerprint: fingerprint || undefined,
-                  neteaseFilenameFormat: state.neteaseFilenameFormat,
+                  ...analysisNeteaseFilenameOptions(candidate.source_path, inputFilenameFormat),
                   highLevelModels,
                   workerClient: candidateWorker,
                   workerJobId,
@@ -7230,6 +7241,14 @@ export function bindApp(
       return;
     }
 
+    if (select.dataset.action === 'choose-netease-filename-format') {
+      const format = select.value as AppNeteaseFilenameFormat;
+      if (format !== state.neteaseFilenameFormat) {
+        void runAction(() => services.chooseNeteaseFilenameFormat(format), 'all');
+      }
+      return;
+    }
+
   });
 
   root.addEventListener('compositionstart', (event) => {
@@ -7765,6 +7784,15 @@ function renderOutputSettings(
             <option value="artist_title" ${state.filenameRule === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
             <option value="original" ${state.filenameRule === 'original' ? 'selected' : ''}>${t('originalName', state.lang)}</option>
           </select>
+        </label>
+        <label>
+          <span>${t('neteaseInputFormat', state.lang)}</span>
+          <select data-action="choose-netease-filename-format" aria-label="${t('neteaseInputFormat', state.lang)}">
+            <option value="title_only" ${state.neteaseFilenameFormat === 'title_only' ? 'selected' : ''}>${t('titleOnly', state.lang)}</option>
+            <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('titleArtist', state.lang)}</option>
+            <option value="artist_title" ${state.neteaseFilenameFormat === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
+          </select>
+          <small class="input-format-hint">${t('neteaseInputFormatHint', state.lang)}</small>
         </label>
         <div class="concurrency-setting" data-role="concurrency-setting">
           <label for="concurrency-limit-range"><span>${t('concurrencyLimit', state.lang)}</span></label>

@@ -357,6 +357,7 @@ export type AnalysisWorkerClientLike = {
     metadata?: TrackMetadata;
     fingerprint?: AnalysisFingerprint;
     neteaseFilenameFormat: NeteaseFilenameFormat;
+    neteaseSource?: boolean;
     highLevel?: HighLevelAnalysis;
     audio: DecodedAudioData;
     onProgress?: (progress: AnalysisWorkerProgress) => void;
@@ -2034,14 +2035,24 @@ function isNeteaseSource(path: string): boolean {
     || lowerPath.split(/[\\/]/).some((segment) => segment.includes('netease') || segment.includes('网易云'));
 }
 
+export function analysisNeteaseFilenameOptions(
+  path: string,
+  neteaseFilenameFormat: NeteaseFilenameFormat,
+): { neteaseFilenameFormat: NeteaseFilenameFormat; neteaseSource: boolean } {
+  return {
+    neteaseFilenameFormat,
+    neteaseSource: isNeteaseSource(path),
+  };
+}
+
 export function filenameIdentity(
   path: string,
   neteaseFilenameFormat: NeteaseFilenameFormat = 'title_artist',
+  neteaseSource = isNeteaseSource(path),
 ): TrackMetadata {
   const stem = normalizedFilenameStem(path);
   const separator = stem.indexOf(' - ');
-  const neteaseSource = isNeteaseSource(path);
-  if (neteaseSource && /\.ncm$/i.test(path) && neteaseFilenameFormat === 'title_only') {
+  if (neteaseSource && neteaseFilenameFormat === 'title_only') {
     return { title: stem, artist: '', album: '' };
   }
   if (separator > 0) {
@@ -2067,26 +2078,15 @@ export function resolveTrackMetadata(
   path: string,
   metadata: TrackMetadata | undefined,
   neteaseFilenameFormat: NeteaseFilenameFormat = 'title_artist',
+  neteaseSource = isNeteaseSource(path),
 ): TrackMetadata {
-  const fallback = filenameIdentity(path, neteaseFilenameFormat);
+  const fallback = filenameIdentity(path, neteaseFilenameFormat, neteaseSource);
   const title = cleanMetadataValue(metadata?.title);
   const artist = cleanMetadataValue(metadata?.artist);
   const album = cleanMetadataValue(metadata?.album);
   const genre = cleanMetadataValue(metadata?.genre ?? undefined);
   const withGenre = (result: Omit<TrackMetadata, 'genre'>): TrackMetadata =>
     genre ? { ...result, genre } : result;
-
-  if (/\.ncm$/i.test(path) && neteaseFilenameFormat !== 'title_only') {
-    const hasSplitName = fallback.artist.length > 0;
-    if (hasSplitName) {
-      return withGenre({ title: fallback.title, artist: fallback.artist, album });
-    }
-  }
-
-  if (title && artist && fallback.title && fallback.artist
-    && title === fallback.artist && artist === fallback.title) {
-    return withGenre({ title: fallback.title, artist: fallback.artist, album });
-  }
 
   return withGenre({
     title: title || fallback.title,
@@ -2606,6 +2606,7 @@ export async function analyzeDecodedAudio(
   options: {
     fingerprint?: AnalysisFingerprint;
     neteaseFilenameFormat?: NeteaseFilenameFormat;
+    neteaseSource?: boolean;
     highLevel?: HighLevelAnalysis;
     highLevelModels?: EssentiaModelFile[];
     tensorflowBackend?: 'cpu' | 'webgl' | 'wasm';
@@ -2613,8 +2614,8 @@ export async function analyzeDecodedAudio(
   } = {},
 ): Promise<TrackAnalysis> {
   const neteaseFilenameFormat = options.neteaseFilenameFormat ?? 'title_artist';
-  const resolvedMetadata = resolveTrackMetadata(path, metadata, neteaseFilenameFormat);
-  const fallbackMetadata = filenameIdentity(path, neteaseFilenameFormat);
+  const resolvedMetadata = resolveTrackMetadata(path, metadata, neteaseFilenameFormat, options.neteaseSource);
+  const fallbackMetadata = filenameIdentity(path, neteaseFilenameFormat, options.neteaseSource);
   const essentia = await getEssentia();
   if (audio.basicAnalysisMode === 'chunked') {
     const basic = await analyzeChunkedBasicAudio(essentia, audio, options.onProgress, {
@@ -2882,6 +2883,7 @@ export async function analyzeAudioFile(
   options: {
     fingerprint?: AnalysisFingerprint;
     neteaseFilenameFormat?: NeteaseFilenameFormat;
+    neteaseSource?: boolean;
     highLevel?: HighLevelAnalysis;
     highLevelModels?: EssentiaModelFile[];
     tensorflowBackend?: 'cpu' | 'webgl' | 'wasm';
@@ -2925,6 +2927,7 @@ export async function analyzeAudioFile(
     metadata,
     fingerprint: options.fingerprint,
     neteaseFilenameFormat: options.neteaseFilenameFormat ?? 'title_artist',
+    neteaseSource: options.neteaseSource,
     highLevel: options.highLevel,
     audio: prepared,
     onProgress: options.onProgress,

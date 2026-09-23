@@ -79,7 +79,7 @@ use w4dj::scan_cache::{ScanCache, clear_scan_cache as clear_scan_cache_file, loa
 use w4dj::sync::{
     apply_track_analysis_metadata_with_context,
     cleanup_temporary_outputs, compare_music_dicts,
-    EmbeddedAnalysis, inspect_metadata_diagnostic_with_resolver,
+    EmbeddedAnalysis, inspect_metadata_diagnostic_with_resolver_and_settings,
     is_ignored_music_file,
     is_supported_source_file,
     get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy,
@@ -3054,6 +3054,7 @@ fn run_scan_task(
             Arc::clone(&concurrency_budget),
             Arc::clone(&scan_cancel),
             &committed_bindings,
+            netease_resolver.as_ref(),
             &source_snapshots,
             &destination_snapshots,
         ) {
@@ -3408,16 +3409,44 @@ fn deduplicate_cross_slot_candidates(previews: &mut [SlotPreview]) {
                     }
                     _ => None,
                 };
+                let source_path = candidate.source_path.clone();
+                let skip_reason = format!(
+                    "与任务 {} 的输出文件重复，已交由任务 {} 处理",
+                    owner_slot + 1,
+                    owner_slot + 1
+                );
                 let issue = PreviewIssue {
-                    path: candidate.source_path,
-                    message: format!(
-                        "与任务 {} 的输出文件重复，已交由任务 {} 处理",
-                        owner_slot + 1,
-                        owner_slot + 1
-                    ),
+                    path: source_path.clone(),
+                    message: skip_reason.clone(),
                 };
                 slot_preview.preview.skipped.push(issue.clone());
                 slot_preview.preview.warnings.push(issue);
+                let detail = slot_preview
+                    .preview
+                    .detail_items
+                    .iter_mut()
+                    .find(|item| item.source_path == source_path);
+                if let Some(detail) = detail {
+                    detail.destination_path = None;
+                    detail.existing_output = false;
+                    detail.classification = "skip".to_string();
+                    detail.reason = Some(skip_reason.clone());
+                } else {
+                    slot_preview
+                        .preview
+                        .detail_items
+                        .push(w4dj::preview::PreviewDetailItem {
+                            name: candidate.name.clone(),
+                            source_path,
+                            destination_path: None,
+                            existing_output: false,
+                            classification: "skip".to_string(),
+                            reason: Some(skip_reason),
+                        });
+                }
+                if slot_preview.preview.action_kind == "skip" {
+                    slot_preview.preview.action_count = slot_preview.preview.skipped_count;
+                }
                 continue;
             }
 
@@ -9337,6 +9366,8 @@ fn run_confirmed_sync_task(
                     &recovery_entry,
                     candidate,
                     job.metadata_context.as_ref(),
+                    job.netease_filename_format,
+                    filename_normalization_policy_for_slot(job.slot_index),
                 );
                 mark_recovery_processed(
                     &history_path,
@@ -9450,6 +9481,8 @@ fn run_confirmed_sync_task(
                                 &recovery_entry,
                                 candidate,
                                 job.metadata_context.as_ref(),
+                                job.netease_filename_format,
+                                filename_normalization_policy_for_slot(job.slot_index),
                             );
                         }
                         mark_recovery_processed(
@@ -9608,11 +9641,15 @@ fn record_metadata_diagnostic(
     recovery_entry: &Arc<Mutex<HistoryEntry>>,
     candidate: &PreviewCandidate,
     metadata_context: &ConversionMetadataContext,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
 ) {
-    let diagnostic = inspect_metadata_diagnostic_with_resolver(
+    let diagnostic = inspect_metadata_diagnostic_with_resolver_and_settings(
         Path::new(&candidate.source_path),
         Path::new(&candidate.destination_path),
         metadata_context.netease.as_ref(),
+        netease_filename_format,
+        filename_policy,
     );
     let mut entry = recovery_entry.lock().expect("recovery history lock poisoned");
     if entry
@@ -10381,7 +10418,9 @@ mod tests {
         }
     }
     use w4dj::preferences::{AppPreferences, SyncSlotPreferences};
-    use w4dj::preview::{PreviewCandidate, PreviewIssue, SlotPreview, SyncPreview};
+    use w4dj::preview::{
+        PreviewCandidate, PreviewDetailItem, PreviewIssue, SlotPreview, SyncPreview,
+    };
     use w4dj::task::TaskController;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11540,6 +11579,14 @@ mod tests {
     #[test]
     fn duplicate_outputs_across_slots_are_only_planned_once() {
         let mut previews = vec![sample_preview(0, true), sample_preview(1, true)];
+        previews[1].preview.detail_items.push(PreviewDetailItem {
+            name: "song".into(),
+            source_path: "/music/in/song.mp3".into(),
+            destination_path: Some("/music/out/song.mp3".into()),
+            existing_output: false,
+            classification: "new".into(),
+            reason: None,
+        });
 
         assert!(validate_unique_planned_outputs(&previews).is_err());
         deduplicate_cross_slot_candidates(&mut previews);
@@ -11548,6 +11595,11 @@ mod tests {
         assert!(previews[1].preview.candidates.is_empty());
         assert_eq!(previews[1].preview.new_count, 0);
         assert_eq!(previews[1].preview.skipped_count, 1);
+        assert_eq!(previews[1].preview.detail_items.len(), 1);
+        assert_eq!(previews[1].preview.detail_items[0].classification, "skip");
+        assert!(previews[1].preview.detail_items[0]
+            .destination_path
+            .is_none());
         assert!(validate_unique_planned_outputs(&previews).is_ok());
     }
 

@@ -2135,7 +2135,7 @@ pub fn update_existing_metadata_with_resolver_and_policy(
     source_path: &Path,
     destination_path: &Path,
     metadata_context: &ConversionMetadataContext,
-    filename_policy: FilenameNormalizationPolicy,
+    _filename_policy: FilenameNormalizationPolicy,
 ) -> io::Result<()> {
     let source_extension = source_path
         .extension()
@@ -2176,16 +2176,7 @@ pub fn update_existing_metadata_with_resolver_and_policy(
         })?,
     };
     let mut source_tag = source_tag;
-    if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
-        && !matches!(source_extension.as_str(), "ncm")
-        && let Some(recovered) = crate::netease::recover_local_metadata_with_resolver(
-            source_path,
-            &metadata_context.netease,
-        )
-        .metadata
-    {
-        merge_recovered_metadata(&mut source_tag, &recovered);
-    }
+    merge_resolved_local_metadata(&mut source_tag, source_path, &metadata_context.netease);
 
     let destination_extension = destination_path
         .extension()
@@ -3198,22 +3189,21 @@ fn source_metadata_as_id3_with_resolver(
     resolver: &NeteaseMetadataResolver,
 ) -> id3::Tag {
     let mut tag = read_source_container_metadata(source_path);
-
-    if !matches!(
-        source_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "ncm"
-    ) && let Some(recovered) =
-        crate::netease::recover_local_metadata_with_resolver(source_path, resolver).metadata
-    {
-        merge_recovered_metadata(&mut tag, &recovered);
-    }
-
+    merge_resolved_local_metadata(&mut tag, source_path, resolver);
     tag
+}
+
+fn merge_resolved_local_metadata(
+    tag: &mut id3::Tag,
+    source_path: &Path,
+    resolver: &NeteaseMetadataResolver,
+) -> bool {
+    let Some(recovered) =
+        crate::netease::recover_local_metadata_with_resolver(source_path, resolver).metadata
+    else {
+        return false;
+    };
+    merge_recovered_metadata(tag, &recovered)
 }
 
 fn read_source_container_metadata(source_path: &Path) -> id3::Tag {
@@ -3515,9 +3505,33 @@ pub fn inspect_metadata_diagnostic_with_resolver(
     output_path: &Path,
     resolver: &NeteaseMetadataResolver,
 ) -> MetadataDiagnostic {
+    let netease_filename_format = if source_prefers_title_artist_filename(source_path) {
+        NeteaseFilenameFormat::TitleArtist
+    } else {
+        NeteaseFilenameFormat::ArtistTitle
+    };
+    inspect_metadata_diagnostic_with_resolver_and_settings(
+        source_path,
+        output_path,
+        resolver,
+        netease_filename_format,
+        FilenameNormalizationPolicy::PreserveSource,
+    )
+}
+
+pub fn inspect_metadata_diagnostic_with_resolver_and_settings(
+    source_path: &Path,
+    output_path: &Path,
+    resolver: &NeteaseMetadataResolver,
+    netease_filename_format: NeteaseFilenameFormat,
+    filename_policy: FilenameNormalizationPolicy,
+) -> MetadataDiagnostic {
     let source_tag = read_source_container_metadata(source_path);
-    let recovery = crate::netease::recover_local_metadata_with_resolver(source_path, resolver);
-    let recovered = recovery.metadata.as_ref();
+    let recovery = matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
+        .then(|| crate::netease::recover_local_metadata_with_resolver(source_path, resolver));
+    let recovered = recovery
+        .as_ref()
+        .and_then(|recovery| recovery.metadata.as_ref());
     let mut effective_tag = source_tag.clone();
     if let Some(recovered) = recovered {
         merge_recovered_metadata(&mut effective_tag, recovered);
@@ -3528,16 +3542,16 @@ pub fn inspect_metadata_diagnostic_with_resolver(
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or_default();
-    let prefer_title_artist = source_prefers_title_artist_filename(source_path);
     let source_title = non_empty(source_tag.title()).map(str::to_string);
     let source_artist =
         non_empty(source_tag.artist().or_else(|| source_tag.album_artist())).map(str::to_string);
     let source_album = non_empty(source_tag.album()).map(str::to_string);
-    let filename_identity = infer_song_identity_with_filename_preference(
+    let filename_identity = infer_song_identity_with_netease_filename_format(
         fallback_name,
         source_title.as_deref(),
         source_artist.as_deref(),
-        prefer_title_artist,
+        netease_filename_format,
+        filename_policy,
     );
     let (selected_title, title_source) = select_metadata_field(
         source_title.as_deref(),
@@ -3615,12 +3629,17 @@ pub fn inspect_metadata_diagnostic_with_resolver(
         source_artwork: valid_cover(&source_tag),
         output_artwork: output_tag.as_ref().map(valid_cover),
         detected_filename_layout: if split_filename_identity(fallback_name).is_some() {
-            if prefer_title_artist {
-                "标题 - 歌手"
-            } else {
-                "歌手 - 标题"
-            }
-            .to_string()
+            let interpretation =
+                if matches!(filename_policy, FilenameNormalizationPolicy::SoundCloud) {
+                    "普通文件夹：歌手 - 标题"
+                } else {
+                    match netease_filename_format {
+                        NeteaseFilenameFormat::TitleOnly => "网易云输入：仅歌曲名（不拆分）",
+                        NeteaseFilenameFormat::ArtistTitle => "网易云输入：歌手 - 标题",
+                        NeteaseFilenameFormat::TitleArtist => "网易云输入：标题 - 歌手",
+                    }
+                };
+            format!("检测到分隔符；按设置解释为{interpretation}")
         } else {
             "未检测到分隔符".to_string()
         },
@@ -3639,14 +3658,22 @@ pub fn inspect_metadata_diagnostic_with_resolver(
                 "通过：按网易云正式数据库补全字段比较，输出标题、歌手、专辑和可用封面已精确校验"
                     .to_string()
             } else {
-                "通过：按可靠文件名推断比较，输出标题、歌手、专辑和可用封面已精确校验".to_string()
+                if matches!(filename_policy, FilenameNormalizationPolicy::SoundCloud) {
+                    "写入一致：与普通文件夹解析规则一致；歌名和歌手身份未经独立验证".to_string()
+                } else {
+                    "写入一致：与所选输入格式推断一致；歌名和歌手身份未经独立验证".to_string()
+                }
             }
         } else if source_tags_are_reliable {
             "未通过：输出标题、歌手、专辑或封面与源文件可靠字段不一致".to_string()
         } else if validation_basis == "netease_database" {
             "未通过：输出标题、歌手、专辑或封面与网易云正式数据库字段不一致".to_string()
         } else {
-            "未通过：输出标题、歌手、专辑或封面与文件名推断不一致".to_string()
+            if matches!(filename_policy, FilenameNormalizationPolicy::SoundCloud) {
+                "写入不一致：输出字段与普通文件夹解析规则不一致".to_string()
+            } else {
+                "写入不一致：输出标题、歌手、专辑或封面与所选输入格式推断不一致".to_string()
+            }
         },
         validation_basis: Some(validation_basis.to_string()),
         output_tags_match: output_exists.then_some(output_matches),
@@ -3665,7 +3692,7 @@ pub fn inspect_metadata_diagnostic_with_resolver(
             selected_album.as_deref(),
             output_album.as_deref(),
         )),
-        netease_recovery: Some(recovery.diagnostic),
+        netease_recovery: recovery.map(|recovery| recovery.diagnostic),
     }
 }
 
@@ -4571,6 +4598,12 @@ fn infer_song_identity_with_netease_filename_format(
         };
     }
 
+    // Task 2 uses the ordinary-folder parser only for missing fields. The
+    // NetEase selector must not affect it, and complete tags remain primary.
+    if matches!(filename_policy, FilenameNormalizationPolicy::SoundCloud) {
+        return infer_song_identity(fallback_name, title.as_deref(), artist.as_deref());
+    }
+
     let fallback = normalize_text_for_policy(fallback_name, filename_policy);
     let (fallback_title, fallback_artist) = match netease_filename_format {
         NeteaseFilenameFormat::TitleOnly => (fallback, String::new()),
@@ -4708,7 +4741,7 @@ fn build_song_name_with_rule(
     )
 }
 
-fn build_song_name_with_policy(
+pub(crate) fn build_song_name_with_policy(
     title: &str,
     artist: &str,
     filename_rule: FilenameRule,
@@ -5137,14 +5170,15 @@ mod tests {
         build_song_name_with_policy, build_song_name_with_rule, commit_temporary_output,
         compare_music_dicts, derive_song_name, derive_song_name_with_policy,
         derive_song_name_with_policy_and_resolver, derive_song_name_with_rule,
-        derive_song_name_with_settings, ensure_generated_output, ensure_output_metadata,
-        ensure_output_metadata_with_settings,
+        ensure_generated_output, ensure_output_metadata, ensure_output_metadata_with_settings,
         ensure_output_metadata_with_settings_with_context_and_policy,
         enumerate_music_files_observed, fill_missing_metadata, find_ffmpeg_next_to_exe,
-        infer_song_identity, inspect_metadata_diagnostic_with_resolver, is_hidden_path,
+        infer_song_identity, inspect_metadata_diagnostic_with_resolver,
+        inspect_metadata_diagnostic_with_resolver_and_settings, is_hidden_path,
         is_ignored_music_file, merge_recovered_metadata, ncm_decryption_available,
         remove_conflicting_outputs, run_output_transaction, sanitize_filename_component,
-        sanitize_preserve_source_filename_component, strip_163_key_from_mp3,
+        sanitize_preserve_source_filename_component, source_metadata_as_id3_with_resolver,
+        strip_163_key_from_mp3,
         sync_music_library_transactional_with_observer_and_budget_and_context,
         target_output_path_with_policy, update_analysis_metadata_transactionally,
         update_existing_metadata_transactionally,
@@ -5785,6 +5819,58 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_update_fills_missing_tags_for_the_other_task_filename_policy() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("Downloaded Track.mp3");
+        let output = dir.path().join("output.mp3");
+        fs::write(&source, b"source audio").unwrap();
+        fs::write(&output, b"existing output audio").unwrap();
+        let mut source_tag = Tag::new();
+        source_tag.set_title("Source Title");
+        source_tag.write_to_path(&source, Version::Id3v24).unwrap();
+        let mut output_tag = Tag::new();
+        output_tag.set_title("Old Output Title");
+        output_tag.write_to_path(&output, Version::Id3v24).unwrap();
+
+        let database = dir.path().join("sqlite_storage.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE track (file TEXT, title TEXT, artist TEXT, album TEXT, cover BLOB);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO track(file, title, artist, album) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    source.to_string_lossy(),
+                    "Database Title",
+                    "Database Artist",
+                    "Database Album"
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let resolver = Arc::new(NeteaseMetadataResolver::load(Some(&database)).unwrap());
+        let context = ConversionMetadataContext { netease: resolver };
+
+        update_existing_metadata_transactionally_with_context_and_policy(
+            &source,
+            &output,
+            NeteaseFilenameFormat::TitleArtist,
+            |_| Ok(()),
+            &context,
+            FilenameNormalizationPolicy::SoundCloud,
+        )
+        .unwrap();
+
+        let updated = Tag::read_from_path(&output).unwrap();
+        assert_eq!(updated.title(), Some("Source Title"));
+        assert_eq!(updated.artist(), Some("Database Artist"));
+        assert_eq!(updated.album(), Some("Database Album"));
+    }
+
+    #[test]
     fn fills_missing_metadata_from_the_original_filename() {
         let mut output = Tag::new();
         let source = Tag::new();
@@ -5824,20 +5910,73 @@ mod tests {
         fs::write(&flac, b"audio").unwrap();
 
         assert_eq!(
-            derive_song_name_with_settings(
+            derive_song_name_with_policy(
                 &mp3,
                 FilenameRule::TitleArtist,
                 NeteaseFilenameFormat::ArtistTitle,
+                FilenameNormalizationPolicy::PreserveSource,
             ),
             "歌曲 - 歌手"
         );
         assert_eq!(
-            derive_song_name_with_settings(
+            derive_song_name_with_policy(
                 &flac,
                 FilenameRule::TitleArtist,
                 NeteaseFilenameFormat::TitleArtist,
+                FilenameNormalizationPolicy::PreserveSource,
             ),
             "歌曲 - 歌手"
+        );
+    }
+
+    #[test]
+    fn ordinary_folder_ignores_the_netease_input_format() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("Singer - Song.mp3");
+        let output = dir.path().join("Song - Singer.mp3");
+        fs::write(&source, b"audio").unwrap();
+        fs::write(&output, b"audio").unwrap();
+
+        assert_eq!(
+            derive_song_name_with_policy(
+                &source,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::TitleArtist,
+                FilenameNormalizationPolicy::SoundCloud,
+            ),
+            "Song - Singer"
+        );
+        let context = ConversionMetadataContext {
+            netease: Arc::new(NeteaseMetadataResolver::default()),
+        };
+        ensure_output_metadata_with_settings_with_context_and_policy(
+            &source,
+            &output,
+            NeteaseFilenameFormat::TitleArtist,
+            FilenameNormalizationPolicy::SoundCloud,
+            &context,
+        )
+        .unwrap();
+        let tag = Tag::read_from_path(&output).unwrap();
+        assert_eq!(tag.title(), Some("Song"));
+        assert_eq!(tag.artist(), Some("Singer"));
+
+        let tagged_source = dir.path().join("Song - Artist.mp3");
+        fs::write(&tagged_source, b"audio").unwrap();
+        let mut source_tag = Tag::new();
+        source_tag.set_title("Song");
+        source_tag.set_artist("Artist");
+        source_tag
+            .write_to_path(&tagged_source, Version::Id3v24)
+            .unwrap();
+        assert_eq!(
+            derive_song_name_with_policy(
+                &tagged_source,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::ArtistTitle,
+                FilenameNormalizationPolicy::SoundCloud,
+            ),
+            "Song - Artist"
         );
     }
 
@@ -5855,6 +5994,70 @@ mod tests {
         let tag = Tag::read_from_path(&output).unwrap();
         assert_eq!(tag.title(), Some("歌曲"));
         assert_eq!(tag.artist(), Some("歌手"));
+    }
+
+    #[test]
+    fn missing_database_match_uses_selected_input_format_for_output_and_diagnostic() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("川村ゆみ - Burn My Dread (P3D ver.).mp3");
+        let output = dir.path().join("Burn My Dread (P3D ver.) - 川村ゆみ.mp3");
+        let database = dir.path().join("sqlite_storage.sqlite3");
+        fs::write(&source, b"audio").unwrap();
+        fs::write(&output, b"audio").unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE track (file TEXT, title TEXT, artist TEXT);")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO track(file,title,artist) VALUES (?1,?2,?3)",
+                params!["unrelated.mp3", "Other Song", "Other Artist"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let resolver = NeteaseMetadataResolver::load_exact(&database).unwrap();
+        assert_eq!(
+            derive_song_name_with_policy_and_resolver(
+                &source,
+                FilenameRule::TitleArtist,
+                NeteaseFilenameFormat::ArtistTitle,
+                FilenameNormalizationPolicy::PreserveSource,
+                Some(&resolver),
+            ),
+            "Burn My Dread (P3D ver.) - 川村ゆみ"
+        );
+
+        let context = ConversionMetadataContext {
+            netease: Arc::new(resolver.clone()),
+        };
+        ensure_output_metadata_with_settings_with_context_and_policy(
+            &source,
+            &output,
+            NeteaseFilenameFormat::ArtistTitle,
+            FilenameNormalizationPolicy::PreserveSource,
+            &context,
+        )
+        .unwrap();
+        let diagnostic = inspect_metadata_diagnostic_with_resolver_and_settings(
+            &source,
+            &output,
+            &resolver,
+            NeteaseFilenameFormat::ArtistTitle,
+            FilenameNormalizationPolicy::PreserveSource,
+        );
+        assert_eq!(
+            diagnostic.output_title.as_deref(),
+            Some("Burn My Dread (P3D ver.)")
+        );
+        assert_eq!(diagnostic.output_artist.as_deref(), Some("川村ゆみ"));
+        assert_eq!(
+            diagnostic.detected_filename_layout,
+            "检测到分隔符；按设置解释为网易云输入：歌手 - 标题"
+        );
+        assert_eq!(diagnostic.output_tags_match, Some(true));
+        assert!(diagnostic.metadata_validation.contains("所选输入格式"));
+        assert!(!diagnostic.metadata_validation.contains("身份已验证"));
     }
 
     #[test]
@@ -5913,6 +6116,41 @@ mod tests {
             ),
             "Database Song - Database Artist"
         );
+    }
+
+    #[test]
+    fn ncm_source_metadata_is_enriched_from_the_local_netease_database() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("Database Song - Database Artist.ncm");
+        let database = dir.path().join("sqlite_storage.sqlite3");
+        fs::write(&source, b"synthetic NCM source; parsing is not under test").unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE track (file TEXT, title TEXT, artist TEXT, album TEXT, tid TEXT, filesize INTEGER);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO track(file,title,artist,album,tid,filesize) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    source.to_string_lossy(),
+                    "Database Song",
+                    "Database Artist",
+                    "Database Album",
+                    "42",
+                    fs::metadata(&source).unwrap().len() as i64,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let resolver = NeteaseMetadataResolver::load_exact(&database).unwrap();
+
+        let tag = source_metadata_as_id3_with_resolver(&source, &resolver);
+
+        assert_eq!(tag.title(), Some("Database Song"));
+        assert_eq!(tag.artist(), Some("Database Artist"));
+        assert_eq!(tag.album(), Some("Database Album"));
     }
 
     #[test]
@@ -6012,8 +6250,8 @@ mod tests {
         )
         .unwrap();
         let tag = Tag::read_from_path(&output).unwrap();
-        assert_eq!(tag.title(), Some("Database Song"));
-        assert_eq!(tag.artist(), Some("Database Artist"));
+        assert_eq!(tag.title(), Some("Database Artist"));
+        assert_eq!(tag.artist(), Some("Database Song"));
         assert_eq!(tag.album(), None);
     }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   TRACK_ANALYSIS_VERSION,
+  analysisNeteaseFilenameOptions,
   assessTrackAnalysisCompleteness,
   batchMusiCnnMelBuffer,
   batchMusiCnnMelRows,
@@ -544,6 +545,13 @@ describe('TensorFlow.js backend selection', () => {
 });
 
 describe('analysis filename identity', () => {
+  it('uses path detection and the selected filename order for either task slot', () => {
+    expect(analysisNeteaseFilenameOptions('/music/in-2/网易云/Artist - Song.mp3', 'title_artist'))
+      .toEqual({ neteaseFilenameFormat: 'title_artist', neteaseSource: true });
+    expect(analysisNeteaseFilenameOptions('/music/in-2/Artist - Song.mp3', 'title_artist'))
+      .toEqual({ neteaseFilenameFormat: 'title_artist', neteaseSource: false });
+  });
+
   it('uses the existing Artist - Song convention for ordinary files', () => {
     expect(filenameIdentity('/music/Artist - Song.mp3')).toEqual({
       title: 'Song',
@@ -565,14 +573,34 @@ describe('analysis filename identity', () => {
       title: 'Song',
       artist: '',
     });
+    expect(filenameIdentity('/music/网易云/Song - Artist.flac', 'title_only')).toMatchObject({
+      title: 'Song - Artist',
+      artist: '',
+    });
+    expect(filenameIdentity('/music/custom-folder/Artist - Song.mp3', 'artist_title', true)).toMatchObject({
+      title: 'Song',
+      artist: 'Artist',
+    });
   });
 
-  it('repairs metadata that is the exact reverse of the filename identity', () => {
+  it('preserves complete source tags even when the filename suggests the reverse identity', () => {
     expect(resolveTrackMetadata('/music/Artist - Song.mp3', {
       title: 'Artist',
       artist: 'Song',
       album: 'Album',
     })).toEqual({
+      title: 'Artist',
+      artist: 'Song',
+      album: 'Album',
+    });
+  });
+
+  it('does not replace complete NCM tags with the selected filename direction', () => {
+    expect(resolveTrackMetadata('/music/网易云/Artist - Song.ncm', {
+      title: 'Song',
+      artist: 'Artist',
+      album: 'Album',
+    }, 'title_artist')).toEqual({
       title: 'Song',
       artist: 'Artist',
       album: 'Album',

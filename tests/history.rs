@@ -178,6 +178,7 @@ fn conversion_report_explains_netease_database_and_cover_recovery() {
             database_record_count: 89,
             matched: true,
             match_method: Some(NeteaseRecordMatchMethod::FileNameAndIdentity),
+            source_table: Some("offlineTrack".into()),
             track_id: Some("42".into()),
             album_id: Some("7".into()),
             cover_source: Some(NeteaseCoverSource::LocalCache),
@@ -191,6 +192,7 @@ fn conversion_report_explains_netease_database_and_cover_recovery() {
     assert!(report.contains("加载记录数：89"));
     assert!(report.contains("本地封面成功：1"));
     assert!(report.contains("网易云匹配方式：fileNameAndIdentity"));
+    assert!(report.contains("网易云匹配表：offlineTrack"));
     assert!(report.contains("网易云封面来源：localCache"));
 }
 

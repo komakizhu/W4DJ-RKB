@@ -110,6 +110,7 @@ workerScope.onmessage = async (event) => {
       {
         fingerprint: request.fingerprint,
         neteaseFilenameFormat: request.neteaseFilenameFormat,
+        neteaseSource: request.neteaseSource,
         highLevel: request.highLevel,
         highLevelModels: models,
         tensorflowBackend,

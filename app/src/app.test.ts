@@ -248,6 +248,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   chooseEnhancedMode: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseConflictStrategy: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseFilenameRule: vi.fn().mockResolvedValue(makeDesktopState()),
+  chooseNeteaseFilenameFormat: vi.fn().mockResolvedValue(makeDesktopState()),
   chooseConcurrencyLimit: vi.fn().mockResolvedValue(makeDesktopState()),
   previewAllSync: vi.fn().mockResolvedValue(makePreviewResponse()),
   startScan: vi.fn().mockResolvedValue({
@@ -292,7 +293,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '3.2.4',
+    version: '3.2.5',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -2133,10 +2134,18 @@ describe('renderApp', () => {
       true,
     );
     const filenameRule = root.querySelector('[data-action="choose-filename-rule"]') as HTMLSelectElement;
-    const neteaseRule = root.querySelector('[data-action="choose-netease-filename-format"]');
+    const neteaseRule = root.querySelector(
+      '[data-action="choose-netease-filename-format"]',
+    ) as HTMLSelectElement;
 
     expect(root.textContent).toContain('输出文件名规则');
-    expect(neteaseRule).toBeNull();
+    expect(root.textContent).toContain('网易云输入文件名格式');
+    expect([...neteaseRule.options].map((option) => [option.value, option.textContent])).toEqual([
+      ['title_only', '仅歌曲名'],
+      ['title_artist', '歌曲名 - 歌手（默认）'],
+      ['artist_title', '歌手 - 歌曲名'],
+    ]);
+    expect(neteaseRule.value).toBe('title_artist');
 
     expect([...filenameRule.options].map((option) => [option.value, option.textContent])).toEqual([
       ['title_artist', '歌曲名 - 歌手（默认）'],
@@ -2172,13 +2181,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '3.2.4',
+        version: '3.2.5',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.4');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.5');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
     expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();
@@ -3785,13 +3794,16 @@ describe('bindApp', () => {
     expect(root.querySelector('[data-enhanced-mode="off"] .ui-icon-check')).toBeNull();
   });
 
-  it('persists conflict and filename selections through backend services', async () => {
+  it('persists conflict, output, and NetEase input filename selections independently', async () => {
     const services = makeMockServices({
       chooseConflictStrategy: vi.fn().mockResolvedValue(
         makeDesktopState({ conflict_strategy: 'overwrite' }),
       ),
       chooseFilenameRule: vi.fn().mockResolvedValue(
         makeDesktopState({ filename_rule: 'artist_title' }),
+      ),
+      chooseNeteaseFilenameFormat: vi.fn().mockResolvedValue(
+        makeDesktopState({ netease_filename_format: 'artist_title' }),
       ),
     });
     const root = document.createElement('div');
@@ -3807,7 +3819,16 @@ describe('bindApp', () => {
     filename.dispatchEvent(new Event('change', { bubbles: true }));
     await vi.waitFor(() => expect(services.chooseFilenameRule).toHaveBeenCalledWith('artist_title'));
 
-    expect(root.querySelector('[data-action="choose-netease-filename-format"]')).toBeNull();
+    const neteaseInput = root.querySelector(
+      '[data-action="choose-netease-filename-format"]',
+    ) as HTMLSelectElement;
+    neteaseInput.value = 'artist_title';
+    neteaseInput.dispatchEvent(new Event('change', { bubbles: true }));
+    await vi.waitFor(() => {
+      expect(services.chooseNeteaseFilenameFormat).toHaveBeenCalledWith('artist_title');
+      expect((root.querySelector('[data-action="choose-netease-filename-format"]') as HTMLSelectElement).value)
+        .toBe('artist_title');
+    });
   });
 
   it('shows one combined preview modal before starting both slots', async () => {

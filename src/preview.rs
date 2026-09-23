@@ -1,4 +1,4 @@
-use crate::analysis::read_track_metadata;
+use crate::analysis::{read_embedded_track_metadata, read_track_metadata};
 use crate::concurrency::GlobalConcurrencyBudget;
 use crate::config::{
     CandidateOperation, ConflictStrategy, FilenameNormalizationPolicy, FilenameRule,
@@ -9,9 +9,9 @@ use crate::history::HistoryEntry;
 use crate::netease::NeteaseMetadataResolver;
 use crate::scan_cache::ScanCache;
 use crate::sync::{
-    ScanObserver, ScannedFileSnapshot, effective_source_extension, find_ffmpeg,
-    get_destination_music_dict_with_rule, get_destination_music_dict_with_rule_and_observer,
-    get_destination_music_files,
+    ScanObserver, ScannedFileSnapshot, build_song_name_with_policy, effective_source_extension,
+    find_ffmpeg, get_destination_music_dict_with_rule,
+    get_destination_music_dict_with_rule_and_observer, get_destination_music_files,
     get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_budget_and_policy,
     get_music_dict_with_scan_issues_with_settings_and_cache_observer_with_policy,
     get_music_dict_with_scan_issues_with_settings_and_observer_with_budget_and_policy,
@@ -192,17 +192,25 @@ fn resolved_source_metadata(
     source_path: &Path,
     resolver: Option<&NeteaseMetadataResolver>,
 ) -> crate::analysis::TrackMetadata {
-    let mut metadata = read_track_metadata(source_path);
+    // When a task-bound resolver is present, inspect the physical source tags
+    // first. The general analysis reader may consult a different cached local
+    // database; it must not override either those tags or this task's chosen
+    // resolver snapshot.
+    let mut metadata = if resolver.is_some() {
+        read_embedded_track_metadata(source_path)
+    } else {
+        read_track_metadata(source_path)
+    };
     if let Some(identity) =
         resolver.and_then(|resolver| resolver.track_identity_for_preview(source_path))
     {
-        if !identity.title.trim().is_empty() {
+        if metadata.title.trim().is_empty() && !identity.title.trim().is_empty() {
             metadata.title = identity.title;
         }
-        if !identity.artists.trim().is_empty() {
+        if metadata.artist.trim().is_empty() && !identity.artists.trim().is_empty() {
             metadata.artist = identity.artists;
         }
-        if !identity.album.trim().is_empty() {
+        if metadata.album.trim().is_empty() && !identity.album.trim().is_empty() {
             metadata.album = identity.album;
         }
     }
@@ -825,6 +833,7 @@ pub fn build_sync_preview_with_snapshots_and_bindings(
     budget: Arc<GlobalConcurrencyBudget>,
     cancel: Arc<AtomicBool>,
     committed_bindings: &HashMap<String, CommittedOutputBinding>,
+    metadata_resolver: Option<&NeteaseMetadataResolver>,
     source_snapshots: &[ScannedFileSnapshot],
     destination_snapshots: &[ScannedFileSnapshot],
 ) -> io::Result<Option<SyncPreview>> {
@@ -840,7 +849,7 @@ pub fn build_sync_preview_with_snapshots_and_bindings(
         observer,
         Some((cache, Path::new(source_directory))),
         Some((budget, cancel)),
-        None,
+        metadata_resolver,
         Some(committed_bindings),
         Some((source_snapshots, destination_snapshots)),
     )
@@ -1013,9 +1022,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     }
 
     let fallback_cancel = AtomicBool::new(false);
-    let (mut source_files, scan_issues, cancelled) = if let Some((source_snapshots, _)) =
-        pre_scanned
-    {
+    let (source_files, scan_issues, cancelled) = if let Some((source_snapshots, _)) = pre_scanned {
         let cache = scan_cache.as_mut().map(|(cache, _)| &mut **cache);
         let mut no_op_observer = |_: crate::sync::ScanPhase, _: &Path| true;
         let scan_observer = observer.as_deref_mut().unwrap_or(&mut no_op_observer);
@@ -1103,41 +1110,6 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     }
 
     let fast_scan = committed_bindings.is_some();
-    // Compatibility resolver APIs retain their historical identity enrichment.
-    // The application scan passes committed bindings and therefore takes the
-    // pure filesystem path below.
-    if !fast_scan
-        && matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
-        && !matches!(filename_rule, FilenameRule::Original)
-        && let Some(resolver) = metadata_resolver
-    {
-        let scan_cancel = budget.as_ref().map(|(_, cancel)| cancel.as_ref());
-        let mut resolved = HashMap::with_capacity(source_files.len());
-        for (_, (size, path)) in source_files.into_iter() {
-            if scan_cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst)) {
-                return Ok(None);
-            }
-            if let Some(observer) = observer.as_deref_mut()
-                && !observer(crate::sync::ScanPhase::Metadata, &path)
-            {
-                return Ok(None);
-            }
-            let name = crate::sync::derive_song_name_with_policy_and_resolver_cancellable(
-                &path,
-                filename_rule,
-                netease_filename_format,
-                filename_policy,
-                Some(resolver),
-                scan_cancel,
-            );
-            let mut key = name.clone();
-            if resolved.contains_key(&key) {
-                key = format!("{name}\u{1f}{}", path.display());
-            }
-            resolved.insert(key, (size, path));
-        }
-        source_files = resolved;
-    }
     for issue in scan_issues {
         preview.errors.push(PreviewIssue {
             path: issue.path.display().to_string(),
@@ -1256,6 +1228,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         .map(|path| path.display().to_string())
         .collect();
     let mut planned_paths = HashSet::new();
+    let mut newly_planned_sources = HashSet::new();
     let snapshot_mtimes = pre_scanned.map(|(source_snapshots, _)| {
         source_snapshots
             .iter()
@@ -1542,6 +1515,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             preview.error_count += 1;
             continue;
         }
+        let source_key = path.to_string_lossy().into_owned();
         preview.candidates.push(PreviewCandidate {
             name: candidate_name.clone(),
             source_path: path.display().to_string(),
@@ -1563,6 +1537,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
         planned_paths.insert(destination_path);
         if !has_existing {
             preview.new_count += 1;
+            newly_planned_sources.insert(source_key);
         }
         preview.estimated_output_bytes = preview
             .estimated_output_bytes
@@ -1623,7 +1598,29 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
             })
         })
         .collect::<HashMap<_, _>>();
+    // Resolve collisions based on the paths initially planned from source
+    // labels/filenames before applying a database-derived name. A database
+    // replan below is restricted to candidates classified as new above.
     disambiguate_duplicate_output_names(&mut preview, &identities);
+
+    if matches!(filename_policy, FilenameNormalizationPolicy::PreserveSource)
+        && !matches!(filename_rule, FilenameRule::Original)
+        && let Some(resolver) = metadata_resolver
+    {
+        let scan_cancel = budget.as_ref().map(|(_, cancel)| cancel.as_ref());
+        if !replan_new_preview_candidates(
+            &mut preview,
+            &newly_planned_sources,
+            &destination_inventory,
+            resolver,
+            filename_rule,
+            filename_policy,
+            scan_cancel,
+            observer,
+        ) {
+            return Ok(None);
+        }
+    }
 
     let requires_ffmpeg = preview.candidates.iter().any(|candidate| {
         if matches!(candidate.operation, CandidateOperation::UpdateMetadata) {
@@ -1665,6 +1662,303 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     }
 
     Ok(Some(preview))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replan_new_preview_candidates(
+    preview: &mut SyncPreview,
+    newly_planned_sources: &HashSet<String>,
+    destination_inventory: &[PathBuf],
+    resolver: &NeteaseMetadataResolver,
+    filename_rule: FilenameRule,
+    filename_policy: FilenameNormalizationPolicy,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    mut observer: Option<&mut crate::sync::ScanObserver<'_>>,
+) -> bool {
+    if newly_planned_sources.is_empty() {
+        return true;
+    }
+
+    let mut replanned_sources = HashSet::new();
+    let mut identities = HashMap::new();
+    for candidate in &mut preview.candidates {
+        if !newly_planned_sources.contains(&candidate.source_path)
+            || !matches!(candidate.operation, CandidateOperation::Convert)
+        {
+            continue;
+        }
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::SeqCst)) {
+            return false;
+        }
+
+        let source_path = Path::new(&candidate.source_path);
+        if observer
+            .as_deref_mut()
+            .is_some_and(|observer| !observer(crate::sync::ScanPhase::Metadata, source_path))
+        {
+            return false;
+        }
+        let Some(identity) = cancel
+            .map(|cancel| resolver.track_identity_cancellable(source_path, cancel))
+            .unwrap_or_else(|| resolver.track_identity_for_preview(source_path))
+        else {
+            continue;
+        };
+
+        candidate.netease_track_id = identity.track_id.clone();
+        candidate.netease_album_id = identity.album_id.clone();
+        candidate.album = non_empty_identity_value(&identity.album);
+        candidate.netease_title = non_empty_identity_value(&identity.title);
+        candidate.netease_artist = non_empty_identity_value(&identity.artists);
+
+        if identity.title.trim().is_empty() || identity.artists.trim().is_empty() {
+            continue;
+        }
+
+        let embedded = read_embedded_track_metadata(source_path);
+        if identity_fields_conflict(&embedded.title, &identity.title)
+            || identity_fields_conflict(&embedded.artist, &identity.artists)
+        {
+            continue;
+        }
+        let resolved_title = if embedded.title.trim().is_empty() {
+            identity.title.as_str()
+        } else {
+            embedded.title.trim()
+        };
+        let resolved_artist = if embedded.artist.trim().is_empty() {
+            identity.artists.as_str()
+        } else {
+            embedded.artist.trim()
+        };
+        let Some(name) = build_song_name_with_policy(
+            resolved_title,
+            resolved_artist,
+            filename_rule,
+            filename_policy,
+        ) else {
+            continue;
+        };
+        if name.trim().is_empty() {
+            continue;
+        }
+
+        let extension = Path::new(&candidate.destination_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        candidate.name = name;
+        candidate.destination_path = target_output_path_with_policy(
+            &preview.destination_directory,
+            &candidate.name,
+            extension,
+            filename_policy,
+        )
+        .display()
+        .to_string();
+        replanned_sources.insert(candidate.source_path.clone());
+        identities.insert(
+            candidate.source_path.clone(),
+            OutputTrackIdentity {
+                track_id: identity.track_id,
+                album_id: identity.album_id,
+                title: resolved_title.to_string(),
+                artists: resolved_artist.to_string(),
+                album: identity.album,
+                source_path: source_path.to_path_buf(),
+            },
+        );
+    }
+
+    if replanned_sources.is_empty() {
+        return true;
+    }
+
+    let protected_paths = preview
+        .candidates
+        .iter()
+        .filter(|candidate| !replanned_sources.contains(&candidate.source_path))
+        .map(|candidate| PathBuf::from(&candidate.destination_path))
+        .collect::<Vec<_>>();
+    let mut blocked = HashMap::<String, (String, bool)>::new();
+    for candidate in preview
+        .candidates
+        .iter()
+        .filter(|candidate| replanned_sources.contains(&candidate.source_path))
+    {
+        let destination = Path::new(&candidate.destination_path);
+        if same_preview_path(source_path_for(candidate), destination) {
+            blocked.insert(
+                candidate.source_path.clone(),
+                (
+                    "数据库命名后的输出路径与源文件相同，为保护原曲已停止此项".to_string(),
+                    false,
+                ),
+            );
+            continue;
+        }
+        let occupied_output = destination.exists()
+            || destination_inventory
+                .iter()
+                .any(|existing| same_preview_path(existing, destination));
+        if occupied_output {
+            blocked.insert(
+                candidate.source_path.clone(),
+                (
+                    "数据库身份对应的目标文件已存在，为避免覆盖已安全跳过".to_string(),
+                    true,
+                ),
+            );
+            continue;
+        }
+        if protected_paths
+            .iter()
+            .any(|planned| same_preview_path(planned, destination))
+        {
+            blocked.insert(
+                candidate.source_path.clone(),
+                (
+                    "数据库命名后与本批次已有计划输出冲突，已安全跳过".to_string(),
+                    false,
+                ),
+            );
+        }
+    }
+
+    remove_blocked_replanned_candidates(preview, &blocked);
+    replanned_sources.retain(|source| !blocked.contains_key(source));
+    identities.retain(|source, _| replanned_sources.contains(source));
+    if replanned_sources.is_empty() {
+        return true;
+    }
+
+    // Run the established collision disambiguation only over the newly
+    // resolved candidates. Existing/bound candidates are intentionally not
+    // part of this set, so a new database identity cannot rename an old
+    // output merely by colliding with it.
+    let mut new_only = preview.clone();
+    new_only.candidates = preview
+        .candidates
+        .iter()
+        .filter(|candidate| replanned_sources.contains(&candidate.source_path))
+        .cloned()
+        .collect();
+    new_only.new_count = new_only.candidates.len();
+    new_only.existing_count = 0;
+    new_only.skipped_count = 0;
+    new_only.error_count = 0;
+    new_only.estimated_output_bytes = new_only
+        .candidates
+        .iter()
+        .try_fold(0u64, |total, candidate| {
+            total.checked_add(candidate.estimated_output_bytes?)
+        });
+    disambiguate_duplicate_output_names(&mut new_only, &identities);
+
+    let retained_by_source = new_only
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.source_path.clone(), candidate))
+        .collect::<HashMap<_, _>>();
+    let mut removed_by_disambiguation = Vec::new();
+    for candidate in &mut preview.candidates {
+        if !replanned_sources.contains(&candidate.source_path) {
+            continue;
+        }
+        if let Some(replanned) = retained_by_source.get(&candidate.source_path) {
+            *candidate = replanned.clone();
+        } else {
+            removed_by_disambiguation.push(candidate.source_path.clone());
+        }
+    }
+    if !removed_by_disambiguation.is_empty() {
+        let removed_set = removed_by_disambiguation
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut retained = Vec::with_capacity(preview.candidates.len());
+        for candidate in std::mem::take(&mut preview.candidates) {
+            if removed_set.contains(&candidate.source_path) {
+                decrement_new_preview_candidate(preview, &candidate);
+                preview.skipped_count += 1;
+                preview.skipped.push(PreviewIssue {
+                    path: candidate.source_path,
+                    message: "数据库命名后的同名输出已存在且身份相同，已安全跳过".to_string(),
+                });
+            } else {
+                retained.push(candidate);
+            }
+        }
+        preview.candidates = retained;
+    }
+
+    true
+}
+
+fn source_path_for(candidate: &PreviewCandidate) -> &Path {
+    Path::new(&candidate.source_path)
+}
+
+fn non_empty_identity_value(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_string())
+}
+
+fn normalized_identity_comparison(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn identity_fields_conflict(source_value: &str, database_value: &str) -> bool {
+    !source_value.trim().is_empty()
+        && !database_value.trim().is_empty()
+        && normalized_identity_comparison(source_value)
+            != normalized_identity_comparison(database_value)
+}
+
+fn same_preview_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || crate::scan_cache::normalize_path(left) == crate::scan_cache::normalize_path(right)
+}
+
+fn remove_blocked_replanned_candidates(
+    preview: &mut SyncPreview,
+    blocked: &HashMap<String, (String, bool)>,
+) {
+    if blocked.is_empty() {
+        return;
+    }
+    let mut retained = Vec::with_capacity(preview.candidates.len());
+    for candidate in std::mem::take(&mut preview.candidates) {
+        if let Some((reason, existing_output)) = blocked.get(&candidate.source_path) {
+            decrement_new_preview_candidate(preview, &candidate);
+            if *existing_output {
+                preview.existing_count += 1;
+            }
+            if reason.contains("停止此项") {
+                preview.error_count += 1;
+                preview.errors.push(PreviewIssue {
+                    path: candidate.source_path,
+                    message: reason.clone(),
+                });
+            } else {
+                preview.skipped_count += 1;
+                preview.skipped.push(PreviewIssue {
+                    path: candidate.source_path,
+                    message: reason.clone(),
+                });
+            }
+        } else {
+            retained.push(candidate);
+        }
+    }
+    preview.candidates = retained;
+}
+
+fn decrement_new_preview_candidate(preview: &mut SyncPreview, candidate: &PreviewCandidate) {
+    preview.new_count = preview.new_count.saturating_sub(1);
+    if let Some(bytes) = candidate.estimated_output_bytes {
+        preview.estimated_output_bytes = preview
+            .estimated_output_bytes
+            .and_then(|total| total.checked_sub(bytes));
+    }
 }
 
 fn finalize_preview_summary(preview: &mut SyncPreview, strategy: ConflictStrategy) {
@@ -2014,10 +2308,584 @@ fn available_disk_space(_path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_sync_preview;
-    use crate::config::Mode;
+    use super::{
+        build_sync_preview, build_sync_preview_with_settings_and_netease_observed_internal,
+    };
+    use crate::concurrency::GlobalConcurrencyBudget;
+    use crate::config::{
+        ConflictStrategy, FilenameNormalizationPolicy, FilenameRule, Mode, NeteaseFilenameFormat,
+    };
+    use crate::netease::NeteaseMetadataResolver;
+    use crate::scan_cache::ScanCache;
+    use crate::sync::ScannedFileSnapshot;
+    use crate::w4dj_library::CommittedOutputBinding;
+    use std::collections::HashSet;
     use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, atomic::AtomicBool};
     use tempfile::tempdir;
+
+    fn snapshot(path: &Path) -> ScannedFileSnapshot {
+        let metadata = fs::metadata(path).unwrap();
+        ScannedFileSnapshot {
+            path: path.to_path_buf(),
+            size_bytes: metadata.len(),
+            modified_at_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_millis() as u64),
+            source_extension: path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    fn resolver_for_source(
+        directory: &Path,
+        source: &Path,
+        track_id: &str,
+        title: &str,
+        artist: &str,
+        album: &str,
+    ) -> NeteaseMetadataResolver {
+        resolver_for_sources(directory, &[(source, track_id, title, artist, album)])
+    }
+
+    fn resolver_for_sources(
+        directory: &Path,
+        records: &[(&Path, &str, &str, &str, &str)],
+    ) -> NeteaseMetadataResolver {
+        let database = directory.join("netease.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE offlineTrack (
+                    type TEXT, state INTEGER, completeTime INTEGER,
+                    newRelativePath TEXT, trackName TEXT, artistName TEXT,
+                    albumName TEXT, size INTEGER, id TEXT PRIMARY KEY, jsonStr TEXT
+                );",
+            )
+            .unwrap();
+        for (source, track_id, title, artist, album) in records {
+            let stem = source.file_stem().unwrap().to_string_lossy();
+            let detail = serde_json::json!({
+                "detail": {
+                    "id": track_id,
+                    "name": title,
+                    "artists": [{"name": artist}],
+                    "album": {"id": format!("album-{track_id}"), "name": album}
+                }
+            });
+            connection
+                .execute(
+                    "INSERT INTO offlineTrack(type,state,newRelativePath,trackName,artistName,albumName,size,id,jsonStr)
+                     VALUES ('track',4,?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        format!("/{stem}.ncm"),
+                        title,
+                        artist,
+                        album,
+                        fs::metadata(source).unwrap().len(),
+                        track_id,
+                        detail.to_string(),
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        NeteaseMetadataResolver::load_exact(&database).unwrap()
+    }
+
+    fn write_mp3_tags(path: &Path, title: Option<&str>, artist: Option<&str>) {
+        use id3::TagLike;
+
+        fs::write(path, b"synthetic mp3 payload").unwrap();
+        let mut tag = id3::Tag::new();
+        if let Some(title) = title {
+            tag.set_title(title);
+        }
+        if let Some(artist) = artist {
+            tag.set_artist(artist);
+        }
+        tag.write_to_path(path, id3::Version::Id3v24).unwrap();
+    }
+
+    fn build_snapshot_preview(
+        source_root: &Path,
+        destination: &Path,
+        snapshots: (&[ScannedFileSnapshot], &[ScannedFileSnapshot]),
+        filename_rule: FilenameRule,
+        conflict_strategy: ConflictStrategy,
+        bindings: &std::collections::HashMap<String, CommittedOutputBinding>,
+        resolver: &NeteaseMetadataResolver,
+    ) -> super::SyncPreview {
+        let mut cache = ScanCache::default();
+        let budget = Arc::new(GlobalConcurrencyBudget::new(2));
+        let cancel = Arc::new(AtomicBool::new(false));
+        build_sync_preview_with_settings_and_netease_observed_internal(
+            source_root.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            Mode::Compat,
+            None,
+            conflict_strategy,
+            filename_rule,
+            NeteaseFilenameFormat::TitleArtist,
+            FilenameNormalizationPolicy::PreserveSource,
+            None,
+            Some((&mut cache, source_root)),
+            Some((budget, cancel)),
+            Some(resolver),
+            Some(bindings),
+            Some(snapshots),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn newly_added_track_uses_a_reliable_netease_identity_for_its_output_name() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir.path().join("Old Artist - Old Title.flac");
+        fs::write(&source, b"synthetic audio").unwrap();
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+        let source_snapshots = vec![snapshot(&source)];
+        let preview = build_snapshot_preview(
+            source_dir.path(),
+            destination_dir.path(),
+            (&source_snapshots, &[]),
+            FilenameRule::TitleArtist,
+            ConflictStrategy::Skip,
+            &Default::default(),
+            &resolver,
+        );
+
+        assert_eq!(preview.new_count, 1);
+        assert_eq!(preview.candidates.len(), 1);
+        assert_eq!(
+            preview.candidates[0].name,
+            "Database Song - Database Artist"
+        );
+        assert_eq!(
+            PathBuf::from(&preview.candidates[0].destination_path),
+            destination_dir
+                .path()
+                .join("Database Song - Database Artist.mp3")
+        );
+    }
+
+    #[test]
+    fn database_identity_replanning_reports_metadata_progress_and_honors_cancellation() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir.path().join("Download.flac");
+        fs::write(&source, b"synthetic audio").unwrap();
+        let source_snapshots = vec![snapshot(&source)];
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+
+        let mut cache = ScanCache::default();
+        let budget = Arc::new(GlobalConcurrencyBudget::new(2));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut metadata_progress = Vec::new();
+        let mut observer = |phase, path: &Path| {
+            if phase == crate::sync::ScanPhase::Metadata {
+                metadata_progress.push(path.to_path_buf());
+            }
+            true
+        };
+        let preview = build_sync_preview_with_settings_and_netease_observed_internal(
+            source_dir.path().to_str().unwrap(),
+            destination_dir.path().to_str().unwrap(),
+            Mode::Compat,
+            None,
+            ConflictStrategy::Skip,
+            FilenameRule::TitleArtist,
+            NeteaseFilenameFormat::TitleArtist,
+            FilenameNormalizationPolicy::PreserveSource,
+            Some(&mut observer),
+            Some((&mut cache, source_dir.path())),
+            Some((budget, cancel)),
+            Some(&resolver),
+            Some(&Default::default()),
+            Some((&source_snapshots, &[])),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(preview.new_count, 1);
+        assert_eq!(metadata_progress, vec![source.clone()]);
+
+        let mut cache = ScanCache::default();
+        let budget = Arc::new(GlobalConcurrencyBudget::new(2));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut cancelled_metadata = false;
+        let mut observer = |phase, _path: &Path| {
+            if phase == crate::sync::ScanPhase::Metadata {
+                cancelled_metadata = true;
+                false
+            } else {
+                true
+            }
+        };
+        let preview = build_sync_preview_with_settings_and_netease_observed_internal(
+            source_dir.path().to_str().unwrap(),
+            destination_dir.path().to_str().unwrap(),
+            Mode::Compat,
+            None,
+            ConflictStrategy::Skip,
+            FilenameRule::TitleArtist,
+            NeteaseFilenameFormat::TitleArtist,
+            FilenameNormalizationPolicy::PreserveSource,
+            Some(&mut observer),
+            Some((&mut cache, source_dir.path())),
+            Some((budget, cancel)),
+            Some(&resolver),
+            Some(&Default::default()),
+            Some((&source_snapshots, &[])),
+        )
+        .unwrap();
+
+        assert!(cancelled_metadata);
+        assert!(preview.is_none());
+    }
+
+    #[test]
+    fn original_filename_rule_does_not_rename_a_database_matched_track() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir.path().join("Old Artist - Old Title.flac");
+        fs::write(&source, b"synthetic audio").unwrap();
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+        let preview = build_snapshot_preview(
+            source_dir.path(),
+            destination_dir.path(),
+            (&[snapshot(&source)], &[]),
+            FilenameRule::Original,
+            ConflictStrategy::Skip,
+            &Default::default(),
+            &resolver,
+        );
+
+        assert_eq!(preview.new_count, 1);
+        assert_eq!(preview.candidates[0].name, "Old Artist - Old Title");
+        assert_eq!(
+            PathBuf::from(&preview.candidates[0].destination_path),
+            destination_dir.path().join("Old Artist - Old Title.mp3")
+        );
+    }
+
+    #[test]
+    fn database_renaming_never_overwrites_an_existing_target() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir.path().join("Old Artist - Old Title.flac");
+        fs::write(&source, b"synthetic audio").unwrap();
+        let existing_target = destination_dir
+            .path()
+            .join("Database Song - Database Artist.mp3");
+        fs::write(&existing_target, b"preserve existing output").unwrap();
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+        let preview = build_snapshot_preview(
+            source_dir.path(),
+            destination_dir.path(),
+            (&[snapshot(&source)], &[snapshot(&existing_target)]),
+            FilenameRule::TitleArtist,
+            ConflictStrategy::Overwrite,
+            &Default::default(),
+            &resolver,
+        );
+
+        assert_eq!(preview.new_count, 0);
+        assert_eq!(preview.skipped_count, 1);
+        assert!(preview.candidates.is_empty());
+        assert!(preview.skipped.iter().any(|issue| {
+            issue.path == source.display().to_string() && issue.message.contains("已存在")
+        }));
+        assert_eq!(
+            fs::read(existing_target).unwrap(),
+            b"preserve existing output"
+        );
+    }
+
+    #[test]
+    fn committed_output_binding_keeps_an_existing_track_out_of_database_renaming() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir.path().join("Old Artist - Old Title.flac");
+        fs::write(&source, b"synthetic audio").unwrap();
+        let existing_output = destination_dir.path().join("Legacy Export.mp3");
+        fs::write(&existing_output, b"previous output").unwrap();
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+        let source_snapshot = snapshot(&source);
+        let destination_snapshot = snapshot(&existing_output);
+        let normalized_root = crate::scan_cache::normalize_path(destination_dir.path())
+            .to_string_lossy()
+            .into_owned();
+        let bindings = std::collections::HashMap::from([(
+            source.display().to_string(),
+            CommittedOutputBinding {
+                source_path: source.display().to_string(),
+                destination_path: existing_output.display().to_string(),
+                output_root: normalized_root,
+                slot_index: 0,
+                source_size_bytes: Some(source_snapshot.size_bytes),
+                source_modified_at_ms: source_snapshot.modified_at_ms,
+                mode: None,
+                lossless_format: None,
+                filename_rule: None,
+                netease_filename_format: None,
+                filename_normalization_policy: None,
+            },
+        )]);
+        let preview = build_snapshot_preview(
+            source_dir.path(),
+            destination_dir.path(),
+            (&[source_snapshot], &[destination_snapshot]),
+            FilenameRule::TitleArtist,
+            ConflictStrategy::Overwrite,
+            &bindings,
+            &resolver,
+        );
+
+        assert_eq!(preview.new_count, 0);
+        assert_eq!(preview.candidates.len(), 1);
+        assert_eq!(preview.candidates[0].name, "Old Artist - Old Title");
+        assert_eq!(
+            preview.candidates[0].destination_path,
+            destination_dir
+                .path()
+                .join("Old Artist - Old Title.mp3")
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            preview.candidates[0].previous_destination_paths,
+            vec![existing_output.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn conflicting_embedded_identity_prevents_database_based_renaming() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir
+            .path()
+            .join("Filename Artist - Filename Title.mp3");
+        write_mp3_tags(&source, Some("Source Title"), Some("Source Artist"));
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+        let preview = build_snapshot_preview(
+            source_dir.path(),
+            destination_dir.path(),
+            (&[snapshot(&source)], &[]),
+            FilenameRule::TitleArtist,
+            ConflictStrategy::Skip,
+            &Default::default(),
+            &resolver,
+        );
+
+        assert_eq!(preview.new_count, 1);
+        assert_ne!(
+            preview.candidates[0].name,
+            "Database Song - Database Artist"
+        );
+        assert_eq!(
+            preview.candidates[0].netease_title.as_deref(),
+            Some("Database Song")
+        );
+        assert_eq!(
+            preview.candidates[0].netease_artist.as_deref(),
+            Some("Database Artist")
+        );
+    }
+
+    #[test]
+    fn missing_embedded_artist_is_filled_from_a_reliable_database_match_for_naming() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir.path().join("Downloaded Copy.mp3");
+        write_mp3_tags(&source, Some("Database Song"), None);
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+        let preview = build_snapshot_preview(
+            source_dir.path(),
+            destination_dir.path(),
+            (&[snapshot(&source)], &[]),
+            FilenameRule::TitleArtist,
+            ConflictStrategy::Skip,
+            &Default::default(),
+            &resolver,
+        );
+
+        assert_eq!(preview.new_count, 1);
+        assert_eq!(
+            preview.candidates[0].name,
+            "Database Song - Database Artist"
+        );
+    }
+
+    #[test]
+    fn explicit_database_identity_does_not_hide_conflicting_source_tags_from_preview() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let source = source_dir
+            .path()
+            .join("Filename Artist - Filename Title.mp3");
+        write_mp3_tags(&source, Some("Source Title"), Some("Source Artist"));
+        let resolver = resolver_for_source(
+            source_dir.path(),
+            &source,
+            "42",
+            "Database Song",
+            "Database Artist",
+            "Database Album",
+        );
+        let database_named_output = destination_dir
+            .path()
+            .join("Database Song - Database Artist.mp3");
+        write_mp3_tags(
+            &database_named_output,
+            Some("Database Song"),
+            Some("Database Artist"),
+        );
+        let mut cache = ScanCache::default();
+        let preview = build_sync_preview_with_settings_and_netease_observed_internal(
+            source_dir.path().to_str().unwrap(),
+            destination_dir.path().to_str().unwrap(),
+            Mode::Compat,
+            None,
+            ConflictStrategy::Skip,
+            FilenameRule::TitleArtist,
+            NeteaseFilenameFormat::TitleArtist,
+            FilenameNormalizationPolicy::PreserveSource,
+            None,
+            Some((&mut cache, source_dir.path())),
+            None,
+            Some(&resolver),
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(preview.new_count, 1);
+        assert_eq!(preview.candidates.len(), 1);
+        assert_eq!(
+            preview.candidates[0].name,
+            "Filename Artist - Filename Title"
+        );
+        assert_ne!(
+            preview.candidates[0].destination_path,
+            database_named_output.display().to_string()
+        );
+        assert!(database_named_output.is_file());
+    }
+
+    #[test]
+    fn database_name_collisions_are_disambiguated_only_among_new_tracks() {
+        let source_dir = tempdir().unwrap();
+        let destination_dir = tempdir().unwrap();
+        let first = source_dir.path().join("First Download.flac");
+        let second = source_dir.path().join("Second Download.flac");
+        fs::write(&first, b"first synthetic audio").unwrap();
+        fs::write(&second, b"second synthetic audio bytes").unwrap();
+        let resolver = resolver_for_sources(
+            source_dir.path(),
+            &[
+                (
+                    &first,
+                    "42",
+                    "Database Song",
+                    "Database Artist",
+                    "Album One",
+                ),
+                (
+                    &second,
+                    "43",
+                    "Database Song",
+                    "Database Artist",
+                    "Album Two",
+                ),
+            ],
+        );
+        let source_snapshots = vec![snapshot(&first), snapshot(&second)];
+        let preview = build_snapshot_preview(
+            source_dir.path(),
+            destination_dir.path(),
+            (&source_snapshots, &[]),
+            FilenameRule::TitleArtist,
+            ConflictStrategy::Skip,
+            &Default::default(),
+            &resolver,
+        );
+        let names = preview
+            .candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(preview.new_count, 2);
+        assert_eq!(preview.candidates.len(), 2);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("Database Song - Database Artist [Album One]"));
+        assert!(names.contains("Database Song - Database Artist [Album Two]"));
+        assert!(
+            preview
+                .candidates
+                .iter()
+                .all(|candidate| candidate.disambiguation_reason.is_some())
+        );
+    }
 
     #[test]
     fn previews_a_single_supported_audio_file() {

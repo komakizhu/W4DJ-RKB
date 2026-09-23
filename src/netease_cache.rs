@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const CACHE_SCHEMA_VERSION: &str = "2";
+pub const CACHE_SCHEMA_VERSION: &str = "3";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheState {
@@ -257,4 +257,56 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheState, ensure_schema, read_summary};
+    use crate::netease::{DatabaseFingerprintView, FileFingerprintView};
+    use rusqlite::params;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    #[test]
+    fn invalidates_previous_locator_schema_even_when_database_fingerprint_matches() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("netease-cache.sqlite3");
+        let database = directory.path().join("sqlite_storage.sqlite3");
+        ensure_schema(&cache).unwrap();
+        let fingerprint = DatabaseFingerprintView {
+            main: FileFingerprintView {
+                exists: true,
+                size: Some(10),
+                modified_nanos: Some(20),
+            },
+            wal: FileFingerprintView {
+                exists: false,
+                size: None,
+                modified_nanos: None,
+            },
+            shm: FileFingerprintView {
+                exists: false,
+                size: None,
+                modified_nanos: None,
+            },
+        };
+        let connection = rusqlite::Connection::open(&cache).unwrap();
+        for (key, value) in [
+            ("schemaVersion", "2".to_string()),
+            ("status", "ready".to_string()),
+            ("databasePath", database.to_string_lossy().into_owned()),
+            ("fingerprint", serde_json::to_string(&fingerprint).unwrap()),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO netease_cache_meta(key,value) VALUES (?1,?2)",
+                    params![key, value],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let summary = read_summary(&cache, Some(Path::new(&database)), Some(&fingerprint)).unwrap();
+        assert_eq!(summary.state, CacheState::Stale);
+    }
 }

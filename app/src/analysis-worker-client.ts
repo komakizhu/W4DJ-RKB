@@ -98,6 +98,7 @@ type AnalysisRequest = {
   metadata?: TrackMetadata;
   fingerprint?: AnalysisFingerprint;
   neteaseFilenameFormat: NeteaseFilenameFormat;
+  neteaseSource?: boolean;
   highLevel?: HighLevelAnalysis;
   audio: DecodedAudioData;
   onProgress?: (progress: AnalysisWorkerProgress) => void;
@@ -335,6 +336,7 @@ export class AnalysisWorkerClient implements AnalysisWorkerSession {
           metadata: request.metadata,
           fingerprint: request.fingerprint,
           neteaseFilenameFormat: request.neteaseFilenameFormat,
+          neteaseSource: request.neteaseSource,
           highLevel: request.highLevel,
           audio: serialized.payload,
         }, serialized.transfer);
