@@ -155,10 +155,6 @@ const ONBOARDING_STEP_COUNT = 5;
 // ready to return; the Rust analysis backend remains available throughout.
 const ENHANCED_ANALYSIS_FEATURES_VISIBLE = false;
 
-// Cache cleanup is a safe maintenance action and remains available even while
-// the enhanced-analysis controls are hidden from the conversion rail.
-const ANALYSIS_CACHE_CLEAR_VISIBLE = true;
-
 // Keep the song-library backend and state intact while its user-facing entry
 // point remains hidden during the current stability/product rollout.
 const SONG_LIBRARY_FEATURE_VISIBLE = false;
@@ -890,7 +886,6 @@ const translations = {
     conflictMetadata: '仅更新元数据',
     filenameRule: '输出文件名规则',
     neteaseInputFormat: '网易云输入文件名格式',
-    neteaseInputFormatHint: '仅用于补全源标签和数据库缺失的字段；混合命名请核对预览。',
     titleOnly: '仅歌曲名',
     titleArtist: '歌曲名 - 歌手（默认）',
     artistTitle: '歌手 - 歌曲名',
@@ -956,8 +951,6 @@ const translations = {
     analysisComplete: '已保存 {count} 首分析结果，可导入 Rekordbox。',
     analysisPartial: '完成 {done}/{total} 首，{failed} 首失败。',
     analysisNoResults: '没有成功的分析结果。',
-    clearAnalysisCache: '清除歌曲库与分析缓存',
-    clearAnalysisCacheConfirm: '确定清除歌曲库与分析缓存吗？不会删除音频文件、转换历史、歌单或扫描缓存。',
     analysisCacheCleared: '歌曲库与分析缓存已清除。',
     clearEnhancedCache: '清除增强模式缓存',
     clearEnhancedCacheConfirm: '确定清除增强模式缓存吗？不会删除音频文件、扫描缓存或已下载模型。',
@@ -1178,7 +1171,6 @@ const translations = {
     conflictMetadata: 'Update metadata only',
     filenameRule: 'Output filename rule',
     neteaseInputFormat: 'NetEase input filename format',
-    neteaseInputFormatHint: 'Used only for fields missing from tags and the database; review mixed-name previews.',
     titleOnly: 'Title only',
     titleArtist: 'Title - Artist (default)',
     artistTitle: 'Artist - Title',
@@ -1244,8 +1236,6 @@ const translations = {
     analysisComplete: '{count} results saved. Ready for Rekordbox.',
     analysisPartial: 'Completed {done}/{total}; {failed} failed.',
     analysisNoResults: 'No analysis result was completed.',
-    clearAnalysisCache: 'Clear library and analysis cache',
-    clearAnalysisCacheConfirm: 'Clear the W4DJ library and analysis cache? Audio files, conversion history, playlists, and scan cache will be kept.',
     analysisCacheCleared: 'W4DJ library and analysis cache cleared.',
     clearEnhancedCache: 'Clear enhanced-mode cache',
     clearEnhancedCacheConfirm: 'Clear enhanced-mode cache? Audio files, scan cache, and downloaded models will not be deleted.',
@@ -1886,7 +1876,7 @@ export function renderApp(
   pendingSelection: PendingSelection = null,
   previewBusy = false,
   aboutInfo: AppInfo | null = null,
-  outputSettingsExpanded = false,
+  _outputSettingsExpanded = false,
   historyExpanded = false,
   onboardingVisible = false,
   onboardingStep: OnboardingStep = 0,
@@ -2060,7 +2050,7 @@ export function renderApp(
               </span>
             </span>
           </div>
-          ${renderOutputSettings(state, outputSettingsExpanded, modelStatus)}
+          ${renderOutputSettings(state, modelStatus)}
           <div class="global-action-group">
             <button type="button" class="global-action"${onboardingTarget === 'start' ? ' data-onboarding-target="start"' : ''} data-action="${scanRunning ? 'cancel-scan' : analysisRunning ? 'cancel-analysis' : conversionRunning ? 'cancel-all' : 'start-all'}" ${scanCancelling || (!scanRunning && !analysisRunning && !conversionRunning && (configuredTasks === 0 || pendingAction !== null)) ? 'disabled' : ''} aria-busy="${pendingAction !== null}">
               ${scanRunning || analysisRunning || conversionRunning ? icon('pause') : icon('play')}
@@ -3042,7 +3032,6 @@ export function bindApp(
   let updateInfo: AppUpdateCheck | null = null;
   let modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus;
   let helpVisible = false;
-  let outputSettingsExpanded = false;
   let historyExpanded = false;
   let scanProgress: AppScanProgress | null = null;
   let scanTimer: ReturnType<typeof setTimeout> | null = null;
@@ -3241,7 +3230,7 @@ export function bindApp(
         pendingSelection,
         previewBusy,
         aboutInfo,
-        outputSettingsExpanded,
+        false,
         historyExpanded,
         onboardingVisible,
         onboardingStep,
@@ -6922,11 +6911,6 @@ export function bindApp(
       return;
     }
 
-    if (action === 'clear-analysis-cache') {
-      void clearLibraryCache();
-      return;
-    }
-
     if (action === 'clear-enhanced-cache') {
       void clearEnhancedCache();
       return;
@@ -7132,16 +7116,6 @@ export function bindApp(
       render();
     }
   });
-
-  root.addEventListener('toggle', (event) => {
-    const settings = event.target;
-    if (
-      settings instanceof HTMLDetailsElement
-      && settings.dataset.role === 'advanced-output-settings'
-    ) {
-      outputSettingsExpanded = settings.open;
-    }
-  }, true);
 
   root.addEventListener('change', (event) => {
     const playlistSelect = (event.target as HTMLElement | null)?.closest<HTMLInputElement>(
@@ -7737,7 +7711,7 @@ export function bindApp(
 function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSelection = null): string {
   const formats: AppLosslessFormat[] = ['wav', 'aiff'];
   return `
-    <div class="format-slot">
+    <div class="format-slot" data-visible="${state.mode === 'lossless'}">
       <div class="format-row" data-selected-format="${state.losslessFormat || 'wav'}" data-visible="${state.mode === 'lossless'}" aria-label="${t('losslessFormat', state.lang)}" aria-hidden="${state.mode !== 'lossless'}">
         ${formats
           .map(
@@ -7755,7 +7729,6 @@ function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSel
 
 function renderOutputSettings(
   state: AppViewState,
-  expanded = false,
   modelStatus: EssentiaModelStatus = defaultEssentiaModelStatus,
 ): string {
   const discogs = modelStatus.discogsEffnet;
@@ -7766,8 +7739,8 @@ function renderOutputSettings(
     && modelStatus.instrument
     && discogsReady;
   return `
-    <details class="output-settings" data-role="advanced-output-settings" aria-label="${t('advancedOptions', state.lang)}" ${expanded ? 'open' : ''}>
-      <summary aria-label="${t('advancedOptions', state.lang)}">${t('advancedOptions', state.lang)}</summary>
+    <section class="output-settings" data-role="advanced-output-settings" aria-label="${t('advancedOptions', state.lang)}">
+      <h2 class="output-settings-title">${t('advancedOptions', state.lang)}</h2>
       <div class="output-settings-content">
         <label>
           <span>${t('conflictStrategy', state.lang)}</span>
@@ -7792,7 +7765,6 @@ function renderOutputSettings(
             <option value="title_artist" ${state.neteaseFilenameFormat === 'title_artist' ? 'selected' : ''}>${t('titleArtist', state.lang)}</option>
             <option value="artist_title" ${state.neteaseFilenameFormat === 'artist_title' ? 'selected' : ''}>${t('artistTitle', state.lang)}</option>
           </select>
-          <small class="input-format-hint">${t('neteaseInputFormatHint', state.lang)}</small>
         </label>
         <div class="concurrency-setting" data-role="concurrency-setting">
           <label for="concurrency-limit-range"><span>${t('concurrencyLimit', state.lang)}</span></label>
@@ -7824,18 +7796,13 @@ function renderOutputSettings(
             <small>${modelsReady ? t('essentiaModelsReady', state.lang) : t('essentiaModelsMissing', state.lang)}</small>
           </div>
         ` : ''}
-        ${ANALYSIS_CACHE_CLEAR_VISIBLE ? `
-          <button type="button" class="secondary-action analysis-cache-clear" data-action="clear-analysis-cache">
-            ${t('clearAnalysisCache', state.lang)}
-          </button>
-        ` : ''}
         ${ENHANCED_ANALYSIS_FEATURES_VISIBLE ? `
           <button type="button" class="secondary-action scan-cache-clear" data-action="clear-scan-cache">
             ${t('clearScanCache', state.lang)}
           </button>
         ` : ''}
       </div>
-    </details>
+    </section>
   `;
 }
 

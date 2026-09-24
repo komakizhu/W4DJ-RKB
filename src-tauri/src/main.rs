@@ -8400,7 +8400,7 @@ fn main() {
             };
             let mut window_builder = WebviewWindowBuilder::new(app, "main", headless_url)
                 .title(APP_PRODUCT_NAME)
-                .inner_size(1280.0, 800.0)
+                .inner_size(1280.0, if headless_mode { 800.0 } else { 900.0 })
                 .min_inner_size(760.0, 560.0)
                 .resizable(true)
                 .visible(!headless_mode);

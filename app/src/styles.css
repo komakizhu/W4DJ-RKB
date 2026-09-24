@@ -511,6 +511,11 @@ h1 {
   overflow: hidden;
 }
 
+.format-slot[data-visible="false"] {
+  height: 0;
+  min-height: 0;
+}
+
 .format-slot .format-row {
   opacity: 0;
   visibility: hidden;
@@ -699,12 +704,9 @@ h1 {
 }
 
 /* The analysis capability remains available to library/recovery flows while
- * this unstable conversion-rail selector is temporarily hidden. Keep the
- * reserved row in the layout so onboarding anchors and the start button do
- * not move when the controls are hidden. */
+ * this unstable conversion-rail selector is temporarily hidden. */
 .enhanced-mode-row.enhanced-mode-row-hidden {
-  visibility: hidden;
-  pointer-events: none;
+  display: none;
 }
 
 .global-action {
@@ -1358,52 +1360,22 @@ h1 {
 }
 
 .output-settings {
-  margin-top: 14px;
-  padding-top: 9px;
+  margin-top: 2px;
+  padding-top: 12px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.output-settings summary {
+.output-settings-title {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   min-height: 24px;
+  margin: 0;
   color: var(--rail-muted);
-  cursor: pointer;
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 8px;
   font-weight: 400;
   letter-spacing: 0.05em;
-  list-style: none;
-  opacity: 0.76;
   text-transform: uppercase;
-}
-
-.output-settings summary::-webkit-details-marker {
-  display: none;
-}
-
-.output-settings summary::after {
-  width: 6px;
-  height: 6px;
-  border-right: 1px solid currentColor;
-  border-bottom: 1px solid currentColor;
-  content: "";
-  transform: rotate(45deg) translate(-2px, -2px);
-  transition: transform 160ms ease;
-}
-
-.output-settings[open] summary {
-  opacity: 1;
-}
-
-.output-settings[open] summary::after {
-  transform: rotate(225deg) translate(1px, 1px);
-}
-
-.output-settings summary:focus-visible {
-  outline: 2px solid var(--focus);
-  outline-offset: 3px;
 }
 
 .output-settings-content {
@@ -1515,15 +1487,6 @@ h1 {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 22%, transparent);
 }
 
-.output-settings:not([open]) .output-settings-content {
-  display: none;
-}
-
-.output-settings:not([open]) {
-  margin-top: 0;
-  padding-top: 0;
-}
-
 .output-settings .scan-cache-clear,
 .output-settings .enhanced-cache-clear {
   justify-self: start;
@@ -1581,13 +1544,6 @@ h1 {
   font-size: 8px;
   font-weight: 400;
   letter-spacing: 0.04em;
-}
-
-.output-settings .input-format-hint {
-  color: var(--rail-muted);
-  font-size: 8px;
-  line-height: 1.5;
-  letter-spacing: 0;
 }
 
 .output-settings select {

@@ -1921,14 +1921,16 @@ describe('renderApp', () => {
     expect(row?.querySelector('[data-enhanced-mode="on"]')).not.toBeNull();
   });
 
-  it('keeps secondary output settings collapsed with safe defaults', () => {
+  it('shows advanced output settings without a collapse control and keeps safe defaults', () => {
     const root = renderApp(makeViewState());
     const settings = root.querySelector(
       '[data-role="advanced-output-settings"]',
-    ) as HTMLDetailsElement;
+    ) as HTMLElement;
 
-    expect(settings.open).toBe(false);
-    expect(settings.querySelector('summary')?.textContent).toContain('高级选项');
+    expect(settings.tagName).toBe('SECTION');
+    expect(settings.querySelector('summary')).toBeNull();
+    expect(settings.querySelector('.output-settings-title')?.textContent).toContain('高级选项');
+    expect(settings.querySelector('.input-format-hint')).toBeNull();
     expect(settings.textContent).toContain('已存在歌曲策略');
     expect(Array.from(
       (root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement).options,
@@ -2113,7 +2115,7 @@ describe('renderApp', () => {
     expect(enhancedModeRow?.hasAttribute('inert')).toBe(true);
     expect(enhancedModeRow?.classList.contains('enhanced-mode-row-hidden')).toBe(true);
     expect(root.querySelector('.essentia-model-settings')).toBeNull();
-    expect(root.querySelector('[data-action="clear-analysis-cache"]')).not.toBeNull();
+    expect(root.querySelector('[data-action="clear-analysis-cache"]')).toBeNull();
     expect(root.querySelector('[data-action="clear-scan-cache"]')).toBeNull();
     expect(root.querySelector('[data-action="restore-bundled-essentia-models"]')).toBeNull();
     expect(root.querySelector('[data-action="open-essentia-models-page"]')).toBeNull();
@@ -3123,7 +3125,7 @@ describe('bindApp', () => {
     });
   });
 
-  it('keeps advanced output settings open while a selection refreshes', async () => {
+  it('keeps advanced output settings visible while a selection refreshes', async () => {
     const services = makeMockServices({
       chooseConflictStrategy: vi.fn().mockResolvedValue(
         makeDesktopState({ conflict_strategy: 'overwrite' }),
@@ -3136,20 +3138,15 @@ describe('bindApp', () => {
       expect(root.querySelector('[data-role="advanced-output-settings"]')).not.toBeNull();
     });
 
-    const settings = root.querySelector(
-      '[data-role="advanced-output-settings"]',
-    ) as HTMLDetailsElement;
-    settings.open = true;
-    settings.dispatchEvent(new Event('toggle', { bubbles: true }));
-
     const select = root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement;
     select.value = 'overwrite';
     select.dispatchEvent(new Event('change', { bubbles: true }));
 
     await vi.waitFor(() => {
-      expect(
-        (root.querySelector('[data-role="advanced-output-settings"]') as HTMLDetailsElement).open,
-      ).toBe(true);
+      expect(root.querySelector('[data-role="advanced-output-settings"]')?.querySelector('summary'))
+        .toBeNull();
+      expect(root.querySelector('[data-role="advanced-output-settings"]')?.textContent)
+        .toContain('已存在歌曲策略');
       expect((root.querySelector('[data-action="choose-conflict"]') as HTMLSelectElement).value)
         .toBe('overwrite');
     });
@@ -5303,12 +5300,12 @@ describe('bindApp', () => {
     });
   });
 
-  it('keeps analysis cache cleanup available while the feature bundle is hidden', async () => {
+  it('does not show library cache cleanup in the conversion rail', async () => {
     const services = makeMockServices();
     const root = document.createElement('div');
     bindApp(root, makeViewState(), services);
 
-    expect(root.querySelector('[data-action="clear-analysis-cache"]')).not.toBeNull();
+    expect(root.querySelector('[data-action="clear-analysis-cache"]')).toBeNull();
     expect(services.clearTrackAnalyses).not.toHaveBeenCalled();
   });
 
