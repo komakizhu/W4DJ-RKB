@@ -2502,7 +2502,8 @@ fn convert_audio_to_output_path_managed(
 
     match target_profile {
         TargetProfile::CompatMp3 => {
-            command.arg("-q:a").arg("0").arg("-id3v2_version").arg("3");
+            let sample_rate_hz = probe_input_sample_rate(&ffmpeg_path, src_path)?;
+            configure_compat_mp3_encoder(&mut command, sample_rate_hz);
         }
         TargetProfile::LosslessWav => {
             command.arg("-c:a").arg("pcm_s24le");
@@ -2541,6 +2542,41 @@ fn convert_audio_to_output_path_managed(
     }
 
     ensure_generated_output(output_path, name_stem)
+}
+
+fn probe_input_sample_rate(ffmpeg_path: &str, src_path: &Path) -> io::Result<u32> {
+    let mut command = Command::new(ffmpeg_path);
+    configure_background_process(&mut command);
+    let output = command
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(src_path)
+        .output()?;
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.contains("Audio:"))
+        .flat_map(|line| line.split(','))
+        .find_map(|segment| segment.trim().strip_suffix(" Hz")?.parse::<u32>().ok())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Could not read source audio sample rate",
+            )
+        })
+}
+
+fn configure_compat_mp3_encoder(command: &mut Command, sample_rate_hz: u32) {
+    command
+        .arg("-c:a")
+        .arg("libmp3lame")
+        .arg("-b:a")
+        .arg("320k")
+        .arg("-compression_level")
+        .arg("0");
+    if sample_rate_hz < 32_000 {
+        command.arg("-ar").arg("44100");
+    }
+    command.arg("-id3v2_version").arg("3");
 }
 
 fn create_persistent_temp_path(
@@ -5168,17 +5204,18 @@ mod tests {
         ActiveFfmpegRegistry, ConversionMetadataContext, EmbeddedAnalysis,
         SUPPORTED_SOURCE_EXTENSIONS, SongIdentity, apply_track_analysis_metadata, build_song_name,
         build_song_name_with_policy, build_song_name_with_rule, commit_temporary_output,
-        compare_music_dicts, derive_song_name, derive_song_name_with_policy,
-        derive_song_name_with_policy_and_resolver, derive_song_name_with_rule,
-        ensure_generated_output, ensure_output_metadata, ensure_output_metadata_with_settings,
+        compare_music_dicts, configure_compat_mp3_encoder, derive_song_name,
+        derive_song_name_with_policy, derive_song_name_with_policy_and_resolver,
+        derive_song_name_with_rule, ensure_generated_output, ensure_output_metadata,
+        ensure_output_metadata_with_settings,
         ensure_output_metadata_with_settings_with_context_and_policy,
         enumerate_music_files_observed, fill_missing_metadata, find_ffmpeg_next_to_exe,
         infer_song_identity, inspect_metadata_diagnostic_with_resolver,
         inspect_metadata_diagnostic_with_resolver_and_settings, is_hidden_path,
         is_ignored_music_file, merge_recovered_metadata, ncm_decryption_available,
-        remove_conflicting_outputs, run_output_transaction, sanitize_filename_component,
-        sanitize_preserve_source_filename_component, source_metadata_as_id3_with_resolver,
-        strip_163_key_from_mp3,
+        probe_input_sample_rate, remove_conflicting_outputs, run_output_transaction,
+        sanitize_filename_component, sanitize_preserve_source_filename_component,
+        source_metadata_as_id3_with_resolver, strip_163_key_from_mp3,
         sync_music_library_transactional_with_observer_and_budget_and_context,
         target_output_path_with_policy, update_analysis_metadata_transactionally,
         update_existing_metadata_transactionally,
@@ -5239,6 +5276,77 @@ mod tests {
         wav.extend_from_slice(&4u32.to_le_bytes());
         wav.extend_from_slice(&[0, 0, 0, 0]);
         fs::write(path, wav).unwrap();
+    }
+
+    #[test]
+    fn compat_encoder_writes_constant_320kbps_mp3_frames() {
+        let dir = tempdir().unwrap();
+        let ffmpeg_path = which::which("ffmpeg").expect("FFmpeg is required");
+        for source_rate in [22_050u32, 44_100, 48_000, 96_000] {
+            let source = dir.path().join(format!("silent-{source_rate}.wav"));
+            let output = dir.path().join(format!("encoded-{source_rate}.mp3"));
+            let samples = vec![0u8; source_rate as usize * 2];
+            let mut wav = Vec::with_capacity(44 + samples.len());
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + samples.len() as u32).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&source_rate.to_le_bytes());
+            wav.extend_from_slice(&(source_rate * 2).to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+            wav.extend_from_slice(&samples);
+            fs::write(&source, wav).unwrap();
+
+            let measured_rate =
+                probe_input_sample_rate(ffmpeg_path.to_str().unwrap(), &source).unwrap();
+            assert_eq!(measured_rate, source_rate);
+            let mut command = Command::new(&ffmpeg_path);
+            command
+                .arg("-y")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-i")
+                .arg(&source);
+            configure_compat_mp3_encoder(&mut command, measured_rate);
+            assert!(command.arg(&output).status().unwrap().success());
+
+            let bytes = fs::read(output).unwrap();
+            assert_eq!(&bytes[..3], b"ID3");
+            let mut offset = 10
+                + bytes[6..10]
+                    .iter()
+                    .fold(0usize, |size, byte| (size << 7) | usize::from(byte & 0x7f));
+            for frame in 0..12 {
+                let header = &bytes[offset..offset + 4];
+                assert_eq!(
+                    header[0], 0xff,
+                    "{source_rate} Hz frame {frame} has no MP3 sync"
+                );
+                assert_eq!(
+                    header[1] & 0x1e,
+                    0x1a,
+                    "{source_rate} Hz frame {frame} is not MPEG-1 layer III"
+                );
+                assert_eq!(
+                    header[2] >> 4,
+                    14,
+                    "{source_rate} Hz frame {frame} is not 320 kbps"
+                );
+                let encoded_rate = [44_100, 48_000, 32_000][((header[2] >> 2) & 3) as usize];
+                let expected_rate = match source_rate {
+                    22_050 => 44_100,
+                    96_000 => 48_000,
+                    other => other,
+                };
+                assert_eq!(encoded_rate, expected_rate);
+                offset += 144 * 320_000 / encoded_rate as usize + usize::from((header[2] >> 1) & 1);
+            }
+        }
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # W4DJ RKB 更新日志
 
+## v3.2.6
+
+### Fixed
+
+- 兼容模式将非 MP3 来源编码为固定 320 kbps MP3，避免可变码率文件在 Rekordbox 中被显示为 32 kbps；原 MP3 音频仍保留原编码。
+
 ## v3.2.5
 
 ### Changed

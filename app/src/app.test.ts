@@ -293,7 +293,7 @@ const makeMockServices = (overrides: Partial<AppServices> = {}): AppServices => 
   deleteHistoryEntry: vi.fn().mockResolvedValue(undefined),
   clearHistory: vi.fn().mockResolvedValue(undefined),
   loadAppInfo: vi.fn().mockResolvedValue({
-    version: '3.2.5',
+    version: '3.2.6',
     developer: 'komakizhu',
     project_url: 'https://github.com/komakizhu/W4DJ-RKB',
   }),
@@ -1857,7 +1857,7 @@ describe('renderApp', () => {
 
     expect(root.querySelector('.rail-note')).toBeNull();
     expect(root.querySelector('[data-role="help-modal"]')?.textContent)
-      .toContain('兼容模式：最高输出 320kbps MP3');
+      .toContain('兼容模式：转码使用固定 320kbps MP3；原 MP3 音频保留');
     expect(root.querySelector('[data-role="help-modal"]')?.textContent)
       .toContain('无损模式：最高输出 24-bit / 48kHz');
     const helpText = root.querySelector('[data-role="help-modal"]')?.textContent || '';
@@ -2183,13 +2183,13 @@ describe('renderApp', () => {
       null,
       false,
       {
-        version: '3.2.5',
+        version: '3.2.6',
         developer: 'komakizhu',
         project_url: 'https://github.com/komakizhu/W4DJ-RKB',
       },
     );
 
-    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.5');
+    expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('v3.2.6');
     expect(root.querySelector('[data-role="about-modal"]')?.textContent).toContain('komakizhu');
     expect(root.querySelector('[data-role="about-modal"] [data-action="open-project-home"]')?.getAttribute('data-url')).toBe('https://github.com/komakizhu/W4DJ-RKB');
     expect(root.querySelector('[data-role="about-modal"] [data-action="reopen-onboarding"]')).toBeNull();
