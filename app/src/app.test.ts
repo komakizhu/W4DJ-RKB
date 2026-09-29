@@ -1876,16 +1876,21 @@ describe('renderApp', () => {
     expect(helpSections[1]?.getAttribute('aria-labelledby')).toBe('help-output-title');
   });
 
-  it('keeps the global lossless format selector mounted and changes its visible state', () => {
+  it('keeps WAV and AIFF visible but unavailable until lossless mode is selected', () => {
     const compatRoot = renderApp(makeViewState({ mode: 'compat' }));
     expect(compatRoot.querySelector('.format-slot')).not.toBeNull();
-    expect(compatRoot.querySelector('.format-row')?.getAttribute('data-visible')).toBe('false');
-    expect(compatRoot.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('true');
+    expect(compatRoot.querySelector('.format-slot')?.getAttribute('data-visible')).not.toBe('false');
+    expect(compatRoot.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('false');
+    expect(compatRoot.querySelector('.format-row')?.getAttribute('data-available')).toBe('false');
+    expect(compatRoot.querySelector('[data-format="wav"]')?.getAttribute('aria-disabled')).toBe('true');
+    expect(compatRoot.querySelector('[data-format="aiff"]')?.getAttribute('aria-disabled')).toBe('true');
+    expect((compatRoot.querySelector('[data-format="wav"]') as HTMLButtonElement).tabIndex).toBe(-1);
 
     const root = renderApp(makeViewState({ mode: 'lossless', losslessFormat: 'wav' }));
     expect(root.querySelector('.format-slot')).not.toBeNull();
-    expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('true');
+    expect(root.querySelector('.format-slot')?.getAttribute('data-visible')).not.toBe('false');
     expect(root.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('false');
+    expect(root.querySelector('.format-row')?.getAttribute('data-available')).toBe('true');
     expect(root.querySelector('[data-format="wav"]')?.classList.contains('selected')).toBe(true);
     expect(root.querySelector('[data-format="aiff"]')?.classList.contains('selected')).toBe(false);
   });
@@ -3516,11 +3521,16 @@ describe('bindApp', () => {
     bindApp(root, makeViewState(), services);
     const formatRow = root.querySelector('.format-row');
 
+    (root.querySelector('[data-format="aiff"]') as HTMLButtonElement).click();
+    expect(services.chooseLosslessFormat).not.toHaveBeenCalled();
+
     (root.querySelector('[data-mode="lossless"]') as HTMLButtonElement).click();
     await vi.waitFor(() => {
       expect(root.querySelector('.format-row')).toBe(formatRow);
-      expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('true');
+      expect(root.querySelector('.format-slot')?.getAttribute('data-visible')).not.toBe('false');
+      expect(root.querySelector('.format-row')?.getAttribute('data-available')).toBe('true');
       expect(root.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('false');
+      expect((root.querySelector('[data-format="wav"]') as HTMLButtonElement).tabIndex).toBe(0);
     });
 
     (root.querySelector('[data-format="aiff"]') as HTMLButtonElement).click();
@@ -3544,13 +3554,14 @@ describe('bindApp', () => {
     const formatRow = root.querySelector('.format-row');
 
     (root.querySelector('[data-mode="lossless"]') as HTMLButtonElement).click();
-    await vi.waitFor(() => expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('true'));
+    await vi.waitFor(() => expect(root.querySelector('.format-row')?.getAttribute('data-available')).toBe('true'));
     (root.querySelector('[data-mode="compat"]') as HTMLButtonElement).click();
 
     await vi.waitFor(() => {
       expect(root.querySelector('.format-row')).toBe(formatRow);
-      expect(root.querySelector('.format-row')?.getAttribute('data-visible')).toBe('false');
-      expect(root.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('true');
+      expect(root.querySelector('.format-slot')?.getAttribute('data-visible')).not.toBe('false');
+      expect(root.querySelector('.format-row')?.getAttribute('data-available')).toBe('false');
+      expect(root.querySelector('.format-row')?.getAttribute('aria-hidden')).toBe('false');
     });
   });
 

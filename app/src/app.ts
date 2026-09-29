@@ -3580,9 +3580,13 @@ export function bindApp(
     if (isMode) {
       const formatRow = root.querySelector<HTMLElement>('.format-row');
       if (formatRow) {
-        const losslessVisible = state.mode === 'lossless';
-        formatRow.dataset.visible = String(losslessVisible);
-        formatRow.setAttribute('aria-hidden', String(!losslessVisible));
+        const formatAvailable = state.mode === 'lossless';
+        formatRow.dataset.available = String(formatAvailable);
+        formatRow.setAttribute('aria-disabled', String(!formatAvailable));
+        formatRow.querySelectorAll<HTMLButtonElement>('.format-button').forEach((button) => {
+          button.setAttribute('aria-disabled', String(!formatAvailable));
+          button.tabIndex = formatAvailable ? 0 : -1;
+        });
       }
     }
 
@@ -7008,6 +7012,7 @@ export function bindApp(
     }
 
     if (format) {
+      if (state.mode !== 'lossless') return;
       void runSelectionAction(
         'format',
         state.losslessFormat !== format,
@@ -7710,13 +7715,14 @@ export function bindApp(
 
 function renderLosslessFormats(state: AppViewState, pendingSelection: PendingSelection = null): string {
   const formats: AppLosslessFormat[] = ['wav', 'aiff'];
+  const available = state.mode === 'lossless';
   return `
-    <div class="format-slot" data-visible="${state.mode === 'lossless'}">
-      <div class="format-row" data-selected-format="${state.losslessFormat || 'wav'}" data-visible="${state.mode === 'lossless'}" aria-label="${t('losslessFormat', state.lang)}" aria-hidden="${state.mode !== 'lossless'}">
+    <div class="format-slot">
+      <div class="format-row" data-selected-format="${state.losslessFormat || 'wav'}" data-available="${available}" aria-label="${t('losslessFormat', state.lang)}" aria-hidden="false" aria-disabled="${!available}">
         ${formats
           .map(
             (format) => `
-              <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}" aria-disabled="${pendingSelection === 'format' ? 'true' : 'false'}">
+              <button type="button" class="format-button ${state.losslessFormat === format ? 'selected' : ''}" data-format="${format}" aria-disabled="${!available || pendingSelection === 'format'}" tabindex="${available ? 0 : -1}">
                 ${format.toUpperCase()}
               </button>
             `,
