@@ -1,5 +1,12 @@
 # W4DJ RKB 项目长期协作规则
 
+## 项目与任务隔离（强制）
+
+- 本文件仅适用于当前 W4DJ RKB 仓库；每次开始先确认 `git rev-parse --show-toplevel` 和 `git remote get-url origin`，不得依据其他对话、窗口标题或旧工作树猜测项目身份。
+- 当前受信的主线基准为提交 `24aee846d2707f300a044d9d957e758b1c164cd0`（3.2.7 版本提交）；用户另行指定前，新任务从该提交创建独立的 `codex/<task>` 分支，不盲信可能漂移的本地 `main` 或其他工作树。
+- 本项目的所有读取、修改、测试、构建和提交都必须留在当前 RKB 工作目录及其任务分支；不得切换到或修改 `main`，不得跨项目访问、引用、合并、摘取或复制仓库、分支与工作历史。
+- 若当前仓库根目录、`origin` 或基准提交与本项目规则不符，先停止并核实，不要尝试跨仓库“修复”或迁移，也不要自动移动或重写 `main`。
+
 ## 项目定位
 
 W4DJ RKB 是一个面向 DJ 音乐库整理的跨平台桌面应用：负责把文件夹或单曲转换为适合 Rekordbox/CDJ 工作流的音频文件，并保留、补全和展示歌曲元数据、封面、歌词及 Essentia 分析结果。应用也包含本地歌曲库索引和网易云音乐本地数据读取能力。
@@ -16,13 +23,13 @@ W4DJ RKB 是一个面向 DJ 音乐库整理的跨平台桌面应用：负责把�
 
 ## 主要目录
 
-- `/Users/mac2/Documents/W4DJ RKB/app/`：前端入口、样式、教程、任务卡、歌曲库 Dashboard 和 Vitest 测试。
-- `/Users/mac2/Documents/W4DJ RKB/src/`：共享 Rust 库，包含分析、同步、元数据、历史、网易云恢复、媒体探测、歌曲库和缓存。
-- `/Users/mac2/Documents/W4DJ RKB/src-tauri/`：Tauri 桌面壳、命令、系统文件操作、sidecar 和图标。
-- `/Users/mac2/Documents/W4DJ RKB/tests/`：Rust 集成测试。
-- `/Users/mac2/Documents/W4DJ RKB/docs/`：设计、实施计划、测试包和项目状态文档。
-- `/Users/mac2/Documents/W4DJ RKB/scripts/`：测试夹具和本地调试脚本；使用前先确认脚本是否属于当前任务。
-- `/Users/mac2/Documents/W4DJ RKB/packaging/macos/`：macOS DMG 中使用的正式 Gatekeeper 修复脚本来源。
+- `app/`：前端入口、样式、教程、任务卡、歌曲库 Dashboard 和 Vitest 测试。
+- `src/`：共享 Rust 库，包含分析、同步、元数据、历史、网易云恢复、媒体探测、歌曲库和缓存。
+- `src-tauri/`：Tauri 桌面壳、命令、系统文件操作、sidecar 和图标。
+- `tests/`：Rust 集成测试。
+- `docs/`：设计、实施计划、测试包和项目状态文档。
+- `scripts/`：测试夹具和本地调试脚本；使用前先确认脚本是否属于当前任务。
+- `packaging/macos/`：macOS DMG 中使用的正式 Gatekeeper 修复脚本来源。
 
 ## 架构原则
 
@@ -70,4 +77,3 @@ Apple Silicon 本地 App 输出在 `src-tauri/target/aarch64-apple-darwin/releas
 - 只有用户明确要求定稿/推送/发布时，才执行对应 GitHub 操作；CI 失败时只在用户授权范围内修复当前分支。
 - 不从其他版本分支复制源码，不把临时测试文件、桌面脚本副本或用户数据混入发布提交。
 - 完成代码任务后先测试、展示 `git status` 和 diff 摘要，等待用户确认。
-
