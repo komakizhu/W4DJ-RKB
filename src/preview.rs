@@ -18,7 +18,7 @@ use crate::sync::{
     get_music_dict_with_scan_issues_with_settings_and_observer_with_policy,
     get_music_dict_with_scan_issues_with_settings_and_policy, is_ignored_music_file,
     is_supported_source_file, music_dict_from_snapshots_with_cache, resolve_output_policy,
-    source_entry_name, target_output_path_with_policy,
+    source_entry_name, source_file_rejection_message, target_output_path_with_policy,
 };
 use crate::w4dj_library::CommittedOutputBinding;
 use serde::{Deserialize, Serialize};
@@ -50,19 +50,6 @@ fn contains_ncm_source_file(path: &Path) -> bool {
         .into_iter()
         .filter_map(Result::ok)
         .any(|entry| entry.file_type().is_file() && is_ncm_source_file(entry.path()))
-}
-
-fn unsupported_source_message(path: &Path) -> &'static str {
-    let supported_formats = if crate::sync::ncm_decryption_available() {
-        "不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件"
-    } else {
-        "不支持的单曲格式；请选择 MP3、FLAC、WAV 或 AIFF 文件"
-    };
-    if is_ncm_source_file(path) && !crate::sync::ncm_decryption_available() {
-        crate::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE
-    } else {
-        supported_formats
-    }
 }
 
 /// Recover a single-file source after the original downloaded file was
@@ -986,7 +973,7 @@ fn build_sync_preview_with_settings_and_netease_observed_internal(
     if source_path.is_file() && !is_supported_source_file(source_path) {
         preview.errors.push(PreviewIssue {
             path: source_directory.to_string(),
-            message: unsupported_source_message(source_path).to_string(),
+            message: source_file_rejection_message(source_path).to_string(),
         });
         preview.error_count = 1;
         preview.estimated_output_bytes = None;

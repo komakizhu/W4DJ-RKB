@@ -92,6 +92,7 @@ use w4dj::sync::{
     MusicScanIssue, ScanEnumerationError, ScanPhase, ScannedFileSnapshot,
     enumerate_music_files_observed,
     filename_rule_cache_key, netease_filename_format_cache_key,
+    source_file_rejection_message,
 };
 
 mod essentia_model_import;
@@ -10226,11 +10227,7 @@ fn validate_source_input(source: &str) -> Result<(), String> {
         return Err(w4dj::sync::NCM_DECRYPTION_UNAVAILABLE_MESSAGE.to_string());
     }
     if path.is_file() && !is_supported_source_file(path) {
-        return Err(if w4dj::sync::ncm_decryption_available() {
-            String::from("不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件")
-        } else {
-            String::from("不支持的单曲格式；请选择 MP3、FLAC、WAV 或 AIFF 文件")
-        });
+        return Err(source_file_rejection_message(path).to_string());
     }
     if !path.is_dir() && !path.is_file() {
         return Err(String::from("输入来源不是文件夹或音频文件"));

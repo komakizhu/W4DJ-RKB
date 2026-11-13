@@ -41,6 +41,8 @@ pub const SUPPORTED_SOURCE_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "aiff"]
 
 pub const NCM_DECRYPTION_UNAVAILABLE_MESSAGE: &str =
     "此 Legacy 版本不包含 NCM 解密功能，请先使用标准版处理 .ncm 文件";
+pub const HIDDEN_SOURCE_FILE_MESSAGE: &str =
+    "该文件或所在文件夹被标记为隐藏，已跳过；请取消隐藏后重试";
 
 pub fn ncm_decryption_available() -> bool {
     cfg!(feature = "ncm-decryption")
@@ -1335,6 +1337,26 @@ pub fn is_supported_source_file(path: &Path) -> bool {
         && has_allowed_extension(path, SUPPORTED_SOURCE_EXTENSIONS)
 }
 
+/// Explain why a single file was rejected by the shared source-file policy.
+pub fn source_file_rejection_message(path: &Path) -> &'static str {
+    if has_allowed_extension(path, SUPPORTED_SOURCE_EXTENSIONS) && is_hidden_path(path) {
+        return HIDDEN_SOURCE_FILE_MESSAGE;
+    }
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ncm"))
+        && !ncm_decryption_available()
+    {
+        return NCM_DECRYPTION_UNAVAILABLE_MESSAGE;
+    }
+    if ncm_decryption_available() {
+        "不支持的单曲格式；请选择 MP3、FLAC、NCM、WAV 或 AIFF 文件"
+    } else {
+        "不支持的单曲格式；请选择 MP3、FLAC、WAV 或 AIFF 文件"
+    }
+}
+
 pub fn get_music_dict(folder: &str) -> HashMap<String, (String, PathBuf)> {
     get_music_dict_with_scan_issues(folder).0
 }
@@ -1588,6 +1610,13 @@ fn ancestor_metadata_is_hidden(path: &Path) -> bool {
     if path == Path::new("/var") || path == Path::new("/private/var") {
         return false;
     }
+    #[cfg(target_os = "windows")]
+    if is_windows_root_path(path) {
+        // Windows volume roots commonly carry the Hidden attribute along
+        // with System and Directory.  That machine-managed flag must not hide
+        // every normal song stored below the root.
+        return false;
+    }
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
@@ -1606,6 +1635,16 @@ fn ancestor_metadata_is_hidden(path: &Path) -> bool {
         }
     }
     false
+}
+
+#[cfg(target_os = "windows")]
+fn is_windows_root_path(path: &Path) -> bool {
+    use std::path::Component;
+
+    path.has_root()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
 }
 
 fn is_macos_appledouble_file(path: &Path) -> bool {
@@ -5215,7 +5254,8 @@ mod tests {
         is_ignored_music_file, merge_recovered_metadata, ncm_decryption_available,
         probe_input_sample_rate, remove_conflicting_outputs, run_output_transaction,
         sanitize_filename_component, sanitize_preserve_source_filename_component,
-        source_metadata_as_id3_with_resolver, strip_163_key_from_mp3,
+        source_file_rejection_message, source_metadata_as_id3_with_resolver,
+        strip_163_key_from_mp3,
         sync_music_library_transactional_with_observer_and_budget_and_context,
         target_output_path_with_policy, update_analysis_metadata_transactionally,
         update_existing_metadata_transactionally,
@@ -5395,6 +5435,36 @@ mod tests {
         .unwrap();
         assert_eq!(result.paths.len(), 1);
         assert!(result.paths[0].ends_with("visible.mp3"));
+    }
+
+    #[test]
+    fn source_rejection_distinguishes_hidden_audio_from_unsupported_formats() {
+        let directory = tempdir().unwrap();
+        let hidden_audio = directory.path().join(".hidden.mp3");
+        let unsupported_file = directory.path().join("notes.txt");
+        fs::write(&hidden_audio, b"audio").unwrap();
+        fs::write(&unsupported_file, b"text").unwrap();
+
+        assert_eq!(
+            source_file_rejection_message(&hidden_audio),
+            super::HIDDEN_SOURCE_FILE_MESSAGE
+        );
+        assert!(source_file_rejection_message(&unsupported_file).starts_with("不支持的单曲格式"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_volume_roots_do_not_hide_normal_files_below_them() {
+        let drive_root = Path::new(r"C:\");
+        let extended_drive_root = Path::new(r"\\?\C:\");
+        let network_share_root = Path::new(r"\\server\share\");
+
+        assert!(super::is_windows_root_path(drive_root));
+        assert!(super::is_windows_root_path(extended_drive_root));
+        assert!(super::is_windows_root_path(network_share_root));
+        assert!(!super::is_windows_root_path(&drive_root.join("Music")));
+        assert!(!super::ancestor_metadata_is_hidden(drive_root));
+        assert!(!is_hidden_path(&drive_root.join("Music/Track.flac")));
     }
 
     #[cfg(target_os = "macos")]
